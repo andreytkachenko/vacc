@@ -1,0 +1,67 @@
+[package]
+name = "examples"
+description = "Examples for vk-video library"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[example]]
+name = "basic_decode"
+path = "src/basic_decode.rs"
+
+[[example]]
+name = "parse_bitstream"
+path = "src/parse_bitstream.rs"
+
+[[example]]
+name = "decode_verify"
+path = "src/decode_verify.rs"
+
+[[example]]
+name = "pixel_verify"
+path = "src/pixel_verify.rs"
+
+[[example]]
+name = "vulkan_decode_verify"
+path = "src/vulkan_decode_verify.rs"
+
+[[example]]
+name = "debug_vulkan"
+path = "src/debug_vulkan.rs"
+
+[[example]]
+name = "vulkan_decode"
+path = "src/vulkan_decode.rs"
+
+[[example]]
+name = "debug_decode"
+path = "src/debug_decode.rs"
+
+[[example]]
+name = "dump_sps_pps"
+path = "src/dump_sps_pps.rs"
+
+[[example]]
+name = "bisect_decode"
+path = "src/bisect_decode.rs"
+
+[[example]]
+name = "compare_sps_pps"
+path = "src/compare_sps_pps.rs"
+
+[[example]]
+name = "analyze_frame1"
+path = "src/analyze_frame1.rs"
+
+[dependencies]
+vk-video-core = { workspace = true }
+vk-video-parser = { workspace = true }
+vk-video-vulkan = { workspace = true }
+ash = { workspace = true }
+bytemuck.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+tempfile = "3"
+serde_json = "1"
+image = "0.25"

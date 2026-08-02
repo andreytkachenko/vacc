@@ -1,0 +1,14 @@
+[package]
+name = "vk-video-core"
+description = "Core types and traits for Vulkan Video Decoder"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = { workspace = true }
+bytemuck.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+log.workspace = true

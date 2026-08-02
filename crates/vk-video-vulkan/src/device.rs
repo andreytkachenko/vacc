@@ -1,0 +1,613 @@
+//! Vulkan device initialization for video decode.
+
+use ash::vk;
+use std::ffi::CString;
+
+use super::{AppInfo, VideoError, VideoResult};
+
+/// Queue family indices found during device selection.
+#[derive(Debug, Clone, Default)]
+pub struct QueueFamilies {
+    pub graphics: Option<u32>,
+    pub compute: Option<u32>,
+    pub transfer: Option<u32>,
+    pub video_decode: Option<u32>,
+    pub video_encode: Option<u32>,
+    pub present: Option<u32>,
+}
+
+/// Video capabilities queried from the GPU.
+#[derive(Debug, Clone)]
+pub struct VideoCapabilities {
+    pub codec_operations: vk::VideoCodecOperationFlagsKHR,
+    pub min_bitstream_buffer_offset_alignment: u32,
+    pub min_bitstream_buffer_size_alignment: u32,
+    pub picture_access_granularity: vk::Extent2D,
+    pub min_coded_extent: vk::Extent2D,
+    pub max_coded_extent: vk::Extent2D,
+    pub max_dpb_slots: u32,
+    pub max_active_reference_pictures: u32,
+    pub supported_formats: Vec<VideoFormatProperties>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoFormatProperties {
+    pub format: vk::Format,
+    pub image_tiling: vk::ImageTiling,
+    pub image_usage_flags: vk::ImageUsageFlags,
+    pub sample_count: vk::SampleCountFlags,
+}
+
+/// Video codec type for the Rust API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    DecodeH264,
+    DecodeH265,
+    DecodeAv1,
+}
+
+impl VideoCodec {
+    pub fn to_vk_flag(self) -> vk::VideoCodecOperationFlagsKHR {
+        match self {
+            Self::DecodeH264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+            Self::DecodeH265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+            Self::DecodeAv1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+        }
+    }
+}
+
+/// Vulkan device wrapper for video decode.
+pub struct VulkanDevice {
+    pub entry: ash::Entry,
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
+    pub device: ash::Device,
+    pub enabled_extensions: Vec<String>,
+    pub queue_families: QueueFamilies,
+    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+}
+
+pub struct VideoDeviceBuilder {
+    app_info: AppInfo,
+    enable_validation: bool,
+    video_codecs: vk::VideoCodecOperationFlagsKHR,
+    num_decode_queues: usize,
+    create_graphics_queue: bool,
+    create_transfer_queue: bool,
+}
+
+impl VideoDeviceBuilder {
+    pub fn new() -> Self {
+        Self {
+            app_info: AppInfo::default(),
+            enable_validation: false,
+            video_codecs: vk::VideoCodecOperationFlagsKHR::DECODE_H264
+                | vk::VideoCodecOperationFlagsKHR::DECODE_H265
+                | vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+            num_decode_queues: 1,
+            create_graphics_queue: false,
+            create_transfer_queue: false,
+        }
+    }
+
+    pub fn with_app_info(mut self, info: AppInfo) -> Self {
+        self.app_info = info;
+        self
+    }
+
+    pub fn with_validation(mut self, enable: bool) -> Self {
+        self.enable_validation = enable;
+        self
+    }
+
+    pub fn with_video_codecs(mut self, codecs: vk::VideoCodecOperationFlagsKHR) -> Self {
+        self.video_codecs = codecs;
+        self
+    }
+
+    pub fn with_num_decode_queues(mut self, count: usize) -> Self {
+        self.num_decode_queues = count;
+        self
+    }
+
+    pub fn with_graphics_queue(mut self, enable: bool) -> Self {
+        self.create_graphics_queue = enable;
+        self
+    }
+
+    pub fn build(self) -> VideoResult<VulkanDevice> {
+        let entry = unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
+        let instance = Self::create_instance(&entry, &self)?;
+        let (physical_device, queue_families) =
+            Self::select_physical_device(&instance, &self)?;
+        let (device, enabled_extensions) = Self::create_device(
+            &entry, &instance, &physical_device, &queue_families, &self,
+        )?;
+        let memory_properties = unsafe {
+            instance.get_physical_device_memory_properties(physical_device)
+        };
+
+        Ok(VulkanDevice {
+            entry,
+            instance,
+            physical_device,
+            device,
+            enabled_extensions,
+            queue_families,
+            memory_properties,
+        })
+    }
+
+    fn create_instance(
+        entry: &ash::Entry,
+        builder: &VideoDeviceBuilder,
+    ) -> VideoResult<ash::Instance> {
+        let app_name = CString::new(&builder.app_info.name[..]).map_err(|e| {
+            VideoError::VulkanInit(format!("Failed to create CString for app name: {}", e))
+        })?;
+        let engine_name = CString::new(&builder.app_info.engine_name[..]).map_err(|e| {
+            VideoError::VulkanInit(format!("Failed to create CString for engine name: {}", e))
+        })?;
+
+        let api_version = std::cmp::min(builder.app_info.api_version, vk::API_VERSION_1_2);
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(&app_name)
+            .engine_name(&engine_name)
+            .api_version(api_version);
+
+        let instance_extensions: Vec<CString> = vec![
+            CString::new("VK_KHR_surface").unwrap(),
+            CString::new("VK_KHR_get_physical_device_properties2").unwrap(),
+        ];
+        let ext_ptrs: Vec<*const std::os::raw::c_char> =
+            instance_extensions.iter().map(|c| c.as_ptr()).collect();
+
+        let mut layers: Vec<CString> = Vec::new();
+        let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
+        if builder.enable_validation {
+            if let Ok(layer) = CString::new("VK_LAYER_KHRONOS_validation") {
+                layers.push(layer);
+            }
+        }
+        if !layers.is_empty() {
+            layer_ptrs = layers.iter().map(|c| c.as_ptr()).collect();
+        }
+
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&ext_ptrs)
+            .enabled_layer_names(&layer_ptrs);
+
+        unsafe { entry.create_instance(&create_info, None) }
+            .map_err(|e| VideoError::VulkanInit(e.to_string()))
+    }
+
+    fn select_physical_device(
+        instance: &ash::Instance,
+        builder: &VideoDeviceBuilder,
+    ) -> VideoResult<(vk::PhysicalDevice, QueueFamilies)> {
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate physical devices: {}", e)))?;
+
+        if physical_devices.is_empty() {
+            return Err(VideoError::VulkanInit("No physical devices found".to_string()));
+        }
+
+        // Find a physical device with video decode support
+        for &pd in &physical_devices {
+            let queue_families_list =
+                unsafe { instance.get_physical_device_queue_family_properties(pd) };
+
+            let mut decode_queue_family: Option<u32> = None;
+            let mut graphics_queue_family: Option<u32> = None;
+            let mut transfer_queue_family: Option<u32> = None;
+
+            for (i, qf) in queue_families_list.iter().enumerate() {
+                let i = i as u32;
+                if qf.queue_flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+                    && decode_queue_family.is_none()
+                {
+                    decode_queue_family = Some(i);
+                }
+                if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    && graphics_queue_family.is_none()
+                {
+                    graphics_queue_family = Some(i);
+                }
+                if qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    && transfer_queue_family.is_none()
+                {
+                    transfer_queue_family = Some(i);
+                }
+            }
+
+            if let Some(decode_qf) = decode_queue_family {
+                let queue_families = QueueFamilies {
+                    graphics: graphics_queue_family,
+                    compute: None,
+                    transfer: transfer_queue_family.or(Some(decode_qf)),
+                    video_decode: decode_queue_family,
+                    video_encode: None,
+                    present: None,
+                };
+                return Ok((pd, queue_families));
+            }
+        }
+
+        Err(VideoError::VideoNotSupported(
+            "No physical device with video decode queue found".to_string(),
+        ))
+    }
+
+    fn create_device(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: &vk::PhysicalDevice,
+        queue_families: &QueueFamilies,
+        builder: &VideoDeviceBuilder,
+    ) -> VideoResult<(ash::Device, Vec<String>)> {
+        // Query available device extensions
+        let available_extensions = unsafe {
+            instance.enumerate_device_extension_properties(*physical_device)
+        }.map_err(|e| VideoError::DeviceCreation(format!("Failed to enumerate extensions: {}", e)))?;
+
+        let available_names: Vec<String> = available_extensions
+            .iter()
+            .map(|ext| {
+                let name_bytes: Vec<u8> = ext.extension_name.iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
+                String::from_utf8_lossy(&name_bytes).into_owned()
+            })
+            .collect();
+
+        eprintln!("[VideoDeviceBuilder] Available video extensions:");
+        for name in &available_names {
+            if name.contains("video") {
+                eprintln!("  - {}", name);
+            }
+        }
+
+        // Collect device extensions (only those that are actually available)
+        let mut extensions: Vec<&str> = Vec::new();
+        let required = [
+            "VK_KHR_video_queue",
+            "VK_KHR_video_decode_queue",
+            "VK_KHR_sampler_ycbcr_conversion",
+            "VK_KHR_synchronization2",
+        ];
+        for ext in &required {
+            if available_names.iter().any(|n| n.as_str() == *ext) {
+                extensions.push(ext);
+            } else {
+                eprintln!("[VideoDeviceBuilder] WARNING: Required extension {} not available", ext);
+            }
+        }
+
+        // Add codec-specific extensions only if available
+        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264) {
+            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h264") {
+                extensions.push("VK_KHR_video_decode_h264");
+            }
+        }
+        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265) {
+            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h265") {
+                extensions.push("VK_KHR_video_decode_h265");
+            }
+        }
+        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1) {
+            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_av1") {
+                extensions.push("VK_KHR_video_decode_av1");
+            } else {
+                eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)");
+            }
+        }
+
+        let c_extensions: Vec<CString> = extensions
+            .iter()
+            .map(|e| CString::new(*e).unwrap())
+            .collect();
+        let ext_ptrs: Vec<*const std::os::raw::c_char> =
+            c_extensions.iter().map(|c| c.as_ptr()).collect();
+
+        let mut sync2_features = vk::PhysicalDeviceSynchronization2FeaturesKHR::default();
+        sync2_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+        sync2_features.synchronization2 = 1;
+
+        let mut sampler_ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        sampler_ycbcr_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+        sampler_ycbcr_features.p_next = &mut sync2_features as *mut _ as *mut _;
+        sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
+
+        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        features2.s_type = vk::StructureType::PHYSICAL_DEVICE_FEATURES_2;
+        features2.p_next = &mut sampler_ycbcr_features as *mut _ as *mut std::ffi::c_void;
+
+        let queue_priorities = vec![1.0f32; builder.num_decode_queues];
+        let mut queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = Vec::new();
+
+        if let Some(qf) = queue_families.video_decode {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&queue_priorities),
+            );
+        }
+
+        if builder.create_graphics_queue {
+            if let Some(qf) = queue_families.graphics {
+                queue_create_infos.push(
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(qf)
+                        .queue_priorities(&[1.0f32]),
+                );
+            }
+        }
+
+        if builder.create_transfer_queue {
+            if let Some(qf) = queue_families.transfer {
+                // Only add if different from decode queue
+                if queue_families.video_decode != Some(qf) {
+                    queue_create_infos.push(
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(qf)
+                            .queue_priorities(&[1.0f32]),
+                    );
+                }
+            }
+        }
+
+        let device_create_info = vk::DeviceCreateInfo {
+            s_type: vk::StructureType::DEVICE_CREATE_INFO,
+            p_next: &features2 as *const _ as *const _,
+            flags: vk::DeviceCreateFlags::empty(),
+            queue_create_info_count: queue_create_infos.len() as u32,
+            p_queue_create_infos: queue_create_infos.as_ptr(),
+            enabled_layer_count: 0,
+            pp_enabled_layer_names: std::ptr::null(),
+            enabled_extension_count: ext_ptrs.len() as u32,
+            pp_enabled_extension_names: ext_ptrs.as_ptr(),
+            p_enabled_features: std::ptr::null(),
+            _marker: Default::default(),
+        };
+
+        let device = unsafe {
+            instance
+                .create_device(*physical_device, &device_create_info, None)
+        }
+        .map_err(|e| VideoError::DeviceCreation(e.to_string()))?;
+
+        let ext_names: Vec<String> = c_extensions
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+
+        Ok((device, ext_names))
+    }
+}
+
+impl Default for VideoDeviceBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VulkanDevice {
+    pub fn video_decode_queue(&self, index: u32) -> vk::Queue {
+        let qf = self
+            .queue_families
+            .video_decode
+            .expect("No video decode queue family");
+        unsafe { self.device.get_device_queue(qf, index) }
+    }
+
+    pub fn video_decode_queue_family(&self) -> Option<u32> {
+        self.queue_families.video_decode
+    }
+
+    /// Query video decode capabilities for a given codec profile.
+    pub fn query_video_capabilities(
+        &self,
+        codec: VideoCodec,
+        profile_idc: u32,
+        chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    ) -> VideoResult<vk::VideoCapabilitiesKHR> {
+        let codec_op = codec.to_vk_flag();
+
+        // Build profile info chain
+        let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
+        let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
+        let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default();
+
+        let profile_ptr: *const vk::VideoProfileInfoKHR = match codec {
+            VideoCodec::DecodeH264 => {
+                h264_profile.std_profile_idc = profile_idc;
+                h264_profile.picture_layout = vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE;
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &h264_profile as *const _ as *const _,
+                    video_codec_operation: codec_op,
+                    chroma_subsampling,
+                    luma_bit_depth,
+                    chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                &profile_info as *const vk::VideoProfileInfoKHR
+            }
+            VideoCodec::DecodeH265 => {
+                h265_profile.std_profile_idc = profile_idc;
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &h265_profile as *const _ as *const _,
+                    video_codec_operation: codec_op,
+                    chroma_subsampling,
+                    luma_bit_depth,
+                    chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                &profile_info as *const vk::VideoProfileInfoKHR
+            }
+            VideoCodec::DecodeAv1 => {
+                av1_profile.std_profile = profile_idc;
+                av1_profile.film_grain_support = 0;
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &av1_profile as *const _ as *const _,
+                    video_codec_operation: codec_op,
+                    chroma_subsampling,
+                    luma_bit_depth,
+                    chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                &profile_info as *const vk::VideoProfileInfoKHR
+            }
+        };
+
+        // Get function pointer
+        let get_caps_fn = unsafe {
+            self.entry.get_instance_proc_addr(
+                self.instance.handle(),
+                b"vkGetPhysicalDeviceVideoCapabilitiesKHR\0".as_ptr().cast(),
+            )
+        }
+        .ok_or_else(|| {
+            VideoError::CapabilityNotAvailable(
+                "vkGetPhysicalDeviceVideoCapabilitiesKHR not found".to_string(),
+            )
+        })?;
+
+        let caps = unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::PhysicalDevice,
+                *const vk::VideoProfileInfoKHR<'_>,
+                *mut vk::VideoCapabilitiesKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = std::mem::transmute(get_caps_fn);
+            let mut caps = vk::VideoCapabilitiesKHR::default();
+            let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
+            if result != vk::Result::SUCCESS {
+                return Err(VideoError::CapabilityNotAvailable(format!(
+                    "vkGetPhysicalDeviceVideoCapabilitiesKHR failed: {:?}",
+                    result
+                )));
+            }
+            caps
+        };
+
+        Ok(caps)
+    }
+
+    /// Query supported video formats for a codec.
+    pub fn query_supported_formats(
+        &self,
+        codec: VideoCodec,
+    ) -> Vec<vk::VideoFormatPropertiesKHR> {
+        let codec_op = codec.to_vk_flag();
+
+        // Common semi-planar 420 formats
+        let candidate_formats = [
+            vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            vk::Format::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16,
+        ];
+
+        let mut formats = Vec::new();
+        eprintln!("[VideoDeviceBuilder] Querying supported video formats for codec {:?}", codec_op);
+        for fmt in candidate_formats {
+            eprintln!("  Trying format: {:?}", fmt);
+            let format_props = self.get_physical_device_video_format_properties(
+                codec_op,
+                vk::ImageTiling::OPTIMAL,
+                fmt,
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+                vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+                vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            );
+            formats.extend(format_props);
+        }
+
+        formats
+    }
+
+    fn get_physical_device_video_format_properties(
+        &self,
+        video_operation: vk::VideoCodecOperationFlagsKHR,
+        image_tiling: vk::ImageTiling,
+        image_format: vk::Format,
+        chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    ) -> Vec<vk::VideoFormatPropertiesKHR> {
+        // Chain: PhysicalDeviceVideoFormatInfoKHR -> VideoProfileInfoKHR
+        let profile_info = vk::VideoProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            video_codec_operation: video_operation,
+            chroma_subsampling,
+            luma_bit_depth,
+            chroma_bit_depth,
+            _marker: Default::default(),
+        };
+
+        let format_info = vk::PhysicalDeviceVideoFormatInfoKHR {
+            s_type: vk::StructureType::PHYSICAL_DEVICE_VIDEO_FORMAT_INFO_KHR,
+            p_next: &profile_info as *const _ as *const _,
+            image_usage: vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
+            _marker: Default::default(),
+        };
+
+        let get_format_props_fn = unsafe {
+            self.entry.get_instance_proc_addr(
+                self.instance.handle(),
+                b"vkGetPhysicalDeviceVideoFormatPropertiesKHR\0".as_ptr().cast(),
+            )
+        };
+
+        let Some(fn_ptr_raw) = get_format_props_fn else {
+            return Vec::new();
+        };
+
+        unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::PhysicalDevice,
+                *const vk::PhysicalDeviceVideoFormatInfoKHR<'_>,
+                *mut u32,
+                *mut vk::VideoFormatPropertiesKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = std::mem::transmute(fn_ptr_raw);
+
+            let mut count: u32 = 0;
+            let result = fn_ptr(
+                self.physical_device,
+                &format_info,
+                &mut count,
+                std::ptr::null_mut(),
+            );
+            if result != vk::Result::SUCCESS {
+                return Vec::new();
+            }
+
+            let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+            let result = fn_ptr(
+                self.physical_device,
+                &format_info,
+                &mut count,
+                props.as_mut_ptr(),
+            );
+            if result != vk::Result::SUCCESS {
+                return Vec::new();
+            }
+
+            props.truncate(count as usize);
+            for p in &props {
+                eprintln!("    Supported: format={:?}, usage={:?}", p.format, p.image_usage_flags);
+            }
+            props
+        }
+    }
+}
