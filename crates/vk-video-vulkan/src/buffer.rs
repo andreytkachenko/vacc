@@ -191,6 +191,19 @@ impl BitstreamBuffer {
         self.mapped_ptr
     }
 
+    /// Zero out a range in the mapped buffer.
+    pub fn zero_range(&self, offset: u64, size: u64) {
+        if let Some(ptr) = self.mapped_ptr {
+            unsafe {
+                std::ptr::write_bytes(
+                    ptr.add(offset as usize),
+                    0,
+                    size as usize,
+                );
+            }
+        }
+    }
+
     pub fn flush_range(&self, offset: u64, size: u64) -> VideoResult<()> {
         unsafe {
             self.device

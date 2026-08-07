@@ -60,6 +60,7 @@ pub enum DecoderWrapper {
     H264(super::h264::H264Decoder),
     H265(super::h265::H265Decoder),
     Av1(super::av1::Av1Decoder),
+    Vp9(super::vp9::Vp9Decoder),
 }
 
 impl VideoPipeline {
@@ -133,6 +134,11 @@ impl VideoPipeline {
                     self.device.clone(), self.instance.clone(),
                 ))
             }
+            VideoCodec::DecodeVp9 => {
+                DecoderWrapper::Vp9(super::vp9::Vp9Decoder::new(
+                    self.device.clone(), self.instance.clone(),
+                ))
+            }
         });
 
         // Link session to decoder
@@ -141,6 +147,7 @@ impl VideoPipeline {
                 DecoderWrapper::H264(d) => d.set_session(session),
                 DecoderWrapper::H265(d) => d.set_session(session),
                 DecoderWrapper::Av1(d) => d.set_session(session),
+                DecoderWrapper::Vp9(d) => d.set_session(session),
             }
         }
 
@@ -150,6 +157,7 @@ impl VideoPipeline {
                 DecoderWrapper::H264(d) => d.create_session_parameters()?,
                 DecoderWrapper::H265(d) => d.create_session_parameters()?,
                 DecoderWrapper::Av1(d) => d.create_session_parameters()?,
+                DecoderWrapper::Vp9(d) => d.create_session_parameters()?,
             };
             self.session_parameters = Some(session_params);
 
@@ -159,6 +167,7 @@ impl VideoPipeline {
                     DecoderWrapper::H264(d) => d.set_session_parameters(params.clone()),
                     DecoderWrapper::H265(d) => d.set_session_parameters(params.clone()),
                     DecoderWrapper::Av1(d) => d.set_session_parameters(params.clone()),
+                    DecoderWrapper::Vp9(d) => d.set_session_parameters(params.clone()),
                 }
             }
         }
@@ -237,6 +246,7 @@ impl VideoPipeline {
                 }
             }
             VideoCodec::DecodeAv1 => {}
+            VideoCodec::DecodeVp9 => {}
         }
 
         Ok(())
@@ -366,6 +376,102 @@ impl VideoPipeline {
                         },
                     )?;
                 }
+                DecoderWrapper::Vp9(d) => {
+                    // VP9 decode requires parsed frame data; use direct API for now
+                    // Pipeline integration for VP9 needs frame parser integration
+                    let _ = (d, bs_buffer, bs_size, output, session, session_params);
+                }
+            }
+        }
+
+        // Submit command buffer
+        unsafe {
+            self.device.queue_submit(
+                self.decode_queue,
+                &[ash::vk::SubmitInfo::default()
+                    .command_buffers(&[self.command_buffer])],
+                self.fence,
+            ).map_err(|e| VideoError::QueueSubmission(format!("Queue submit failed: {:?}", e)))?;
+
+            // Wait for completion
+            self.device.wait_for_fences(&[self.fence], true, 5_000_000_000)
+                .map_err(|e| VideoError::FenceWait(format!("Fence wait failed: {:?}", e)))?;
+        }
+
+        self.frame_count += 1;
+        Ok(Some(output.image_view))
+    }
+
+    /// Decode a single VP9 frame with parsed frame data.
+    ///
+    /// Unlike the generic [`decode_frame`](Self::decode_frame), this method accepts
+    /// VP9-specific parsed frame information (DPB references, picture info, offsets,
+    /// etc.) so the decoder can record a proper VP9 decode command.
+    pub fn decode_vp9_frame(
+        &mut self,
+        bitstream_data: &[u8],
+        frame_index: u32,
+        picture_info_container: &super::vp9::Vp9PictureInfoContainer,
+        vp9_decode_info: &super::vp9::VideoDecodeVP9PictureInfoKHR,
+        dpb_setup_picture: Option<ash::vk::VideoPictureResourceInfoKHR<'static>>,
+        dpb_ref_pictures: &[ash::vk::VideoPictureResourceInfoKHR<'static>],
+        dpb_ref_slot_indices: &[i32],
+        output_slot_index: i32,
+        is_first_frame: bool,
+    ) -> VideoResult<Option<ash::vk::ImageView>> {
+        let session = self.session
+            .as_ref()
+            .ok_or_else(|| VideoError::InvalidState("No video session".to_string()))?
+            .session();
+
+        let session_params = self.session_parameters
+            .as_ref()
+            .ok_or_else(|| VideoError::InvalidState("No session parameters".to_string()))?
+            .parameters();
+
+        // Get an output image
+        let output_idx = frame_index as usize % self.output_images.len();
+        let output = &self.output_images[output_idx];
+
+        // Upload bitstream data to a bitstream buffer
+        let mut buffers = self.bitstream_buffers.as_mut().unwrap();
+        let mut bs_buf = buffers.get_mut(0).unwrap();
+        bs_buf.write(bitstream_data)?;
+        bs_buf.flush_range(0, bitstream_data.len() as u64)?;
+
+        let bs_buffer = bs_buf.buffer();
+        let bs_size = bitstream_data.len() as u64;
+
+        // Reset fence
+        unsafe {
+            self.device.reset_fence(self.fence)
+                .map_err(|e| VideoError::FenceWait(format!("Fence reset failed: {:?}", e)))?;
+        }
+
+        // Record VP9 decode command
+        if let Some(ref mut decoder) = self.decoder {
+            if let DecoderWrapper::Vp9(d) = decoder {
+                d.record_decode_command(
+                    self.command_buffer,
+                    session,
+                    session_params,
+                    bs_buffer,
+                    0,
+                    bs_size,
+                    output.image_view,
+                    output.image,
+                    ash::vk::Extent2D {
+                        width: self.config.max_coded_extent.0,
+                        height: self.config.max_coded_extent.1,
+                    },
+                    dpb_setup_picture,
+                    dpb_ref_pictures,
+                    dpb_ref_slot_indices,
+                    picture_info_container,
+                    vp9_decode_info,
+                    is_first_frame,
+                    output_slot_index,
+                )?;
             }
         }
 

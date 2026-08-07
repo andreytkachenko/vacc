@@ -360,21 +360,21 @@ pub fn parse_h264_nal_header(data: &[u8]) -> Option<(bool, u8, u8)> {
     Some((forbidden_zero_bit, nal_ref_idc, nal_unit_type))
 }
 
-/// Parse NAL unit header for H.265.
-///
-/// Returns (forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1).
-pub fn parse_h265_nal_header(data: &[u8]) -> Option<(bool, u8, u16, u8)> {
-    if data.is_empty() {
-        return None;
-    }
-    let first_byte = data[0];
-    let second_byte = if data.len() > 1 { data[1] } else { 0 };
-    let forbidden_zero_bit = (first_byte & 0x80) != 0;
-    let nal_unit_type = (first_byte & 0x7E) >> 1;
-    let nuh_layer_id: u16 = (((first_byte & 0x01) as u16) << 6) | (((second_byte & 0xFC) as u16) >> 2);
-    let nuh_temporal_id_plus1 = second_byte & 0x07;
-    Some((forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1))
-}
+ /// Parse NAL unit header for H.265.
+ ///
+ /// Returns (forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1).
+ pub fn parse_h265_nal_header(data: &[u8]) -> Option<(bool, u8, u16, u8)> {
+      if data.is_empty() {
+          return None;
+      }
+      let first_byte = data[0];
+      let second_byte = if data.len() > 1 { data[1] } else { 0 };
+      let forbidden_zero_bit = (first_byte & 0x80) != 0;
+      let nal_unit_type = (first_byte & 0x7E) >> 1;
+      let nuh_layer_id: u16 = (((first_byte & 0x01) as u16) << 6) | (((second_byte & 0xFC) as u16) >> 2);
+      let nuh_temporal_id_plus1 = second_byte & 0x07;
+      Some((forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1))
+  }
 
 /// Remove emulation prevention bytes from RBSP data.
 ///

@@ -4,6 +4,8 @@ use ash::vk;
 use std::ffi::CString;
 
 use super::{AppInfo, VideoError, VideoResult};
+use super::vp9::{VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9CapabilitiesKHR, vp9_vk_constants};
+
 
 /// Queue family indices found during device selection.
 #[derive(Debug, Clone, Default)]
@@ -44,6 +46,7 @@ pub enum VideoCodec {
     DecodeH264,
     DecodeH265,
     DecodeAv1,
+    DecodeVp9,
 }
 
 impl VideoCodec {
@@ -52,6 +55,7 @@ impl VideoCodec {
             Self::DecodeH264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
             Self::DecodeH265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
             Self::DecodeAv1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+            Self::DecodeVp9 => vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9),
         }
     }
 }
@@ -83,7 +87,8 @@ impl VideoDeviceBuilder {
             enable_validation: false,
             video_codecs: vk::VideoCodecOperationFlagsKHR::DECODE_H264
                 | vk::VideoCodecOperationFlagsKHR::DECODE_H265
-                | vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+                | vk::VideoCodecOperationFlagsKHR::DECODE_AV1
+                | vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9),
             num_decode_queues: 1,
             create_graphics_queue: false,
             create_transfer_queue: false,
@@ -304,6 +309,14 @@ impl VideoDeviceBuilder {
                 eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)");
             }
         }
+        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9)) {
+            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_vp9") {
+                extensions.push("VK_KHR_video_decode_vp9");
+            } else {
+                eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_vp9 not available (VP9 decode not supported)");
+            }
+        }
+
 
         let c_extensions: Vec<CString> = extensions
             .iter()
@@ -422,6 +435,7 @@ impl VulkanDevice {
         let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
         let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
         let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default();
+        let mut vp9_profile = VideoDecodeVP9ProfileInfoKHR::default();
 
         let profile_ptr: *const vk::VideoProfileInfoKHR = match codec {
             VideoCodec::DecodeH264 => {
@@ -465,8 +479,22 @@ impl VulkanDevice {
                 };
                 &profile_info as *const vk::VideoProfileInfoKHR
             }
+            VideoCodec::DecodeVp9 => {
+                vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+                vp9_profile.p_next = std::ptr::null();
+                vp9_profile.std_profile = profile_idc;
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &vp9_profile as *const _ as *const _,
+                    video_codec_operation: codec_op,
+                    chroma_subsampling,
+                    luma_bit_depth,
+                    chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                &profile_info as *const vk::VideoProfileInfoKHR
+            }
         };
-
         // Get function pointer
         let get_caps_fn = unsafe {
             self.entry.get_instance_proc_addr(
@@ -480,6 +508,8 @@ impl VulkanDevice {
             )
         })?;
 
+        // Build output pNext chain per codec:
+        // VideoCapabilitiesKHR -> VideoDecodeCapabilitiesKHR -> <codec-specific>
         let caps = unsafe {
             type FnType = unsafe extern "system" fn(
                 vk::PhysicalDevice,
@@ -487,7 +517,38 @@ impl VulkanDevice {
                 *mut vk::VideoCapabilitiesKHR,
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(get_caps_fn);
+
+            // Codec-specific capabilities structs
+            let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
+            let mut h265_caps = vk::VideoDecodeH265CapabilitiesKHR::default();
+            let mut av1_caps = vk::VideoDecodeAV1CapabilitiesKHR::default();
+            let mut vp9_caps = VideoDecodeVP9CapabilitiesKHR::default();
+
+            // Decode capabilities (intermediate)
+            let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+
+            // Chain decode_caps -> codec-specific
+            match codec {
+                VideoCodec::DecodeH264 => {
+                    decode_caps.p_next = &mut h264_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeH265 => {
+                    decode_caps.p_next = &mut h265_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeAv1 => {
+                    decode_caps.p_next = &mut av1_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeVp9 => {
+                    vp9_caps.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_CAPABILITIES_KHR);
+                    vp9_caps.p_next = std::ptr::null_mut();
+                    decode_caps.p_next = &mut vp9_caps as *mut _ as *mut _;
+                }
+            }
+
+            // Top-level capabilities
             let mut caps = vk::VideoCapabilitiesKHR::default();
+            caps.p_next = &mut decode_caps as *mut _ as *mut _;
+
             let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::CapabilityNotAvailable(format!(

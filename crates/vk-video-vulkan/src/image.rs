@@ -150,6 +150,26 @@ pub fn create_output_image(
     height: u32,
     format: ash::vk::Format,
 ) -> VideoResult<(ash::vk::Image, ash::vk::ImageView, ash::vk::DeviceMemory)> {
+    create_output_image_with_pnext(
+        device,
+        memory_properties,
+        width,
+        height,
+        format,
+        std::ptr::null(),
+    )
+}
+
+/// Create an output image suitable for video decode with a pNext chain
+/// (e.g., VkVideoProfileListInfoKHR for video profile compatibility).
+pub fn create_output_image_with_pnext(
+    device: &ash::Device,
+    memory_properties: &ash::vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+    format: ash::vk::Format,
+    p_next: *const std::ffi::c_void,
+) -> VideoResult<(ash::vk::Image, ash::vk::ImageView, ash::vk::DeviceMemory)> {
     let image_create_info = ash::vk::ImageCreateInfo::default()
         .image_type(ash::vk::ImageType::TYPE_2D)
         .format(format)
@@ -160,9 +180,19 @@ pub fn create_output_image(
         .tiling(ash::vk::ImageTiling::OPTIMAL)
         .usage(ash::vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
             | ash::vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-            | ash::vk::ImageUsageFlags::TRANSFER_SRC)
+            | ash::vk::ImageUsageFlags::TRANSFER_SRC
+            | ash::vk::ImageUsageFlags::SAMPLED)
         .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
         .initial_layout(ash::vk::ImageLayout::UNDEFINED);
+
+    // Apply pNext chain if provided
+    let image_create_info = if p_next.is_null() {
+        image_create_info
+    } else {
+        let mut info = image_create_info;
+        info.p_next = p_next;
+        info
+    };
 
     let image = unsafe {
         device.create_image(&image_create_info, None)

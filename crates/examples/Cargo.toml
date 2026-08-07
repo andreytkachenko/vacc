@@ -54,6 +54,18 @@ path = "src/compare_sps_pps.rs"
 name = "analyze_frame1"
 path = "src/analyze_frame1.rs"
 
+[[example]]
+name = "test_h265_decoder"
+path = "src/test_h265_decoder.rs"
+
+[[example]]
+name = "vulkan_decode_vp9"
+path = "src/vulkan_decode_vp9.rs"
+
+[[example]]
+name = "diag_vp9"
+path = "src/diag_vp9.rs"
+
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }

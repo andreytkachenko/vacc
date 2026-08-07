@@ -1,11 +1,12 @@
 //! # vk-video-parser
 //!
-//! Bitstream parser for H.264, H.265, and AV1 video codecs.
+//! Bitstream parser for H.264, H.265, VP9, and AV1 video codecs.
 //!
 //! This crate provides:
 //! - Start-code detection and NAL unit extraction
 //! - RBSP (Raw Byte Sequence Payload) parsing
 //! - SPS/PPS/VPS extraction for H.264 and H.265
+//! - VP9 frame header parsing with superframe support
 //! - AV1 sequence header parsing
 //! - Bitstream buffer management
 //!
@@ -14,6 +15,7 @@
 
 pub mod h264;
 pub mod h265;
+pub mod vp9;
 pub mod av1;
 pub mod bitstream;
 pub mod nal;

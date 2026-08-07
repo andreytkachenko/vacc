@@ -1,4 +1,7 @@
 /target
 **/*.rs.bk
 *.log
+*.yuv
+*.bin
+*.vp9
 .DS_Store

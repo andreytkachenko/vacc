@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod frame;
 pub mod h264;
 pub mod h265;
+pub mod vp9;
 pub mod av1;
 pub mod image;
 pub mod codec_types;
@@ -16,7 +17,7 @@ pub use device::{VideoCodec, VulkanDevice, VideoDeviceBuilder, QueueFamilies};
 pub use session::{VideoSession, VideoSessionParams, VideoSessionParameters, CodecProfileInfo};
 pub use buffer::{BitstreamBuffer, BitstreamBufferPool};
 pub use frame::{DecodedFrame, YCbCrPlane};
-pub use image::{create_output_image, StagingImage};
+pub use image::{create_output_image, create_output_image_with_pnext, StagingImage};
 pub use codec_types::*;
 
 /// Result type for Vulkan video operations.

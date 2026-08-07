@@ -4,6 +4,7 @@ use ash::vk;
 use ash::vk::Handle;
 
 use super::{device::VideoCodec, VideoError, VideoResult};
+use super::vp9::{VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9SessionParametersCreateInfoKHR, vp9_vk_constants};
 
 /// Codec-specific profile information for session creation.
 #[derive(Debug, Clone)]
@@ -18,6 +19,9 @@ pub enum CodecProfileInfo {
     Av1 {
         std_profile: u32,
         film_grain_support: bool,
+    },
+    Vp9 {
+        std_profile: u32,
     },
 }
 
@@ -196,6 +200,7 @@ impl VideoSession {
         let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
         let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
         let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default();
+        let mut vp9_profile = VideoDecodeVP9ProfileInfoKHR::default();
 
         let profile_next: *const std::ffi::c_void = match &params.codec_profile_info {
             CodecProfileInfo::H264 {
@@ -217,6 +222,12 @@ impl VideoSession {
                 av1_profile.std_profile = *std_profile;
                 av1_profile.film_grain_support = if *film_grain_support { 1 } else { 0 };
                 &av1_profile as *const _ as *const std::ffi::c_void
+            }
+            CodecProfileInfo::Vp9 { std_profile } => {
+                vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+                vp9_profile.p_next = std::ptr::null();
+                vp9_profile.std_profile = *std_profile;
+                &vp9_profile as *const _ as *const std::ffi::c_void
             }
         };
 
@@ -402,6 +413,18 @@ impl VideoSessionParameters {
                 vk::VideoSessionParametersCreateInfoKHR {
                     s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
                     p_next: &av1_params as *const _ as *const _,
+                    flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
+                    video_session: session,
+                    video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
+                    _marker: Default::default(),
+                }
+            }
+            VideoCodec::DecodeVp9 => {
+                // VP9 doesn't need codec-specific session parameters create info
+                // (unlike H264/H265 which need SPS/PPS counts, or AV1 which needs SPS)
+                vk::VideoSessionParametersCreateInfoKHR {
+                    s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
+                    p_next: std::ptr::null(),
                     flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
                     video_session: session,
                     video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
