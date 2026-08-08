@@ -5,17 +5,22 @@ use ash::vk::native::*;
 
 use super::codec_types::*;
 use super::{VideoError, VideoResult};
+use super::dpb::LastAccessType;
 
 use vk_video_core::picture::{H265Vps, H265Sps, H265Pps, H265ShortTermRefPicSet, H265SpsVui};
 
 /// Reference picture info for H.265 DPB slot setup.
-pub struct H265RefPictureInfo {
+pub struct H265RefPictureInfo<'a> {
     /// Vulkan DPB slot index
     pub slot_index: u32,
     /// Picture order count
     pub pic_order_cnt: i32,
     /// Picture resource info
-    pub picture_resource: vk::VideoPictureResourceInfoKHR<'static>,
+    pub picture_resource: vk::VideoPictureResourceInfoKHR<'a>,
+    /// Vulkan image handle (for memory barriers)
+    pub image: vk::Image,
+    /// Current image layout (for memory barriers)
+    pub current_layout: vk::ImageLayout,
 }
 
 /// H.265 decoder state.
@@ -88,7 +93,7 @@ impl H265Decoder {
         let update_info = vk::VideoSessionParametersUpdateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_UPDATE_INFO_KHR,
             p_next: &add_info as *const _ as *const _,
-            update_sequence_count: 0,
+            update_sequence_count: 1, // First update must be 1
             _marker: Default::default(),
         };
 
@@ -131,7 +136,7 @@ impl H265Decoder {
     }
 
     /// Record a decode command.
-    pub fn record_decode_command(
+    pub fn record_decode_command<'a>(
         &mut self,
         cmd_buffer: vk::CommandBuffer,
         session: vk::VideoSessionKHR,
@@ -142,14 +147,18 @@ impl H265Decoder {
         output_image_view: vk::ImageView,
         output_image: vk::Image,
         coded_extent: vk::Extent2D,
-        dpb_setup_picture: Option<H265RefPictureInfo>,
-        dpb_ref_pictures: &[H265RefPictureInfo],
+        dpb_setup_picture: Option<H265RefPictureInfo<'a>>,
+        dpb_ref_pictures: &[H265RefPictureInfo<'a>],
         slice_offsets: &[u32],
         pic_order_cnt: Option<i32>,
         is_intra: Option<bool>,
         is_reference: Option<bool>,
         is_idr: Option<bool>,
     ) -> VideoResult<()> {
+        eprintln!("[DEBUG] H265Decoder::record_decode_command: bitstream_range={}, refs={}, slice_offsets={:?}", 
+                  bitstream_range, dpb_ref_pictures.len(), slice_offsets);
+        eprintln!("[DEBUG] H265Decoder::record_decode_command: output_view={:?}, output_img={:?}", 
+                  output_image_view, output_image);
         let (effective_poc, effective_is_intra, effective_is_ref, effective_is_idr) =
             if let (Some(poc), Some(intra), Some(ref_), Some(idr)) =
                 (pic_order_cnt, is_intra, is_reference, is_idr)
@@ -171,15 +180,6 @@ impl H265Decoder {
         );
 
         unsafe {
-            // Begin command buffer
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .begin_command_buffer(cmd_buffer, &begin_info)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("Begin failed: {:?}", e))
-                })?;
-
             // H.265 requires VkVideoDecodeH265DpbSlotInfoKHR in the pNext chain of
             // each reference slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07163).
             // Build all structs in correct order to ensure stable pointers.
@@ -204,12 +204,13 @@ impl H265Decoder {
             });
 
             // Third: create VkVideoReferenceSlotInfoKHR for setup slot
+            // Use actual slot index (matches C++ reference implementation)
             let setup_slot = dpb_setup_picture.as_ref().map(|info| {
                 let pnext = setup_dpb_slot_info.as_ref().map_or(std::ptr::null(), |s| s as *const _ as *const _);
                 vk::VideoReferenceSlotInfoKHR {
                     s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                     p_next: pnext,
-                    slot_index: info.slot_index as i32,
+                    slot_index: info.slot_index as i32, // Use actual slot index
                     p_picture_resource: &info.picture_resource as *const _,
                     _marker: Default::default(),
                 }
@@ -255,30 +256,29 @@ impl H265Decoder {
                 })
                 .collect();
 
-            // all_slots = ref_slots + setup_slot (for BeginVideoCoding)
+            // BeginVideoCoding reference slots: Match C++ reference VkVideoDecoder.cpp:1079-1084
             //
-            // FIX for VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239 and
-            // VUID-vkCmdDecodeVideoKHR-pDecodeInfo-08376:
-            // Always use actual DPB slot indices (never -1) and always provide
-            // pSetupReferenceSlot (never NULL). The C++ reference uses -1 only as
-            // a temporary placeholder during parsing, but updates to actual slot
-            // indices before recording Vulkan commands.
+            // CRITICAL: When refs exist, BeginVideoCoding uses the SAME slots as DecodeVideo's
+            // p_reference_slots (NOT including the setup picture). The setup picture is only
+            // in DecodeVideo's p_setup_reference_slot.
             //
-            // Per Vulkan spec: DPB slots become active when used in BeginVideoCodingKHR.
-            // This happens DURING the call, so the first frame can activate its own slot.
-            let (all_slots, setup_slot_for_decode) = if !ref_slots.is_empty() {
-                // Has reference pictures: include all refs + setup slot
-                let all_slots: Vec<vk::VideoReferenceSlotInfoKHR> = ref_slots
-                    .iter()
-                    .cloned()
-                    .chain(setup_slot.clone())
-                    .collect();
-                (all_slots, setup_slot.clone())
+            // C++ pattern:
+            //   decodeBeginInfo.referenceSlotCount = decodeFrameInfo.referenceSlotCount +
+            //       (decodeFrameInfo.pSetupReferenceSlot ? 1 : 0);
+            //   decodeBeginInfo.pReferenceSlots = (decodeFrameInfo.referenceSlotCount > 0) ?
+            //       decodeFrameInfo.pReferenceSlots : decodeFrameInfo.pSetupReferenceSlot;
+            //
+            // When refs exist: BeginVideoCoding uses refs only (same ptr as DecodeVideo refs).
+            // When no refs: BeginVideoCoding uses only setup slot.
+            let setup_slot_for_decode = setup_slot.clone();
+            let (begin_slot_count, begin_slot_ptr) = if !ref_slots.is_empty() {
+                // Has refs: use refs only for BeginVideoCoding (matches C++)
+                (ref_slots.len() as u32, ref_slots.as_ptr())
             } else {
-                // No reference pictures (first IDR): still use actual slot index.
-                // The slot becomes active during this BeginVideoCodingKHR call.
-                let all_slots = setup_slot.clone().map_or(Vec::new(), |s| vec![s]);
-                (all_slots, setup_slot.clone())
+                // No refs: use only setup slot for BeginVideoCoding
+                setup_slot.as_ref()
+                    .map(|s| (1u32, s as *const _))
+                    .unwrap_or((0u32, std::ptr::null()))
             };
 
             // Begin video coding with reference slots
@@ -288,22 +288,20 @@ impl H265Decoder {
                 flags: vk::VideoBeginCodingFlagsKHR::empty(),
                 video_session: session,
                 video_session_parameters: session_params,
-                reference_slot_count: all_slots.len() as u32,
-                p_reference_slots: if all_slots.is_empty() {
-                    std::ptr::null()
-                } else {
-                    all_slots.as_ptr()
-                },
+                reference_slot_count: begin_slot_count,
+                p_reference_slots: begin_slot_ptr,
                 _marker: Default::default(),
             };
 
-            self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
-
-            // RESET decoder before first frame (required by Vulkan spec)
-            // Must be INSIDE video coding block (after Begin, before Decode)
-            if self.frame_count == 0 {
-                self.cmd_control_video_coding(cmd_buffer);
+            eprintln!("[DEBUG] H265Decoder: BeginVideoCodingKHR: slot_count={}, has_refs={}, has_setup={}",
+                      begin_slot_count, !dpb_ref_pictures.is_empty(), dpb_setup_picture.is_some());
+            for (i, rs) in ref_slots.iter().enumerate() {
+                if let Some(pr) = rs.p_picture_resource.as_ref() {
+                    eprintln!("[DEBUG]   BeginVideoCoding slot[{}] index={}, view={:?}",
+                              i, rs.slot_index, pr.image_view_binding);
+                }
             }
+            self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
 
             // Barriers AFTER BeginVideoCoding and BEFORE DecodeVideo
             // This matches C++ reference VkVideoDecoder.cpp:1216-1227
@@ -358,6 +356,30 @@ impl H265Decoder {
                 _marker: Default::default(),
             };
 
+            // Add barriers for reference images (matches C++ VkVideoDecoder.cpp:1044-1056)
+            let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
+            for ref_pic in dpb_ref_pictures.iter() {
+                // Only add barrier if image is valid and not already in DPB layout
+                if ref_pic.image != vk::Image::null() && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                    all_image_barriers.push(vk::ImageMemoryBarrier2 {
+                        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                        p_next: std::ptr::null(),
+                        src_stage_mask: vk::PipelineStageFlags2::NONE,
+                        src_access_mask: vk::AccessFlags2::empty(),
+                        dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                        dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        image: ref_pic.image,
+                        old_layout: ref_pic.current_layout,
+                        new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                        subresource_range,
+                        _marker: Default::default(),
+                    });
+                }
+            }
+
+            // Single DependencyInfo with ALL barriers (matches C++ VkVideoDecoder.cpp:1229-1240)
             let dep_info = vk::DependencyInfo {
                 s_type: vk::StructureType::DEPENDENCY_INFO,
                 p_next: std::ptr::null(),
@@ -366,10 +388,11 @@ impl H265Decoder {
                 p_memory_barriers: std::ptr::null(),
                 buffer_memory_barrier_count: 1,
                 p_buffer_memory_barriers: &buffer_barrier,
-                image_memory_barrier_count: 1,
-                p_image_memory_barriers: &image_barrier,
+                image_memory_barrier_count: all_image_barriers.len() as u32,
+                p_image_memory_barriers: all_image_barriers.as_ptr(),
                 _marker: Default::default(),
             };
+            eprintln!("[DEBUG] H265Decoder: PipelineBarrier2: 1 buffer barrier, {} image barriers", all_image_barriers.len());
             self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
 
             // Build H.265 decode info
@@ -398,37 +421,62 @@ impl H265Decoder {
                 _marker: Default::default(),
             };
 
-            let decode_info = vk::VideoDecodeInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: &h265_decode_info as *const _ as *const _,
-                flags: vk::VideoDecodeFlagsKHR::empty(),
-                src_buffer: bitstream_buffer,
-                src_buffer_offset: bitstream_offset,
-                src_buffer_range: bitstream_range,
-                dst_picture_resource: dst_picture_resource,
-                // Always include setup slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-08376
-                // requires pSetupReferenceSlot must not be NULL).
-                p_setup_reference_slot: setup_slot_for_decode
-                    .as_ref()
-                    .map_or(std::ptr::null(), |s| s as *const _),
-                reference_slot_count: ref_slots.len() as u32,
-                p_reference_slots: if ref_slots.is_empty() {
-                    std::ptr::null()
-                } else {
-                    ref_slots.as_ptr()
-                },
-                _marker: Default::default(),
-            };
+             let decode_info = vk::VideoDecodeInfoKHR {
+                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+                 p_next: &h265_decode_info as *const _ as *const _,
+                 flags: vk::VideoDecodeFlagsKHR::empty(),
+                 src_buffer: bitstream_buffer,
+                 src_buffer_offset: bitstream_offset,
+                 src_buffer_range: bitstream_range,
+                 dst_picture_resource: dst_picture_resource,
+                 // Always include setup slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-08376
+                 // requires pSetupReferenceSlot must not be NULL).
+                 p_setup_reference_slot: setup_slot_for_decode
+                     .as_ref()
+                     .map_or(std::ptr::null(), |s| s as *const _),
+                 reference_slot_count: ref_slots.len() as u32,
+                 p_reference_slots: if ref_slots.is_empty() {
+                     std::ptr::null()
+                 } else {
+                     ref_slots.as_ptr()
+                 },
+                 _marker: Default::default(),
+             };
 
-            self.cmd_decode_video(cmd_buffer, &decode_info);
+             // Comprehensive debug dump of VkVideoDecodeInfoKHR
+             eprintln!("[DEBUG] H265Decoder: === VkVideoDecodeInfoKHR ===");
+             eprintln!("[DEBUG]   src_buffer={:?}, offset={}, range={}",
+                       decode_info.src_buffer, decode_info.src_buffer_offset, decode_info.src_buffer_range);
+             eprintln!("[DEBUG]   dst_picture_resource.view={:?}",
+                       decode_info.dst_picture_resource.image_view_binding);
+             eprintln!("[DEBUG]   p_setup_reference_slot={:?}",
+                       decode_info.p_setup_reference_slot);
+             if let Some(ref s) = setup_slot_for_decode {
+                 eprintln!("[DEBUG]     setup_slot.index={}, view={:?}",
+                           s.slot_index, s.p_picture_resource.as_ref().map(|pr| pr.image_view_binding));
+             }
+             eprintln!("[DEBUG]   reference_slot_count={}", decode_info.reference_slot_count);
+             eprintln!("[DEBUG]   p_reference_slots={:?}", decode_info.p_reference_slots);
+             for (i, rs) in ref_slots.iter().enumerate() {
+                 if let Some(pr) = rs.p_picture_resource.as_ref() {
+                     eprintln!("[DEBUG]     ref_slot[{}].index={}, view={:?}",
+                               i, rs.slot_index, pr.image_view_binding);
+                 }
+             }
+             eprintln!("[DEBUG]   h265_decode_info.slice_segment_count={}", h265_decode_info.slice_segment_count);
+            if let Some(sps) = &self.sps {
+                eprintln!("[DEBUG]   pic_info.PicOrderCntVal={}, is_reference={}, is_idr={}",
+                          pic_info.PicOrderCntVal,
+                          pic_info.flags.IsReference(), pic_info.flags.IdrPicFlag());
+            }
+             eprintln!("[DEBUG] H265Decoder: ===============================");
+
+             eprintln!("[DEBUG] H265Decoder: calling vkCmdDecodeVideoKHR");
+             self.cmd_decode_video(cmd_buffer, &decode_info);
+             eprintln!("[DEBUG] H265Decoder: vkCmdDecodeVideoKHR returned");
 
             // End video coding
             self.cmd_end_video_coding(cmd_buffer);
-
-            // End command buffer
-            self.device
-                .end_command_buffer(cmd_buffer)
-                .map_err(|e| VideoError::CommandBufferRecording(format!("End failed: {:?}", e)))?;
         }
 
         self.frame_count += 1;

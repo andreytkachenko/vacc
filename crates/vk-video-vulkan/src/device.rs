@@ -69,6 +69,8 @@ pub struct VulkanDevice {
     pub enabled_extensions: Vec<String>,
     pub queue_families: QueueFamilies,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pub debug_messenger: vk::DebugUtilsMessengerEXT,
+    pub has_validation: bool,
 }
 
 pub struct VideoDeviceBuilder {
@@ -122,7 +124,7 @@ impl VideoDeviceBuilder {
 
     pub fn build(self) -> VideoResult<VulkanDevice> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
-        let instance = Self::create_instance(&entry, &self)?;
+        let (instance, has_validation) = Self::create_instance(&entry, &self)?;
         let (physical_device, queue_families) =
             Self::select_physical_device(&instance, &self)?;
         let (device, enabled_extensions) = Self::create_device(
@@ -130,6 +132,12 @@ impl VideoDeviceBuilder {
         )?;
         let memory_properties = unsafe {
             instance.get_physical_device_memory_properties(physical_device)
+        };
+
+        let debug_messenger = if has_validation {
+            Self::create_debug_messenger(&entry, &instance)?
+        } else {
+            vk::DebugUtilsMessengerEXT::null()
         };
 
         Ok(VulkanDevice {
@@ -140,13 +148,15 @@ impl VideoDeviceBuilder {
             enabled_extensions,
             queue_families,
             memory_properties,
+            debug_messenger,
+            has_validation,
         })
     }
 
     fn create_instance(
         entry: &ash::Entry,
         builder: &VideoDeviceBuilder,
-    ) -> VideoResult<ash::Instance> {
+    ) -> VideoResult<(ash::Instance, bool)> {
         let app_name = CString::new(&builder.app_info.name[..]).map_err(|e| {
             VideoError::VulkanInit(format!("Failed to create CString for app name: {}", e))
         })?;
@@ -161,31 +171,81 @@ impl VideoDeviceBuilder {
             .engine_name(&engine_name)
             .api_version(api_version);
 
-        let instance_extensions: Vec<CString> = vec![
+        let mut instance_extensions: Vec<CString> = vec![
             CString::new("VK_KHR_surface").unwrap(),
             CString::new("VK_KHR_get_physical_device_properties2").unwrap(),
         ];
-        let ext_ptrs: Vec<*const std::os::raw::c_char> =
-            instance_extensions.iter().map(|c| c.as_ptr()).collect();
-
         let mut layers: Vec<CString> = Vec::new();
-        let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
+        let mut has_validation = false;
         if builder.enable_validation {
             if let Ok(layer) = CString::new("VK_LAYER_KHRONOS_validation") {
                 layers.push(layer);
+                has_validation = true;
+            }
+            if let Ok(debug_ext) = CString::new("VK_EXT_debug_utils") {
+                instance_extensions.push(debug_ext);
             }
         }
-        if !layers.is_empty() {
-            layer_ptrs = layers.iter().map(|c| c.as_ptr()).collect();
-        }
+        let layer_ptrs: Vec<*const std::os::raw::c_char> =
+            layers.iter().map(|c| c.as_ptr()).collect();
+        let ext_ptrs: Vec<*const std::os::raw::c_char> =
+            instance_extensions.iter().map(|c| c.as_ptr()).collect();
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&ext_ptrs)
             .enabled_layer_names(&layer_ptrs);
 
-        unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| VideoError::VulkanInit(e.to_string()))
+        let instance = unsafe { entry.create_instance(&create_info, None) }
+            .map_err(|e| VideoError::VulkanInit(e.to_string()))?;
+
+        Ok((instance, has_validation))
+    }
+
+    fn create_debug_messenger(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+    ) -> VideoResult<vk::DebugUtilsMessengerEXT> {
+        unsafe extern "system" fn debug_callback(
+            _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+            _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+            p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+            _user_data: *mut std::os::raw::c_void,
+        ) -> u32 {
+            if p_callback_data.is_null() {
+                return 0;
+            }
+            let data = *p_callback_data;
+            let message = if !data.p_message.is_null() {
+                std::ffi::CStr::from_ptr(data.p_message).to_string_lossy().into_owned()
+            } else {
+                String::new()
+            };
+            eprintln!("[Vulkan Validation] {}", message);
+            0 // VK_FALSE - don't abort
+        }
+
+        let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+            )
+            .pfn_user_callback(Some(debug_callback))
+            .user_data(std::ptr::null_mut());
+
+        let debug_utils = ash::ext::debug_utils::Instance::new(entry, instance);
+        unsafe {
+            debug_utils
+                .create_debug_utils_messenger(&create_info, None)
+                .map_err(|e| VideoError::VulkanInit(format!("Failed to create debug messenger: {}", e)))
+        }
     }
 
     fn select_physical_device(
@@ -280,6 +340,7 @@ impl VideoDeviceBuilder {
         let required = [
             "VK_KHR_video_queue",
             "VK_KHR_video_decode_queue",
+            "VK_KHR_video_maintenance2",
             "VK_KHR_sampler_ycbcr_conversion",
             "VK_KHR_synchronization2",
         ];
@@ -432,15 +493,15 @@ impl VulkanDevice {
         let codec_op = codec.to_vk_flag();
 
         // Build profile info chain
-        let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
-        let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
-        let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default();
-        let mut vp9_profile = VideoDecodeVP9ProfileInfoKHR::default();
-
         let profile_ptr: *const vk::VideoProfileInfoKHR = match codec {
             VideoCodec::DecodeH264 => {
-                h264_profile.std_profile_idc = profile_idc;
-                h264_profile.picture_layout = vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE;
+                let h264_profile = vk::VideoDecodeH264ProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    std_profile_idc: profile_idc,
+                    picture_layout: vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE,
+                    _marker: Default::default(),
+                };
                 let profile_info = vk::VideoProfileInfoKHR {
                     s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
                     p_next: &h264_profile as *const _ as *const _,
@@ -453,7 +514,12 @@ impl VulkanDevice {
                 &profile_info as *const vk::VideoProfileInfoKHR
             }
             VideoCodec::DecodeH265 => {
-                h265_profile.std_profile_idc = profile_idc;
+                let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_H265_PROFILE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    std_profile_idc: profile_idc,
+                    _marker: Default::default(),
+                };
                 let profile_info = vk::VideoProfileInfoKHR {
                     s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
                     p_next: &h265_profile as *const _ as *const _,
@@ -466,8 +532,13 @@ impl VulkanDevice {
                 &profile_info as *const vk::VideoProfileInfoKHR
             }
             VideoCodec::DecodeAv1 => {
-                av1_profile.std_profile = profile_idc;
-                av1_profile.film_grain_support = 0;
+                let av1_profile = vk::VideoDecodeAV1ProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_AV1_PROFILE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    std_profile: profile_idc,
+                    film_grain_support: 0,
+                    _marker: Default::default(),
+                };
                 let profile_info = vk::VideoProfileInfoKHR {
                     s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
                     p_next: &av1_profile as *const _ as *const _,
@@ -480,9 +551,12 @@ impl VulkanDevice {
                 &profile_info as *const vk::VideoProfileInfoKHR
             }
             VideoCodec::DecodeVp9 => {
-                vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
-                vp9_profile.p_next = std::ptr::null();
-                vp9_profile.std_profile = profile_idc;
+                let vp9_profile = VideoDecodeVP9ProfileInfoKHR {
+                    s_type: vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR),
+                    p_next: std::ptr::null(),
+                    std_profile: profile_idc,
+                    _marker: Default::default(),
+                };
                 let profile_info = vk::VideoProfileInfoKHR {
                     s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
                     p_next: &vp9_profile as *const _ as *const _,
@@ -672,3 +746,17 @@ impl VulkanDevice {
         }
     }
 }
+
+ impl Drop for VulkanDevice {
+      fn drop(&mut self) {
+          // Destroy debug messenger BEFORE instance (if not already destroyed)
+          if self.has_validation && self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
+              let debug_utils = ash::ext::debug_utils::Instance::new(&self.entry, &self.instance);
+              unsafe {
+                  // Ignore errors - instance may already be destroyed
+                  let _ = debug_utils.destroy_debug_utils_messenger(self.debug_messenger, None);
+              }
+              self.debug_messenger = vk::DebugUtilsMessengerEXT::null();
+          }
+      }
+  }

@@ -61,15 +61,6 @@ impl Av1Decoder {
         let pic_info = self.build_picture_info(coded_extent);
 
         unsafe {
-            // Begin command buffer
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .begin_command_buffer(cmd_buffer, &begin_info)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("Begin failed: {:?}", e))
-                })?;
-
             // Bitstream buffer barrier
             let buffer_barrier = vk::BufferMemoryBarrier2 {
                 s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
@@ -195,13 +186,6 @@ impl Av1Decoder {
 
             // End video coding
             self.cmd_end_video_coding(cmd_buffer);
-
-            // End command buffer
-            self.device
-                .end_command_buffer(cmd_buffer)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("End failed: {:?}", e))
-                })?;
         }
 
         self.frame_count += 1;
@@ -298,6 +282,13 @@ impl Av1Decoder {
     }
 
     fn cmd_end_video_coding(&self, cmd_buffer: vk::CommandBuffer) {
+        let end_coding_info = vk::VideoEndCodingInfoKHR {
+            s_type: vk::StructureType::VIDEO_END_CODING_INFO_KHR,
+            p_next: std::ptr::null(),
+            flags: vk::VideoEndCodingFlagsKHR::empty(),
+            _marker: Default::default(),
+        };
+
         let fn_ptr = unsafe {
             self.instance
                 .get_device_proc_addr(
@@ -307,9 +298,12 @@ impl Av1Decoder {
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType = unsafe extern "system" fn(vk::CommandBuffer);
+                type FnType = unsafe extern "system" fn(
+                    vk::CommandBuffer,
+                    *const vk::VideoEndCodingInfoKHR<'_>,
+                );
                 let f: FnType = std::mem::transmute(ptr);
-                f(cmd_buffer);
+                f(cmd_buffer, &end_coding_info);
             }
         }
     }

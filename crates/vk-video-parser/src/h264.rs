@@ -224,16 +224,24 @@ impl H264Parser {
         let pic_order_cnt_type = r.read_ue()? as u8;
 
         let (mut log2_max_pic_order_cnt_lsb_minus4, mut max_pic_order_cnt_lsb) = (0u8, 0u32);
+        let (mut delta_pic_order_always_zero_flag, mut offset_for_non_ref_pic,
+             mut offset_for_top_to_bottom_field, mut num_ref_frames_in_pic_order_cnt_cycle) =
+            (false, 0i32, 0i32, 0u32);
+        let mut offset_for_ref_frame: Vec<i32> = Vec::new();
+
         match pic_order_cnt_type {
             0 => {
                 log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()? as u8;
                 max_pic_order_cnt_lsb = 1u32 << (log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
             }
             1 => {
-                let _delta_pic_order_always_zero_flag = r.read_bit()?;
-                let _offset_for_non_ref_pic = r.read_se()?;
-                let _offset_for_top_to_bottom_field = r.read_se()?;
-                let _num_ref_frames_in_pic_order_cnt_cycle = r.read_ue()?;
+                delta_pic_order_always_zero_flag = r.read_bit()?;
+                offset_for_non_ref_pic = r.read_se()?;
+                offset_for_top_to_bottom_field = r.read_se()?;
+                num_ref_frames_in_pic_order_cnt_cycle = r.read_ue()?;
+                for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
+                    offset_for_ref_frame.push(r.read_se()?);
+                }
             }
             2 => {}
             _ => {}
@@ -289,6 +297,11 @@ impl H264Parser {
         sps.log2_max_frame_num_minus4 = log2_max_frame_num_minus4;
         sps.max_frame_num = max_frame_num;
         sps.pic_order_cnt_type = pic_order_cnt_type;
+        sps.delta_pic_order_always_zero_flag = delta_pic_order_always_zero_flag;
+        sps.offset_for_non_ref_pic = offset_for_non_ref_pic;
+        sps.offset_for_top_to_bottom_field = offset_for_top_to_bottom_field;
+        sps.num_ref_frames_in_pic_order_cnt_cycle = num_ref_frames_in_pic_order_cnt_cycle;
+        sps.offset_for_ref_frame = offset_for_ref_frame;
         sps.log2_max_pic_order_cnt_lsb_minus4 = log2_max_pic_order_cnt_lsb_minus4;
         sps.max_pic_order_cnt_lsb = max_pic_order_cnt_lsb;
         sps.max_num_ref_frames = max_num_ref_frames;
@@ -377,7 +390,7 @@ impl H264Parser {
 
         let transform_8x8_mode_flag = r.read_bit().unwrap_or(false);
         let constrained_intra_pred_flag = r.read_bit().unwrap_or(false);
-        // second_chroma_qp_index_offset is only present when constrained_intra_pred_flag is true
+        // second_chroma_qp_index_offset is present when constrained_intra_pred_flag is true
         let second_chroma_qp_index_offset = if constrained_intra_pred_flag {
             r.read_se().unwrap_or(0)
         } else {

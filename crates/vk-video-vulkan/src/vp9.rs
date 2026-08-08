@@ -125,6 +125,11 @@ impl Vp9Decoder {
             &self.device,
             self.session,
             VideoCodec::DecodeVp9,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -231,15 +236,6 @@ impl Vp9Decoder {
         }
 
         unsafe {
-            // Begin command buffer
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .begin_command_buffer(cmd_buffer, &begin_info)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("Begin failed: {:?}", e))
-                })?;
-
             // Begin video coding with reference slots
             let begin_coding_info = vk::VideoBeginCodingInfoKHR {
                 s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
@@ -409,13 +405,6 @@ impl Vp9Decoder {
 
             // End video coding
             self.cmd_end_video_coding(cmd_buffer);
-
-            // End command buffer
-            self.device
-                .end_command_buffer(cmd_buffer)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("End failed: {:?}", e))
-                })?;
         }
 
         self.frame_count += 1;

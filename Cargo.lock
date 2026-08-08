@@ -1867,6 +1867,7 @@ dependencies = [
  "bitflags",
  "bytemuck",
  "gpu-video",
+ "libloading",
  "log",
  "thiserror 2.0.18",
  "tracing",

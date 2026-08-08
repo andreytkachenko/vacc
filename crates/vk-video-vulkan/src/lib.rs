@@ -12,13 +12,23 @@ pub mod vp9;
 pub mod av1;
 pub mod image;
 pub mod codec_types;
+pub mod dpb;
+pub mod access_unit;
+pub mod readback;
+pub mod profile_chain;
+pub mod decoder;
 
 pub use device::{VideoCodec, VulkanDevice, VideoDeviceBuilder, QueueFamilies};
 pub use session::{VideoSession, VideoSessionParams, VideoSessionParameters, CodecProfileInfo};
 pub use buffer::{BitstreamBuffer, BitstreamBufferPool};
-pub use frame::{DecodedFrame, YCbCrPlane};
+pub use frame::{DecodedFrame as FrameDecodedFrame, YCbCrPlane};
 pub use image::{create_output_image, create_output_image_with_pnext, StagingImage};
 pub use codec_types::*;
+pub use dpb::{DpbManager, DpbEntry, LastAccessType};
+pub use access_unit::{AccessUnit, H264OrH265Sps, H264OrH265Pps, VideoCodec as AccessUnitCodec};
+pub use readback::{DecodedPixels, readback_decoded_image};
+pub use profile_chain::{create_output_image_with_profile, create_bitstream_buffer_with_profile};
+pub use decoder::{VideoDecoder, DecodedFrame};
 
 /// Result type for Vulkan video operations.
 pub type VideoResult<T> = std::result::Result<T, VideoError>;

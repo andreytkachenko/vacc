@@ -15,5 +15,6 @@ bitflags.workspace = true
 thiserror.workspace = true
 log.workspace = true
 tracing.workspace = true
+libloading.workspace = true
 vk-video = "0.3.1"
 gpu-video = "0.4.0"

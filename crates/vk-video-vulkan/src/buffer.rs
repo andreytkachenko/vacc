@@ -15,8 +15,22 @@ pub struct BitstreamBuffer {
     mapped_ptr: Option<*mut u8>,
 }
 
-impl BitstreamBuffer {
-    pub fn create(
+ impl BitstreamBuffer {
+     /// Create a null BitstreamBuffer (for cleanup purposes).
+     pub fn null(device: &ash::Device) -> Self {
+         Self {
+             buffer: ash::vk::Buffer::null(),
+             memory: ash::vk::DeviceMemory::null(),
+             size: 0,
+             offset_alignment: 0,
+             size_alignment: 0,
+             device: device.clone(),
+             memory_properties: ash::vk::PhysicalDeviceMemoryProperties::default(),
+             mapped_ptr: None,
+         }
+     }
+
+     pub fn create(
         device: &ash::Device,
         memory_properties: &ash::vk::PhysicalDeviceMemoryProperties,
         size: u64,

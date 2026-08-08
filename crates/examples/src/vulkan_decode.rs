@@ -76,7 +76,7 @@ fn main() {
 
     // Step 2: Initialize Vulkan
     println!("--- Step 2: Vulkan initialization ---");
-    let vulkan = match VideoDeviceBuilder::new().with_validation(false).build() {
+    let mut vulkan = match VideoDeviceBuilder::new().with_validation(true).build() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Failed to initialize Vulkan: {}", e);
@@ -411,13 +411,26 @@ fn main() {
             );
         } else {
             // P/B frame: find or recycle a slot
-            // Pass ref_pocs to protect reference pictures needed by this frame
+            // For H.264, ref_pocs may be empty from parser, so protect ALL valid DPB entries
+            // to avoid premature recycling causing deadlocks
+            let protected_pocs: Vec<i32> = if codec == VideoCodec::H264 {
+                dpb_manager.entries.iter()
+                    .filter(|e| e.is_valid)
+                    .flat_map(|e| if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
+                        vec![e.pic_order_cnt[0]]
+                    } else {
+                        vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
+                    })
+                    .collect()
+            } else {
+                au.ref_pocs.clone()
+            };
             output_slot = dpb_manager
-                .find_or_recycle_slot(&au.ref_pocs)
+                .find_or_recycle_slot(&protected_pocs)
                 .unwrap_or(0);
             eprintln!(
-                "[decode_loop] Frame {} (non-IDR): selected slot {} (find_or_recycle path)",
-                frame_idx, output_slot
+                "[decode_loop] Frame {} (non-IDR): selected slot {} (find_or_recycle path, protected_pocs={:?})",
+                frame_idx, output_slot, protected_pocs
             );
         }
         eprintln!(
@@ -429,11 +442,10 @@ fn main() {
         let output_img = dpb_image_handles[output_slot as usize];
 
         // Record decode command (pass DPB manager for reference slot setup)
-        // CRITICAL: Use actual bitstream size, NOT aligned.
-        // The Vulkan spec requires minBitstreamBufferSizeAlignment for BUFFER SIZE,
-        // not for the decode range. Using aligned range causes the decoder to read
-        // garbage bytes from previous frames that weren't overwritten.
-        let actual_bs_size = au.data.len() as u64;
+        // Use aligned bitstream size to match Vulkan spec requirement for srcBufferRange.
+        // The buffer is already zero-padded to aligned_size above, so the decoder
+        // reads only valid data + zeros, not garbage from previous frames.
+        let aligned_bs_size = aligned_size;
         let result = record_decode_command(
             &vulkan.instance,
             &vulkan.device,
@@ -443,7 +455,7 @@ fn main() {
             session_params,
             bs_buffer.buffer(),
             0,
-            actual_bs_size,
+            aligned_bs_size,
             output_view,
             output_img,
             coded_extent,
@@ -529,8 +541,16 @@ fn main() {
                 }
             }
 
-            // Apply sliding window reference picture marking after registering new reference
-            dpb_manager.apply_sliding_window(au.frame_num);
+            // Apply reference picture marking after registering new reference.
+            // When adaptive_ref_pic_marking_mode_flag is true, use MMCO commands.
+            // When false, use sliding window.
+            if au.adaptive_ref_pic_marking_mode_flag && !au.mmco_commands.is_empty() {
+                eprintln!("[dpb] Using MMCO commands ({} commands)", au.mmco_commands.len());
+                dpb_manager.apply_mmco(au.frame_num, output_slot, &au.mmco_commands);
+            } else {
+                eprintln!("[dpb] Using sliding window");
+                dpb_manager.apply_sliding_window(au.frame_num);
+            }
         }
 
         // Readback and verify decoded pixels
@@ -741,6 +761,13 @@ fn main() {
             vulkan.device.free_memory(mem, None);
         }
 
+        // Destroy debug messenger BEFORE destroying instance
+        if vulkan.has_validation && vulkan.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
+            let debug_utils = ash::ext::debug_utils::Instance::new(&vulkan.entry, &vulkan.instance);
+            let _ = debug_utils.destroy_debug_utils_messenger(vulkan.debug_messenger, None);
+            vulkan.debug_messenger = vk::DebugUtilsMessengerEXT::null();
+        }
+
         vulkan.device.destroy_device(None);
         vulkan.instance.destroy_instance(None);
     }
@@ -810,6 +837,28 @@ struct AccessUnit {
     short_term_ref_pic_set_sps_flag: bool,
     /// H.265: Computed reference picture POCs from RPS (empty for IDR/I-frames)
     ref_pocs: Vec<i32>,
+    /// H.264: adaptive_ref_pic_marking_mode_flag from slice header (true=MMCO, false=sliding window)
+    adaptive_ref_pic_marking_mode_flag: bool,
+    /// H.264: MMCO commands parsed from slice header
+    mmco_commands: Vec<H264MmcoCommand>,
+}
+
+/// H.264 Memory Management Control Operation (MMCO) command.
+/// See H.264 spec 8.2.5.4 for details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H264MmcoCommand {
+    /// MMCO 1: Unmark short-term reference with difference_of_pic_nums_minus1
+    UnmarkShortTerm { difference_of_pic_nums_minus1: u32 },
+    /// MMCO 2: Unmark long-term reference with long_term_frame_idx
+    UnmarkLongTerm { long_term_frame_idx: u32 },
+    /// MMCO 3: Assign LongTermFrameIdx to short-term reference
+    AssignLongTerm { difference_of_pic_nums_minus1: u32, long_term_frame_idx: u32 },
+    /// MMCO 4: Set MaxLongTermFrameIdx
+    SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: u32 },
+    /// MMCO 5: Unmark all references
+    UnmarkAll,
+    /// MMCO 6: Assign LongTermFrameIdx to current picture
+    AssignLongTermToCurrent { long_term_frame_idx: u32 },
 }
 
 /// Slice header information extracted from a NAL unit.
@@ -1022,6 +1071,81 @@ impl DpbManager {
     /// Get all valid reference entries.
     fn get_references(&self) -> Vec<&DpbEntry> {
         self.entries.iter().filter(|e| e.is_valid).collect()
+    }
+
+    /// Apply H.264 MMCO (Memory Management Control Operations) commands.
+    /// See H.264 spec 8.2.5.4 for details.
+    fn apply_mmco(
+        &mut self,
+        current_frame_num: u32,
+        _current_slot_index: u32,
+        mmco_commands: &[H264MmcoCommand],
+    ) {
+        eprintln!("[dpb] Applying MMCO commands ({} commands):", mmco_commands.len());
+
+        for cmd in mmco_commands {
+            eprintln!("[dpb]   MMCO: {:?}", cmd);
+        }
+
+        for cmd in mmco_commands {
+            match cmd {
+                // MMCO 1: Mark short-term reference as unused
+                // picNumX = CurrPicNum - (difference_of_pic_nums_minus1 + 1)
+                H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1 } => {
+                    let pic_num_x = if *difference_of_pic_nums_minus1 + 1 <= current_frame_num {
+                        current_frame_num - (difference_of_pic_nums_minus1 + 1)
+                    } else {
+                        // Wraparound case
+                        u32::MAX - (difference_of_pic_nums_minus1 + 1 - current_frame_num)
+                    };
+                    eprintln!("[dpb]   MMCO 1: unmark short-term picNumX={}", pic_num_x);
+                    for entry in &mut self.entries {
+                        if entry.is_valid && entry.frame_num == pic_num_x {
+                            entry.is_valid = false;
+                            eprintln!("[dpb]     invalidated slot {} (frame_num={})", entry.slot_index, entry.frame_num);
+                        }
+                    }
+                }
+
+                // MMCO 2: Mark long-term reference as unused (not fully tracked)
+                H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx } => {
+                    eprintln!("[dpb]   MMCO 2: unmark long-term long_term_frame_idx={} (not fully tracked)", long_term_frame_idx);
+                }
+
+                // MMCO 3: Assign LongTermFrameIdx to short-term reference (not fully tracked)
+                H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1, long_term_frame_idx } => {
+                    let pic_num_x = if *difference_of_pic_nums_minus1 + 1 <= current_frame_num {
+                        current_frame_num - (difference_of_pic_nums_minus1 + 1)
+                    } else {
+                        u32::MAX - (difference_of_pic_nums_minus1 + 1 - current_frame_num)
+                    };
+                    eprintln!("[dpb]   MMCO 3: assign LongTermFrameIdx={} to picNumX={} (not fully tracked)",
+                              long_term_frame_idx, pic_num_x);
+                }
+
+                // MMCO 4: Set MaxLongTermFrameIdx (not fully tracked)
+                H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1 } => {
+                    eprintln!("[dpb]   MMCO 4: set MaxLongTermFrameIdx={} (not fully tracked)",
+                              max_long_term_frame_idx_plus1);
+                }
+
+                // MMCO 5: Unmark all references
+                H264MmcoCommand::UnmarkAll => {
+                    eprintln!("[dpb]   MMCO 5: unmark ALL references");
+                    for entry in &mut self.entries {
+                        if entry.is_valid {
+                            entry.is_valid = false;
+                        }
+                    }
+                }
+
+                // MMCO 6: Assign LongTermFrameIdx to current picture (not fully tracked)
+                H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx } => {
+                    eprintln!("[dpb]   MMCO 6: assign LongTermFrameIdx={} to current (not fully tracked)",
+                              long_term_frame_idx);
+                }
+            }
+        }
     }
 }
 
@@ -1238,8 +1362,8 @@ fn parse_h264_slice_header(
     prev_pic_order_cnt_lsb: i32,
     prev_pic_order_cnt_msb: i32,
     max_pic_order_cnt_lsb: u32,
-) -> Option<(u32, u32, i32, i32, [i32; 2])> {
-    // Returns: (first_mb_in_slice, frame_num, pic_order_cnt_lsb, pic_order_cnt_msb, pic_order_cnt)
+) -> Option<(u32, u32, i32, i32, [i32; 2], bool, Vec<H264MmcoCommand>)> {
+    // Returns: (first_mb_in_slice, frame_num, pic_order_cnt_lsb, pic_order_cnt_msb, pic_order_cnt, adaptive_ref_pic_marking_mode_flag, mmco_commands)
     if nal_data.len() < 4 {
         return None;
     }
@@ -1290,12 +1414,73 @@ fn parse_h264_slice_header(
         pic_order_cnt_msb + pic_order_cnt_lsb,
     ];
 
+    // adaptive_ref_pic_marking_mode_flag appears after pic_order_cnt for reference frames
+    let adaptive_ref_pic_marking_mode_flag = if nal_ref_idc > 0 {
+        r.read_bit().unwrap_or(0) != 0
+    } else {
+        false
+    };
+
+    // Parse MMCO commands if adaptive_ref_pic_marking_mode_flag is true
+    // See H.264 spec 7.3.3 and 8.2.5.4
+    let mut mmco_commands = Vec::new();
+    if adaptive_ref_pic_marking_mode_flag {
+        loop {
+            let Some(memory_management_control_operation) = r.read_ue() else {
+                break;
+            };
+
+            // MMCO 0 is the terminator
+            if memory_management_control_operation == 0 {
+                break;
+            }
+
+            let cmd = match memory_management_control_operation {
+                // MMCO 1: Unmark short-term reference
+                1 => {
+                    let difference_of_pic_nums_minus1 = r.read_ue().unwrap_or(0);
+                    H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1 }
+                }
+                // MMCO 2: Unmark long-term reference
+                2 => {
+                    let long_term_frame_idx = r.read_ue().unwrap_or(0);
+                    H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx }
+                }
+                // MMCO 3: Assign LongTermFrameIdx to short-term reference
+                3 => {
+                    let difference_of_pic_nums_minus1 = r.read_ue().unwrap_or(0);
+                    let long_term_frame_idx = r.read_ue().unwrap_or(0);
+                    H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1, long_term_frame_idx }
+                }
+                // MMCO 4: Set MaxLongTermFrameIdx
+                4 => {
+                    let long_term_frame_idx = r.read_ue().unwrap_or(0);
+                    H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: long_term_frame_idx }
+                }
+                // MMCO 5: Unmark all references
+                5 => H264MmcoCommand::UnmarkAll,
+                // MMCO 6: Assign LongTermFrameIdx to current picture
+                6 => {
+                    let long_term_frame_idx = r.read_ue().unwrap_or(0);
+                    H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx }
+                }
+                _ => {
+                    // Unknown MMCO, stop parsing
+                    break;
+                }
+            };
+            mmco_commands.push(cmd);
+        }
+    }
+
     Some((
         first_mb_in_slice,
         frame_num,
         pic_order_cnt_lsb,
         pic_order_cnt_msb,
         pic_order_cnt,
+        adaptive_ref_pic_marking_mode_flag,
+        mmco_commands,
     ))
 }
 
@@ -1763,7 +1948,9 @@ fn extract_all_access_units(
      let mut current_num_bits_for_st_ref_pic_set_in_slice: i32 = 0;
      let mut current_num_delta_pocs_of_ref_rps_idx: i32 = 0;
      let mut current_short_term_ref_pic_set_sps_flag: bool = true;
-     let mut current_ref_pocs: Vec<i32> = Vec::new();
+      let mut current_ref_pocs: Vec<i32> = Vec::new();
+     let mut current_adaptive_ref_pic_marking_mode_flag: bool = false;
+     let mut current_mmco_commands: Vec<H264MmcoCommand> = Vec::new();
     let mut in_frame = false;
     let mut found_first_frame = false;
 
@@ -1858,22 +2045,25 @@ fn extract_all_access_units(
         // Handle access unit delimiter (H.264) - signals start of new AU
         if is_au_delimiter {
             if in_frame && !current_au_data.is_empty() {
-                  access_units.push(AccessUnit {
-                      data: current_au_data.clone(),
-                      slice_offsets: current_slice_offsets.clone(),
-                      frame_num: current_frame_num,
-                      pic_order_cnt: current_poc,
-                      is_idr: current_is_idr,
-                      is_reference: current_is_reference,
-                      slice_type: current_slice_type,
-                       num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                        ref_pocs: current_ref_pocs.clone(),
-                    });
-                  current_au_data.clear();
-                  current_slice_offsets.clear();
-              }
+                   access_units.push(AccessUnit {
+                        data: current_au_data.clone(),
+                        slice_offsets: current_slice_offsets.clone(),
+                        frame_num: current_frame_num,
+                        pic_order_cnt: current_poc,
+                        is_idr: current_is_idr,
+                        is_reference: current_is_reference,
+                        slice_type: current_slice_type,
+                         num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                          num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                          ref_pocs: current_ref_pocs.clone(),
+                          adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                          mmco_commands: current_mmco_commands.clone(),
+                      });
+                    current_au_data.clear();
+                    current_slice_offsets.clear();
+                    current_mmco_commands.clear();
+                }
               offset = end;
               continue;
           }
@@ -1892,7 +2082,7 @@ fn extract_all_access_units(
                 // Parse slice header to get frame boundary info
                 if let Some(H264OrH265Sps::H264(sps)) = sps {
                     if let Some((_, ref_idc, nal_unit_type)) = parse_h264_nal_header(nal_data) {
-                        if let Some((first_mb, frame_num, poc_lsb, poc_msb, poc)) =
+                        if let Some((first_mb, frame_num, poc_lsb, poc_msb, poc, adaptive_ref_pic_marking_mode_flag, mmco_commands)) =
                             parse_h264_slice_header(
                                 nal_data,
                                 sps,
@@ -1933,37 +2123,42 @@ fn extract_all_access_units(
                                         current_is_idr,
                                         current_slice_offsets.len()
                                     );
-                                     access_units.push(AccessUnit {
-                                          data: current_au_data.clone(),
-                                          slice_offsets: current_slice_offsets.clone(),
-                                          frame_num: current_frame_num,
-                                          pic_order_cnt: current_poc,
-                                          is_idr: current_is_idr,
-                                          is_reference: current_is_reference,
-                                          slice_type: current_slice_type,
-                                           num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                            num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                            ref_pocs: current_ref_pocs.clone(),
-                                        });
-                                      current_au_data.clear();
-                                      current_slice_offsets.clear();
-                                  }
+                                      access_units.push(AccessUnit {
+                                            data: current_au_data.clone(),
+                                            slice_offsets: current_slice_offsets.clone(),
+                                            frame_num: current_frame_num,
+                                            pic_order_cnt: current_poc,
+                                            is_idr: current_is_idr,
+                                            is_reference: current_is_reference,
+                                            slice_type: current_slice_type,
+                                             num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                                              num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                              ref_pocs: current_ref_pocs.clone(),
+                                              adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                              mmco_commands: current_mmco_commands.clone(),
+                                          });
+                                        current_au_data.clear();
+                                        current_slice_offsets.clear();
+                                        current_mmco_commands.clear();
+                                    }
 
-                                  // First slice of a frame - set frame properties from parsed header
-                                  current_is_idr = is_idr_slice;
-                                current_is_reference = ref_idc != 0;
-                                current_frame_num = frame_num;
-                                current_poc = poc;
-                                current_slice_type = if nal_unit_type == 5 {
-                                    0 // IDR = I
-                                } else if ref_idc != 0 {
-                                    1 // P-frame
-                                } else {
-                                    2 // B-frame
-                                };
+                                   // First slice of a frame - set frame properties from parsed header
+                                   current_is_idr = is_idr_slice;
+                                 current_is_reference = ref_idc != 0;
+                                 current_frame_num = frame_num;
+                                 current_poc = poc;
+                                 current_slice_type = if nal_unit_type == 5 {
+                                     0 // IDR = I
+                                 } else if ref_idc != 0 {
+                                     1 // P-frame
+                                 } else {
+                                     2 // B-frame
+                                 };
+                                 current_adaptive_ref_pic_marking_mode_flag = adaptive_ref_pic_marking_mode_flag;
+                                 current_mmco_commands = mmco_commands;
 
-                                // Update POC tracking
+                                 // Update POC tracking
                                 prev_pic_order_cnt_lsb = poc_lsb;
                                 prev_pic_order_cnt_msb = poc_msb;
                                 prev_frame_num = frame_num;
@@ -2057,22 +2252,25 @@ fn extract_all_access_units(
                                         current_is_idr,
                                         current_slice_offsets.len()
                                     );
-                                     access_units.push(AccessUnit {
-                                          data: current_au_data.clone(),
-                                          slice_offsets: current_slice_offsets.clone(),
-                                          frame_num: current_frame_num,
-                                          pic_order_cnt: current_poc,
-                                          is_idr: current_is_idr,
-                                          is_reference: current_is_reference,
-                                          slice_type: current_slice_type,
-                                           num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                            num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                            ref_pocs: current_ref_pocs.clone(),
-                                        });
-                                      current_au_data.clear();
-                                      current_slice_offsets.clear();
-                                  }
+                                      access_units.push(AccessUnit {
+                                            data: current_au_data.clone(),
+                                            slice_offsets: current_slice_offsets.clone(),
+                                            frame_num: current_frame_num,
+                                            pic_order_cnt: current_poc,
+                                            is_idr: current_is_idr,
+                                            is_reference: current_is_reference,
+                                            slice_type: current_slice_type,
+                                             num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                                              num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                              ref_pocs: current_ref_pocs.clone(),
+                                              adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                              mmco_commands: current_mmco_commands.clone(),
+                                          });
+                                        current_au_data.clear();
+                                        current_slice_offsets.clear();
+                                        current_mmco_commands.clear();
+                                    }
 
                                   // First slice of a frame - set frame properties from parsed header
                                   current_is_idr = slice_is_idr;
@@ -2136,22 +2334,25 @@ fn extract_all_access_units(
                                          current_is_idr,
                                          current_slice_offsets.len()
                                      );
-                                      access_units.push(AccessUnit {
-                                           data: current_au_data.clone(),
-                                           slice_offsets: current_slice_offsets.clone(),
-                                           frame_num: current_frame_num,
-                                           pic_order_cnt: current_poc,
-                                           is_idr: current_is_idr,
-                                           is_reference: current_is_reference,
-                                           slice_type: current_slice_type,
-                                            num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                             num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                         short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                             ref_pocs: current_ref_pocs.clone(),
-                                         });
-                                       current_au_data.clear();
-                                       current_slice_offsets.clear();
-                                   }
+                                       access_units.push(AccessUnit {
+                                             data: current_au_data.clone(),
+                                             slice_offsets: current_slice_offsets.clone(),
+                                             frame_num: current_frame_num,
+                                             pic_order_cnt: current_poc,
+                                             is_idr: current_is_idr,
+                                             is_reference: current_is_reference,
+                                             slice_type: current_slice_type,
+                                              num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                                               num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                           short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                               ref_pocs: current_ref_pocs.clone(),
+                                               adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                               mmco_commands: current_mmco_commands.clone(),
+                                           });
+                                         current_au_data.clear();
+                                         current_slice_offsets.clear();
+                                         current_mmco_commands.clear();
+                                     }
 
                   if codec == VideoCodec::H264 && sps.is_none() {
                     // Fallback for H.264 without SPS
@@ -2204,20 +2405,22 @@ fn extract_all_access_units(
 
     // Don't forget the last frame
     if in_frame && !current_au_data.is_empty() {
-        access_units.push(AccessUnit {
-             data: current_au_data,
-             slice_offsets: current_slice_offsets,
-             frame_num: current_frame_num,
-             pic_order_cnt: current_poc,
-             is_idr: current_is_idr,
-             is_reference: current_is_reference,
-             slice_type: current_slice_type,
-              num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-               num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-               ref_pocs: current_ref_pocs,
-           });
-      }
+         access_units.push(AccessUnit {
+               data: current_au_data,
+               slice_offsets: current_slice_offsets,
+               frame_num: current_frame_num,
+               pic_order_cnt: current_poc,
+               is_idr: current_is_idr,
+               is_reference: current_is_reference,
+               slice_type: current_slice_type,
+                num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                 num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                 ref_pocs: current_ref_pocs,
+                 adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                 mmco_commands: current_mmco_commands,
+             });
+        }
 
       eprintln!(
         "[extract_all] Extracted {} access units",
@@ -3228,12 +3431,10 @@ fn record_decode_command(
         "[decode] coded_extent parameter: {}x{}",
         coded_extent.width, coded_extent.height
     );
-    // Use actual bitstream size, matching C++ reference (VkVideoDecoder.cpp:818).
-    // The C++ reference uses bitstreamDataLen directly without alignment.
-    // While the Vulkan spec says srcBufferRange must be aligned to
-    // minBitstreamBufferSizeAlignment, the driver may handle this internally.
-    // Using aligned range causes the decoder to read zero-padded bytes
-    // which may be interpreted as start codes, causing decode failures.
+    // Use aligned bitstream range to match Vulkan spec requirement for srcBufferRange.
+    // srcBufferRange must be aligned to minBitstreamBufferSizeAlignment (typically 256 bytes).
+    // The buffer is already zero-padded to this boundary, so the decoder reads
+    // only valid data + zeros.
     let bs_range = bitstream_range;
     eprintln!("[decode] Bitstream range: {} bytes -> aligned to {} bytes, slice_count={}, frame_num={}, is_idr={}",
                bitstream_range, bs_range, slice_offsets.len(), frame_num, is_idr);
@@ -3664,10 +3865,14 @@ fn record_decode_command(
                 unsafe { std::mem::zeroed::<ash::vk::native::StdVideoDecodeH264ReferenceInfo>() };
             ref_info.FrameNum = frame_num as u16;
             ref_info.PicOrderCnt = poc;
-            // For frame pictures: top_field_flag=0, bottom_field_flag=0
-            // Validation layer IsFrame() requires both flags to be 0
-            ref_info.flags.set_top_field_flag(0);
-            ref_info.flags.set_bottom_field_flag(0);
+            // Setup picture reference info (current picture being decoded):
+            // Per C++ reference (VulkanVideoParser.cpp:2321-2322):
+            //   top_field_flag = !field_pic_flag || !bottom_field_flag
+            //   bottom_field_flag = !field_pic_flag || bottom_field_flag
+            // For progressive frames (field_pic_flag=0): both flags = 1
+            // This indicates both fields of the setup picture are available.
+            ref_info.flags.set_top_field_flag(1);
+            ref_info.flags.set_bottom_field_flag(1);
             ref_info.flags.set_used_for_long_term_reference(0);
             ref_info.flags.set_is_non_existing(0);
 
@@ -3682,6 +3887,16 @@ fn record_decode_command(
                 ref_info.flags.used_for_long_term_reference(),
                 ref_info.flags.is_non_existing()
             );
+
+            // DEBUG: Dump setup picture reference info for frame 1
+            if frame_num == 1 {
+                eprintln!("[DEBUG-FRAME1-SETUP] Setup picture ref info: frame_num={}, poc=[{}, {}], flags(top={},bottom={},ltr={},non_exist={})",
+                    ref_info.FrameNum, ref_info.PicOrderCnt[0], ref_info.PicOrderCnt[1],
+                    ref_info.flags.top_field_flag(),
+                    ref_info.flags.bottom_field_flag(),
+                    ref_info.flags.used_for_long_term_reference(),
+                    ref_info.flags.is_non_existing());
+            }
 
             h264_ref_info_vec.push(ref_info);
             let ref_info = &h264_ref_info_vec[h264_ref_info_vec.len() - 1];
@@ -3890,6 +4105,14 @@ fn record_decode_command(
     // function returns, but the pointers are used in the command buffer.
     let valid_refs_len = valid_refs.len();
 
+    // CRITICAL FIX: Reserve capacity before reference loop to prevent vector reallocation
+    // from invalidating pointers to setup picture's ref_info and dpb_slot_info taken earlier.
+    // Without this, pushing reference pictures can reallocate vectors and cause dangling pointers.
+    h264_ref_info_vec.reserve(valid_refs_len);
+    h264_dpb_slot_info_vec.reserve(valid_refs_len);
+    h265_ref_info_vec.reserve(valid_refs_len);
+    h265_dpb_slot_info_vec.reserve(valid_refs_len);
+
     let mut reference_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
         Vec::with_capacity(valid_refs_len);
     let mut ref_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> =
@@ -3903,12 +4126,25 @@ fn record_decode_command(
                 };
                 ref_std_info.FrameNum = ref_entry.frame_num as u16;
                 ref_std_info.PicOrderCnt = ref_entry.pic_order_cnt;
-                // For frame pictures: top_field_flag=0, bottom_field_flag=0
-                // Validation layer IsFrame() requires both flags to be 0
-                ref_std_info.flags.set_top_field_flag(0);
-                ref_std_info.flags.set_bottom_field_flag(0);
+                // Per Vulkan spec and C++ reference (VulkanVideoParser.cpp:getPictureFlag):
+                // For progressive reference pictures: both flags = 1 (both fields available)
+                // For field reference pictures: flags indicate which fields are available
+                // Since we only handle progressive H.264, both flags = 1.
+                ref_std_info.flags.set_top_field_flag(1);
+                ref_std_info.flags.set_bottom_field_flag(1);
                 ref_std_info.flags.set_used_for_long_term_reference(0);
                 ref_std_info.flags.set_is_non_existing(0);
+
+                // DEBUG: Dump reference info for frame 1
+                if frame_num == 1 {
+                    eprintln!("[DEBUG-FRAME1-REF] DPB ref slot {}: dpb_slot={}, frame_num={}, poc=[{}, {}], flags(top={},bottom={},ltr={},non_exist={})",
+                        reference_slots.len(), ref_entry.slot_index, ref_entry.frame_num,
+                        ref_entry.pic_order_cnt[0], ref_entry.pic_order_cnt[1],
+                        ref_std_info.flags.top_field_flag(),
+                        ref_std_info.flags.bottom_field_flag(),
+                        ref_std_info.flags.used_for_long_term_reference(),
+                        ref_std_info.flags.is_non_existing());
+                }
 
                 h264_ref_info_vec.push(ref_std_info);
                 let ref_info = &h264_ref_info_vec[h264_ref_info_vec.len() - 1];
@@ -4232,6 +4468,13 @@ fn record_decode_command(
         // Reference picture barriers (READ access - decoder reads reference frames here)
         for ref_entry in &valid_refs {
             let ref_slot_layout = dpb_manager.get_slot_layout(ref_entry.slot_index);
+            eprintln!("[barrier-after-coding] Ref slot {}: frame_num={}, tracked_layout={:?}, needs_barrier={}",
+                ref_entry.slot_index, ref_entry.frame_num, ref_slot_layout,
+                ref_slot_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+            if frame_num == 1 {
+                eprintln!("[DEBUG-FRAME1-REF-BARRIER] slot={}, frame_num={}, image={:?}, layout={:?}",
+                    ref_entry.slot_index, ref_entry.frame_num, ref_entry.image, ref_slot_layout);
+            }
             if ref_slot_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
                 for &aspect in &[vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1] {
                     image_barriers.push(vk::ImageMemoryBarrier2 {
@@ -4258,6 +4501,9 @@ fn record_decode_command(
                 }
                 eprintln!("[barrier-after-coding] Ref slot {}: {:?} -> VIDEO_DECODE_DPB_KHR (READ)",
                     ref_entry.slot_index, ref_slot_layout);
+            } else {
+                eprintln!("[barrier-after-coding] Ref slot {}: already VIDEO_DECODE_DPB_KHR - NO BARRIER",
+                    ref_entry.slot_index);
             }
         }
 
@@ -5887,15 +6133,10 @@ fn readback_decoded_image(
             .begin_command_buffer(cmd_buffer, &begin_info)
             .map_err(|e| format!("Begin command buffer failed: {:?}", e))?;
 
-        // CRITICAL FIX: Do NOT transition the DPB image layout.
-        // Match C++ reference: copy from DPB image while it stays in VIDEO_DECODE_DPB_KHR.
-        // The C++ reference (VkVideoDecoder.cpp:763-765) copies from the DPB image
-        // WITHOUT changing its layout. Transitioning the DPB image out of
-        // VIDEO_DECODE_DPB_KHR and back loses internal decoder state,
-        // causing reference picture corruption for subsequent frames.
-        //
-        // Instead, use a visibility barrier to make the decode-write access
-        // visible to the transfer-read access, WITHOUT changing the layout.
+        // Transition DPB image to TRANSFER_SRC_OPTIMAL before copy.
+        // Matches C++ reference VkVideoDecoder.cpp:763-795.
+        // cmd_copy_image_to_buffer requires TRANSFER_SRC_OPTIMAL layout;
+        // copying from VIDEO_DECODE_DPB_KHR directly is undefined behavior.
         let plane0_barrier = vk::ImageMemoryBarrier2 {
             s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
             p_next: std::ptr::null(),
@@ -5907,7 +6148,7 @@ fn readback_decoded_image(
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
             old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,  // NO layout change!
+            new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::PLANE_0,
                 base_mip_level: 0,
@@ -5929,9 +6170,9 @@ fn readback_decoded_image(
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
             old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,  // NO layout change!
+            new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                aspect_mask: vk::ImageAspectFlags::PLANE_1 | vk::ImageAspectFlags::PLANE_2,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -5956,11 +6197,10 @@ fn readback_decoded_image(
         cmd_pipeline_barrier_2(instance, device.handle(), cmd_buffer, &dep_info);
 
         // Copy PLANE_0 (Y) to buffer at offset 0
-        // Source image stays in VIDEO_DECODE_DPB_KHR layout (no transition)
         device.cmd_copy_image_to_buffer(
             cmd_buffer,
             image,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,  // Keep DPB layout!
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             buffer,
             &[vk::BufferImageCopy::default()
                 .buffer_offset(0)
@@ -5982,11 +6222,10 @@ fn readback_decoded_image(
         );
 
         // Copy PLANE_1 (UV interleaved) to buffer at offset y_size
-        // Source image stays in VIDEO_DECODE_DPB_KHR layout (no transition)
         device.cmd_copy_image_to_buffer(
             cmd_buffer,
             image,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,  // Keep DPB layout!
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             buffer,
             &[vk::BufferImageCopy::default()
                 .buffer_offset(y_size as u64)
@@ -6038,7 +6277,7 @@ fn readback_decoded_image(
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
-            old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::PLANE_0,
@@ -6060,7 +6299,7 @@ fn readback_decoded_image(
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
-            old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::PLANE_1,

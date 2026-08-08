@@ -66,6 +66,10 @@ path = "src/vulkan_decode_vp9.rs"
 name = "diag_vp9"
 path = "src/diag_vp9.rs"
 
+[[example]]
+name = "test_decoder"
+path = "src/test_decoder.rs"
+
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
@@ -77,3 +81,4 @@ thiserror.workspace = true
 tempfile = "3"
 serde_json = "1"
 image = "0.25"
+

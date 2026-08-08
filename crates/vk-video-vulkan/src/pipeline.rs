@@ -336,6 +336,7 @@ impl VideoPipeline {
                         None,
                         None,
                         None,
+                        frame_index == 0,
                     )?;
                 }
                 DecoderWrapper::H265(d) => {
