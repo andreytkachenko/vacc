@@ -6,6 +6,21 @@ use std::ffi::CString;
 use super::{AppInfo, VideoError, VideoResult};
 use super::vp9::{VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9CapabilitiesKHR, vp9_vk_constants};
 
+/// PhysicalDeviceVideoDecodeFeaturesKHR - not available in ash 0.38, define manually.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct PhysicalDeviceVideoDecodeFeaturesKHR {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    video_decode_h264: u32,
+    video_decode_h265: u32,
+    video_decode_av1: u32,
+    video_decode_vp9: u32,
+}
+
+const PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR: vk::StructureType =
+    vk::StructureType::from_raw(1000346000);
+
 
 /// Queue family indices found during device selection.
 #[derive(Debug, Clone, Default)]
@@ -336,11 +351,16 @@ impl VideoDeviceBuilder {
         }
 
         // Collect device extensions (only those that are actually available)
+        // NOTE: We use VK_KHR_video_maintenance1 instead of maintenance2.
+        // maintenance2 adds vkUpdateVideoSessionKHR which is required to initialize
+        // the session, but some drivers advertise the extension without exporting
+        // the function. Using maintenance1 allows vkCmdBeginVideoCodingKHR to
+        // auto-initialize the session (matching NVIDIA Vulkan-Video-Samples behavior).
         let mut extensions: Vec<&str> = Vec::new();
         let required = [
             "VK_KHR_video_queue",
             "VK_KHR_video_decode_queue",
-            "VK_KHR_video_maintenance2",
+            "VK_KHR_video_maintenance1",
             "VK_KHR_sampler_ycbcr_conversion",
             "VK_KHR_synchronization2",
         ];
@@ -390,9 +410,17 @@ impl VideoDeviceBuilder {
         sync2_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
         sync2_features.synchronization2 = 1;
 
+        let mut video_decode_features = PhysicalDeviceVideoDecodeFeaturesKHR::default();
+        video_decode_features.s_type = PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR;
+        video_decode_features.p_next = &mut sync2_features as *mut _ as *mut _;
+        video_decode_features.video_decode_h264 = 1;
+        video_decode_features.video_decode_h265 = 1;
+        video_decode_features.video_decode_av1 = 1;
+        video_decode_features.video_decode_vp9 = 1;
+
         let mut sampler_ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
         sampler_ycbcr_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
-        sampler_ycbcr_features.p_next = &mut sync2_features as *mut _ as *mut _;
+        sampler_ycbcr_features.p_next = &mut video_decode_features as *mut _ as *mut _;
         sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default();

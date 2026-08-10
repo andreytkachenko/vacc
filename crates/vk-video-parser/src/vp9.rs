@@ -38,6 +38,8 @@ pub struct Vp9Parser {
     loop_filter_ref_deltas: [i8; VP9_MAX_REF_FRAMES as usize],
     /// Last loop filter mode deltas.
     loop_filter_mode_deltas: [i8; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
+    /// Reference frame sizes indexed by DPB slot (for inter frame size inheritance).
+    reference_frame_sz: [(u32, u32); VP9_NUM_REF_FRAMES as usize],
 }
 
 impl Vp9Parser {
@@ -52,6 +54,7 @@ impl Vp9Parser {
             last_show_frame: false,
             loop_filter_ref_deltas: [0; VP9_MAX_REF_FRAMES as usize],
             loop_filter_mode_deltas: [0; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
+            reference_frame_sz: [(0, 0); VP9_NUM_REF_FRAMES as usize],
         }
     }
 
@@ -70,8 +73,10 @@ impl Vp9Parser {
             return Err(ParserError::InvalidBitstream);
         }
 
-        // Parse profile (2 bits)
-        let profile = r.read_bits(2)?;
+        // Parse profile (2 bits: low first, then high)
+        let profile_low = r.read_bits(1)?;
+        let profile_high = r.read_bits(1)?;
+        let profile = (profile_high << 1) | profile_low;
         frame_data.picture_info.profile = match profile {
             0 => Vp9Profile::Profile0,
             1 => Vp9Profile::Profile1,
@@ -105,11 +110,12 @@ impl Vp9Parser {
         // show_frame
         frame_data.picture_info.flags.show_frame = r.read_bits(1)? as u8;
 
-        // error_resilient_mode
+        // error_resilient_mode: read for ALL frames to match cros-codecs bitstream position
+        // (for key frames, this bit is part of the data that gets byte-aligned away)
         frame_data.picture_info.flags.error_resilient_mode = r.read_bits(1)? as u8;
 
         if frame_data.picture_info.frame_type == Vp9FrameType::Key {
-            // Key frame: check frame sync code (24 bits)
+            // Key frame: read frame sync code (24 bits)
             let sync_code = r.read_bits(24)?;
             if sync_code != VP9_FRAME_SYNC_CODE {
                 eprintln!("[VP9] Invalid frame sync code: 0x{:06x} (expected 0x{:06x})",
@@ -121,33 +127,33 @@ impl Vp9Parser {
 
             self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
 
-            frame_data.picture_info.refresh_frame_flags = 0xFF; // (1u8 << 8) - 1, but 1u8 << 8 overflows
+            // Key frames implicitly refresh all frame buffers
+            frame_data.picture_info.refresh_frame_flags = 0xFF;
 
             frame_data.frame_is_intra = true;
             for i in 0..VP9_REFS_PER_FRAME as usize {
                 frame_data.ref_frame_idx[i] = 0;
             }
         } else {
-            // Non-key frame
-            // Per spec: intra_only is read only when show_frame == 0
-            // C++: pStdPicInfo->flags.intra_only = pStdPicInfo->flags.show_frame ? 0 : u(1);
+            // Non-key frame: error_resilient_mode already read above
+
+            // intra_only: only present when show_frame == 0 (per VP9 spec)
             if frame_data.picture_info.flags.show_frame == 0 {
                 frame_data.picture_info.flags.intra_only = r.read_bits(1)? as u8;
-            } else {
-                frame_data.picture_info.flags.intra_only = 0;
             }
-            frame_data.frame_is_intra = frame_data.picture_info.flags.intra_only != 0;
-
+            // reset_frame_context: only present when !error_resilient_mode
             if frame_data.picture_info.flags.error_resilient_mode == 0 {
                 frame_data.picture_info.flags.reset_frame_context = r.read_bits(2)? as u8;
-            } else {
-                frame_data.picture_info.flags.reset_frame_context = 0;
             }
 
+            frame_data.frame_is_intra = frame_data.picture_info.flags.intra_only != 0;
+
             if frame_data.frame_is_intra {
+                // Intra-only non-key frame: read sync code
                 let sync_code = r.read_bits(24)?;
                 if sync_code != VP9_FRAME_SYNC_CODE {
-                    eprintln!("[VP9] Invalid intra frame sync code: 0x{:06x}", sync_code);
+                    eprintln!("[VP9] Invalid intra frame sync code: 0x{:06x} (expected 0x{:06x})",
+                        sync_code, VP9_FRAME_SYNC_CODE);
                 }
 
                 if (frame_data.picture_info.profile as u32) > (Vp9Profile::Profile0 as u32) {
@@ -160,21 +166,22 @@ impl Vp9Parser {
                     frame_data.color_config.bit_depth = 8;
                 }
 
-                frame_data.picture_info.refresh_frame_flags =
-                    r.read_bits(VP9_NUM_REF_FRAMES as u8)? as u8;
+                // refresh_frame_flags comes AFTER color_config but BEFORE frame_size
+                // for intra-only frames (per VP9 spec section 7.2.4.1 and cros-codecs)
+                frame_data.picture_info.refresh_frame_flags = r.read_bits(8)? as u8;
 
                 self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
             } else {
-                // Inter frame
-                frame_data.picture_info.refresh_frame_flags =
-                    r.read_bits(VP9_NUM_REF_FRAMES as u8)? as u8;
+                // Inter frame: refresh_frame_flags comes before ref_frame_idx
+                frame_data.picture_info.refresh_frame_flags = r.read_bits(8)? as u8;
 
                 frame_data.picture_info.ref_frame_sign_bias_mask = 0;
-                for i in 0..VP9_REFS_PER_FRAME as usize {
+                // VP9 spec: each frame specifies exactly 3 reference frames
+                for i in 0..3usize {
                     frame_data.ref_frame_idx[i] = r.read_bits(3)? as u8;
                     let sign_bias = r.read_bits(1)?;
                     frame_data.picture_info.ref_frame_sign_bias_mask |=
-                        (sign_bias as u8) << (VP9_REFERENCE_NAME_LAST_FRAME as u8 + i as u8);
+                        (sign_bias as u8) << (i + 1);
                 }
 
                 self.parse_frame_and_render_size_with_refs(&mut r, &mut frame_data)?;
@@ -240,6 +247,15 @@ impl Vp9Parser {
         frame_data.compressed_header_offset = Self::consumed_bits_to_bytes(&r);
         frame_data.tiles_offset =
             frame_data.compressed_header_offset + frame_data.compressed_header_size;
+
+        // Update reference frame sizes for refreshed frames (per cros-codecs)
+        for i in 0..VP9_NUM_REF_FRAMES as usize {
+            let flag = 1u8 << i;
+            if frame_data.picture_info.refresh_frame_flags & flag != 0 {
+                self.reference_frame_sz[i] =
+                    (frame_data.frame_width, frame_data.frame_height);
+            }
+        }
 
         // Update detected format
         self.update_format(&frame_data);
@@ -331,43 +347,39 @@ impl Vp9Parser {
         r: &mut BitReader,
         frame_data: &mut Vp9FrameData,
     ) -> ParserResult<()> {
+        // Per VP9 spec and cros-codecs: read frame_size_coding_flag for each of 3 refs.
+        // When the first flag is 1, use that ref's size and stop reading flags.
         let mut found_ref = false;
 
-        for _i in 0..VP9_REFS_PER_FRAME as usize {
-            found_ref = r.read_bits(1)? != 0;
-            if found_ref {
-                // Use previously known frame dimensions (from reference frame),
-                // NOT from bitstream. Matches C++ reference behavior.
-                frame_data.frame_width = self.last_frame_width;
-                frame_data.frame_height = self.last_frame_height;
+        for i in 0..3usize {
+            let frame_size_coding_flag = r.read_bits(1)? != 0;
 
-                self.compute_image_size(frame_data);
-
-                // Read render size flag (1 bit) - NOT frame size!
-                if r.read_bits(1)? != 0 {
-                    frame_data.render_width = r.read_bits(16)? as u32 + 1;
-                    frame_data.render_height = r.read_bits(16)? as u32 + 1;
-                } else {
-                    frame_data.render_width = frame_data.frame_width;
-                    frame_data.render_height = frame_data.frame_height;
-                }
+            if frame_size_coding_flag {
+                let idx = frame_data.ref_frame_idx[i] as usize;
+                frame_data.frame_width = self.reference_frame_sz[idx].0;
+                frame_data.frame_height = self.reference_frame_sz[idx].1;
+                found_ref = true;
                 break;
             }
         }
 
         if !found_ref {
+            // No reference frame size available, read from bitstream
             frame_data.frame_width = r.read_bits(16)? as u32 + 1;
             frame_data.frame_height = r.read_bits(16)? as u32 + 1;
 
             self.compute_image_size(frame_data);
+        } else {
+            self.compute_image_size(frame_data);
+        }
 
-            if r.read_bits(1)? != 0 {
-                frame_data.render_width = r.read_bits(16)? as u32 + 1;
-                frame_data.render_height = r.read_bits(16)? as u32 + 1;
-            } else {
-                frame_data.render_width = frame_data.frame_width;
-                frame_data.render_height = frame_data.frame_height;
-            }
+        // Per cros-codecs: always read render_size_flag for inter frames
+        if r.read_bits(1)? != 0 {
+            frame_data.render_width = r.read_bits(16)? as u32 + 1;
+            frame_data.render_height = r.read_bits(16)? as u32 + 1;
+        } else {
+            frame_data.render_width = frame_data.frame_width;
+            frame_data.render_height = frame_data.frame_height;
         }
 
         Ok(())
@@ -522,6 +534,7 @@ impl Vp9Parser {
             }
         }
 
+        // segmentation_update_data is read unconditionally when segmentation is enabled
         segmentation.flags.segmentation_update_data = r.read_bits(1)? as u8;
         if segmentation.flags.segmentation_update_data != 0 {
             segmentation.flags.segmentation_abs_or_delta_update = r.read_bits(1)? as u8;
@@ -529,6 +542,11 @@ impl Vp9Parser {
             segmentation.feature_enabled.fill(0);
             segmentation.feature_data.iter_mut().for_each(|f| f.fill(0));
 
+            // VP9 segmentation feature bits and signedness per spec:
+            // Feature 0 (ALT_Q): 8 bits magnitude + sign bit
+            // Feature 1 (ALT_Y_AC): 6 bits magnitude + sign bit
+            // Feature 2 (ALT_Y_DC): 2 bits (unsigned, used as offset)
+            // Feature 3 (ALT_UV_AC): 0 bits (always 0)
             let feature_bits: [u8; VP9_SEG_LVL_MAX as usize] = [8, 6, 2, 0];
             let feature_signed: [bool; VP9_SEG_LVL_MAX as usize] = [true, true, false, false];
 
@@ -537,15 +555,15 @@ impl Vp9Parser {
                     let feature_enabled = r.read_bits(1)?;
                     segmentation.feature_enabled[i] |= (feature_enabled as u8) << j;
 
-                    if feature_enabled != 0 {
-                        let bits = feature_bits[j];
-                        if bits > 0 {
-                            segmentation.feature_data[i][j] = r.read_bits(bits)? as i8;
-                            if feature_signed[j] && r.read_bits(1)? != 0 {
-                                segmentation.feature_data[i][j] =
-                                    -segmentation.feature_data[i][j];
+                    if feature_enabled != 0 && feature_bits[j] > 0 {
+                        let mut feature_value = r.read_bits(feature_bits[j])? as i8;
+                        if feature_signed[j] {
+                            let feature_sign = r.read_bits(1)?;
+                            if feature_sign != 0 {
+                                feature_value = -feature_value;
                             }
                         }
+                        segmentation.feature_data[i][j] = feature_value;
                     }
                 }
             }
@@ -732,6 +750,7 @@ impl VideoParser for Vp9Parser {
         self.last_show_frame = false;
         self.loop_filter_ref_deltas.fill(0);
         self.loop_filter_mode_deltas.fill(0);
+        self.reference_frame_sz.fill((0, 0));
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {

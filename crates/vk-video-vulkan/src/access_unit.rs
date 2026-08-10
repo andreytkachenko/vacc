@@ -577,6 +577,7 @@ fn parse_h265_slice_header(
 pub enum VideoCodec {
     H264,
     H265,
+    Vp9,
 }
 
 /// Extract all access units from the bitstream.
@@ -667,6 +668,10 @@ pub fn extract_all_access_units(
                 } else {
                     (0, false, false, false, false)
                 }
+            }
+            VideoCodec::Vp9 => {
+                // VP9 uses extract_vp9_frames, not this function
+                (0, false, false, false, false)
             }
         };
 
@@ -979,4 +984,210 @@ pub fn extract_all_access_units(
     }
 
     access_units
+}
+
+// ============================================================================
+// VP9 bitstream parsing
+// ============================================================================
+
+/// A VP9 frame extracted from the bitstream.
+#[derive(Debug, Clone)]
+pub struct Vp9Frame {
+    /// Raw frame data (header + compressed data)
+    pub data: Vec<u8>,
+    /// Frame count (sequential)
+    pub frame_count: u32,
+}
+
+/// Parse an IVF container file and extract raw VP9 frame data.
+pub fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if data.len() < 32 {
+        return Err("File too small for IVF header".to_string());
+    }
+    if data[0..4] != *b"DKIF" {
+        return Err("Invalid IVF magic".to_string());
+    }
+
+    let mut frames = Vec::new();
+    let mut offset = 32usize;
+
+    while offset < data.len() {
+        if offset + 12 > data.len() {
+            break;
+        }
+
+        let packet_size = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+
+        offset += 12;
+
+        if packet_size == 0 || offset + packet_size > data.len() {
+            break;
+        }
+
+        frames.push(data[offset..offset + packet_size].to_vec());
+        offset += packet_size;
+    }
+
+    if frames.is_empty() {
+        return Err("No frames found in IVF container".to_string());
+    }
+
+    Ok(frames)
+}
+
+/// Expand superframes into individual frames.
+pub fn expand_superframes(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut expanded = Vec::new();
+
+    for frame in packets {
+        let data_len = frame.len();
+        if data_len < 2 {
+            expanded.push(frame.clone());
+            continue;
+        }
+
+        let final_byte = frame[data_len - 1];
+        if (final_byte & 0xE0) != 0xC0 {
+            expanded.push(frame.clone());
+            continue;
+        }
+
+        let num_frames = (final_byte & 0x07) as usize + 1;
+        if num_frames <= 1 {
+            expanded.push(frame.clone());
+            continue;
+        }
+
+        let mag = (((final_byte >> 3) & 0x03) as usize) + 1;
+        let index_size = 2 + mag * num_frames;
+
+        if data_len < index_size {
+            expanded.push(frame.clone());
+            continue;
+        }
+
+        let index_start = data_len - index_size;
+        if frame[index_start] != final_byte {
+            expanded.push(frame.clone());
+            continue;
+        }
+
+        let frame_data_size = data_len - index_size;
+        let mut offset = 0;
+        let mut x = index_start + 1;
+        for _ in 0..num_frames {
+            let mut this_sz: usize = 0;
+            for j in 0..mag {
+                this_sz |= (frame[x + j] as usize) << (j * 8);
+            }
+            x += mag;
+
+            if offset + this_sz <= frame_data_size {
+                expanded.push(frame[offset..offset + this_sz].to_vec());
+            }
+            offset += this_sz;
+        }
+    }
+
+    expanded
+}
+
+/// Split a VP9 bitstream into individual frame packets.
+pub fn split_vp9_bitstream(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use vk_video_parser::vp9::Vp9Parser;
+    use vk_video_parser::{DetectedVideoFormat, VideoParser};
+    use vk_video_core::codec::VideoCodec as CoreCodec;
+
+    let mut frames = Vec::new();
+
+    for packet in packets {
+        let data = packet.as_slice();
+        let mut offset = 0;
+        let data_len = data.len();
+
+        loop {
+            while offset < data_len && data[offset] == 0 {
+                offset += 1;
+            }
+            if offset >= data_len {
+                break;
+            }
+
+            if (data[offset] & 0xC0) != 0x80 {
+                break;
+            }
+
+            let frame_start = offset;
+
+            let mut parser = Vp9Parser::new();
+            let parsed = match parser.init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9)) {
+                Ok(()) => parser.parse_frame(&data[offset..]),
+                Err(_) => break,
+            };
+            let parsed = match parsed {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            let mut next_frame = data_len;
+
+            let search_start = (frame_start
+                + parsed.compressed_header_offset as usize
+                + parsed.compressed_header_size as usize)
+                .min(data_len);
+
+            for i in search_start..data_len {
+                if (data[i] & 0xC0) != 0x80 {
+                    continue;
+                }
+                let mut validator = Vp9Parser::new();
+                if validator.init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9)).is_ok()
+                    && validator.parse_frame(&data[i..]).is_ok()
+                {
+                    next_frame = i;
+                    break;
+                }
+            }
+
+            let frame_size = next_frame - frame_start;
+            if frame_size == 0 {
+                break;
+            }
+
+            frames.push(data[frame_start..next_frame].to_vec());
+            offset = next_frame;
+        }
+    }
+
+    frames
+}
+
+/// Extract VP9 frames from raw bitstream data.
+pub fn extract_vp9_frames(data: &[u8], max_frames: usize) -> Vec<Vp9Frame> {
+    let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
+
+    let raw_frames = if is_ivf {
+        match parse_ivf_container(data) {
+            Ok(frames) => frames,
+            Err(_) => vec![data.to_vec()],
+        }
+    } else {
+        let expanded = expand_superframes(&[data.to_vec()]);
+        split_vp9_bitstream(&expanded)
+    };
+
+    raw_frames
+        .into_iter()
+        .enumerate()
+        .take(max_frames)
+        .map(|(i, data)| Vp9Frame {
+            data,
+            frame_count: i as u32,
+        })
+        .collect()
 }

@@ -168,22 +168,6 @@ impl H264Decoder {
         dpb_images: &[vk::Image],
         dpb_views: &[vk::ImageView],
     ) -> VideoResult<()> {
-        eprintln!("[DEBUG] H264Decoder::record_decode_command: bitstream_range={}, refs={}, slice_offsets={:?}", 
-                  bitstream_range, dpb_ref_pictures.len(), slice_offsets);
-        eprintln!("[DEBUG] H264Decoder::record_decode_command: output_view={:?}, output_img={:?}", 
-                  output_image_view, output_image);
-        eprintln!("[DEBUG] H264Decoder::record_decode_command: frame_num={:?}, poc={:?}, is_intra={:?}, is_ref={:?}, is_idr={:?}",
-                  frame_num, pic_order_cnt, is_intra, is_reference, is_idr);
-        if let Some(ref setup) = dpb_setup_picture {
-            eprintln!("[DEBUG] H264Decoder::record_decode_command: setup_picture slot={}, view={:?}, img_in_view={}",
-                      setup.slot_index, setup.picture_resource.image_view_binding,
-                      setup.picture_resource.image_view_binding == output_image_view);
-        }
-        for (i, ref_pic) in dpb_ref_pictures.iter().enumerate() {
-            eprintln!("[DEBUG] H264Decoder::record_decode_command: ref[{}] slot={}, frame_num={}, poc={:?}, last_access={:?}, view={:?}, img={:?}",
-                      i, ref_pic.slot_index, ref_pic.frame_num, ref_pic.pic_order_cnt, ref_pic.last_access,
-                      ref_pic.picture_resource.image_view_binding, ref_pic.image);
-        }
         // Use provided values or compute from internal state
         let (effective_frame_num, effective_poc, effective_is_intra, effective_is_ref, effective_is_idr) = 
             if let (Some(fn_), Some(poc), Some(intra), Some(ref_), Some(idr)) = 
@@ -243,7 +227,6 @@ impl H264Decoder {
 
             if is_first_frame {
                 // RESET frame: activate ALL DPB slots
-                eprintln!("[DEBUG] H264Decoder: RESET frame - activating ALL {} DPB slots", dpb_views.len());
 
                 // Build picture resources for all slots
                 let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> = (0..dpb_views.len() as u32)
@@ -303,7 +286,6 @@ impl H264Decoder {
                     _marker: Default::default(),
                 };
 
-                eprintln!("[DEBUG] H264Decoder: BeginVideoCodingKHR (RESET): slot_count={}", all_begin_slots.len());
                 self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
             } else {
                 // Non-RESET frame: Build DPB slot info for reference pictures
@@ -343,29 +325,63 @@ impl H264Decoder {
                     })
                     .collect();
 
-                // C++ pattern: if no refs, use setup slot; if refs exist, use refs only
-                let (slot_count, slot_ptr) = if all_begin_slots.is_empty() {
-                    // No refs: use only setup slot for BeginVideoCoding
-                    // Build setup DPB info
-                    let mut setup_ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                    setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
-                    setup_ref_info.PicOrderCnt = effective_poc;
-                    setup_ref_info.flags.set_top_field_flag(1);
-                    setup_ref_info.flags.set_bottom_field_flag(1);
-                    let setup_dpb_slot_info = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info);
-                    
-                    // Store in a static-like location for pointer validity
-                    let setup_slot_info = vk::VideoReferenceSlotInfoKHR {
+                // C++ pattern: count = ref_count + (setup ? 1 : 0), ptr = refs when refs exist
+                // Setup must be adjacent to refs in memory (driver reads count elements from ptr)
+                //
+                // CRITICAL: All structs must stay alive until after cmd_begin_video_coding!
+                // We use Box::leak to ensure pointers remain valid.
+
+                // Build setup DPB info (leaked to ensure pointer validity)
+                let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo = if dpb_setup_picture.is_some() {
+                    let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                    info.FrameNum = (effective_frame_num % max_frame_num) as u16;
+                    info.PicOrderCnt = effective_poc;
+                    info.flags.set_top_field_flag(1);
+                    info.flags.set_bottom_field_flag(1);
+                    Box::leak(Box::new(info))
+                } else {
+                    std::ptr::null()
+                };
+
+                let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR = if !setup_ref_info.is_null() {
+                    let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(unsafe { &*setup_ref_info });
+                    Box::leak(Box::new(dpb_info))
+                } else {
+                    std::ptr::null()
+                };
+
+                // Build setup slot info (if setup picture exists)
+                let setup_slot_info = if !setup_dpb_slot_info.is_null() {
+                    Some(vk::VideoReferenceSlotInfoKHR {
                         s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                        p_next: &setup_dpb_slot_info as *const _ as *const _,
+                        p_next: setup_dpb_slot_info as *const _ as *const _,
                         slot_index: dpb_setup_picture.as_ref().map_or(0, |s| s.slot_index as i32),
                         p_picture_resource: dpb_setup_picture.as_ref().map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
                         _marker: Default::default(),
-                    };
-                    (1u32, &setup_slot_info as *const _)
+                    })
                 } else {
-                    // Has refs: use refs only (matches C++)
-                    (all_begin_slots.len() as u32, all_begin_slots.as_ptr())
+                    None
+                };
+
+                // Build combined slots array for BeginVideoCoding
+                // MUST keep this alive until after cmd_begin_video_coding is called!
+                let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> = if all_begin_slots.is_empty() {
+                    // No refs: use only setup slot
+                    setup_slot_info.into_iter().collect()
+                } else {
+                    // Has refs: combine refs + setup
+                    let mut combined = all_begin_slots.clone();
+                    if let Some(slot) = setup_slot_info {
+                        combined.push(slot);
+                    }
+                    combined
+                };
+
+                let slot_count = begin_video_coding_slots.len() as u32;
+                let slot_ptr = if begin_video_coding_slots.is_empty() {
+                    std::ptr::null()
+                } else {
+                    begin_video_coding_slots.as_ptr()
                 };
 
                 let begin_coding_info = vk::VideoBeginCodingInfoKHR {
@@ -379,12 +395,6 @@ impl H264Decoder {
                     _marker: Default::default(),
                 };
 
-                eprintln!("[DEBUG] H264Decoder: BeginVideoCodingKHR: slot_count={}, has_refs={}, has_setup={}",
-                          slot_count, !dpb_ref_pictures.is_empty(), dpb_setup_picture.is_some());
-                for (i, rs) in dpb_ref_pictures.iter().enumerate() {
-                    eprintln!("[DEBUG]   BeginVideoCoding slot[{}] index={}, view={:?}",
-                              i, rs.slot_index, rs.picture_resource.image_view_binding);
-                }
                 self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
             }
 
@@ -635,43 +645,12 @@ impl H264Decoder {
                 p_setup_reference_slot: setup_slot.as_ref().map_or(std::ptr::null(), |s| s as *const _),
                 reference_slot_count: ref_slots.len() as u32,
                 p_reference_slots: ref_slots.as_ptr(),
-                _marker: Default::default(),
-             };
+                 _marker: Default::default(),
+              };
 
-             // Comprehensive debug dump of VkVideoDecodeInfoKHR
-             eprintln!("[DEBUG] H264Decoder: === VkVideoDecodeInfoKHR ===");
-             eprintln!("[DEBUG]   src_buffer={:?}, offset={}, range={}",
-                       decode_info.src_buffer, decode_info.src_buffer_offset, decode_info.src_buffer_range);
-             eprintln!("[DEBUG]   dst_picture_resource.view={:?}",
-                       decode_info.dst_picture_resource.image_view_binding);
-             eprintln!("[DEBUG]   p_setup_reference_slot={:?}",
-                       decode_info.p_setup_reference_slot);
-             if let Some(ref s) = setup_slot {
-                 eprintln!("[DEBUG]     setup_slot.index={}, view={:?}",
-                           s.slot_index, s.p_picture_resource.as_ref().map(|pr| pr.image_view_binding));
-             }
-             eprintln!("[DEBUG]   reference_slot_count={}", decode_info.reference_slot_count);
-             eprintln!("[DEBUG]   p_reference_slots={:?}", decode_info.p_reference_slots);
-             for (i, (rs, ref_info)) in ref_slots.iter().zip(ref_infos.iter()).enumerate() {
-                 if let Some(pr) = rs.p_picture_resource.as_ref() {
-                     eprintln!("[DEBUG]     ref_slot[{}].index={}, view={:?}, FrameNum={}, Poc=[{}, {}]",
-                               i, rs.slot_index, pr.image_view_binding,
-                               ref_info.FrameNum, ref_info.PicOrderCnt[0], ref_info.PicOrderCnt[1]);
-                 }
-             }
-             eprintln!("[DEBUG]   h264_decode_info.slice_count={}", h264_decode_info.slice_count);
-            if let Some(sps) = &self.sps {
-                eprintln!("[DEBUG]   pic_info.frame_num={}, PicOrderCnt=[{}, {}], is_reference={}, is_idr={}",
-                          pic_info.frame_num, pic_info.PicOrderCnt[0], pic_info.PicOrderCnt[1],
-                          pic_info.flags.is_reference(), pic_info.flags.IdrPicFlag());
-            }
-             eprintln!("[DEBUG] H264Decoder: ===============================");
+              self.cmd_decode_video(cmd_buffer, &decode_info);
 
-             eprintln!("[DEBUG] H264Decoder: calling vkCmdDecodeVideoKHR");
-             self.cmd_decode_video(cmd_buffer, &decode_info);
-             eprintln!("[DEBUG] H264Decoder: vkCmdDecodeVideoKHR returned");
-
-            // End video coding
+             // End video coding
             self.cmd_end_video_coding(cmd_buffer);
 
         }

@@ -112,7 +112,6 @@ impl H265Parser {
         let profile_bits = r.read_bits(8)?;
         let general_profile_idc = (profile_bits & 0x1F) as u8; // Lower 5 bits are profile_idc
         let general_tier_flag = ((profile_bits >> 3) & 1) != 0; // Bit 3 is tier_flag
-        eprintln!("[H265 PTL] general_profile_idc={}, general_tier_flag={}", general_profile_idc, general_tier_flag);
 
         // Skip general_profile_compatibility_flag (32 bits)
         // Note: read_bits max is 31, so we split into 16 + 16
@@ -128,7 +127,6 @@ impl H265Parser {
         // --- Common info (CommonInfPresentFlag = 1) ---
         // general_level_idc is read ONCE
         let level_idc = r.read_bits(8)? as u8; // general_level_idc
-        eprintln!("[H265 PTL] level_idc=0x{:02x} ({})", level_idc, level_idc);
 
         // --- Sub-layer profile/level presence flags ---
         let mut sub_layer_level_flags: Vec<bool> = Vec::new();
@@ -257,10 +255,6 @@ impl H265Parser {
             // Resolve predictive RPS against reference STRPS
             Self::resolve_predictive_rps(r, delta_rps_sign, strps.abs_delta_rps_minus1,
                 idx, delta_idx_minus1, prev_strps, &mut strps)?;
-
-            eprintln!("[H265 STRPS] PREDICTIVE idx={} delta_idx_minus1={} delta_rps_sign={} abs_delta_rps_minus1={} -> num_neg={} num_pos={}",
-                idx, delta_idx_minus1, delta_rps_sign, strps.abs_delta_rps_minus1,
-                strps.num_negative_pics, strps.num_positive_pics);
         } else {
             // Direct encoding
             // Matches C++: VulkanH265Parser.cpp:1870-1914
@@ -300,9 +294,6 @@ impl H265Parser {
                 // Store directly like C++: (uint16_t)DeltaPocS1[i]
                 strps.delta_poc_s1_minus1[i as usize] = cum_delta_poc_s1 as u16;
             }
-
-            eprintln!("[H265 STRPS] DIRECT idx={} num_negative_pics={} num_positive_pics={}",
-                     idx, num_negative_pics, num_positive_pics);
         }
 
         Ok(strps)
@@ -448,9 +439,6 @@ impl H265Parser {
         if data.is_empty() {
             return Err(ParserError::InvalidBitstream);
         }
-
-        eprintln!("[H265 VPS] data len={}, first 10 bytes: {:?}", data.len(), &data[..data.len().min(10)]);
-
         // Skip NAL header (2 bytes for H.265)
         let mut r = BitReader::new(&data[2..], true);
 
@@ -461,15 +449,12 @@ impl H265Parser {
         vps.vps_max_layers_minus1 = r.read_bits(6)? as u16;
         vps.vps_max_sub_layers_minus1 = r.read_bits(3)? as u8;
         vps.vps_temporal_id_nesting_flag = r.read_bit()?;
-        eprintln!("[H265 VPS] max_layers={}, max_sub_layers={}, temporal_nesting={}",
-            vps.vps_max_layers_minus1, vps.vps_max_sub_layers_minus1, vps.vps_temporal_id_nesting_flag);
 
         // vps_reserved_0xffff (16 bits) - must be equal to 0xFFFF per spec
         let _reserved_16 = r.read_bits(16)?;
 
         // Parse profile_tier_level (VPS: ProfilePresentFlag=1, SubLayerLevelPresentFlag=1)
         let (vps_profile_idc, vps_level_idc, vps_tier_flag) = Self::parse_ptl(&mut r, vps.vps_max_sub_layers_minus1, true)?;
-        eprintln!("[H265 VPS] PTL done, pos={}, profile={}, level={}, tier={}", r.pos, vps_profile_idc, vps_level_idc, vps_tier_flag);
         vps.profile_idc = vps_profile_idc;
         vps.level_idc = vps_level_idc;
         vps.tier_flag = vps_tier_flag;
@@ -488,12 +473,10 @@ impl H265Parser {
             vps.max_num_reorder_pics[i] = r.read_ue()? as u8;
             vps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
         }
-        eprintln!("[H265 VPS] DPB: max_dec_pic_buffering_minus1[0]={}", vps.max_dec_pic_buffering_minus1[0]);
 
         // VPS layer info
         vps.vps_max_layer_id = r.read_bits(6)? as u16;
         vps.vps_num_layer_sets = r.read_ue()? + 1; // ue(v) + 1
-        eprintln!("[H265 VPS] max_layer_id={}, num_layer_sets={}", vps.vps_max_layer_id, vps.vps_num_layer_sets);
 
         // layer_id_included_flag[layer_set_idx][layer_id]
         vps.layer_id_included_flag.clear();
@@ -515,9 +498,6 @@ impl H265Parser {
                 vps.vps_num_ticks_poc_diff_one_minus1 = r.read_ue()?;
             }
             vps.vps_num_hrd_parameters = r.read_ue()?;
-            eprintln!("[H265 VPS] timing: num_units_in_tick={}, time_scale={}, poc_prop={}, num_hrd={}",
-                vps.vps_num_units_in_tick, vps.vps_time_scale,
-                vps.vps_poc_proportional_to_timing_flag, vps.vps_num_hrd_parameters);
 
             // Skip HRD parameters (complex nested structure, not needed for Vulkan decode)
             // C++ parses hrd_parameters for each of vps_num_hrd_parameters
@@ -533,10 +513,6 @@ impl H265Parser {
             vps.vps_extension_flag = r.read_bit().unwrap_or(false);
         }
 
-        eprintln!("[H265 VPS] parsed vps_id={}, profile={}, level={}, layers={}, sub_layers={}",
-            vps.vps_video_parameter_set_id, vps.profile_idc, vps.level_idc,
-            vps.vps_max_layers_minus1, vps.vps_max_sub_layers_minus1);
-
         self.vps_cache.insert(vps.vps_video_parameter_set_id, vps.clone());
         self.active_vps = Some(vps);
 
@@ -547,20 +523,15 @@ impl H265Parser {
         if data.is_empty() {
             return Err(ParserError::InvalidBitstream);
         }
-
-        eprintln!("[H265 SPS] data len={}, first 10 bytes: {:?}", data.len(), &data[..data.len().min(10)]);
-
         // Skip NAL header (2 bytes for H.265)
         let mut r = BitReader::new(&data[2..], true);
 
         let sps_video_parameter_set_id = r.read_bits(4)? as u8;
         let sps_max_sub_layers_minus1 = r.read_bits(3)? as u8;
         let sps_temporal_id_nesting_flag = r.read_bit()?;
-        eprintln!("[H265 SPS] max_sub_layers={}, temporal_nesting={}", sps_max_sub_layers_minus1, sps_temporal_id_nesting_flag);
 
         // Parse profile_tier_level (SPS: SubLayerLevelPresentFlag=0)
         let (sps_profile_idc, sps_level_idc, sps_tier_flag) = Self::parse_ptl(&mut r, sps_max_sub_layers_minus1, false)?;
-        eprintln!("[H265 SPS] PTL done, pos={}, profile={}, level={}, tier={}", r.pos, sps_profile_idc, sps_level_idc, sps_tier_flag);
 
         let mut sps = vk_video_core::picture::H265Sps::new();
         sps.sps_video_parameter_set_id = sps_video_parameter_set_id;
@@ -570,12 +541,8 @@ impl H265Parser {
         sps.level_idc = sps_level_idc;
         sps.tier_flag = sps_tier_flag;
 
-        match r.read_ue() {
-            Ok(v) => { sps.sps_seq_parameter_set_id = v; eprintln!("[H265 SPS] sps_id={}", v); }
-            Err(e) => { eprintln!("[H265 SPS] ERROR reading sps_id: {:?}", e); return Err(e.into()); }
-        }
+        sps.sps_seq_parameter_set_id = r.read_ue()?;
         sps.chroma_format_idc = r.read_ue()? as u8;
-        eprintln!("[H265 SPS] chroma_format_idc={}", sps.chroma_format_idc);
 
         if sps.chroma_format_idc == 3 {
             sps.separate_colour_plane_flag = r.read_bit()?;
@@ -583,7 +550,6 @@ impl H265Parser {
 
         sps.pic_width_in_luma_samples = r.read_ue()? as u16;
         sps.pic_height_in_luma_samples = r.read_ue()? as u16;
-        eprintln!("[H265 SPS] width={} height={}", sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples);
 
         // Parse conformance_window_flag and offsets
         sps.conformance_window_flag = r.read_bit()?;
@@ -609,7 +575,6 @@ impl H265Parser {
             sps.max_num_reorder_pics[i] = r.read_ue()? as u8;
             sps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
         }
-        eprintln!("[H265 SPS] DPB: max_dec_pic_buffering_minus1[0]={}", sps.max_dec_pic_buffering_minus1[0]);
 
         // Additional SPS fields (per VulkanH265Parser.cpp:541-562)
         sps.log2_min_luma_coding_block_size_minus3 = r.read_ue()? as u8;
@@ -626,7 +591,6 @@ impl H265Parser {
             if sps.sps_scaling_list_data_present_flag {
                 // Parse scaling_list_data per H.265 spec and C++ VulkanH265Parser.cpp:1674-1727
                 Self::parse_scaling_list_data(&mut r, &mut sps.scaling_lists)?;
-                eprintln!("[H265 SPS] scaling_list_data parsed");
             }
         }
 
@@ -644,7 +608,6 @@ impl H265Parser {
         // Short-term reference picture sets (per VulkanH265Parser.cpp:579-598)
         let num_short_term_ref_pic_sets = r.read_ue()? as u8;
         sps.num_short_term_ref_pic_sets = num_short_term_ref_pic_sets;
-        eprintln!("[H265 SPS] num_short_term_ref_pic_sets={}", num_short_term_ref_pic_sets);
 
         for i in 0..num_short_term_ref_pic_sets {
             let strps = Self::parse_short_term_ref_pic_set(
@@ -661,7 +624,6 @@ impl H265Parser {
         if sps.long_term_ref_pics_present_flag {
             let num_long_term_ref_pics_sps = r.read_ue()? as u8;
             sps.num_long_term_ref_pics_sps = num_long_term_ref_pics_sps;
-            eprintln!("[H265 SPS] num_long_term_ref_pics_sps={}", num_long_term_ref_pics_sps);
 
             let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
             for i in 0..num_long_term_ref_pics_sps {
@@ -737,7 +699,6 @@ impl H265Parser {
                     // Skip hrd_parameters() - complex nested structure
                     // Matches C++: hrd_parameters(&sps->stdHrdParameters, 1, sps_max_sub_layers_minus1)
                     // For decode, HRD params are not needed
-                    eprintln!("[H265 SPS] vui_hrd_parameters_present - skipping (not needed for decode)");
                 }
             }
 
@@ -752,7 +713,6 @@ impl H265Parser {
                 sps.vui.log2_max_mv_length_horizontal = r.read_ue()?;
                 sps.vui.log2_max_mv_length_vertical = r.read_ue()?;
             }
-            eprintln!("[H265 SPS] vui_parameters parsed successfully");
         }
         sps.sps_extension_present_flag = r.read_bit()?;
         if sps.sps_extension_present_flag {
@@ -795,28 +755,7 @@ impl H265Parser {
             if sps_multilayer_extension_flag {
                 let _ = r.read_bit().unwrap_or(false);
             }
-            eprintln!("[H265 SPS] sps_extension_present - consumed extension bits");
         }
-
-        // DEBUG: dump all SPS fields for verification
-        eprintln!("[H265 SPS DUMP] vps_id={} max_sub_layers_minus1={} temporal_nesting={} sps_id={} profile={} level={} chroma={} sep_plane={}",
-            sps.sps_video_parameter_set_id, sps.sps_max_sub_layers_minus1, sps.sps_temporal_id_nesting_flag,
-            sps.sps_seq_parameter_set_id, sps.profile_idc, sps.level_idc, sps.chroma_format_idc, sps.separate_colour_plane_flag as u8);
-        eprintln!("[H265 SPS DUMP] w={} h={} bd_luma={} bd_chroma={} log2_poc_lsb={} sub_layer_ord_present={}",
-            sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples, sps.bit_depth_luma_minus8,
-            sps.bit_depth_chroma_minus8, sps.log2_max_pic_order_cnt_lsb_minus4, sps.sps_sub_layer_ordering_info_present_flag as u8);
-        eprintln!("[H265 SPS DUMP] log2_min_cb={} log2_diff_max_min_cb={} log2_min_tb={} log2_diff_max_min_tb={} max_tf_h_i={} max_tf_h_i2={}",
-            sps.log2_min_luma_coding_block_size_minus3, sps.log2_diff_max_min_luma_coding_block_size,
-            sps.log2_min_luma_transform_block_size_minus2, sps.log2_diff_max_min_luma_transform_block_size,
-            sps.max_transform_hierarchy_depth_inter, sps.max_transform_hierarchy_depth_intra);
-        eprintln!("[H265 SPS DUMP] scaling_list_enabled={} amp={} sao={} pcm={} temporal_mvp={} strong_intra={} vui={} long_term_ref={} ext_present={}",
-            sps.scaling_list_enabled_flag as u8, sps.amp_enabled_flag as u8, sps.sample_adaptive_offset_enabled_flag as u8,
-            sps.pcm_enabled_flag as u8, sps.sps_temporal_mvp_enabled_flag as u8, sps.strong_intra_smoothing_enabled_flag as u8,
-            sps.vui_parameters_present_flag as u8, sps.long_term_ref_pics_present_flag as u8, sps.sps_extension_present_flag as u8);
-        eprintln!("[H265 SPS DUMP] max_dec_pic_buffering={:?} max_num_reorder={:?} num_st_rps={} num_lt={} conf_win=[{},{},{},{}]",
-            &sps.max_dec_pic_buffering_minus1[..3], &sps.max_num_reorder_pics[..3],
-            sps.num_short_term_ref_pic_sets, sps.num_long_term_ref_pics_sps,
-            sps.conf_win_left_offset, sps.conf_win_right_offset, sps.conf_win_top_offset, sps.conf_win_bottom_offset);
 
         self.sps_cache.insert(sps.sps_seq_parameter_set_id, sps.clone());
         self.active_sps = Some(sps);
@@ -934,10 +873,6 @@ impl H265Parser {
                 let _ = r.read_ue().ok(); // num_ref_loc_offsets
             }
         }
-
-        eprintln!("[H265 PPS] pps_id={}, sps_id={}, num_ref_idx_l0={}, num_ref_idx_l1={}",
-                 pps.pps_pic_parameter_set_id, pps.pps_seq_parameter_set_id,
-                 pps.num_ref_idx_l0_default_active_minus1, pps.num_ref_idx_l1_default_active_minus1);
 
         self.pps_cache.insert(pps.pps_pic_parameter_set_id, pps.clone());
         self.active_pps = Some(pps);
@@ -1159,12 +1094,6 @@ impl H265Parser {
             }
         }
 
-        eprintln!(
-            "[H265 SliceHeader] type={}, poc_lsb={}, curr_poc={}, is_idr={}, is_rap={}, is_ref={}, first_slice={}",
-            info.slice_type, info.pic_order_cnt_lsb, info.curr_pic_order_cnt_val,
-            info.is_idr, info.is_rap, info.is_reference, first_slice_segment_in_pic_flag
-        );
-
         Ok(info)
     }
 
@@ -1222,10 +1151,6 @@ impl VideoParser for H265Parser {
         }
 
         let nal_units = self.extract_nal_units(&packet.payload);
-        eprintln!("[H265 parse] Found {} NAL units", nal_units.len());
-        for nal in &nal_units {
-            eprintln!("[H265 parse] NAL type={}, data_len={}", nal.nal_unit_type, nal.data.len());
-        }
 
         let mut result_sps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut result_pps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
@@ -1237,27 +1162,18 @@ impl VideoParser for H265Parser {
         for nal in &nal_units {
             match H265NalUnitType::from_u8(nal.nal_unit_type) {
                 Some(H265NalUnitType::Vps) => {
-                    eprintln!("[H265 parse] Found VPS NAL, size={}", nal.data.len());
                     match self.parse_vps(&nal.data) {
                         Ok(vps) => {
-                            eprintln!("[H265 VPS] parsed vps_id={}", vps.vps_video_parameter_set_id);
                             result_vps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
                                 self.active_vps.clone().unwrap(),
                             ));
                         }
-                        Err(e) => {
-                            eprintln!("[H265 VPS] parse ERROR: {:?}", e);
-                        }
+                        Err(_) => {}
                     }
                 }
                 Some(H265NalUnitType::Sps) => {
-                    eprintln!("[H265 parse] Found SPS NAL, size={}", nal.data.len());
                     match self.parse_sps(&nal.data) {
                         Ok(sps) => {
-                            eprintln!("[H265 SPS] parsed sps_id={}, {}x{}",
-                                sps.sps_seq_parameter_set_id,
-                                sps.pic_width_in_luma_samples,
-                                sps.pic_height_in_luma_samples);
                             result_sps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
                                 self.active_sps.clone().unwrap(),
                             ));
@@ -1288,23 +1204,17 @@ impl VideoParser for H265Parser {
                             self.detected_format.codec_profile = sps.profile_idc as u32;
                             self.detected_format.progressive_sequence = !sps.vui.field_seq_flag;
                         }
-                        Err(e) => {
-                            eprintln!("[H265 SPS] parse ERROR: {:?}", e);
-                        }
+                        Err(_) => {}
                     }
                 }
                 Some(H265NalUnitType::Pps) => {
-                    eprintln!("[H265 parse] Found PPS NAL, size={}", nal.data.len());
                     match self.parse_pps(&nal.data) {
                         Ok(pps) => {
-                            eprintln!("[H265 PPS] parsed pps_id={}", pps.pps_pic_parameter_set_id);
                             result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
                                 self.active_pps.clone().unwrap(),
                             ));
                         }
-                        Err(e) => {
-                            eprintln!("[H265 PPS] parse ERROR: {:?}", e);
-                        }
+                        Err(_) => {}
                     }
                 }
                 Some(t) if t.is_slice() => {

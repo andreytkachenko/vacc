@@ -90,6 +90,7 @@ fn create_image_with_profile_chain(
 
     let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
     let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
+    let mut vp9_profile = super::vp9::VideoDecodeVP9ProfileInfoKHR::default();
 
     let profile_next: *const std::ffi::c_void = match codec {
         VideoCodec::DecodeH264 => {
@@ -100,6 +101,10 @@ fn create_image_with_profile_chain(
         VideoCodec::DecodeH265 => {
             h265_profile.std_profile_idc = profile_idc;
             &h265_profile as *const _ as *const std::ffi::c_void
+        }
+        VideoCodec::DecodeVp9 => {
+            vp9_profile.std_profile = profile_idc;
+            &vp9_profile as *const _ as *const std::ffi::c_void
         }
         _ => std::ptr::null(),
     };
@@ -171,6 +176,7 @@ pub fn create_bitstream_buffer_with_profile(
 
     let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default();
     let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
+    let mut vp9_profile = super::vp9::VideoDecodeVP9ProfileInfoKHR::default();
 
     let profile_next: *const std::ffi::c_void = match codec {
         VideoCodec::DecodeH264 => {
@@ -181,6 +187,10 @@ pub fn create_bitstream_buffer_with_profile(
         VideoCodec::DecodeH265 => {
             h265_profile.std_profile_idc = profile_idc;
             &h265_profile as *const _ as *const std::ffi::c_void
+        }
+        VideoCodec::DecodeVp9 => {
+            vp9_profile.std_profile = profile_idc;
+            &vp9_profile as *const _ as *const std::ffi::c_void
         }
         _ => std::ptr::null(),
     };

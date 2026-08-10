@@ -28,9 +28,8 @@ use vk_video_vulkan::{
     VideoCodec, VideoDeviceBuilder,
 };
 use vk_video_vulkan::vp9::{
-    convert_vp9_picture_info, vp9_vk_constants, Vp9Decoder, Vp9PictureInfoContainer,
-    StdVideoDecodeVP9PictureInfo, StdVideoVP9ColorConfig, StdVideoVP9LoopFilter,
-    StdVideoVP9Segmentation, VideoDecodeVP9PictureInfoKHR, VideoDecodeVP9ProfileInfoKHR,
+    convert_vp9_picture_info, vp9_vk_constants, Vp9Decoder,
+    VideoDecodeVP9PictureInfoKHR, VideoDecodeVP9ProfileInfoKHR,
 };
 
 fn main() {
@@ -38,8 +37,13 @@ fn main() {
     let bitstream_path = if args.len() >= 2 {
         &args[1]
     } else {
-        eprintln!("Usage: {} <bitstream.vp9>", args[0]);
+        eprintln!("Usage: {} <bitstream.vp9> [max_frames]", args[0]);
         std::process::exit(1);
+    };
+    let max_frames_arg: usize = if args.len() >= 3 {
+        args[2].parse().unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
     };
 
     if !std::path::Path::new(bitstream_path).exists() {
@@ -51,23 +55,19 @@ fn main() {
     println!("File: {}\n", bitstream_path);
 
     // Step 1: Read bitstream, expand superframes, and split into frames
-    println!("--- Step 1: Read and split VP9 bitstream ---");
     let data = std::fs::read(bitstream_path).expect("Failed to read file");
 
     // Check if this is an IVF container first
     let raw_frames = if data.len() >= 32 && data[0..4] == *b"DKIF" {
-        println!("  Detected IVF container format");
         parse_ivf_container(&data).expect("Failed to parse IVF container")
     } else {
         // Expand superframes BEFORE splitting — superframe index at end of data
         // must be detected and removed before frame splitting
         let expanded_packets = expand_superframes(&[data.to_vec()]);
-        println!("  Expanded superframes: 1 packet -> {} packets", expanded_packets.len());
 
         // Split bitstream into individual frames using sequential parsing
         split_vp9_bitstream(&expanded_packets)
     };
-    println!("  Found {} raw frame packets\n", raw_frames.len());
 
     if raw_frames.is_empty() {
         eprintln!("Error: No VP9 frames found in bitstream");
@@ -75,7 +75,6 @@ fn main() {
     }
 
     // Step 2: Parse first frame to get format info
-    println!("--- Step 2: Parse first frame for format info ---");
     let mut parser = Vp9Parser::new();
     parser
         .init(&DetectedVideoFormat::new(
@@ -101,7 +100,6 @@ fn main() {
     }
 
     // Step 3: Initialize Vulkan
-    println!("--- Step 3: Vulkan initialization ---");
     let vulkan = match VideoDeviceBuilder::new()
         .with_validation(false)
         .with_video_codecs(vk::VideoCodecOperationFlagsKHR::from_raw(
@@ -125,11 +123,8 @@ fn main() {
             .into_owned()
     };
     println!("  GPU: {}", gpu_name);
-    println!("  Video decode queue family = {}", decode_qf);
-    println!("  Extensions: {}\n", vulkan.enabled_extensions.join(", "));
 
     // Step 4: Query video decode capabilities
-    println!("--- Step 4: Query video capabilities ---");
     let luma_bit_depth = match bit_depth {
         8 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
         10 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
@@ -140,7 +135,6 @@ fn main() {
     let chroma_subsampling = vk::VideoChromaSubsamplingFlagsKHR::TYPE_420;
 
     // Try querying capabilities for all 4 VP9 profiles (0-3)
-    println!("  Testing VP9 decode profile support:");
     let mut supported_profiles: Vec<u32> = Vec::new();
     let mut video_caps: Option<vk::VideoCapabilitiesKHR> = None;
     for p in 0..=3 {
@@ -152,21 +146,17 @@ fn main() {
             chroma_bit_depth,
         ) {
             Ok(caps) => {
-                println!("    Profile {}: SUPPORTED", p);
                 supported_profiles.push(p);
                 if video_caps.is_none() {
                     video_caps = Some(caps);
                 }
             }
-            Err(e) => {
-                println!("    Profile {}: NOT SUPPORTED ({})", p, e);
-            }
+            Err(_) => {}
         }
     }
 
     if supported_profiles.is_empty() {
         // Check if VP9 encode is available instead
-        println!();
         let available_ext = unsafe {
             vulkan.instance
                 .enumerate_device_extension_properties(vulkan.physical_device)
@@ -204,16 +194,7 @@ fn main() {
 
     let video_caps = video_caps.expect("No supported VP9 profile found");
 
-    println!(
-        "  minBitstreamBufferSizeAlignment: {}",
-        video_caps.min_bitstream_buffer_size_alignment
-    );
-    println!("  maxDPBSlots: {}", video_caps.max_dpb_slots);
-    println!(
-        "  pictureAccessGranularity: {}x{}\n",
-        video_caps.picture_access_granularity.width,
-        video_caps.picture_access_granularity.height
-    );
+
 
     // Align coded extent to picture access granularity
     let align_width = video_caps.picture_access_granularity.width;
@@ -222,20 +203,13 @@ fn main() {
         width: (coded_width + align_width - 1) & !(align_width - 1),
         height: (coded_height + align_height - 1) & !(align_height - 1),
     };
-    println!(
-        "  Coded extent aligned: {}x{} -> {}x{}\n",
-        coded_width,
-        coded_height,
-        coded_extent.width,
-        coded_extent.height
-    );
+
 
     // VP9 has 8 DPB slots (VP9_NUM_REF_FRAMES)
     let max_dpb_slots = 8u32.min(video_caps.max_dpb_slots);
     let session_dpb_slots = max_dpb_slots + 1;
 
     // Step 5: Create video session
-    println!("--- Step 5: Create video session ---");
     let output_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
     let session_params = VideoSessionParams {
@@ -261,18 +235,12 @@ fn main() {
     )
     .expect("Failed to create video session");
 
-    println!("  Video session created\n");
-
     // VP9 doesn't use session parameters objects.
     // All per-frame info is passed in the picture info for each decode command.
-    // See: Vulkan-Video-Samples C++ decoder uses VK_NULL_HANDLE for VP9.
-    println!("--- Step 6: Session parameters (VP9 uses NULL) ---");
     let session_params_handle = vk::VideoSessionParametersKHR::null();
     let session_parameters: Option<VideoSessionParameters> = None;
-    println!("  VP9: using VK_NULL_HANDLE for session parameters\n");
 
     // Step 7: Create output image
-    println!("--- Step 7: Create output image ---");
     let (output_image, output_image_view, output_memory) = create_vp9_output_image(
         &vulkan.device,
         &vulkan.memory_properties,
@@ -286,21 +254,9 @@ fn main() {
     )
     .map_err(|e| format!("Failed to create output image: {}", e))
     .expect("Failed to create output image");
-    // [CHECK 5] Image view creation verification
-    println!(
-        "  Output image: {}x{} format={:?}\n",
-        coded_extent.width, coded_extent.height, output_format
-    );
-    println!(
-        "  [ImageView CHECK] format={:?} uses COLOR aspect (no SamplerYcbcrConversion)",
-        output_format
-    );
-    println!(
-        "  [ImageView CHECK] For 2-plane formats, COLOR aspect covers all planes per Vulkan spec\n"
-    );
+
 
     // Step 8: Create DPB images for reference frame management
-    println!("--- Step 8: Create DPB images ---");
     let mut dpb_images: Vec<(vk::Image, vk::ImageView, vk::DeviceMemory)> = Vec::new();
 
     // Create DPB images (slot 0 = output_image, slots 1..N = dpb_images)
@@ -332,15 +288,13 @@ fn main() {
     for (img, _, _) in &dpb_images {
         dpb_image_handles.push(*img);
     }
-    println!("  DPB slots: {}\n", max_dpb_slots);
+
 
     // Step 9: Create bitstream buffer
-    println!("--- Step 9: Create bitstream buffer ---");
     let max_frame_size = raw_frames.iter().map(|f| f.len()).max().unwrap_or(0);
     let bs_size_align = video_caps.min_bitstream_buffer_size_alignment;
     // Align buffer size to minBitstreamBufferSizeAlignment
     let max_frame_size_aligned = ((max_frame_size as u64 + bs_size_align as u64 - 1) / bs_size_align as u64 * bs_size_align as u64).max(bs_size_align as u64);
-    println!("  max_frame_size={} bs_size_align={} aligned_size={}", max_frame_size, bs_size_align, max_frame_size_aligned);
     let mut bs_buffer = create_vp9_bitstream_buffer(
         &vulkan.device,
         &vulkan.memory_properties,
@@ -352,10 +306,9 @@ fn main() {
     )
     .map_err(|e| format!("Failed to create bitstream buffer: {}", e))
     .expect("Failed to create bitstream buffer");
-    println!("  Bitstream buffer: {} bytes\n", max_frame_size_aligned);
+
 
     // Step 10: Create command resources
-    println!("--- Step 10: Create command resources ---");
     let command_pool = unsafe {
         vulkan
             .device
@@ -379,10 +332,9 @@ fn main() {
             )
             .expect("Failed to allocate command buffer")[0]
     };
-    println!("  Command buffer allocated\n");
+
 
     // Step 11: Create fence
-    println!("--- Step 11: Create fence ---");
     let fence = unsafe {
         vulkan
             .device
@@ -392,35 +344,31 @@ fn main() {
             )
             .expect("Failed to create fence")
     };
-    println!("  Fence created\n");
+
 
     // Step 12: Create VP9 decoder
-    println!("--- Step 12: Create VP9 decoder ---");
     let mut vp9_decoder = Vp9Decoder::new(vulkan.device.clone(), vulkan.instance.clone());
     vp9_decoder.set_session(&session);
     if let Some(params) = session_parameters {
         vp9_decoder.set_session_parameters(params);
     }
     vp9_decoder.set_max_dpb_slots(max_dpb_slots);
-    println!("  VP9 decoder created\n");
+
 
     // Step 13: Decode frames
-    println!("--- Step 13: Decode frames ---");
-    let max_frames_to_decode = 20;
-
-    let frames_to_decode = raw_frames.len().min(max_frames_to_decode);
-    println!("  Will decode {} frames\n", frames_to_decode);
+    let frames_to_decode = raw_frames.len().min(max_frames_arg);
 
     // DPB management state
     let mut dpb_manager = Vp9DpbManager::new(max_dpb_slots);
     let mut is_first_frame = true;
     let mut frame_count: u32 = 0;
 
+
+
     // Reset parser for fresh parsing
     parser.reset();
 
     for (frame_idx, frame_data) in raw_frames.iter().enumerate().take(frames_to_decode) {
-        println!("\n[Frame {}]", frame_idx);
 
         // Parse frame header
         let parsed = match parser.parse_frame(frame_data) {
@@ -439,17 +387,15 @@ fn main() {
 
         // Handle show_existing_frame
         if parsed.show_existing_frame {
-            let show_idx = parsed.frame_to_show_map_idx as usize;
-            println!(
-                "  show_existing_frame: displaying frame_to_show_map_idx={}",
-                show_idx
-            );
+            let frame_buffer_idx = parsed.frame_to_show_map_idx as usize;
 
-            // Find the DPB slot for this frame
-            let slot = dpb_manager.get_slot_for_pic_idx(show_idx as i32);
-        if let Some(slot) = slot {
-            let img = dpb_image_handles[slot as usize];
-                println!("  Reading back existing frame from slot {}", slot);
+            // Map VP9 frame buffer index to DPB slot via pic_idx.
+            // frame_to_show_map_idx is a VP9 frame buffer index (0-7), not a DPB slot index.
+            // We use the decoder's pic_idx mapping to find which DPB slot holds that frame buffer.
+            let pic_idx = vp9_decoder.get_pic_idx_for_frame_buffer(frame_buffer_idx);
+            if pic_idx >= 0 {
+                let slot = pic_idx as u32;
+                let img = dpb_image_handles[slot as usize];
                 readback_and_verify(
                     &vulkan.instance,
                     &vulkan.device,
@@ -466,7 +412,10 @@ fn main() {
                     bitstream_path,
                 );
             } else {
-                eprintln!("  Warning: frame_to_show_map_idx={} not found in DPB", show_idx);
+                eprintln!(
+                    "  Warning: frame_to_show_map_idx={} not mapped to any DPB slot",
+                    frame_buffer_idx
+                );
             }
             continue;
         }
@@ -475,23 +424,27 @@ fn main() {
             == vk_video_core::picture::Vp9FrameType::Key;
 
         println!(
-            "  Type: {} | Size: {}x{} | Refresh flags: 0x{:02x}",
-            if is_key_frame { "KEY" } else { "INTER" },
-            parsed.frame_width,
-            parsed.frame_height,
-            parsed.picture_info.refresh_frame_flags,
+            "[{}] {}", 
+            frame_idx,
+            if is_key_frame { "KEY" } else { "INTER" }
         );
 
         // Write bitstream data to buffer
-        // Zero the aligned range first to avoid feeding garbage to the decoder
-        // Align to minBitstreamBufferSizeAlignment (e.g., 256 bytes) per Vulkan spec
+        // Zero the aligned range first to clear any leftover data from previous frames.
+        // Then flush the FULL aligned range to ensure GPU sees clean data.
         let bs_align = bs_size_align as u64;
-        let flush_size = ((frame_data.len() as u64 + bs_align - 1) / bs_align * bs_align).max(bs_align);
-        bs_buffer.zero_range(0, flush_size);
+        let actual_size = frame_data.len() as u64;
+        let aligned_size = ((actual_size + bs_align - 1) / bs_align * bs_align).max(bs_align);
+        bs_buffer.zero_range(0, aligned_size);
         bs_buffer.write(frame_data).expect("Failed to write bitstream");
-        bs_buffer.flush_range(0, flush_size).ok();
+        bs_buffer.flush_range(0, aligned_size).ok();
 
-        // Select DPB slot for this frame
+        // Compute reference name slot indices FIRST (before selecting output slot)
+        // so we can avoid using a reference slot as output (prevents self-reference).
+        let reference_name_slot_indices =
+            vp9_decoder.compute_reference_name_slot_indices(is_key_frame, &parsed.ref_frame_idx);
+
+        // Select DPB slot for this frame, avoiding slots needed as references
         let output_slot;
         if is_key_frame || is_first_frame {
             // Key frame or first frame: reset DPB and use slot 0
@@ -501,28 +454,25 @@ fn main() {
             }
             output_slot = 0;
         } else {
-            // Inter frame: find or recycle a slot
-            output_slot = dpb_manager.find_or_recycle_slot().unwrap_or(0);
+            // Inter frame: find or recycle a slot that is NOT a reference
+            let exclude_slots: Vec<i32> = reference_name_slot_indices
+                .iter()
+                .filter(|&&s| s >= 0)
+                .copied()
+                .collect();
+            output_slot = dpb_manager
+                .find_or_recycle_slot(&exclude_slots)
+                .unwrap_or(0);
         }
 
         let output_slot_usize = output_slot as usize;
         let output_view = dpb_views[output_slot_usize];
         let output_img = dpb_image_handles[output_slot_usize];
 
-        // Compute reference name slot indices
-        let reference_name_slot_indices =
-            vp9_decoder.compute_reference_name_slot_indices(is_key_frame);
 
-        println!(
-            "  Output slot: {} | DPB Ref slots: [{}, {}, {}]",
-            output_slot,
-            reference_name_slot_indices[0],
-            reference_name_slot_indices[1],
-            reference_name_slot_indices[2],
-        );
 
         // Build DPB reference picture resources
-        let (dpb_setup_picture, dpb_ref_pictures, dpb_ref_slot_indices, vulkan_ref_name_slot_indices) = build_dpb_picture_resources(
+        let (dpb_setup_picture, dpb_ref_pictures, dpb_ref_slot_indices) = build_dpb_picture_resources(
             &dpb_manager,
             &dpb_views,
             frame_coded_extent,
@@ -531,232 +481,74 @@ fn main() {
             &reference_name_slot_indices,
         );
 
-        // DEBUG: print values being passed to Vulkan
-        let actual_bs_size = frame_data.len() as u64;
-        // Align srcBufferRange to minBitstreamBufferSizeAlignment per Vulkan spec
-        let bs_range_aligned = ((actual_bs_size + bs_align - 1) / bs_align * bs_align).max(bs_align);
-        println!(
-            "  Bitstream: offset=0 range={} (frame_data.len={} aligned={})",
-            bs_range_aligned,
-            frame_data.len(),
-            bs_range_aligned,
-        );
-        // [CHECK 2] Bitstream data integrity - hex dump of first 32 bytes
-        let first_bytes: Vec<String> = frame_data.iter().take(32).map(|b| format!("{:02x}", b)).collect();
-        println!("  Bitstream first 32 bytes: {}", first_bytes.join(" "));
-        // CRC32-like checksum of entire frame for integrity check
-        let checksum: u32 = frame_data.iter().fold(0u32, |acc, &b| {
-            acc.wrapping_add(b as u32).wrapping_mul(31)
-        });
-        println!("  Bitstream checksum (simple): 0x{:08x} (len={})", checksum, frame_data.len());
-        // [CHECK 1] compressed_header_size - critical for tiles_offset calculation
-        println!(
-            "  compressed_header_size: {} (0x{:04x})",
-            parsed.compressed_header_size,
-            parsed.compressed_header_size,
-        );
-        println!(
-            "  Header offsets: uncompressed={} compressed={} tiles={}",
-            parsed.uncompressed_header_offset,
-            parsed.compressed_header_offset,
-            parsed.tiles_offset,
-        );
-        // Verify: tiles_offset should equal compressed_header_offset + compressed_header_size
-        let expected_tiles = parsed.compressed_header_offset + parsed.compressed_header_size;
-        if parsed.tiles_offset != expected_tiles {
-            println!(
-                "  *** WARNING: tiles_offset mismatch! expected={} actual={}",
-                expected_tiles, parsed.tiles_offset
-            );
-        }
-        // Verify tiles_offset is within frame data bounds
-        if parsed.tiles_offset as usize > frame_data.len() {
-            println!(
-                "  *** WARNING: tiles_offset ({}) exceeds frame_data.len() ({})",
-                parsed.tiles_offset, frame_data.len()
-            );
-        } else {
-            println!(
-                "  tiles_offset ({}) is within bounds (frame_data.len()={})",
-                parsed.tiles_offset, frame_data.len()
-            );
-        }
-        // [CHECK 1b] Verify compressed_header_size against raw bitstream bytes
-        // compressed_header_size is a 16-bit value at the end of the uncompressed header.
-        // The compressed_header_offset includes these 16 bits, so the raw bytes are
-        // approximately at (compressed_header_offset - 2) to compressed_header_offset.
-        let chs_start = if parsed.compressed_header_offset >= 2 {
-            parsed.compressed_header_offset as usize - 2
-        } else {
-            0
-        };
-        let chs_end = (parsed.compressed_header_offset as usize).min(frame_data.len());
-        if chs_end > chs_start {
-            let raw_bytes: Vec<String> = frame_data[chs_start..chs_end]
-                .iter().map(|b| format!("{:02x}", b)).collect();
-            let raw_val = if chs_end - chs_start >= 2 {
-                u16::from_le_bytes([frame_data[chs_end - 2], frame_data[chs_end - 1]]) as u32
-            } else {
-                0
-            };
-            println!(
-                "  [CHS VERIFY] raw bytes at [{}..{}]: {} (LE u16={})",
-                chs_start, chs_end, raw_bytes.join(" "), raw_val
-            );
-            if raw_val != parsed.compressed_header_size {
-                println!(
-                    "  *** WARNING: raw LE u16 ({}) != parsed compressed_header_size ({}) - bit alignment may differ",
-                    raw_val, parsed.compressed_header_size
-                );
-            }
-        }
-        println!(
-            "  Coded extent: {}x{}",
-            frame_coded_extent.width,
-            frame_coded_extent.height,
-        );
-        println!(
-            "  p_std_picture_info: frame_type={} profile={} refresh_flags=0x{:02x}",
-            if is_key_frame { "KEY" } else { "INTER" },
-            parsed.picture_info.profile as u32,
-            parsed.picture_info.refresh_frame_flags,
-        );
-        // Print additional picture info fields
-        println!(
-            "  Picture info detail: frame_ctx_idx={} reset_ctx={} sign_bias_mask=0x{:02x} interp_filter={}",
-            parsed.picture_info.frame_context_idx,
-            parsed.picture_info.flags.reset_frame_context,
-            parsed.picture_info.ref_frame_sign_bias_mask,
-            match parsed.picture_info.interpolation_filter {
-                vk_video_core::picture::Vp9InterpolationFilter::EightTap => "EIGHTTAP",
-                vk_video_core::picture::Vp9InterpolationFilter::EightTapSmooth => "EIGHTTAP_SMOOTH",
-                vk_video_core::picture::Vp9InterpolationFilter::EightTapSharp => "EIGHTTAP_SHARP",
-                vk_video_core::picture::Vp9InterpolationFilter::Bilinear => "BILINEAR",
-                vk_video_core::picture::Vp9InterpolationFilter::Switchable => "SWITCHABLE",
-            },
-        );
-        println!(
-            "  Picture info quant: base_q={} dq_ydc={} dq_uvdc={} dq_uvac={}",
-            parsed.picture_info.base_q_idx,
-            parsed.picture_info.delta_q_y_dc,
-            parsed.picture_info.delta_q_uv_dc,
-            parsed.picture_info.delta_q_uv_ac,
-        );
-        println!(
-            "  Picture info tiles: cols_log2={} rows_log2={}",
-            parsed.picture_info.tile_cols_log2,
-            parsed.picture_info.tile_rows_log2,
-        );
-        println!(
-            "  Picture info flags: error_resilient={} intra_only={} high_prec_mv={} refresh_ctx={} parallel={} seg={} show={} prev_mv={}",
-            parsed.picture_info.flags.error_resilient_mode,
-            parsed.picture_info.flags.intra_only,
-            parsed.picture_info.flags.allow_high_precision_mv,
-            parsed.picture_info.flags.refresh_frame_context,
-            parsed.picture_info.flags.frame_parallel_decoding_mode,
-            parsed.picture_info.flags.segmentation_enabled,
-            parsed.picture_info.flags.show_frame,
-            parsed.picture_info.flags.use_prev_frame_mvs,
-        );
-        // [CHECK 3 & 4] DPB setup + VkVideoPictureResourceInfoKHR verification
-        println!(
-            "  DPB: setup_slot={} ref_count={}",
-            output_slot,
-            dpb_ref_pictures.len(),
-        );
-        for (i, &slot) in dpb_ref_slot_indices.iter().enumerate() {
-            println!("    ref[{}] -> slot {}", i, slot);
-        }
-        // [CHECK 4] For key frame, verify DPB is clean
-        if is_key_frame {
-            println!("  [DPB CHECK] Key frame: dpb_ref_pictures.len()={} (expected 0)", dpb_ref_pictures.len());
-            println!("  [DPB CHECK] Key frame: dpb_ref_slot_indices.len()={} (expected 0)", dpb_ref_slot_indices.len());
-            println!("  [DPB CHECK] Key frame: dpb_setup_picture.is_some()={} (expected true)", dpb_setup_picture.is_some());
-            if dpb_ref_pictures.is_empty() && dpb_ref_slot_indices.is_empty() && dpb_setup_picture.is_some() {
-                println!("  [DPB CHECK] Key frame DPB setup: OK");
-            } else {
-                println!("  [DPB CHECK] Key frame DPB setup: UNEXPECTED!");
-            }
-        }
-        // [CHECK 3] Print VkVideoPictureResourceInfoKHR fields for setup picture
-        if let Some(ref setup) = dpb_setup_picture {
-            println!(
-                "  [PictureResource] setup: coded_extent={}x{} coded_offset=({},{}) base_array_layer={} image_view_binding={:?}",
-                setup.coded_extent.width,
-                setup.coded_extent.height,
-                setup.coded_offset.x,
-                setup.coded_offset.y,
-                setup.base_array_layer,
-                setup.image_view_binding,
-            );
-        }
-        for (i, ref pr) in dpb_ref_pictures.iter().enumerate() {
-            println!(
-                "  [PictureResource] ref[{}]: coded_extent={}x{} coded_offset=({},{}) base_array_layer={} image_view_binding={:?}",
-                i,
-                pr.coded_extent.width,
-                pr.coded_extent.height,
-                pr.coded_offset.x,
-                pr.coded_offset.y,
-                pr.base_array_layer,
-                pr.image_view_binding,
-            );
-        }
+        // srcBufferRange MUST be aligned to minBitstreamBufferSizeAlignment per Vulkan spec.
+        // VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07139
+        let bs_range = aligned_size;
 
         // Convert parsed frame data to Vulkan picture info container
         // Allocate on heap to ensure lifetime through command execution
-        let picture_info_container = Box::new({
-            let mut c = convert_vp9_picture_info(
-                &parsed.picture_info,
-                &parsed.color_config,
-                &parsed.loop_filter,
-                &parsed.segmentation,
-            );
-            c.init_pointers();
-            c
-        });
-
-        // DEBUG: dump struct layouts for frame 0
-        if frame_idx == 0 {
-            dump_vp9_struct_debug(
-                &picture_info_container,
-                &reference_name_slot_indices,
-                parsed.uncompressed_header_offset,
-                parsed.compressed_header_offset,
-                parsed.tiles_offset,
-            );
-        }
-
-        // Build VP9 decode picture info on heap alongside the container.
-        // CRITICAL: Both must stay alive until after fence wait, otherwise the
-        // command buffer holds dangling pointers to freed stack memory.
-        let vp9_decode_info = Box::new(VideoDecodeVP9PictureInfoKHR::new(
-            picture_info_container.std_picture_info(),
-            vulkan_ref_name_slot_indices,
-            parsed.uncompressed_header_offset,
-            parsed.compressed_header_offset,
-            parsed.tiles_offset,
+        let mut picture_info_container = Box::new(convert_vp9_picture_info(
+            &parsed.picture_info,
+            &parsed.color_config,
+            &parsed.loop_filter,
+            &parsed.segmentation,
         ));
+        // CRITICAL: init_pointers must be called AFTER Box::new so pointers
+        // point to heap-allocated fields, not stack temporaries
+        picture_info_container.init_pointers();
+
+          // Build VP9 decode picture info on heap alongside the container.
+          // CRITICAL: Both must stay alive until after fence wait, otherwise the
+          // command buffer holds dangling pointers to freed stack memory.
+          // IMPORTANT: referenceNameSlotIndices must be DPB slot indices (matching
+          // VkVideoBeginCodingInfoKHR::pReferenceSlots[i].slot_index), NOT indices
+          // into p_reference_slots. This matches Vulkan-Video-Samples behavior.
+              let vp9_decode_info = Box::new(VideoDecodeVP9PictureInfoKHR::new(
+                  picture_info_container.std_picture_info(),
+                  reference_name_slot_indices,
+                  parsed.uncompressed_header_offset,
+                  parsed.compressed_header_offset,
+                  parsed.tiles_offset,
+              ));
 
         // Record decode command
-        let result = vp9_decoder.record_decode_command(
-            command_buffer,
-            session.handle(),
-            session_params_handle,
-            bs_buffer.buffer(),
-            0,
-            bs_range_aligned,
-            output_view,
-            output_img,
-            frame_coded_extent,
-            dpb_setup_picture,
-            &dpb_ref_pictures,
-            &dpb_ref_slot_indices,
-            &picture_info_container,
-            &vp9_decode_info,
-            is_first_frame,
-            output_slot as i32,
-        );
+         // Build reference image handles from slot indices
+         let dpb_ref_images: Vec<vk::Image> = dpb_ref_slot_indices
+             .iter()
+             .map(|&slot_idx| {
+                 dpb_image_handles[slot_idx as usize]
+             })
+             .collect();
+
+        // Reset command buffer before recording for this frame
+        unsafe {
+            vulkan
+                .device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .expect("Failed to reset command buffer");
+        }
+
+          let output_slot_old_layout = dpb_manager.get_slot_layout(output_slot as u32);
+          let result = vp9_decoder.record_decode_command(
+               command_buffer,
+               session.handle(),
+               session_params_handle,
+               bs_buffer.buffer(),
+               0,
+               bs_range,
+               output_view,
+              output_img,
+              frame_coded_extent,
+              dpb_setup_picture,
+              &dpb_ref_pictures,
+              &dpb_ref_slot_indices,
+              &dpb_ref_images,
+              &picture_info_container,
+              &vp9_decode_info,
+              is_first_frame,
+              output_slot as i32,
+              output_slot_old_layout,
+          );
 
         // Keep container AND vp9_decode_info alive until after submit + wait
         let _picture_info_guard = picture_info_container;
@@ -808,6 +600,7 @@ fn main() {
             current_pic_idx,
         );
 
+
         // Register this frame in DPB manager
         dpb_manager.register_frame(output_slot as u32, frame_count);
 
@@ -818,7 +611,6 @@ fn main() {
         );
 
         // Readback and verify decoded pixels
-        println!("  Reading back decoded pixels...");
         readback_and_verify(
             &vulkan.instance,
             &vulkan.device,
@@ -841,17 +633,10 @@ fn main() {
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
         );
 
-        println!(
-            "  DPB state: {} valid frames",
-            dpb_manager.get_valid_count()
-        );
-
         frame_count += 1;
     }
 
-    println!("\n--- Decode summary ---");
-    println!("Decoded {} frames", frame_count);
-    println!("DPB valid frames: {}", dpb_manager.get_valid_count());
+    println!("\nDecoded {} frames", frame_count);
 
     // Cleanup DPB images
     for (img, view, mem) in dpb_images {
@@ -863,7 +648,6 @@ fn main() {
     }
 
     // Cleanup
-    println!("\n--- Cleanup ---");
     unsafe {
         vulkan
             .device
@@ -894,258 +678,6 @@ fn main() {
 }
 
 // ============================================================================
-// Debug dump for VP9 struct layouts
-// ============================================================================
-
-/// Dump struct sizes, field offsets, raw bytes, and key field values for VP9 Vulkan structs.
-/// Called once for frame 0 to diagnose struct layout issues and compare with C++ reference.
-fn dump_vp9_struct_debug(
-    picture_info_container: &Vp9PictureInfoContainer,
-    reference_name_slot_indices: &[i32; 3],
-    uncompressed_header_offset: u32,
-    compressed_header_offset: u32,
-    tiles_offset: u32,
-) {
-    use std::fmt::Write;
-
-    let std_info = &picture_info_container.std_picture_info;
-
-    // =========================================================================
-    // Print key field values for comparison with C++ reference
-    // =========================================================================
-    eprintln!("\n========== VP9 Picture Info Key Fields (Rust) ==========");
-    eprintln!("  profile: {} (StdVideoVP9Profile={:?})",
-        std_info.profile as u32, std_info.profile);
-    eprintln!("  frame_type: {} ({})",
-        std_info.frame_type as u32,
-        if std_info.frame_type as u32 == 0 { "KEY" } else { "INTER" });
-    eprintln!("  refresh_frame_flags: 0x{:02x} ({})",
-        std_info.refresh_frame_flags, std_info.refresh_frame_flags);
-    eprintln!("  base_q_idx: {} (0x{:02x})", std_info.base_q_idx, std_info.base_q_idx);
-    eprintln!("  delta_q_y_dc: {}", std_info.delta_q_y_dc);
-    eprintln!("  delta_q_uv_dc: {}", std_info.delta_q_uv_dc);
-    eprintln!("  delta_q_uv_ac: {}", std_info.delta_q_uv_ac);
-    eprintln!("  tile_cols_log2: {}", std_info.tile_cols_log2);
-    eprintln!("  tile_rows_log2: {}", std_info.tile_rows_log2);
-    eprintln!("  interpolation_filter: {} ({})",
-        std_info.interpolation_filter as u32,
-        match std_info.interpolation_filter {
-            vk_video_vulkan::vp9::StdVideoVP9InterpolationFilter::EightTap => "EIGHTTAP",
-            vk_video_vulkan::vp9::StdVideoVP9InterpolationFilter::EightTapSmooth => "EIGHTTAP_SMOOTH",
-            vk_video_vulkan::vp9::StdVideoVP9InterpolationFilter::EightTapSharp => "EIGHTTAP_SHARP",
-            vk_video_vulkan::vp9::StdVideoVP9InterpolationFilter::Bilinear => "BILINEAR",
-            vk_video_vulkan::vp9::StdVideoVP9InterpolationFilter::Switchable => "SWITCHABLE",
-        });
-    eprintln!("  frame_context_idx: {}", std_info.frame_context_idx);
-    eprintln!("  reset_frame_context: {}", std_info.reset_frame_context);
-    eprintln!("  ref_frame_sign_bias_mask: 0x{:02x}", std_info.ref_frame_sign_bias_mask);
-    eprintln!("  flags: 0x{:08x}", std_info.flags.bits);
-    eprintln!("  ref_name_slot_indices: [{}, {}, {}]",
-        reference_name_slot_indices[0],
-        reference_name_slot_indices[1],
-        reference_name_slot_indices[2]);
-    eprintln!("  uncompressed_header_offset: {}", uncompressed_header_offset);
-    eprintln!("  compressed_header_offset: {}", compressed_header_offset);
-    eprintln!("  tiles_offset: {}", tiles_offset);
-    eprintln!("  color_config: bit_depth={} subsampling_x={} subsampling_y={} color_space={}",
-        picture_info_container.color_config.bit_depth,
-        picture_info_container.color_config.subsampling_x,
-        picture_info_container.color_config.subsampling_y,
-        picture_info_container.color_config.color_space as u32);
-    eprintln!("  loop_filter: level={} sharpness={} update_ref_delta={}",
-        picture_info_container.loop_filter.loop_filter_level,
-        picture_info_container.loop_filter.loop_filter_sharpness,
-        picture_info_container.loop_filter.update_ref_delta);
-    eprintln!("  loop_filter_ref_deltas: [{}, {}, {}, {}]",
-        picture_info_container.loop_filter.loop_filter_ref_deltas[0],
-        picture_info_container.loop_filter.loop_filter_ref_deltas[1],
-        picture_info_container.loop_filter.loop_filter_ref_deltas[2],
-        picture_info_container.loop_filter.loop_filter_ref_deltas[3]);
-    eprintln!("  loop_filter_mode_deltas: [{}, {}]",
-        picture_info_container.loop_filter.loop_filter_mode_deltas[0],
-        picture_info_container.loop_filter.loop_filter_mode_deltas[1]);
-    eprintln!("==========================================\n");
-
-    // =========================================================================
-    // Dump raw binary of StdVideoDecodeVP9PictureInfo to file
-    // =========================================================================
-    let std_info_bytes = unsafe {
-        std::slice::from_raw_parts(
-            std_info as *const _ as *const u8,
-            std::mem::size_of::<StdVideoDecodeVP9PictureInfo>(),
-        )
-    };
-    if let Err(e) = std::fs::write("rust_std_picture_info.bin", std_info_bytes) {
-        eprintln!("Failed to write rust_std_picture_info.bin: {}", e);
-    } else {
-        eprintln!("Wrote rust_std_picture_info.bin ({} bytes)", std_info_bytes.len());
-    }
-
-    // =========================================================================
-    // Create and dump VideoDecodeVP9PictureInfoKHR
-    // =========================================================================
-    let vp9_khr = VideoDecodeVP9PictureInfoKHR::new(
-        std_info,
-        *reference_name_slot_indices,
-        uncompressed_header_offset,
-        compressed_header_offset,
-        tiles_offset,
-    );
-
-    let khr_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &vp9_khr as *const _ as *const u8,
-            std::mem::size_of::<VideoDecodeVP9PictureInfoKHR>(),
-        )
-    };
-    if let Err(e) = std::fs::write("rust_vp9_picture_info_khr.bin", khr_bytes) {
-        eprintln!("Failed to write rust_vp9_picture_info_khr.bin: {}", e);
-    } else {
-        eprintln!("Wrote rust_vp9_picture_info_khr.bin ({} bytes)", khr_bytes.len());
-    }
-
-    // =========================================================================
-    // Full struct layout dump
-    // =========================================================================
-    let mut dump = String::new();
-
-    // StdVideoDecodeVP9PictureInfo
-    let expected_size = 56usize;
-    let actual_size = std::mem::size_of::<StdVideoDecodeVP9PictureInfo>();
-    writeln!(dump, "=== StdVideoDecodeVP9PictureInfo ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of flags: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, flags)).unwrap();
-    writeln!(dump, "  offset_of profile: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, profile)).unwrap();
-    writeln!(dump, "  offset_of frame_type: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, frame_type)).unwrap();
-    writeln!(dump, "  offset_of frame_context_idx: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, frame_context_idx)).unwrap();
-    writeln!(dump, "  offset_of reset_frame_context: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, reset_frame_context)).unwrap();
-    writeln!(dump, "  offset_of refresh_frame_flags: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, refresh_frame_flags)).unwrap();
-    writeln!(dump, "  offset_of ref_frame_sign_bias_mask: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, ref_frame_sign_bias_mask)).unwrap();
-    writeln!(dump, "  offset_of interpolation_filter: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, interpolation_filter)).unwrap();
-    writeln!(dump, "  offset_of base_q_idx: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, base_q_idx)).unwrap();
-    writeln!(dump, "  offset_of delta_q_y_dc: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, delta_q_y_dc)).unwrap();
-    writeln!(dump, "  offset_of delta_q_uv_dc: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, delta_q_uv_dc)).unwrap();
-    writeln!(dump, "  offset_of delta_q_uv_ac: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, delta_q_uv_ac)).unwrap();
-    writeln!(dump, "  offset_of tile_cols_log2: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, tile_cols_log2)).unwrap();
-    writeln!(dump, "  offset_of tile_rows_log2: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, tile_rows_log2)).unwrap();
-    writeln!(dump, "  offset_of reserved1: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, reserved1)).unwrap();
-    writeln!(dump, "  offset_of p_color_config: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, p_color_config)).unwrap();
-    writeln!(dump, "  offset_of p_loop_filter: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, p_loop_filter)).unwrap();
-    writeln!(dump, "  offset_of p_segmentation: {}", std::mem::offset_of!(StdVideoDecodeVP9PictureInfo, p_segmentation)).unwrap();
-
-    // StdVideoVP9ColorConfig
-    let expected_size = 12usize;
-    let actual_size = std::mem::size_of::<StdVideoVP9ColorConfig>();
-    writeln!(dump, "\n=== StdVideoVP9ColorConfig ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of flags: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, flags)).unwrap();
-    writeln!(dump, "  offset_of bit_depth: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, bit_depth)).unwrap();
-    writeln!(dump, "  offset_of subsampling_x: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, subsampling_x)).unwrap();
-    writeln!(dump, "  offset_of subsampling_y: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, subsampling_y)).unwrap();
-    writeln!(dump, "  offset_of reserved1: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, reserved1)).unwrap();
-    writeln!(dump, "  offset_of color_space: {}", std::mem::offset_of!(StdVideoVP9ColorConfig, color_space)).unwrap();
-
-    // StdVideoVP9LoopFilter - C compiler gives 16 bytes (with natural alignment)
-    let expected_size = 16usize;
-    let actual_size = std::mem::size_of::<StdVideoVP9LoopFilter>();
-    writeln!(dump, "\n=== StdVideoVP9LoopFilter ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of flags: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, flags)).unwrap();
-    writeln!(dump, "  offset_of loop_filter_level: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, loop_filter_level)).unwrap();
-    writeln!(dump, "  offset_of loop_filter_sharpness: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, loop_filter_sharpness)).unwrap();
-    writeln!(dump, "  offset_of update_ref_delta: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, update_ref_delta)).unwrap();
-    writeln!(dump, "  offset_of loop_filter_ref_deltas: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, loop_filter_ref_deltas)).unwrap();
-    writeln!(dump, "  offset_of update_mode_delta: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, update_mode_delta)).unwrap();
-    writeln!(dump, "  offset_of loop_filter_mode_deltas: {}", std::mem::offset_of!(StdVideoVP9LoopFilter, loop_filter_mode_deltas)).unwrap();
-
-    // StdVideoVP9Segmentation - C compiler gives 88 bytes (with natural alignment)
-    let expected_size = 88usize;
-    let actual_size = std::mem::size_of::<StdVideoVP9Segmentation>();
-    writeln!(dump, "\n=== StdVideoVP9Segmentation ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of flags: {}", std::mem::offset_of!(StdVideoVP9Segmentation, flags)).unwrap();
-    writeln!(dump, "  offset_of segmentation_tree_probs: {}", std::mem::offset_of!(StdVideoVP9Segmentation, segmentation_tree_probs)).unwrap();
-    writeln!(dump, "  offset_of segmentation_pred_prob: {}", std::mem::offset_of!(StdVideoVP9Segmentation, segmentation_pred_prob)).unwrap();
-    writeln!(dump, "  offset_of feature_enabled: {}", std::mem::offset_of!(StdVideoVP9Segmentation, feature_enabled)).unwrap();
-    writeln!(dump, "  offset_of feature_data: {}", std::mem::offset_of!(StdVideoVP9Segmentation, feature_data)).unwrap();
-
-    // Vp9PictureInfoContainer - 56+12+16+88=172, but with alignment padding = 176
-    let expected_size = 176usize;
-    let actual_size = std::mem::size_of::<Vp9PictureInfoContainer>();
-    writeln!(dump, "\n=== Vp9PictureInfoContainer ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of std_picture_info: {}", std::mem::offset_of!(Vp9PictureInfoContainer, std_picture_info)).unwrap();
-    writeln!(dump, "  offset_of color_config: {}", std::mem::offset_of!(Vp9PictureInfoContainer, color_config)).unwrap();
-    writeln!(dump, "  offset_of loop_filter: {}", std::mem::offset_of!(Vp9PictureInfoContainer, loop_filter)).unwrap();
-    writeln!(dump, "  offset_of segmentation: {}", std::mem::offset_of!(Vp9PictureInfoContainer, segmentation)).unwrap();
-
-    // VideoDecodeVP9PictureInfoKHR - C compiler gives 48 bytes (with pointer alignment)
-    let expected_size = 48usize;
-    let actual_size = std::mem::size_of::<VideoDecodeVP9PictureInfoKHR>();
-    writeln!(dump, "\n=== VideoDecodeVP9PictureInfoKHR ===").unwrap();
-    writeln!(dump, "  size: expected={} actual={} {}",
-        expected_size, actual_size,
-        if expected_size == actual_size { "OK" } else { "MISMATCH!" }).unwrap();
-    writeln!(dump, "  offset_of s_type: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, s_type)).unwrap();
-    writeln!(dump, "  offset_of p_next: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, p_next)).unwrap();
-    writeln!(dump, "  offset_of p_std_picture_info: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, p_std_picture_info)).unwrap();
-    writeln!(dump, "  offset_of reference_name_slot_indices: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, reference_name_slot_indices)).unwrap();
-    writeln!(dump, "  offset_of uncompressed_header_offset: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, uncompressed_header_offset)).unwrap();
-    writeln!(dump, "  offset_of compressed_header_offset: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, compressed_header_offset)).unwrap();
-    writeln!(dump, "  offset_of tiles_offset: {}", std::mem::offset_of!(VideoDecodeVP9PictureInfoKHR, tiles_offset)).unwrap();
-
-    // VkVideoDecodeInfoKHR
-    writeln!(dump, "\n=== VkVideoDecodeInfoKHR ===").unwrap();
-    writeln!(dump, "  size: {}", std::mem::size_of::<vk::VideoDecodeInfoKHR>()).unwrap();
-    writeln!(dump, "  offset_of s_type: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, s_type)).unwrap();
-    writeln!(dump, "  offset_of p_next: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_next)).unwrap();
-    writeln!(dump, "  offset_of flags: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, flags)).unwrap();
-    writeln!(dump, "  offset_of src_buffer: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer)).unwrap();
-    writeln!(dump, "  offset_of src_buffer_offset: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_offset)).unwrap();
-    writeln!(dump, "  offset_of src_buffer_range: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_range)).unwrap();
-    writeln!(dump, "  offset_of dst_picture_resource: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, dst_picture_resource)).unwrap();
-    writeln!(dump, "  offset_of p_setup_reference_slot: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_setup_reference_slot)).unwrap();
-    writeln!(dump, "  offset_of reference_slot_count: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, reference_slot_count)).unwrap();
-    writeln!(dump, "  offset_of p_reference_slots: {}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_reference_slots)).unwrap();
-
-    // Raw hex dump of Vp9PictureInfoContainer
-    let container_bytes = unsafe {
-        std::slice::from_raw_parts(
-            picture_info_container as *const _ as *const u8,
-            std::mem::size_of::<Vp9PictureInfoContainer>(),
-        )
-    };
-
-    writeln!(dump, "\n=== Vp9PictureInfoContainer raw hex dump ===").unwrap();
-    for (i, chunk) in container_bytes.chunks(16).enumerate() {
-        let offset_str = format!("{:04x}", i * 16);
-        let hex_str: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-        let ascii_str: String = chunk.iter().map(|b| if *b >= 32 && *b < 127 { *b as char } else { '.' }).collect();
-        writeln!(dump, "  {}  {:<48}  |{}|", offset_str, hex_str, ascii_str).unwrap();
-    }
-
-    // Print to stderr
-    eprintln!("{}", dump);
-
-    // Write to file
-    if let Err(e) = std::fs::write("vp9_struct_dump.txt", &dump) {
-        eprintln!("Failed to write vp9_struct_dump.txt: {}", e);
-    } else {
-        eprintln!("Wrote vp9_struct_dump.txt");
-    }
-}
-
-// ============================================================================
 // IVF container parsing
 // ============================================================================
 
@@ -1167,20 +699,6 @@ fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         return Err("Invalid IVF magic".to_string());
     }
 
-    // Parse 32-byte IVF header
-    let version = u16::from_le_bytes([data[4], data[5]]);
-    let header_stride = u16::from_le_bytes([data[6], data[7]]);
-    let fourcc = String::from_utf8_lossy(&data[8..12]).to_string();
-    let width = u16::from_le_bytes([data[12], data[13]]);
-    let height = u16::from_le_bytes([data[14], data[15]]);
-    let rate_num = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let rate_den = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-    let frame_count = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    let time_base = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
-
-    println!("    IVF: version={} stride={} codec={} {}x{} rate={}/{} frames={} time_base={}",
-        version, header_stride, fourcc, width, height, rate_num, rate_den, frame_count, time_base);
-
     // Parse frames
     let mut frames = Vec::new();
     let mut offset = 32usize;
@@ -1200,17 +718,6 @@ fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         ]) as usize;
 
         // 8 bytes: presentation timestamp (64-bit little-endian)
-        let timestamp = u64::from_le_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-            data[offset + 8],
-            data[offset + 9],
-            data[offset + 10],
-            data[offset + 11],
-        ]);
-
         offset += 12;
 
         // Validate packet size
@@ -1220,7 +727,6 @@ fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         }
 
         let frame_data = data[offset..offset + packet_size].to_vec();
-        println!("    Frame {}: size={} timestamp={}", frames.len(), packet_size, timestamp);
         frames.push(frame_data);
         offset += packet_size;
     }
@@ -1229,7 +735,6 @@ fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         return Err("No frames found in IVF container".to_string());
     }
 
-    println!("    Parsed {} frames from IVF container", frames.len());
     Ok(frames)
 }
 
@@ -1427,18 +932,25 @@ impl Vp9DpbManager {
     }
 
     /// Find an empty slot or recycle the oldest reference.
-    fn find_or_recycle_slot(&mut self) -> Option<u32> {
-        // First try to find an empty slot
+    ///
+    /// Avoids slots listed in `exclude_slots` (typically reference frame slots
+    /// that are needed for the current frame). This prevents self-reference bugs
+    /// where a slot is used as both output and reference.
+    fn find_or_recycle_slot(&mut self, exclude_slots: &[i32]) -> Option<u32> {
+        // First try to find an empty slot that is not excluded
         for (i, entry) in self.entries.iter().enumerate() {
-            if !entry.is_valid {
+            if !entry.is_valid && !exclude_slots.contains(&(i as i32)) {
                 return Some(i as u32);
             }
         }
-        // Recycle the oldest valid slot
+        // Recycle the oldest valid slot that is not excluded
         let mut oldest_idx = None;
         let mut oldest_count = u32::MAX;
         for (i, entry) in self.entries.iter().enumerate() {
-            if entry.is_valid && entry.frame_count < oldest_count {
+            if entry.is_valid
+                && !exclude_slots.contains(&(i as i32))
+                && entry.frame_count < oldest_count
+            {
                 oldest_count = entry.frame_count;
                 oldest_idx = Some(i as u32);
             }
@@ -1465,6 +977,7 @@ impl Vp9DpbManager {
     }
 
     /// Get the DPB slot for a given picture index.
+    #[allow(dead_code)]
     fn get_slot_for_pic_idx(&self, pic_idx: i32) -> Option<u32> {
         for (i, entry) in self.entries.iter().enumerate() {
             if entry.is_valid && entry.pic_idx == pic_idx {
@@ -1491,6 +1004,7 @@ impl Vp9DpbManager {
     }
 
     /// Get count of valid DPB entries.
+    #[allow(dead_code)]
     fn get_valid_count(&self) -> usize {
         self.entries.iter().filter(|e| e.is_valid).count()
     }
@@ -1502,11 +1016,15 @@ impl Vp9DpbManager {
 
 /// Build DPB picture resources for VP9 decode.
 ///
-/// Returns (setup_picture, ref_pictures, ref_slot_indices, vulkan_ref_name_slot_indices) where:
+/// Returns (setup_picture, ref_pictures, ref_slot_indices) where:
 /// - setup_picture: the current frame's output slot
 /// - ref_pictures: reference picture slots (only those referenced by reference_name_slot_indices)
 /// - ref_slot_indices: DPB slot indices corresponding to each reference picture
-/// - vulkan_ref_name_slot_indices: indices into p_reference_slots for Vulkan (not DPB slot indices)
+///
+/// IMPORTANT: referenceNameSlotIndices passed to Vulkan must be DPB slot indices
+/// (matching VkVideoBeginCodingInfoKHR::pReferenceSlots[i].slot_index), NOT indices
+/// into p_reference_slots. This is handled by the caller using the original
+/// reference_name_slot_indices directly.
 fn build_dpb_picture_resources(
     dpb_manager: &Vp9DpbManager,
     dpb_views: &[vk::ImageView],
@@ -1518,22 +1036,27 @@ fn build_dpb_picture_resources(
     Option<vk::VideoPictureResourceInfoKHR<'static>>,
     Vec<vk::VideoPictureResourceInfoKHR<'static>>,
     Vec<i32>,
-    [i32; 3],
 ) {
     let mut ref_pictures = Vec::new();
     let mut ref_slot_indices = Vec::new();
-    // Vulkan expects indices into p_reference_slots, not DPB slot indices
-    let mut vulkan_ref_name_slot_indices: [i32; 3] = [-1, -1, -1];
 
     if !is_key_frame {
         // Build reference picture resources ONLY for the 3 VP9 primary reference
         // frame names (LAST, GOLDEN, ALTREF) as specified by
-        // reference_name_slot_indices. Track mapping from VP9 ref name index
-        // to p_reference_slots index.
-        let mut p_ref_slot_idx: i32 = 0;
-        for (ref_name_idx, &slot_idx) in reference_name_slot_indices.iter().enumerate() {
+        // reference_name_slot_indices.
+        // IMPORTANT: Vulkan requires unique slot_index values in p_reference_slots.
+        // If multiple VP9 ref names point to the same DPB slot, we only create
+        // one reference slot for that DPB slot. The caller uses the original
+        // reference_name_slot_indices (DPB slot indices) for Vulkan, which may
+        // have duplicates pointing to the same DPB slot.
+        let mut seen_slots: std::collections::HashSet<i32> =
+            std::collections::HashSet::new();
+        for &slot_idx in reference_name_slot_indices.iter() {
             if slot_idx < 0 {
                 continue; // Reference frame name not assigned
+            }
+            if seen_slots.contains(&slot_idx) {
+                continue; // Already added this DPB slot
             }
             let slot = slot_idx as usize;
             if slot >= dpb_manager.entries.len() {
@@ -1546,6 +1069,7 @@ fn build_dpb_picture_resources(
             if (slot as u32) == output_slot {
                 continue; // Don't reference ourselves
             }
+            seen_slots.insert(slot_idx);
             let view = dpb_views[slot];
             let picture_resource = vk::VideoPictureResourceInfoKHR {
                 s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
@@ -1558,9 +1082,6 @@ fn build_dpb_picture_resources(
             };
             ref_pictures.push(picture_resource);
             ref_slot_indices.push(slot_idx);
-            // Map VP9 ref name index -> p_reference_slots index
-            vulkan_ref_name_slot_indices[ref_name_idx] = p_ref_slot_idx;
-            p_ref_slot_idx += 1;
         }
     }
 
@@ -1575,7 +1096,7 @@ fn build_dpb_picture_resources(
         _marker: Default::default(),
     };
 
-    (Some(setup_picture), ref_pictures, ref_slot_indices, vulkan_ref_name_slot_indices)
+    (Some(setup_picture), ref_pictures, ref_slot_indices)
 }
 
 // ============================================================================
@@ -1940,6 +1461,69 @@ fn readback_and_verify(
         };
         cmd_pipeline_barrier_2(instance, device.handle(), cmd_buffer, &buffer_dep_info);
 
+        // Transition image back to VIDEO_DECODE_DPB_KHR so it can be used as reference
+        // in subsequent decode commands. This is critical: without this transition,
+        // reference images remain in TRANSFER_SRC_OPTIMAL layout, causing crashes
+        // when used as DPB references.
+        let plane0_restore = vk::ImageMemoryBarrier2 {
+            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::TRANSFER,
+            src_access_mask: vk::AccessFlags2::TRANSFER_READ,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            _marker: Default::default(),
+        };
+
+        let plane1_restore = vk::ImageMemoryBarrier2 {
+            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::TRANSFER,
+            src_access_mask: vk::AccessFlags2::TRANSFER_READ,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            _marker: Default::default(),
+        };
+
+        let restore_barriers = [plane0_restore, plane1_restore];
+        let restore_dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 0,
+            p_buffer_memory_barriers: std::ptr::null(),
+            image_memory_barrier_count: restore_barriers.len() as u32,
+            p_image_memory_barriers: restore_barriers.as_ptr(),
+            _marker: Default::default(),
+        };
+        cmd_pipeline_barrier_2(instance, device.handle(), cmd_buffer, &restore_dep_info);
+
         device
             .end_command_buffer(cmd_buffer)
             .expect("Failed to end command buffer");
@@ -1970,42 +1554,47 @@ fn readback_and_verify(
         let data = std::slice::from_raw_parts(data_ptr, total_size as usize);
         let y_data = &data[..y_size];
 
-        // Analyze Y plane
-        let mut sum: u64 = 0;
-        let mut min_val = u8::MAX;
-        let mut max_val = u8::MIN;
+        // Analyze Y plane (values available for debugging if needed)
+        let mut _sum: u64 = 0;
+        let mut _min_val = u8::MAX;
+        let mut _max_val = u8::MIN;
         let pixel_count = (frame_width * frame_height) as usize;
 
         for i in 0..pixel_count.min(y_data.len()) {
-            let val = y_data[i] as u64;
-            sum += val;
-            if y_data[i] < min_val {
-                min_val = y_data[i];
+            _sum += y_data[i] as u64;
+            if y_data[i] < _min_val {
+                _min_val = y_data[i];
             }
-            if y_data[i] > max_val {
-                max_val = y_data[i];
+            if y_data[i] > _max_val {
+                _max_val = y_data[i];
             }
         }
 
-        let avg = if pixel_count > 0 { sum as f64 / pixel_count as f64 } else { 0.0 };
+        // Save all frames for verification
+        // Convert from Vulkan G8_B8R8_2PLANE (Y + interleaved UV) to yuv420p (Y + U + V planar)
+        let uv_plane_size = (uv_width * uv_height) as usize;
+        let mut yuv_data = Vec::with_capacity(y_size + uv_plane_size * 2);
+        yuv_data.extend_from_slice(&data[..y_size]); // Y plane
+        // De-interleave UV plane: Vulkan stores UVUVUV..., yuv420p expects UUUU...VVVV...
+        let uv_interleaved = &data[y_size..y_size + uv_plane_size * 2];
+        let mut u_plane = vec![0u8; uv_plane_size];
+        let mut v_plane = vec![0u8; uv_plane_size];
+        for i in 0..uv_plane_size {
+            u_plane[i] = uv_interleaved[i * 2];
+            v_plane[i] = uv_interleaved[i * 2 + 1];
+        }
+        yuv_data.extend_from_slice(&u_plane);
+        yuv_data.extend_from_slice(&v_plane);
 
-        println!(
-            "    Y plane: avg={:.1} min={} max={} ({}x{})",
-            avg, min_val, max_val, frame_width, frame_height
-        );
-
-        // Save full YUV data for frame 0
-        if frame_idx == 0 {
-            // Derive output filename from input path
-            let stem = std::path::Path::new(bitstream_path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "output".to_string());
-            let output_path = format!("{}_frame_0.yuv", stem);
-            match std::fs::write(&output_path, data) {
-                Ok(()) => println!("    Saved YUV to {}", output_path),
-                Err(e) => eprintln!("    Failed to save YUV: {}", e),
-            }
+        // Derive output filename from input path
+        let stem = std::path::Path::new(bitstream_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "output".to_string());
+        let output_path = format!("{}_frame_{}.yuv", stem, frame_idx);
+        match std::fs::write(&output_path, yuv_data) {
+            Ok(()) => println!("    Saved YUV to {}", output_path),
+            Err(e) => eprintln!("    Failed to save YUV: {}", e),
         }
 
         // Cleanup

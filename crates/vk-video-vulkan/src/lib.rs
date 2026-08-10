@@ -25,7 +25,7 @@ pub use frame::{DecodedFrame as FrameDecodedFrame, YCbCrPlane};
 pub use image::{create_output_image, create_output_image_with_pnext, StagingImage};
 pub use codec_types::*;
 pub use dpb::{DpbManager, DpbEntry, LastAccessType};
-pub use access_unit::{AccessUnit, H264OrH265Sps, H264OrH265Pps, VideoCodec as AccessUnitCodec};
+pub use access_unit::{AccessUnit, H264OrH265Sps, H264OrH265Pps, VideoCodec as AccessUnitCodec, Vp9Frame};
 pub use readback::{DecodedPixels, readback_decoded_image};
 pub use profile_chain::{create_output_image_with_profile, create_bitstream_buffer_with_profile};
 pub use decoder::{VideoDecoder, DecodedFrame};

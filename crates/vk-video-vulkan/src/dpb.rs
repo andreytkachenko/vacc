@@ -204,10 +204,8 @@ impl DpbManager {
     /// Find an empty slot or recycle the oldest reference.
     ///
     /// `protected_pocs` is a list of reference POCs that the current frame needs.
-    /// Slots containing frames with these POCs will NOT be recycled.
-    ///
-    /// Uses POC-based ordering since frame_num wraparound makes it unreliable
-    /// without knowing the current frame_num context.
+    /// Slots containing frames with these POCs will NOT be recycled, preventing
+    /// destruction of reference pictures needed for the current decode.
     pub fn find_or_recycle_slot(&mut self, protected_pocs: &[i32]) -> Option<u32> {
         for i in 0..self.max_dpb_slots as usize {
             if !self.entries[i].is_valid {
@@ -230,11 +228,34 @@ impl DpbManager {
             }
         }
 
-        if let Some(idx) = oldest_idx {
-            self.entries[idx as usize].is_valid = false;
-            self.entries[idx as usize].current_layout = vk::ImageLayout::UNDEFINED;
-            self.entries[idx as usize].last_access = LastAccessType::None;
+        oldest_idx
+    }
+
+    /// Find an empty slot or recycle the oldest reference, excluding specific slots.
+    ///
+    /// For VP9: `exclude_slots` is a list of DPB slot indices that must not be used
+    /// as output (they contain reference frames needed for the current decode).
+    pub fn find_or_recycle_slot_excluding(&mut self, exclude_slots: &[i32]) -> Option<u32> {
+        // First try to find an empty slot that is not excluded
+        for i in 0..self.max_dpb_slots as usize {
+            if !self.entries[i].is_valid && !exclude_slots.contains(&(i as i32)) {
+                return Some(i as u32);
+            }
         }
+
+        // Recycle the oldest valid slot that is not excluded
+        let mut oldest_idx = None;
+        let mut oldest_frame_num = u32::MAX;
+        for i in 0..self.max_dpb_slots as usize {
+            if self.entries[i].is_valid
+                && !exclude_slots.contains(&(i as i32))
+                && self.entries[i].frame_num < oldest_frame_num
+            {
+                oldest_frame_num = self.entries[i].frame_num;
+                oldest_idx = Some(i as u32);
+            }
+        }
+
         oldest_idx
     }
 
@@ -278,5 +299,14 @@ impl DpbManager {
 
     pub fn get_references_mut(&mut self) -> Vec<&mut DpbEntry> {
         self.entries.iter_mut().filter(|e| e.is_valid).collect()
+    }
+
+    /// Register a frame in a DPB slot (VP9-style, without POC tracking).
+    pub fn register_frame(&mut self, slot: u32, frame_count: u32) {
+        if slot < self.entries.len() as u32 {
+            self.entries[slot as usize].is_valid = true;
+            self.entries[slot as usize].frame_num = frame_count;
+            self.entries[slot as usize].slot_index = slot;
+        }
     }
 }

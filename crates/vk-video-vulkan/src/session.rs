@@ -317,6 +317,13 @@ impl VideoSession {
     pub fn is_valid(&self) -> bool {
         !self.session.is_null()
     }
+
+    /// Mark this session as destroyed (null out the handle).
+    /// Call after manually destroying via vkDestroyVideoSessionKHR
+    /// to prevent double-free in Drop.
+    pub fn reset(&mut self) {
+        self.session = vk::VideoSessionKHR::null();
+    }
 }
 
 impl Drop for VideoSession {
@@ -532,71 +539,27 @@ impl VideoSessionParameters {
         !self.parameters.is_null()
     }
 
+    /// Mark these parameters as destroyed (null out the handle).
+    /// Call after manually destroying via vkDestroyVideoSessionParametersKHR
+    /// to prevent double-free in Drop.
+    pub fn reset(&mut self) {
+        self.parameters = vk::VideoSessionParametersKHR::null();
+    }
+
     /// Initialize the video session with the given session parameters.
     ///
-    /// Calls vkUpdateVideoSessionKHR/vkUpdateVideoSession if available.
-    /// Falls back to vkUpdateVideoSessionParametersKHR with empty update entries.
-    /// This is required to transition the session from uninitialized to initialized state.
+    /// With VK_KHR_video_maintenance1 (not maintenance2), vkCmdBeginVideoCodingKHR
+    /// will automatically initialize the session when first called with session parameters.
+    /// This matches the NVIDIA Vulkan-Video-Samples behavior.
     pub fn update_session(
         &self,
-        session: vk::VideoSessionKHR,
+        _session: vk::VideoSessionKHR,
     ) -> VideoResult<()> {
-        // Try vkUpdateVideoSessionKHR first (VK_KHR_video_maintenance2)
-        let update_fn = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                b"vkUpdateVideoSessionKHR\0".as_ptr().cast(),
-            )
-        };
-
-        // Fall back to core vkUpdateVideoSession (Vulkan 1.4+)
-        let update_fn = update_fn.or_else(|| unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                b"vkUpdateVideoSession\0".as_ptr().cast(),
-            )
-        });
-
-        if let Some(fn_ptr) = update_fn {
-            unsafe {
-                type FnType = unsafe extern "system" fn(
-                    vk::Device,
-                    *const VkVideoSessionUpdateInfoKHR,
-                );
-                let fn_ptr: FnType = std::mem::transmute(fn_ptr);
-
-                // VIDEO_SESSION_UPDATE_INFO_KHR = 1000348000 (VK_KHR_video_maintenance2)
-                const VIDEO_SESSION_UPDATE_INFO_KHR: u32 = 1000348000;
-
-                let update_info = VkVideoSessionUpdateInfoKHR {
-                    s_type: vk::StructureType::from_raw(VIDEO_SESSION_UPDATE_INFO_KHR as i32),
-                    p_next: std::ptr::null(),
-                    video_session: session,
-                    video_session_parameters: self.parameters,
-                };
-
-                fn_ptr(self.device.handle(), &update_info);
-            }
-            eprintln!("[session] vkUpdateVideoSessionKHR called successfully");
-            return Ok(());
-        }
-
-        // vkUpdateVideoSessionKHR not available - vkCmdBeginVideoCodingKHR will initialize
-        // the session with the session parameters when first called.
-        eprintln!("[session] vkUpdateVideoSessionKHR not available, relying on vkCmdBeginVideoCodingKHR for initialization");
-
+        // With VK_KHR_video_maintenance1, the session is auto-initialized by
+        // vkCmdBeginVideoCodingKHR when called with session parameters.
+        // No explicit vkUpdateVideoSessionKHR call needed.
         Ok(())
     }
-}
-
-/// VkVideoSessionUpdateInfoKHR structure for vkUpdateVideoSessionKHR.
-/// Defined manually since ash doesn't expose it.
-#[repr(C)]
-struct VkVideoSessionUpdateInfoKHR {
-    s_type: vk::StructureType,
-    p_next: *const std::ffi::c_void,
-    video_session: vk::VideoSessionKHR,
-    video_session_parameters: vk::VideoSessionParametersKHR,
 }
 
 impl Drop for VideoSessionParameters {
