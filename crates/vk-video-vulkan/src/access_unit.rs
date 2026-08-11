@@ -4,6 +4,9 @@ use vk_video_parser::nal::{
     find_next_start_code, parse_h264_nal_header, parse_h265_nal_header,
     remove_emulation_prevention_bytes,
 };
+use vk_video_parser::{
+    bitstream::BitstreamPacket, DetectedVideoFormat, VideoParser,
+};
 
 /// An access unit (single frame) extracted from the bitstream.
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ pub struct AccessUnit {
     pub adaptive_ref_pic_marking_mode_flag: bool,
     /// H.264: MMCO commands parsed from slice header
     pub mmco_commands: Vec<H264MmcoCommand>,
+    /// H.265: no_output_of_prior_pics_flag from slice header (BLA/CRA/IDR frames)
+    pub no_output_of_prior_pics_flag: bool,
 }
 
 /// H.264 Memory Management Control Operation (MMCO) command.
@@ -66,6 +71,27 @@ pub enum H264OrH265Sps {
 pub enum H264OrH265Pps {
     H264(vk_video_core::picture::H264Pps),
     H265(vk_video_core::picture::H265Pps),
+}
+
+/// Enum to hold H.265 VPS.
+#[derive(Debug, Clone)]
+pub enum H265VpsOpt {
+    H265(vk_video_core::picture::H265Vps),
+}
+
+/// In-band parameter set detected during access unit extraction.
+#[derive(Debug, Clone)]
+pub struct InBandParameterSet {
+    pub vps: Option<H265VpsOpt>,
+    pub sps: Option<H264OrH265Sps>,
+    pub pps: Option<H264OrH265Pps>,
+}
+
+/// Items extracted from bitstream: access units and in-band parameter sets.
+#[derive(Debug, Clone)]
+pub enum ExtractedItem {
+    AccessUnit(AccessUnit),
+    ParameterSet(InBandParameterSet),
 }
 
 /// Minimal bit reader for slice header parsing.
@@ -263,7 +289,7 @@ fn parse_h265_slice_header(
     nuh_temporal_id_plus1: u8,
     prev_pic_order_cnt_lsb: i32,
     prev_pic_order_cnt_msb: i32,
-) -> Option<(bool, i32, i32, [i32; 2], bool, bool, u32, i32, i32, bool, Vec<i32>)> {
+) -> Option<(bool, i32, i32, [i32; 2], bool, bool, u32, i32, i32, bool, Vec<i32>, bool)> {
     if nal_data.len() < 3 {
         return None;
     }
@@ -274,9 +300,11 @@ fn parse_h265_slice_header(
     let first_slice_segment_in_pic_flag = r.read_bit()? == 1;
 
     let is_rap = nal_unit_type >= 16 && nal_unit_type <= 23;
-    if is_rap {
-        let _no_output_of_prior_pics_flag = r.read_bit().unwrap_or(0);
-    }
+    let no_output_of_prior_pics_flag = if is_rap {
+        r.read_bit().unwrap_or(0) == 1
+    } else {
+        false
+    };
 
     let _pps_id = r.read_ue().unwrap_or(0);
 
@@ -569,6 +597,7 @@ fn parse_h265_slice_header(
         num_delta_pocs_of_ref_rps_idx,
         short_term_ref_pic_set_sps_flag,
         ref_pocs,
+        no_output_of_prior_pics_flag,
     ))
 }
 
@@ -580,15 +609,15 @@ pub enum VideoCodec {
     Vp9,
 }
 
-/// Extract all access units from the bitstream.
+/// Extract all access units and in-band parameter sets from the bitstream.
 pub fn extract_all_access_units(
     data: &[u8],
     codec: VideoCodec,
     max_frames: usize,
     sps: Option<&H264OrH265Sps>,
     pps: Option<&H264OrH265Pps>,
-) -> Vec<AccessUnit> {
-    let mut access_units: Vec<AccessUnit> = Vec::new();
+) -> Vec<ExtractedItem> {
+    let mut items: Vec<ExtractedItem> = Vec::new();
     let mut offset = 0;
     let mut current_au_data: Vec<u8> = Vec::new();
     let mut current_slice_offsets: Vec<u32> = Vec::new();
@@ -603,12 +632,20 @@ pub fn extract_all_access_units(
     let mut current_ref_pocs: Vec<i32> = Vec::new();
     let mut current_adaptive_ref_pic_marking_mode_flag: bool = false;
     let mut current_mmco_commands: Vec<H264MmcoCommand> = Vec::new();
+    let mut current_no_output_of_prior_pics_flag: bool = false;
     let mut in_frame = false;
 
     let mut prev_pic_order_cnt_lsb: i32 = 0;
     let mut prev_pic_order_cnt_msb: i32 = 0;
     let mut max_pic_order_cnt_lsb: u32 = 256;
     let mut prev_frame_num: u32 = 0;
+
+    // Track seen parameter set IDs to detect in-band updates
+    let mut seen_h264_sps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_h264_pps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_h265_vps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_h265_sps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_h265_pps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let h264_sps = match sps {
         Some(H264OrH265Sps::H264(s)) => Some(s),
@@ -628,11 +665,22 @@ pub fn extract_all_access_units(
         _ => None,
     };
 
+    // Initialize seen IDs from initial parameter sets
     if let Some(sps) = h264_sps {
+        seen_h264_sps_ids.insert(sps.seq_parameter_set_id as u32);
         max_pic_order_cnt_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
     }
+    if let Some(pps) = h264_pps {
+        seen_h264_pps_ids.insert(pps.pic_parameter_set_id as u32);
+    }
+    if let Some(sps) = h265_sps {
+        seen_h265_sps_ids.insert(sps.sps_seq_parameter_set_id as u32);
+    }
+    if let Some(pps) = h265_pps {
+        seen_h265_pps_ids.insert(pps.pps_pic_parameter_set_id as u32);
+    }
 
-    while offset < data.len() && access_units.len() < max_frames {
+    while offset < data.len() && items.len() < max_frames * 2 {
         let Some((start, code_len)) = find_next_start_code(data, offset) else {
             break;
         };
@@ -677,30 +725,60 @@ pub fn extract_all_access_units(
 
         if is_au_delimiter {
             if in_frame && !current_au_data.is_empty() {
-                 access_units.push(AccessUnit {
-                      data: current_au_data.clone(),
-                      slice_offsets: current_slice_offsets.clone(),
-                      frame_num: current_frame_num,
-                      pic_order_cnt: current_poc,
-                      is_idr: current_is_idr,
-                      is_reference: current_is_reference,
-                      slice_type: current_slice_type,
-                      num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                      num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                      short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                      ref_pocs: current_ref_pocs.clone(),
-                      adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
-                      mmco_commands: current_mmco_commands.clone(),
-                  });
-                  current_au_data.clear();
-                  current_slice_offsets.clear();
-                  current_mmco_commands.clear();
+                items.push(ExtractedItem::AccessUnit(AccessUnit {
+                    data: current_au_data.clone(),
+                    slice_offsets: current_slice_offsets.clone(),
+                    frame_num: current_frame_num,
+                    pic_order_cnt: current_poc,
+                    is_idr: current_is_idr,
+                    is_reference: current_is_reference,
+                    slice_type: current_slice_type,
+                    num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                    num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                    short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                    ref_pocs: current_ref_pocs.clone(),
+                    adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                    mmco_commands: current_mmco_commands.clone(),
+                    no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                }));
+                current_au_data.clear();
+                current_slice_offsets.clear();
+                current_mmco_commands.clear();
             }
             offset = end;
             continue;
         }
 
+        // Handle in-band parameter sets
         if is_params {
+            let param_set = match codec {
+                VideoCodec::H264 => parse_h264_inband_params(nal_data, nal_type, &seen_h264_sps_ids, &seen_h264_pps_ids),
+                VideoCodec::H265 => parse_h265_inband_params(nal_data, nal_type, &seen_h265_vps_ids, &seen_h265_sps_ids, &seen_h265_pps_ids),
+                VideoCodec::Vp9 => None,
+            };
+
+            if let Some(ps) = param_set {
+                // Update seen IDs
+                if let Some(ref sps) = ps.sps {
+                    match sps {
+                        H264OrH265Sps::H264(s) => { seen_h264_sps_ids.insert(s.seq_parameter_set_id as u32); }
+                        H264OrH265Sps::H265(s) => { seen_h265_sps_ids.insert(s.sps_seq_parameter_set_id as u32); }
+                    }
+                }
+                if let Some(ref pps) = ps.pps {
+                    match pps {
+                        H264OrH265Pps::H264(p) => { seen_h264_pps_ids.insert(p.pic_parameter_set_id as u32); }
+                        H264OrH265Pps::H265(p) => { seen_h265_pps_ids.insert(p.pps_pic_parameter_set_id as u32); }
+                    }
+                }
+                if let Some(ref vps) = ps.vps {
+                    match vps {
+                        H265VpsOpt::H265(v) => { seen_h265_vps_ids.insert(v.vps_video_parameter_set_id as u32); }
+                    }
+                }
+                items.push(ExtractedItem::ParameterSet(ps));
+            }
+
             offset = end;
             continue;
         }
@@ -738,37 +816,38 @@ pub fn extract_all_access_units(
                                 false
                             };
 
-                             if is_new_frame {
-                                 if in_frame && !current_au_data.is_empty() {
-                                      access_units.push(AccessUnit {
-                                          data: current_au_data.clone(),
-                                          slice_offsets: current_slice_offsets.clone(),
-                                          frame_num: current_frame_num,
-                                          pic_order_cnt: current_poc,
-                                          is_idr: current_is_idr,
-                                          is_reference: current_is_reference,
-                                          slice_type: current_slice_type,
-                                          num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                          num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                          ref_pocs: current_ref_pocs.clone(),
-                                          adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
-                                          mmco_commands: current_mmco_commands.clone(),
-                                      });
-                                      current_au_data.clear();
-                                      current_slice_offsets.clear();
-                                      current_mmco_commands.clear();
-                                  }
+                            if is_new_frame {
+                                if in_frame && !current_au_data.is_empty() {
+                                    items.push(ExtractedItem::AccessUnit(AccessUnit {
+                                        data: current_au_data.clone(),
+                                        slice_offsets: current_slice_offsets.clone(),
+                                        frame_num: current_frame_num,
+                                        pic_order_cnt: current_poc,
+                                        is_idr: current_is_idr,
+                                        is_reference: current_is_reference,
+                                        slice_type: current_slice_type,
+                                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                        ref_pocs: current_ref_pocs.clone(),
+                                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                        mmco_commands: current_mmco_commands.clone(),
+                                        no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                                    }));
+                                    current_au_data.clear();
+                                    current_slice_offsets.clear();
+                                    current_mmco_commands.clear();
+                                }
 
-                                   current_is_idr = is_idr_slice;
-                                 current_is_reference = ref_idc != 0;
-                                 current_frame_num = frame_num;
-                                 current_poc = poc;
-                                 current_slice_type = slice_type;
-                                 current_adaptive_ref_pic_marking_mode_flag = adaptive_ref_pic_marking_mode_flag;
-                                 current_mmco_commands = mmco_commands;
+                                current_is_idr = is_idr_slice;
+                                current_is_reference = ref_idc != 0;
+                                current_frame_num = frame_num;
+                                current_poc = poc;
+                                current_slice_type = slice_type;
+                                current_adaptive_ref_pic_marking_mode_flag = adaptive_ref_pic_marking_mode_flag;
+                                current_mmco_commands = mmco_commands;
 
-                                 if ref_idc != 0 {
+                                if ref_idc != 0 {
                                     prev_pic_order_cnt_lsb = poc_lsb;
                                     prev_pic_order_cnt_msb = poc_msb;
                                     prev_frame_num = frame_num;
@@ -814,6 +893,7 @@ pub fn extract_all_access_units(
                             slice_num_delta_pocs,
                             slice_short_term_ref_pic_set_sps_flag,
                             slice_ref_pocs,
+                            slice_no_output_of_prior_pics_flag,
                         )) = parse_h265_slice_header(
                             nal_data,
                             h265_sps,
@@ -833,36 +913,38 @@ pub fn extract_all_access_units(
                                 false
                             };
 
-                             if is_new_frame {
-                                 if in_frame && !current_au_data.is_empty() {
-                                      access_units.push(AccessUnit {
-                                          data: current_au_data.clone(),
-                                          slice_offsets: current_slice_offsets.clone(),
-                                          frame_num: current_frame_num,
-                                          pic_order_cnt: current_poc,
-                                          is_idr: current_is_idr,
-                                          is_reference: current_is_reference,
-                                          slice_type: current_slice_type,
-                                          num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                          num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                                          short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                          ref_pocs: current_ref_pocs.clone(),
-                                          adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
-                                          mmco_commands: current_mmco_commands.clone(),
-                                      });
-                                      current_au_data.clear();
-                                      current_slice_offsets.clear();
-                                      current_mmco_commands.clear();
-                                  }
+                            if is_new_frame {
+                                if in_frame && !current_au_data.is_empty() {
+                                    items.push(ExtractedItem::AccessUnit(AccessUnit {
+                                        data: current_au_data.clone(),
+                                        slice_offsets: current_slice_offsets.clone(),
+                                        frame_num: current_frame_num,
+                                        pic_order_cnt: current_poc,
+                                        is_idr: current_is_idr,
+                                        is_reference: current_is_reference,
+                                        slice_type: current_slice_type,
+                                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                        ref_pocs: current_ref_pocs.clone(),
+                                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                        mmco_commands: current_mmco_commands.clone(),
+                                        no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                                    }));
+                                    current_au_data.clear();
+                                    current_slice_offsets.clear();
+                                    current_mmco_commands.clear();
+                                }
 
-                                  current_is_idr = slice_is_idr;
-                                 current_is_reference = slice_is_reference;
+                                current_is_idr = slice_is_idr;
+                                current_is_reference = slice_is_reference;
                                 current_poc = poc;
                                 current_slice_type = slice_type;
                                 current_num_bits_for_st_ref_pic_set_in_slice = slice_num_bits_strps;
                                 current_num_delta_pocs_of_ref_rps_idx = slice_num_delta_pocs;
                                 current_short_term_ref_pic_set_sps_flag = slice_short_term_ref_pic_set_sps_flag;
                                 current_ref_pocs = slice_ref_pocs;
+                                current_no_output_of_prior_pics_flag = slice_no_output_of_prior_pics_flag;
                                 prev_frame_num += 1;
                                 current_frame_num = prev_frame_num;
 
@@ -902,24 +984,25 @@ pub fn extract_all_access_units(
 
             if is_new_frame && codec != VideoCodec::H264 {
                 if in_frame && !current_au_data.is_empty() {
-                                         access_units.push(AccessUnit {
-                                             data: current_au_data.clone(),
-                                             slice_offsets: current_slice_offsets.clone(),
-                                             frame_num: current_frame_num,
-                                             pic_order_cnt: current_poc,
-                                             is_idr: current_is_idr,
-                                             is_reference: current_is_reference,
-                                             slice_type: current_slice_type,
-                                             num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                             num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                                             short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
-                                             ref_pocs: current_ref_pocs.clone(),
-                                             adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
-                                             mmco_commands: current_mmco_commands.clone(),
-                                         });
-                     current_au_data.clear();
-                     current_slice_offsets.clear();
-                     current_mmco_commands.clear();
+                    items.push(ExtractedItem::AccessUnit(AccessUnit {
+                        data: current_au_data.clone(),
+                        slice_offsets: current_slice_offsets.clone(),
+                        frame_num: current_frame_num,
+                        pic_order_cnt: current_poc,
+                        is_idr: current_is_idr,
+                        is_reference: current_is_reference,
+                        slice_type: current_slice_type,
+                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
+                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                        ref_pocs: current_ref_pocs.clone(),
+                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                        mmco_commands: current_mmco_commands.clone(),
+                        no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                    }));
+                    current_au_data.clear();
+                    current_slice_offsets.clear();
+                    current_mmco_commands.clear();
                 }
 
                 if codec == VideoCodec::H264 && sps.is_none() {
@@ -966,7 +1049,7 @@ pub fn extract_all_access_units(
     }
 
     if in_frame && !current_au_data.is_empty() {
-        access_units.push(AccessUnit {
+        items.push(ExtractedItem::AccessUnit(AccessUnit {
             data: current_au_data,
             slice_offsets: current_slice_offsets,
             frame_num: current_frame_num,
@@ -980,10 +1063,124 @@ pub fn extract_all_access_units(
             ref_pocs: current_ref_pocs,
             adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
             mmco_commands: current_mmco_commands,
-        });
+            no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+        }));
     }
 
-    access_units
+    items
+}
+
+/// Parse H.264 in-band SPS/PPS from NAL unit data.
+fn parse_h264_inband_params(
+    nal_data: &[u8],
+    nal_type: usize,
+    seen_sps_ids: &std::collections::HashSet<u32>,
+    seen_pps_ids: &std::collections::HashSet<u32>,
+) -> Option<InBandParameterSet> {
+    use vk_video_parser::{h264::H264Parser, ParseResult};
+
+    if nal_data.is_empty() {
+        return None;
+    }
+
+    let mut parser = H264Parser::new();
+    if parser.init(&DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH264)).is_err() {
+        return None;
+    }
+
+    let packet = BitstreamPacket::new(nal_data.to_vec());
+    let mut vps: Option<H265VpsOpt> = None;
+    let mut sps: Option<H264OrH265Sps> = None;
+    let mut pps: Option<H264OrH265Pps> = None;
+
+    match parser.parse(&packet) {
+        Ok(ParseResult::ParameterSet { sps: s, pps: p, .. }) => {
+            if let Some(s) = s {
+                if let Some(h264_sps) = s.downcast_ref::<vk_video_core::picture::H264Sps>() {
+                    // Only report if this is a new SPS ID
+                    if !seen_sps_ids.contains(&(h264_sps.seq_parameter_set_id as u32)) {
+                        sps = Some(H264OrH265Sps::H264(h264_sps.clone()));
+                    }
+                }
+            }
+            if let Some(p) = p {
+                if let Some(h264_pps) = p.downcast_ref::<vk_video_core::picture::H264Pps>() {
+                    // Only report if this is a new PPS ID
+                    if !seen_pps_ids.contains(&(h264_pps.pic_parameter_set_id as u32)) {
+                        pps = Some(H264OrH265Pps::H264(h264_pps.clone()));
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    if sps.is_some() || pps.is_some() {
+        Some(InBandParameterSet { vps, sps, pps })
+    } else {
+        None
+    }
+}
+
+/// Parse H.265 in-band VPS/SPS/PPS from NAL unit data.
+fn parse_h265_inband_params(
+    nal_data: &[u8],
+    nal_type: usize,
+    seen_vps_ids: &std::collections::HashSet<u32>,
+    seen_sps_ids: &std::collections::HashSet<u32>,
+    seen_pps_ids: &std::collections::HashSet<u32>,
+) -> Option<InBandParameterSet> {
+    use vk_video_parser::{h265::H265Parser, ParseResult};
+
+    if nal_data.is_empty() {
+        return None;
+    }
+
+    let mut parser = H265Parser::new();
+    if parser.init(&DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH265)).is_err() {
+        return None;
+    }
+
+    let packet = BitstreamPacket::new(nal_data.to_vec());
+    let mut vps: Option<H265VpsOpt> = None;
+    let mut sps: Option<H264OrH265Sps> = None;
+    let mut pps: Option<H264OrH265Pps> = None;
+
+    match parser.parse(&packet) {
+        Ok(ParseResult::ParameterSet { vps: v, sps: s, pps: p, .. }) => {
+            if let Some(v) = v {
+                if let Some(h265_vps) = v.downcast_ref::<vk_video_core::picture::H265Vps>() {
+                    // Only report if this is a new VPS ID
+                    if !seen_vps_ids.contains(&(h265_vps.vps_video_parameter_set_id as u32)) {
+                        vps = Some(H265VpsOpt::H265(h265_vps.clone()));
+                    }
+                }
+            }
+            if let Some(s) = s {
+                if let Some(h265_sps) = s.downcast_ref::<vk_video_core::picture::H265Sps>() {
+                    // Only report if this is a new SPS ID
+                    if !seen_sps_ids.contains(&(h265_sps.sps_seq_parameter_set_id as u32)) {
+                        sps = Some(H264OrH265Sps::H265(h265_sps.clone()));
+                    }
+                }
+            }
+            if let Some(p) = p {
+                if let Some(h265_pps) = p.downcast_ref::<vk_video_core::picture::H265Pps>() {
+                    // Only report if this is a new PPS ID
+                    if !seen_pps_ids.contains(&(h265_pps.pps_pic_parameter_set_id as u32)) {
+                        pps = Some(H264OrH265Pps::H265(h265_pps.clone()));
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    if vps.is_some() || sps.is_some() || pps.is_some() {
+        Some(InBandParameterSet { vps, sps, pps })
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -1008,8 +1205,38 @@ pub fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         return Err("Invalid IVF magic".to_string());
     }
 
+    // Validate version (must be 0)
+    let version = u16::from_le_bytes([data[4], data[5]]);
+    if version != 0 {
+        return Err(format!("Unsupported IVF version: {} (expected 0)", version));
+    }
+
+    // Read header_size from file instead of hardcoding
+    let header_size = u16::from_le_bytes([data[6], data[7]]) as usize;
+    if header_size < 32 || header_size > 256 {
+        return Err(format!("Invalid IVF header_size: {} (expected 32)", header_size));
+    }
+    if data.len() < header_size {
+        return Err("File too small for IVF header".to_string());
+    }
+
+    // Read codec, width, height for logging
+    let codec_bytes = [data[8], data[9], data[10], data[11]];
+    let codec = String::from_utf8_lossy(&codec_bytes);
+    let width = u16::from_le_bytes([data[12], data[13]]);
+    let height = u16::from_le_bytes([data[14], data[15]]);
+    let num_frames = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+
+    log::debug!(
+        "IVF container: codec={}, {}x{}, {} frames",
+        codec,
+        width,
+        height,
+        num_frames
+    );
+
     let mut frames = Vec::new();
-    let mut offset = 32usize;
+    let mut offset = header_size;
 
     while offset < data.len() {
         if offset + 12 > data.len() {

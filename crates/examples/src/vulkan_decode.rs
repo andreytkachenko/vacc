@@ -63,10 +63,23 @@ fn main() {
         }
     };
 
-    println!("\n--- Decode summary ---");
-    println!("Decoded {} frames", frames.len());
+    // Reorder frames from decoding order to presentation order (by POC)
+    // H.264/H.265 use B-frames which are decoded out of order
+    let frames = VideoDecoder::reorder_to_presentation(frames);
 
-    // Save decoded frames as YUV files
+    println!("\n--- Decode summary ---");
+    println!("Decoded {} frames (in presentation order)", frames.len());
+
+    // Print frame info for debugging
+    for (i, frame) in frames.iter().enumerate().take(10) {
+        println!("  Frame {}: POC={}, frame_num={}, is_idr={}, is_ref={}",
+            i, frame.poc, frame.frame_num, frame.is_idr, frame.is_reference);
+    }
+    if frames.len() > 10 {
+        println!("  ... and {} more frames", frames.len() - 10);
+    }
+
+    // Save decoded frames as YUV files (in presentation order)
     let stem = std::path::Path::new(bitstream_path)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())

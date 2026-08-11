@@ -1,6 +1,7 @@
 //! Helpers for creating Vulkan resources with VkVideoProfileListInfoKHR pNext chains.
 
 use ash::vk::{self, Handle};
+use super::vp9::vp9_vk_constants;
 use super::{device::VideoCodec, buffer::BitstreamBuffer, VideoError, VideoResult};
 
 /// Create an output image with VkVideoProfileListInfoKHR in the pNext chain.
@@ -103,6 +104,8 @@ fn create_image_with_profile_chain(
             &h265_profile as *const _ as *const std::ffi::c_void
         }
         VideoCodec::DecodeVp9 => {
+            vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+            vp9_profile.p_next = std::ptr::null();
             vp9_profile.std_profile = profile_idc;
             &vp9_profile as *const _ as *const std::ffi::c_void
         }
@@ -130,7 +133,7 @@ fn create_image_with_profile_chain(
     let image_create_info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         p_next: &profile_list as *const _ as *const _,
-        flags: vk::ImageCreateFlags::empty(),
+        flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
         image_type: vk::ImageType::TYPE_2D,
         format,
         extent: vk::Extent3D {
@@ -189,6 +192,8 @@ pub fn create_bitstream_buffer_with_profile(
             &h265_profile as *const _ as *const std::ffi::c_void
         }
         VideoCodec::DecodeVp9 => {
+            vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+            vp9_profile.p_next = std::ptr::null();
             vp9_profile.std_profile = profile_idc;
             &vp9_profile as *const _ as *const std::ffi::c_void
         }

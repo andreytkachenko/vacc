@@ -186,6 +186,38 @@ impl VideoDeviceBuilder {
             .engine_name(&engine_name)
             .api_version(api_version);
 
+        // Check available instance layers
+        let available_layers = unsafe {
+            entry.enumerate_instance_layer_properties()
+        }.map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate instance layers: {}", e)))?;
+
+        let available_layer_names: Vec<String> = available_layers
+            .iter()
+            .map(|layer| {
+                let name_bytes: Vec<u8> = layer.layer_name.iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
+                String::from_utf8_lossy(&name_bytes).into_owned()
+            })
+            .collect();
+
+        // Check available instance extensions
+        let available_extensions = unsafe {
+            entry.enumerate_instance_extension_properties(None)
+        }.map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate instance extensions: {}", e)))?;
+
+        let available_ext_names: Vec<String> = available_extensions
+            .iter()
+            .map(|ext| {
+                let name_bytes: Vec<u8> = ext.extension_name.iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
+                String::from_utf8_lossy(&name_bytes).into_owned()
+            })
+            .collect();
+
         let mut instance_extensions: Vec<CString> = vec![
             CString::new("VK_KHR_surface").unwrap(),
             CString::new("VK_KHR_get_physical_device_properties2").unwrap(),
@@ -193,12 +225,22 @@ impl VideoDeviceBuilder {
         let mut layers: Vec<CString> = Vec::new();
         let mut has_validation = false;
         if builder.enable_validation {
-            if let Ok(layer) = CString::new("VK_LAYER_KHRONOS_validation") {
-                layers.push(layer);
+            // Check if validation layer is available
+            let validation_layer = "VK_LAYER_KHRONOS_validation";
+            if available_layer_names.contains(&validation_layer.to_string()) {
+                layers.push(CString::new(validation_layer).unwrap());
                 has_validation = true;
+            } else {
+                eprintln!("[VideoDeviceBuilder] WARNING: Validation layer {} not available", validation_layer);
             }
-            if let Ok(debug_ext) = CString::new("VK_EXT_debug_utils") {
-                instance_extensions.push(debug_ext);
+
+            // Check if debug utils extension is available
+            let debug_ext = "VK_EXT_debug_utils";
+            if available_ext_names.contains(&debug_ext.to_string()) {
+                instance_extensions.push(CString::new(debug_ext).unwrap());
+            } else {
+                eprintln!("[VideoDeviceBuilder] WARNING: Debug extension {} not available", debug_ext);
+                has_validation = false;
             }
         }
         let layer_ptrs: Vec<*const std::os::raw::c_char> =
@@ -222,8 +264,8 @@ impl VideoDeviceBuilder {
         instance: &ash::Instance,
     ) -> VideoResult<vk::DebugUtilsMessengerEXT> {
         unsafe extern "system" fn debug_callback(
-            _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-            _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+            message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+            message_type: vk::DebugUtilsMessageTypeFlagsEXT,
             p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
             _user_data: *mut std::os::raw::c_void,
         ) -> u32 {
@@ -236,7 +278,28 @@ impl VideoDeviceBuilder {
             } else {
                 String::new()
             };
-            eprintln!("[Vulkan Validation] {}", message);
+
+            // Format severity level
+            let severity = if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+                "ERROR"
+            } else if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+                "WARN"
+            } else if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+                "INFO"
+            } else {
+                "VERBOSE"
+            };
+
+            // Format message type
+            let msg_type = if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+                "PERF"
+            } else if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION) {
+                "VALID"
+            } else {
+                "GEN"
+            };
+
+            eprintln!("[Vulkan Validation] [{}] [{}] {}", severity, msg_type, message);
             0 // VK_FALSE - don't abort
         }
 
@@ -611,7 +674,7 @@ impl VulkanDevice {
         })?;
 
         // Build output pNext chain per codec:
-        // VideoCapabilitiesKHR -> VideoDecodeCapabilitiesKHR -> <codec-specific>
+        // VideoCapabilitiesKHR -> <codec-specific> -> VideoDecodeCapabilitiesKHR
         let caps = unsafe {
             type FnType = unsafe extern "system" fn(
                 vk::PhysicalDevice,
@@ -629,27 +692,39 @@ impl VulkanDevice {
             // Decode capabilities (intermediate)
             let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
 
-            // Chain decode_caps -> codec-specific
+            // Chain: codec-specific -> decode_caps
             match codec {
                 VideoCodec::DecodeH264 => {
-                    decode_caps.p_next = &mut h264_caps as *mut _ as *mut _;
+                    h264_caps.p_next = &mut decode_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeH265 => {
-                    decode_caps.p_next = &mut h265_caps as *mut _ as *mut _;
+                    h265_caps.p_next = &mut decode_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeAv1 => {
-                    decode_caps.p_next = &mut av1_caps as *mut _ as *mut _;
+                    av1_caps.p_next = &mut decode_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeVp9 => {
                     vp9_caps.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_CAPABILITIES_KHR);
-                    vp9_caps.p_next = std::ptr::null_mut();
-                    decode_caps.p_next = &mut vp9_caps as *mut _ as *mut _;
+                    vp9_caps.p_next = &mut decode_caps as *mut _ as *mut _;
                 }
             }
 
-            // Top-level capabilities
+            // Top-level capabilities: caps -> codec-specific
             let mut caps = vk::VideoCapabilitiesKHR::default();
-            caps.p_next = &mut decode_caps as *mut _ as *mut _;
+            match codec {
+                VideoCodec::DecodeH264 => {
+                    caps.p_next = &mut h264_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeH265 => {
+                    caps.p_next = &mut h265_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeAv1 => {
+                    caps.p_next = &mut av1_caps as *mut _ as *mut _;
+                }
+                VideoCodec::DecodeVp9 => {
+                    caps.p_next = &mut vp9_caps as *mut _ as *mut _;
+                }
+            }
 
             let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
             if result != vk::Result::SUCCESS {

@@ -40,6 +40,8 @@ pub struct H264Decoder {
     prev_frame_num: u32,
     /// Previous POC LSB.
     prev_pic_order_cnt_lsb: u32,
+    /// Monotonically increasing counter for session parameter updates.
+    update_sequence_count: u32,
 }
 
 impl H264Decoder {
@@ -52,6 +54,7 @@ impl H264Decoder {
             frame_count: 0,
             prev_frame_num: 0,
             prev_pic_order_cnt_lsb: 0,
+            update_sequence_count: 0,
         }
     }
 
@@ -65,7 +68,7 @@ impl H264Decoder {
 
     /// Update session parameters with SPS/PPS data.
     pub fn update_session_parameters(
-        &self,
+        &mut self,
         session_params: vk::VideoSessionParametersKHR,
         sps: Option<&vk_video_core::picture::H264Sps>,
         pps: Option<&vk_video_core::picture::H264Pps>,
@@ -85,10 +88,14 @@ impl H264Decoder {
             _marker: Default::default(),
         };
 
+        // Increment update_sequence_count for each session parameter update.
+        // Vulkan spec: must be monotonically increasing.
+        self.update_sequence_count += 1;
+
         let update_info = vk::VideoSessionParametersUpdateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_UPDATE_INFO_KHR,
             p_next: &add_info as *const _ as *const _,
-            update_sequence_count: 1, // First update must be 1
+            update_sequence_count: self.update_sequence_count,
             _marker: Default::default(),
         };
 
@@ -174,7 +181,7 @@ impl H264Decoder {
                 (frame_num, pic_order_cnt, is_intra, is_reference, is_idr) {
                 (fn_, poc, intra, ref_, idr)
             } else {
-                let sps = self.sps.as_ref().expect("H264 SPS not set before decode");
+                let sps = self.sps.as_ref().ok_or(VideoError::InvalidState("H264 SPS not set before decode".into()))?;
                 let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 as u32 + 4);
                 let computed_frame_num = self.frame_count % max_frame_num;
                 let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
@@ -208,7 +215,7 @@ impl H264Decoder {
             //
             // Matches working example: vulkan_decode.rs lines 4061-4140
 
-            let max_frame_num = 1u32 << (self.sps.as_ref().expect("SPS").log2_max_frame_num_minus4 as u32 + 4);
+            let max_frame_num = 1u32 << (self.sps.as_ref().ok_or(VideoError::InvalidState("H264 SPS not set".into()))?.log2_max_frame_num_minus4 as u32 + 4);
 
             // Build reference slots for begin coding
             //
@@ -406,12 +413,11 @@ impl H264Decoder {
 
             // Barriers AFTER BeginVideoCoding and BEFORE DecodeVideo
             // This matches C++ reference VkVideoDecoder.cpp:1216-1227
-
-            // Bitstream buffer barrier: HOST_WRITE -> VIDEO_DECODE_READ
+            // Bitstream buffer barrier
             let buffer_barrier = vk::BufferMemoryBarrier2 {
                 s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
                 p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::HOST,
+                src_stage_mask: vk::PipelineStageFlags2::NONE,
                 src_access_mask: vk::AccessFlags2::HOST_WRITE,
                 dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
                 dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
@@ -423,6 +429,65 @@ impl H264Decoder {
                 _marker: Default::default(),
             };
 
+            // Output image barrier
+            // Use COLOR aspect (matches C++ reference VkVideoDecoder.cpp:857)
+            // When dpb_setup_picture points to the same image as dstPictureResource,
+            // use VIDEO_DECODE_DPB_KHR layout (per Vulkan spec).
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+
+            let new_layout = if dpb_setup_picture.is_some() {
+                // dpb_setup_picture points to the same image, so use DPB layout
+                vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+            } else {
+                vk::ImageLayout::VIDEO_DECODE_DST_KHR
+            };
+
+            let image_barrier = vk::ImageMemoryBarrier2 {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                p_next: std::ptr::null(),
+                src_stage_mask: vk::PipelineStageFlags2::NONE,
+                src_access_mask: vk::AccessFlags2::NONE,
+                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: output_image,
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout,
+                subresource_range,
+                _marker: Default::default(),
+            };
+
+            // Add barriers for reference images (matches C++ VkVideoDecoder.cpp:1044-1056)
+            let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
+            for ref_pic in dpb_ref_pictures.iter() {
+                // Only add barrier if image is valid and not already in DPB layout
+                if ref_pic.image != vk::Image::null() && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                    all_image_barriers.push(vk::ImageMemoryBarrier2 {
+                        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                        p_next: std::ptr::null(),
+                        src_stage_mask: vk::PipelineStageFlags2::NONE,
+                        src_access_mask: vk::AccessFlags2::empty(),
+                        dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                        dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        image: ref_pic.image,
+                        old_layout: ref_pic.current_layout,
+                        new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                        subresource_range,
+                        _marker: Default::default(),
+                    });
+                }
+            }
+
+            // Single DependencyInfo with ALL barriers (matches C++ VkVideoDecoder.cpp:1229-1240)
             let dep_info = vk::DependencyInfo {
                 s_type: vk::StructureType::DEPENDENCY_INFO,
                 p_next: std::ptr::null(),
@@ -431,120 +496,6 @@ impl H264Decoder {
                 p_memory_barriers: std::ptr::null(),
                 buffer_memory_barrier_count: 1,
                 p_buffer_memory_barriers: &buffer_barrier,
-                image_memory_barrier_count: 0,
-                p_image_memory_barriers: std::ptr::null(),
-                _marker: Default::default(),
-            };
-            self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
-
-            // Output image barrier: UNDEFINED -> VIDEO_DECODE_DPB_KHR
-            // PLANE_0 and PLANE_1 for semi-planar YUV images (G8_B8R8_2PLANE_420_UNORM)
-            // When old_layout is UNDEFINED, src_stage_mask must be NONE
-            let image_barriers = [
-                vk::ImageMemoryBarrier2 {
-                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                    p_next: std::ptr::null(),
-                    src_stage_mask: vk::PipelineStageFlags2::NONE,
-                    src_access_mask: vk::AccessFlags2::NONE,
-                    dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                    dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: output_image,
-                    old_layout: vk::ImageLayout::UNDEFINED,
-                    new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                    subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::PLANE_0,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    _marker: Default::default(),
-                },
-                vk::ImageMemoryBarrier2 {
-                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                    p_next: std::ptr::null(),
-                    src_stage_mask: vk::PipelineStageFlags2::NONE,
-                    src_access_mask: vk::AccessFlags2::NONE,
-                    dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                    dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: output_image,
-                    old_layout: vk::ImageLayout::UNDEFINED,
-                    new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                    subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::PLANE_1,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    _marker: Default::default(),
-                },
-            ];
-
-            // Add barriers for reference images only when layout is not already DPB.
-            // Match C++ reference: srcStageMask=NONE, srcAccessMask=0 for all image barriers.
-            let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = image_barriers.to_vec();
-            for ref_pic in dpb_ref_pictures.iter() {
-                if ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
-                    all_image_barriers.extend([
-                        vk::ImageMemoryBarrier2 {
-                            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                            p_next: std::ptr::null(),
-                            src_stage_mask: vk::PipelineStageFlags2::NONE,
-                            src_access_mask: vk::AccessFlags2::empty(),
-                            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
-                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            image: ref_pic.image,
-                            old_layout: ref_pic.current_layout,
-                            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                            subresource_range: vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::PLANE_0,
-                                base_mip_level: 0,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            _marker: Default::default(),
-                        },
-                        vk::ImageMemoryBarrier2 {
-                            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                            p_next: std::ptr::null(),
-                            src_stage_mask: vk::PipelineStageFlags2::NONE,
-                            src_access_mask: vk::AccessFlags2::empty(),
-                            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
-                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            image: ref_pic.image,
-                            old_layout: ref_pic.current_layout,
-                            new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                            subresource_range: vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::PLANE_1,
-                                base_mip_level: 0,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            _marker: Default::default(),
-                        },
-                    ]);
-                }
-            }
-
-            let dep_info = vk::DependencyInfo {
-                s_type: vk::StructureType::DEPENDENCY_INFO,
-                p_next: std::ptr::null(),
-                dependency_flags: vk::DependencyFlags::BY_REGION,
-                memory_barrier_count: 0,
-                p_memory_barriers: std::ptr::null(),
-                buffer_memory_barrier_count: 0,
-                p_buffer_memory_barriers: std::ptr::null(),
                 image_memory_barrier_count: all_image_barriers.len() as u32,
                 p_image_memory_barriers: all_image_barriers.as_ptr(),
                 _marker: Default::default(),

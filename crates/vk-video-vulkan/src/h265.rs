@@ -37,6 +37,8 @@ pub struct H265Decoder {
     frame_count: u32,
     /// Previous POC LSB.
     prev_pic_order_cnt_lsb: u32,
+    /// Monotonically increasing counter for session parameter updates.
+    update_sequence_count: u32,
 }
 
 impl H265Decoder {
@@ -49,6 +51,7 @@ impl H265Decoder {
             pps: None,
             frame_count: 0,
             prev_pic_order_cnt_lsb: 0,
+            update_sequence_count: 0,
         }
     }
 
@@ -66,7 +69,7 @@ impl H265Decoder {
 
     /// Update session parameters with VPS/SPS/PPS data.
     pub fn update_session_parameters(
-        &self,
+        &mut self,
         session_params: vk::VideoSessionParametersKHR,
         vps: Option<&H265Vps>,
         sps: Option<&H265Sps>,
@@ -90,10 +93,14 @@ impl H265Decoder {
             _marker: Default::default(),
         };
 
+        // Increment update_sequence_count for each session parameter update.
+        // Vulkan spec: must be monotonically increasing.
+        self.update_sequence_count += 1;
+
         let update_info = vk::VideoSessionParametersUpdateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_UPDATE_INFO_KHR,
             p_next: &add_info as *const _ as *const _,
-            update_sequence_count: 1, // First update must be 1
+            update_sequence_count: self.update_sequence_count,
             _marker: Default::default(),
         };
 

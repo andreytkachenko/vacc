@@ -223,6 +223,9 @@ fn main() {
         codec_profile_info: CodecProfileInfo::Vp9 {
             std_profile: use_profile,
         },
+        chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
     };
 
     let std_header_version = build_std_header_version("VK_STD_vulkan_video_codec_vp9_decode");

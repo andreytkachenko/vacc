@@ -4,7 +4,7 @@ use ash::vk::{self, Handle};
 use std::ffi::CString;
 
 use super::{
-    access_unit::{AccessUnit, H264OrH265Pps, H264OrH265Sps, VideoCodec as AccessUnitCodec, Vp9Frame},
+    access_unit::{AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet, VideoCodec as AccessUnitCodec, Vp9Frame},
     buffer::BitstreamBuffer,
     device::{VideoCodec, VulkanDevice},
     dpb::{DpbEntry, DpbManager, LastAccessType},
@@ -156,19 +156,17 @@ impl VideoDecoder {
         let bs_buffer_size_alignment = caps.min_bitstream_buffer_size_alignment;
         let picture_access_granularity = caps.picture_access_granularity;
 
-        // Align coded_extent to picture_access_granularity for VP9.
+        // Align coded_extent to picture_access_granularity.
         // Vulkan requires coded extent to be a multiple of picture_access_granularity.
         // Without this alignment, decode writes to a different extent than the image was created with,
         // causing pixel offset artifacts.
-        let coded_extent = if decoded_codec == AccessUnitCodec::Vp9 {
+        let coded_extent = {
             let align_width = picture_access_granularity.width;
             let align_height = picture_access_granularity.height;
             vk::Extent2D {
                 width: (coded_extent.width + align_width - 1) & !(align_width - 1),
                 height: (coded_extent.height + align_height - 1) & !(align_height - 1),
             }
-        } else {
-            coded_extent
         };
 
         let (session, session_params, session_memories) = create_video_session(
@@ -230,7 +228,7 @@ impl VideoDecoder {
             let mut parser = vk_video_parser::vp9::Vp9Parser::new();
             vk_video_parser::VideoParser::init(&mut parser, &vk_video_parser::DetectedVideoFormat::new(
                 vk_video_core::codec::VideoCodec::DecodeVp9,
-            )).ok();
+            )).map_err(|e| VideoError::DecoderInit(format!("VP9 parser init error: {e}")))?;
             Some(parser)
         } else {
             None
@@ -281,8 +279,18 @@ impl VideoDecoder {
         }
     }
 
+    /// Reorder frames from decoding order to presentation order (by POC).
+    ///
+    /// H.264/H.265 use B-frames which are decoded out of order. This method
+    /// sorts frames by their picture order count (POC) for correct display.
+    pub fn reorder_to_presentation(frames: Vec<DecodedFrame>) -> Vec<DecodedFrame> {
+        let mut sorted = frames;
+        sorted.sort_by_key(|f| f.poc);
+        sorted
+    }
+
     fn decode_all_h26x(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
-        let access_units = super::access_unit::extract_all_access_units(
+        let items = super::access_unit::extract_all_access_units(
             self.bitstream_data(),
             self.decoded_codec,
             max_frames,
@@ -290,132 +298,212 @@ impl VideoDecoder {
             self.parsed.pps.as_ref(),
         );
 
-        if access_units.is_empty() {
+        if items.is_empty() {
             return Err(VideoError::DecoderInit("No access units found".to_string()));
         }
 
         let mut frames = Vec::new();
         let mut is_first_frame = true;
+        let mut access_unit_count = 0;
 
-        for (frame_idx, au) in access_units.iter().enumerate().take(max_frames) {
-            self.bs_buffer.write(&au.data)?;
+        for item in items.iter().take(max_frames * 2) {
+            match item {
+                ExtractedItem::ParameterSet(ps) => {
+                    // Handle in-band parameter set update
+                    self.handle_inband_parameter_set(ps)?;
+                }
+                ExtractedItem::AccessUnit(au) => {
+                    if access_unit_count >= max_frames {
+                        break;
+                    }
+                    access_unit_count += 1;
 
-            let alignment = self.bs_buffer_size_alignment.max(1);
-            let aligned_size = ((au.data.len() as u64 + alignment - 1) & !(alignment - 1)).max(alignment);
-            let padding_start = au.data.len() as u64;
-            let padding_size = aligned_size - padding_start;
-            if padding_size > 0 {
-                self.bs_buffer.zero_range(padding_start, padding_size);
-            }
-            self.bs_buffer.flush_range(0, aligned_size).ok();
+                    self.bs_buffer.write(&au.data)?;
 
-            let output_slot = if au.is_idr {
-                self.dpb_manager.invalidate_all();
-                0
-            } else {
-                // For H.264: ref_pocs from access_unit is empty (no RPS concept).
-                // Use all valid DPB entries as protected references since any could be needed.
-                // For H.265: use ref_pocs from RPS parsing.
-                let protected_pocs: Vec<i32> = if self.decoded_codec == AccessUnitCodec::H264 {
+                    let alignment = self.bs_buffer_size_alignment.max(1);
+                    let aligned_size = ((au.data.len() as u64 + alignment - 1) & !(alignment - 1)).max(alignment);
+                    let padding_start = au.data.len() as u64;
+                    let padding_size = aligned_size - padding_start;
+                    if padding_size > 0 {
+                        self.bs_buffer.zero_range(padding_start, padding_size);
+                    }
+                    self.bs_buffer.flush_range(0, aligned_size).ok();
+
+                    let output_slot = if au.is_idr || au.no_output_of_prior_pics_flag {
+                        self.dpb_manager.invalidate_all();
+                        0
+                    } else {
+                        // For H.264: ref_pocs from access_unit is empty (no RPS concept).
+                        // Use all valid DPB entries as protected references since any could be needed.
+                        // For H.265: use ref_pocs from RPS parsing.
+                        let protected_pocs: Vec<i32> = if self.decoded_codec == AccessUnitCodec::H264 {
+                            self.dpb_manager
+                                .entries
+                                .iter()
+                                .filter(|e| e.is_valid)
+                                .flat_map(|e| {
+                                    if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
+                                        vec![e.pic_order_cnt[0]]
+                                    } else {
+                                        vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            au.ref_pocs.clone()
+                        };
+                        self.dpb_manager
+                            .find_or_recycle_slot(&protected_pocs)
+                            .unwrap_or(0)
+                    };
+
+                    let output_view = self.dpb_views[output_slot as usize];
+                    let output_img = self.dpb_images[output_slot as usize];
+
+                    let actual_bs_size = aligned_size;
+
+                    self.record_decode_command(
+                        au,
+                        output_view,
+                        output_img,
+                        actual_bs_size,
+                        output_slot,
+                        is_first_frame,
+                    )?;
+
+                    if is_first_frame {
+                        is_first_frame = false;
+                        self.decoder_reset_done = true;
+                    }
+
                     self.dpb_manager
-                        .entries
-                        .iter()
-                        .filter(|e| e.is_valid)
-                        .flat_map(|e| {
-                            if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
-                                vec![e.pic_order_cnt[0]]
-                            } else {
-                                vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
-                            }
-                        })
-                        .collect()
-                } else {
-                     au.ref_pocs.clone()
-                };
-                self.dpb_manager
-                    .find_or_recycle_slot(&protected_pocs)
-                    .unwrap_or(0)
-            };
+                        .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                    self.dpb_manager
+                        .set_slot_last_access(output_slot, LastAccessType::DecodeWrite);
 
-            let output_view = self.dpb_views[output_slot as usize];
-            let output_img = self.dpb_images[output_slot as usize];
+                    // Always update DPB entry for reference frames, regardless of MMCO flag.
+                    // When adaptive_ref_pic_marking_mode_flag is true, MMCO commands are present
+                    // in the bitstream and take precedence over sliding window.
+                    // When false, sliding window handles cleanup.
+                    if au.is_reference {
+                        self.dpb_manager.entries[output_slot as usize] = DpbEntry {
+                            frame_num: au.frame_num,
+                            pic_order_cnt: au.pic_order_cnt,
+                            slot_index: output_slot,
+                            is_valid: true,
+                            image_view: self.dpb_views[output_slot as usize],
+                            image: self.dpb_images[output_slot as usize],
+                            current_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                            last_access: LastAccessType::DecodeWrite,
+                        };
 
-            let actual_bs_size = aligned_size;
+                        // Apply reference picture marking AFTER updating the current frame's DPB entry.
+                        // When adaptive_ref_pic_marking_mode_flag is true, use MMCO commands.
+                        // When false, use sliding window.
+                        if au.adaptive_ref_pic_marking_mode_flag && !au.mmco_commands.is_empty() {
+                            self.dpb_manager.apply_mmco(au.frame_num, output_slot, &au.mmco_commands);
+                        } else {
+                            self.dpb_manager.apply_sliding_window(au.frame_num);
+                        }
+                    }
 
-            self.record_decode_command(
-                au,
-                output_view,
-                output_img,
-                actual_bs_size,
-                output_slot,
-                is_first_frame,
-            )?;
+                    let pixels = super::readback::readback_decoded_image(
+                        &self.vulkan.instance,
+                        &self.vulkan.device,
+                        &self.vulkan.memory_properties,
+                        self.decode_queue_family,
+                        self.command_pool,
+                        self.fence,
+                        output_img,
+                        self.coded_extent.width,
+                        self.coded_extent.height,
+                    )?;
 
-            if is_first_frame {
-                is_first_frame = false;
-                self.decoder_reset_done = true;
-            }
+                    self.dpb_manager
+                        .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                    self.dpb_manager
+                        .set_slot_last_access(output_slot, LastAccessType::TransferRead);
 
-            self.dpb_manager
-                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
-            self.dpb_manager
-                .set_slot_last_access(output_slot, LastAccessType::DecodeWrite);
-
-            // Always update DPB entry for reference frames, regardless of MMCO flag.
-            // When adaptive_ref_pic_marking_mode_flag is true, MMCO commands are present
-            // in the bitstream and take precedence over sliding window.
-            // When false, sliding window handles cleanup.
-            if au.is_reference {
-                self.dpb_manager.entries[output_slot as usize] = DpbEntry {
-                    frame_num: au.frame_num,
-                    pic_order_cnt: au.pic_order_cnt,
-                    slot_index: output_slot,
-                    is_valid: true,
-                    image_view: self.dpb_views[output_slot as usize],
-                    image: self.dpb_images[output_slot as usize],
-                    current_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                    last_access: LastAccessType::DecodeWrite,
-                };
-
-                // Apply reference picture marking AFTER updating the current frame's DPB entry.
-                // When adaptive_ref_pic_marking_mode_flag is true, use MMCO commands.
-                // When false, use sliding window.
-                if au.adaptive_ref_pic_marking_mode_flag && !au.mmco_commands.is_empty() {
-                    self.dpb_manager.apply_mmco(au.frame_num, output_slot, &au.mmco_commands);
-                } else {
-                    self.dpb_manager.apply_sliding_window(au.frame_num);
+                    frames.push(DecodedFrame {
+                        poc: au.pic_order_cnt[0],
+                        frame_num: au.frame_num,
+                        is_idr: au.is_idr,
+                        is_reference: au.is_reference,
+                        pixels,
+                        coded_width: self.coded_extent.width,
+                        coded_height: self.coded_extent.height,
+                    });
                 }
             }
-
-            let pixels = super::readback::readback_decoded_image(
-                &self.vulkan.instance,
-                &self.vulkan.device,
-                &self.vulkan.memory_properties,
-                self.decode_queue_family,
-                self.command_pool,
-                self.fence,
-                output_img,
-                self.coded_extent.width,
-                self.coded_extent.height,
-            )?;
-
-            self.dpb_manager
-                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
-            self.dpb_manager
-                .set_slot_last_access(output_slot, LastAccessType::TransferRead);
-
-            frames.push(DecodedFrame {
-                poc: au.pic_order_cnt[0],
-                frame_num: au.frame_num,
-                is_idr: au.is_idr,
-                is_reference: au.is_reference,
-                pixels,
-                coded_width: self.coded_extent.width,
-                coded_height: self.coded_extent.height,
-            });
         }
 
         Ok(frames)
+    }
+
+    /// Handle in-band parameter set updates.
+    /// Updates cached parameter sets and calls vkUpdateVideoSessionParametersKHR.
+    fn handle_inband_parameter_set(&mut self, ps: &InBandParameterSet) -> VideoResult<()> {
+        if ps.vps.is_none() && ps.sps.is_none() && ps.pps.is_none() {
+            return Ok(());
+        }
+
+        // Update cached parameter sets
+        if let Some(ref vps_opt) = ps.vps {
+            if let H265VpsOpt::H265(vps) = vps_opt {
+                self.parsed.vps = Some(vps.clone());
+            }
+        }
+        if let Some(ref sps) = ps.sps {
+            self.parsed.sps = Some(sps.clone());
+        }
+        if let Some(ref pps) = ps.pps {
+            self.parsed.pps = Some(pps.clone());
+        }
+
+        // Call update_session_parameters with the new parameter sets
+        let session_params = match &self.session_params {
+            Some(p) => p.handle(),
+            None => return Ok(()), // No session params to update
+        };
+
+        match self.codec {
+            VideoCodec::DecodeH264 => {
+                let sps_ref = match &self.parsed.sps {
+                    Some(H264OrH265Sps::H264(s)) => Some(s),
+                    _ => None,
+                };
+                let pps_ref = match &self.parsed.pps {
+                    Some(H264OrH265Pps::H264(p)) => Some(p),
+                    _ => None,
+                };
+
+                let mut h264_decoder = H264Decoder::new(
+                    self.vulkan.device.clone(),
+                    self.vulkan.instance.clone(),
+                );
+                h264_decoder.update_session_parameters(session_params, sps_ref, pps_ref)?;
+            }
+            VideoCodec::DecodeH265 => {
+                let vps_ref = self.parsed.vps.as_ref();
+                let sps_ref = match &self.parsed.sps {
+                    Some(H264OrH265Sps::H265(s)) => Some(s),
+                    _ => None,
+                };
+                let pps_ref = match &self.parsed.pps {
+                    Some(H264OrH265Pps::H265(p)) => Some(p),
+                    _ => None,
+                };
+
+                let mut h265_decoder = H265Decoder::new(
+                    self.vulkan.device.clone(),
+                    self.vulkan.instance.clone(),
+                );
+                h265_decoder.update_session_parameters(session_params, vps_ref, sps_ref, pps_ref)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     fn decode_all_vp9(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
@@ -1184,27 +1272,29 @@ fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
             let sub_width_c = 1u32 << log2_sub_width_c;
             let sub_height_c = 1u32 << log2_sub_height_c;
 
+            let ctb_size = 1u32 << (s.log2_min_luma_coding_block_size_minus3 as u32 + 3);
+
             let pic_width = s.pic_width_in_luma_samples as u32;
             let pic_height = s.pic_height_in_luma_samples as u32;
 
             let (crop_left, crop_top) = if s.conformance_window_flag {
                 (
-                    s.conf_win_left_offset * sub_width_c,
-                    s.conf_win_top_offset * sub_height_c,
+                    s.conf_win_left_offset * ctb_size,
+                    s.conf_win_top_offset * ctb_size,
                 )
             } else {
                 (0, 0)
             };
 
             let display_width = if s.conformance_window_flag {
-                let left_right = (s.conf_win_left_offset + s.conf_win_right_offset) * sub_width_c;
+                let left_right = (s.conf_win_left_offset + s.conf_win_right_offset) * ctb_size;
                 pic_width.saturating_sub(left_right)
             } else {
                 pic_width
             };
 
             let display_height = if s.conformance_window_flag {
-                let top_bottom = (s.conf_win_top_offset + s.conf_win_bottom_offset) * sub_height_c;
+                let top_bottom = (s.conf_win_top_offset + s.conf_win_bottom_offset) * ctb_size;
                 pic_height.saturating_sub(top_bottom)
             } else {
                 pic_height
@@ -1302,6 +1392,9 @@ fn create_video_session(
         max_active_reference_pictures: max_dpb_slots,
         codec,
         codec_profile_info,
+        chroma_subsampling: parsed.chroma_subsampling,
+        luma_bit_depth: parsed.luma_bit_depth,
+        chroma_bit_depth: parsed.chroma_bit_depth,
     };
 
     let std_header_version = build_std_header_version(std_header_name);
@@ -1476,7 +1569,7 @@ fn extract_max_au_size(
     max_frames: usize,
     parsed: &ParsedInfo,
 ) -> usize {
-    let access_units = super::access_unit::extract_all_access_units(
+    let items = super::access_unit::extract_all_access_units(
         data,
         codec,
         max_frames,
@@ -1484,9 +1577,15 @@ fn extract_max_au_size(
         parsed.pps.as_ref(),
     );
 
-    access_units
+    items
         .iter()
-        .map(|au| au.data.len())
+        .filter_map(|item| {
+            if let ExtractedItem::AccessUnit(au) = item {
+                Some(au.data.len())
+            } else {
+                None
+            }
+        })
         .max()
         .unwrap_or(0)
 }

@@ -36,6 +36,9 @@ pub struct VideoSessionParams {
     pub max_active_reference_pictures: u32,
     pub codec: VideoCodec,
     pub codec_profile_info: CodecProfileInfo,
+    pub chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+    pub luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    pub chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
 }
 
 /// A Vulkan video session.
@@ -242,9 +245,9 @@ impl VideoSession {
             s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
             p_next: profile_next as *const _,
             video_codec_operation: codec_op,
-            chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-            chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            chroma_subsampling: params.chroma_subsampling,
+            luma_bit_depth: params.luma_bit_depth,
+            chroma_bit_depth: params.chroma_bit_depth,
             _marker: Default::default(),
         };
 
