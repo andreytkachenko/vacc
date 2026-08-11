@@ -116,6 +116,105 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
+    /// Read an unsigned variable-length coded integer (uvlc) per AV1 spec 4.10.3.
+    ///
+    /// Format: leading_zeroes zeros, then a one bit, then leading_zeroes value bits.
+    /// Value = 2^leading_zeroes - 1 + value_bits.
+    pub fn read_uvlc(&mut self) -> Result<u32, ParserError> {
+        let mut leading_zeroes = 0u8;
+
+        loop {
+            let done = self.read_bits(1)? != 0;
+            if done {
+                break;
+            }
+            leading_zeroes += 1;
+        }
+
+        if leading_zeroes >= 32 {
+            return Ok(u32::MAX);
+        }
+
+        let value = self.read_bits(leading_zeroes)?;
+        Ok(value + (1u32 << leading_zeroes) - 1)
+    }
+
+    /// Read a little-endian base-128 encoded integer (leb128) per AV1 spec 4.10.5.
+    ///
+    /// Each byte has 7 data bits and a continuation bit (MSB).
+    /// Returns the decoded value.
+    pub fn read_leb128(&mut self) -> Result<u32, ParserError> {
+        let mut value = 0u64;
+
+        for i in 0..8 {
+            let byte = self.read_bits(8)? as u64;
+            value |= (byte & 0x7F) << (i * 7);
+
+            if (byte & 0x80) == 0 {
+                return Ok(value as u32);
+            }
+        }
+
+        Err(ParserError::InvalidBitstream)
+    }
+
+    /// Get current bit position in the stream.
+    pub fn position(&self) -> u64 {
+        (self.pos as u64) * 8 - (8 - self.bits_left) as u64
+    }
+
+    /// Check if there is more data to read.
+    pub fn has_more_data(&self) -> bool {
+        self.pos < self.data.len() || self.bits_left > 0
+    }
+
+    /// Check if there is more RBSP data to read.
+    ///
+    /// Returns false when we've reached the end of meaningful RBSP data
+    /// (at or past the trailing bit and trailing zeros).
+    ///
+    /// RBSP format: data bits + one trailing bit (1) + zero or more padding bits (0).
+    /// We need to detect when remaining bits are just the trailing bit + padding.
+    pub fn has_more_rsbp_data(&self) -> bool {
+        // If we've consumed all bytes, no more data
+        if self.pos >= self.data.len() && self.bits_left == 0 {
+            return false;
+        }
+
+        // Collect all remaining bits from current position to end of data
+        // to check if they match the RBSP ending pattern: 1 followed by all 0s
+        let mut remaining_value: u64 = 0;
+        let mut remaining_bits: u32 = 0;
+
+        // Bits remaining in current byte
+        if self.bits_left > 0 {
+            let mask = (1u8 << self.bits_left) - 1;
+            remaining_value = (self.curr_byte & mask) as u64;
+            remaining_bits = self.bits_left as u32;
+        }
+
+        // Include all subsequent bytes
+        for &byte in &self.data[self.pos..] {
+            remaining_value = (remaining_value << 8) | (byte as u64);
+            remaining_bits += 8;
+        }
+
+        if remaining_bits == 0 {
+            return false;
+        }
+
+        // RBSP ending pattern: 1 followed by all 0s
+        // This means: remaining_value should be a power of 2 (single bit set at the top)
+        // Example: 10000000 (trailing bit + 7 padding bits) = 0x80 = power of 2
+        // Example: 1000000 (trailing bit + 6 padding bits) = 0x40 = power of 2
+        if remaining_value > 0 && (remaining_value & (remaining_value - 1)) == 0 {
+            // Remaining bits are just trailing bit + padding zeros
+            return false;
+        }
+
+        true
+    }
+
     /// Load the next byte into curr_byte, handling EPB if enabled.
     fn load_byte(&mut self) -> Result<(), ParserError> {
         if self.pos >= self.data.len() {

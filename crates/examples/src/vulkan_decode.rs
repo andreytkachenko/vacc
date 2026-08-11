@@ -124,15 +124,40 @@ fn detect_codec(path: &str) -> &'static str {
     }
 }
 
-/// Convert decoded frame to yuv420p planar format.
+/// Convert decoded frame to yuv420p planar format, cropping to the conformance window.
 fn frame_to_yuv420p(frame: &vk_video_vulkan::DecodedFrame) -> Vec<u8> {
-    let mut yuv_data = Vec::with_capacity(
-        frame.pixels.y_plane.len()
-        + frame.pixels.u_plane.len()
-        + frame.pixels.v_plane.len(),
-    );
-    yuv_data.extend_from_slice(&frame.pixels.y_plane);
-    yuv_data.extend_from_slice(&frame.pixels.u_plane);
-    yuv_data.extend_from_slice(&frame.pixels.v_plane);
+    let coded_w = frame.coded_width as usize;
+    let disp_w = frame.display_width as usize;
+    let disp_h = frame.display_height as usize;
+    let crop_x = frame.crop_left as usize;
+    let crop_y = frame.crop_top as usize;
+
+    let y_stride = coded_w;
+    let uv_stride = coded_w / 2;
+    let uv_crop_x = crop_x / 2;
+    let uv_crop_y = crop_y / 2;
+    let uv_disp_w = disp_w / 2;
+    let uv_disp_h = disp_h / 2;
+
+    let mut yuv_data = Vec::with_capacity(disp_w * disp_h + uv_disp_w * uv_disp_h * 2);
+
+    // Crop Y plane
+    for y in crop_y..crop_y + disp_h {
+        let src_start = y * y_stride + crop_x;
+        yuv_data.extend_from_slice(&frame.pixels.y_plane[src_start..src_start + disp_w]);
+    }
+
+    // Crop U plane
+    for y in uv_crop_y..uv_crop_y + uv_disp_h {
+        let src_start = y * uv_stride + uv_crop_x;
+        yuv_data.extend_from_slice(&frame.pixels.u_plane[src_start..src_start + uv_disp_w]);
+    }
+
+    // Crop V plane
+    for y in uv_crop_y..uv_crop_y + uv_disp_h {
+        let src_start = y * uv_stride + uv_crop_x;
+        yuv_data.extend_from_slice(&frame.pixels.v_plane[src_start..src_start + uv_disp_w]);
+    }
+
     yuv_data
 }

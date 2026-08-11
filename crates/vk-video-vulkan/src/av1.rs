@@ -308,25 +308,3 @@ impl Av1Decoder {
         }
     }
 }
-
-fn convert_av1_sps(sps: &vk_video_core::picture::Av1Sps) -> StdVideoAV1SequenceHeader {
-    let mut flags = unsafe { std::mem::zeroed::<StdVideoAV1SequenceHeaderFlags>() };
-    flags.set_reduced_still_picture_header(if sps.reduced_still_picture_header { 1 } else { 0 });
-
-    StdVideoAV1SequenceHeader {
-        flags,
-        seq_profile: 0, // Main profile
-        frame_width_bits_minus_1: 0,
-        frame_height_bits_minus_1: 0,
-        max_frame_width_minus_1: sps.max_frame_width_minus_1,
-        max_frame_height_minus_1: sps.max_frame_height_minus_1,
-        delta_frame_id_length_minus_2: 0,
-        additional_frame_id_length_minus_1: 0,
-        order_hint_bits_minus_1: 0,
-        seq_force_integer_mv: 0,
-        seq_force_screen_content_tools: 0,
-        reserved1: [0; 5],
-        pColorConfig: std::ptr::null(),
-        pTimingInfo: std::ptr::null(),
-    }
-}

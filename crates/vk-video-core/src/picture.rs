@@ -124,8 +124,14 @@ pub struct H264SpsVui {
     pub chroma_sample_loc_type_top_field: u8,
     pub chroma_sample_loc_type_bottom_field: u8,
     // Bitstream restrictions
+    pub motion_vectors_over_pic_boundaries_flag: bool,
+    pub max_bytes_per_pic_denom: u8,
+    pub max_bits_per_mb_denom: u8,
+    pub log2_max_mv_length_horizontal: u8,
+    pub log2_max_mv_length_vertical: u8,
     pub max_num_reorder_frames: u8,
     pub max_dec_frame_buffering: u8,
+    pub pic_struct_present_flag: bool,
 }
 
 impl H264Sps {
@@ -892,6 +898,26 @@ pub struct Av1Sps {
     pub delta_frame_id_length_minus2: u8,
     pub additional_frame_id_length_minus1: u8,
     pub order_hint_bits_minus1: u8,
+    // Timing info (from timing_info_present_flag)
+    pub timing_info_present_flag: bool,
+    pub num_units_in_display_tick: u32,
+    pub time_scale: u32,
+    pub equal_picture_interval: bool,
+    // Decoder model info
+    pub decoder_model_info_present_flag: bool,
+    pub buffer_delay_length_minus_1: u8,
+    // Color config
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub mono_chrome: bool,
+    pub color_description_present: bool,
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub color_range: bool,
+    pub subsampling_x: u8,
+    pub subsampling_y: u8,
+    pub chroma_sample_position: u8,
 }
 
 impl Av1Sps {
@@ -925,6 +951,26 @@ impl Av1Sps {
             delta_frame_id_length_minus2: 0,
             additional_frame_id_length_minus1: 0,
             order_hint_bits_minus1: 0,
+            // Timing info
+            timing_info_present_flag: false,
+            num_units_in_display_tick: 0,
+            time_scale: 0,
+            equal_picture_interval: false,
+            // Decoder model info
+            decoder_model_info_present_flag: false,
+            buffer_delay_length_minus_1: 0,
+            // Color config
+            high_bitdepth: false,
+            twelve_bit: false,
+            mono_chrome: false,
+            color_description_present: false,
+            color_primaries: 2, // BT.709 default
+            transfer_characteristics: 2, // BT.709 default
+            matrix_coefficients: 2, // BT.709 default
+            color_range: false,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            chroma_sample_position: 0,
         }
     }
 }
@@ -1178,6 +1224,8 @@ pub struct Vp9PictureInfo {
     pub tile_cols_log2: u8,
     pub tile_rows_log2: u8,
     pub flags: Vp9PictureInfoFlags,
+    /// Whether this frame is lossless (derived from quantization parameters).
+    pub lossless: bool,
 }
 
 impl Default for Vp9PictureInfo {
@@ -1196,6 +1244,7 @@ impl Default for Vp9PictureInfo {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             flags: Vp9PictureInfoFlags::default(),
+            lossless: false,
         }
     }
 }
@@ -1361,6 +1410,8 @@ pub struct Vp9FrameData {
     pub segmentation: Vp9Segmentation,
     /// Compressed header size (from bitstream).
     pub compressed_header_size: u32,
+    /// Uncompressed header size in bytes (from frame marker to compressed_header_size).
+    pub uncompressed_header_size: u32,
     /// Offset to uncompressed header in bitstream buffer.
     pub uncompressed_header_offset: u32,
     /// Offset to compressed header in bitstream buffer.
@@ -1393,6 +1444,7 @@ impl Default for Vp9FrameData {
             loop_filter: Vp9LoopFilter::default(),
             segmentation: Vp9Segmentation::default(),
             compressed_header_size: 0,
+            uncompressed_header_size: 0,
             uncompressed_header_offset: 0,
             compressed_header_offset: 0,
             tiles_offset: 0,

@@ -171,8 +171,26 @@ impl H265Parser {
             for matrix_id in 0..matrix_count {
                 let scaling_list_pred_mode_flag = r.read_bit()?;
                 if !scaling_list_pred_mode_flag {
-                    // Predicted from another matrix - skip pred_matrix_id_delta
-                    let _ = r.read_ue()?;
+                    // Predicted from another matrix (scaling_list_pred_mode_flag == 0)
+                    // Per H.265 spec 7.3.4.2: predMatrixId = matrixId + scaling_list_pred_matrix_id_delta
+                    let scaling_list_pred_matrix_id_delta = r.read_ue()? as i32;
+                    let pred_matrix_id = ((matrix_id as i32) + scaling_list_pred_matrix_id_delta) as usize;
+
+                    // Copy AC coefficients from predicted matrix
+                    match size_id {
+                        0 => scaling_lists.scaling_list_4x4[matrix_id as usize] = scaling_lists.scaling_list_4x4[pred_matrix_id],
+                        1 => scaling_lists.scaling_list_8x8[matrix_id as usize] = scaling_lists.scaling_list_8x8[pred_matrix_id],
+                        2 => scaling_lists.scaling_list_16x16[matrix_id as usize] = scaling_lists.scaling_list_16x16[pred_matrix_id],
+                        3 => scaling_lists.scaling_list_32x32[matrix_id as usize] = scaling_lists.scaling_list_32x32[pred_matrix_id],
+                        _ => {}
+                    }
+
+                    // Copy DC coefficients for 16x16 and 32x32
+                    if size_id == 2 {
+                        scaling_lists.scaling_list_dc_coef_16x16[matrix_id as usize][0] = scaling_lists.scaling_list_dc_coef_16x16[pred_matrix_id][0];
+                    } else if size_id == 3 {
+                        scaling_lists.scaling_list_dc_coef_32x32[matrix_id as usize][0] = scaling_lists.scaling_list_dc_coef_32x32[pred_matrix_id][0];
+                    }
                 } else {
                     let coef_num = (1u32 << (4 + (size_id as u32) * 2)).min(64);
                     let mut next_coef: i32 = 8;
@@ -207,6 +225,94 @@ impl H265Parser {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Parse HRD parameters to advance bitstream position correctly.
+    /// Based on cros-codecs parse_hrd_parameters implementation.
+    /// Per H.265 spec Table 7.3 and 7.4.10.
+    fn parse_hrd_parameters(
+        common_inf_present_flag: bool,
+        max_num_sublayers_minus1: u8,
+        r: &mut BitReader,
+    ) -> ParserResult<()> {
+        let mut nal_hrd_parameters_present_flag = false;
+        let mut vcl_hrd_parameters_present_flag = false;
+        let mut sub_pic_hrd_params_present_flag = false;
+
+        if common_inf_present_flag {
+            nal_hrd_parameters_present_flag = r.read_bit()?;
+            vcl_hrd_parameters_present_flag = r.read_bit()?;
+            if nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag {
+                sub_pic_hrd_params_present_flag = r.read_bit()?;
+                if sub_pic_hrd_params_present_flag {
+                    let _tick_divisor_minus2 = r.read_bits(8)?;
+                    let _du_cpb_removal_delay_increment_length_minus1 = r.read_bits(5)?;
+                    let _sub_pic_cpb_params_in_pic_timing_sei_flag = r.read_bit()?;
+                    let _dpb_output_delay_du_length_minus1 = r.read_bits(5)?;
+                }
+                let _bit_rate_scale = r.read_bits(4)?;
+                let _cpb_size_scale = r.read_bits(4)?;
+                if sub_pic_hrd_params_present_flag {
+                    let _cpb_size_du_scale = r.read_bits(4)?;
+                }
+                let _initial_cpb_removal_delay_length_minus1 = r.read_bits(5)?;
+                let _au_cpb_removal_delay_length_minus1 = r.read_bits(5)?;
+                let _dpb_output_delay_length_minus1 = r.read_bits(5)?;
+            }
+        }
+
+        for i in 0..=max_num_sublayers_minus1 as usize {
+            let fixed_pic_rate_general_flag = r.read_bit()?;
+            let mut fixed_pic_rate_within_cvs_flag = false;
+            if !fixed_pic_rate_general_flag {
+                fixed_pic_rate_within_cvs_flag = r.read_bit()?;
+            }
+            if fixed_pic_rate_within_cvs_flag {
+                let _elemental_duration_in_tc_minus1 = r.read_ue()?;
+            } else {
+                let low_delay_hrd_flag = r.read_bit()?;
+                if !low_delay_hrd_flag {
+                    let cpb_cnt_minus1 = r.read_ue()?;
+                    if nal_hrd_parameters_present_flag {
+                        Self::parse_sublayer_hrd_parameters(
+                            cpb_cnt_minus1 + 1,
+                            sub_pic_hrd_params_present_flag,
+                            r,
+                        )?;
+                    }
+                    if vcl_hrd_parameters_present_flag {
+                        Self::parse_sublayer_hrd_parameters(
+                            cpb_cnt_minus1 + 1,
+                            sub_pic_hrd_params_present_flag,
+                            r,
+                        )?;
+                    }
+                } else {
+                    // low_delay_hrd_flag is true - no sublayer HRD params
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse sublayer HRD parameters.
+    /// Based on cros-codecs parse_sublayer_hrd_parameters.
+    fn parse_sublayer_hrd_parameters(
+        cpb_cnt: u32,
+        sub_pic_hrd_params_present_flag: bool,
+        r: &mut BitReader,
+    ) -> ParserResult<()> {
+        for _ in 0..cpb_cnt {
+            let _bit_rate_value_minus1 = r.read_ue()?;
+            let _cpb_size_value_minus1 = r.read_ue()?;
+            if sub_pic_hrd_params_present_flag {
+                let _cpb_size_du_value_minus1 = r.read_ue()?;
+                let _bit_rate_du_value_minus1 = r.read_ue()?;
+            }
+            let _cbr_flag = r.read_bit()?;
         }
         Ok(())
     }
@@ -444,8 +550,10 @@ impl H265Parser {
 
         let mut vps = vk_video_core::picture::H265Vps::new();
         vps.vps_video_parameter_set_id = r.read_bits(4)? as u8;
-        // vps_reserved_0ffff2_bits (2 bits) - must be equal to 11 (binary) per spec
-        let _ = r.read_bits(2)?;
+        // Per H.265 spec 7.3.2.1:
+        // vps_base_layer_internal_flag(1) + vps_base_layer_available_flag(1)
+        vps.vps_base_layer_internal_flag = r.read_bit()?;
+        vps.vps_base_layer_available_flag = r.read_bit()?;
         vps.vps_max_layers_minus1 = r.read_bits(6)? as u16;
         vps.vps_max_sub_layers_minus1 = r.read_bits(3)? as u8;
         vps.vps_temporal_id_nesting_flag = r.read_bit()?;
@@ -462,7 +570,8 @@ impl H265Parser {
         vps.vps_sub_layer_ordering_info_present_flag = r.read_bit()?;
 
         // DPB management (StdVideoH265DecPicBufMgr)
-        // Per C++: for i = (vps_sub_layer_ordering_info_present_flag ? 0 : vps_max_sub_layers_minus1) to vps_max_sub_layers_minus1
+        // When vps_sub_layer_ordering_info_present_flag=0, DPB params are only specified
+        // for the highest sublayer and MUST be propagated to all lower sublayers (spec NOTE).
         let dpb_start = if vps.vps_sub_layer_ordering_info_present_flag {
             0
         } else {
@@ -472,6 +581,15 @@ impl H265Parser {
             vps.max_dec_pic_buffering_minus1[i] = r.read_ue()? as u8;
             vps.max_num_reorder_pics[i] = r.read_ue()? as u8;
             vps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
+        }
+        // Propagate DPB params from highest sublayer to all lower sublayers when flag=0
+        if !vps.vps_sub_layer_ordering_info_present_flag {
+            let highest = vps.vps_max_sub_layers_minus1 as usize;
+            for i in 0..highest {
+                vps.max_dec_pic_buffering_minus1[i] = vps.max_dec_pic_buffering_minus1[highest];
+                vps.max_num_reorder_pics[i] = vps.max_num_reorder_pics[highest];
+                vps.max_latency_increase_plus1[i] = vps.max_latency_increase_plus1[highest];
+            }
         }
 
         // VPS layer info
@@ -499,18 +617,20 @@ impl H265Parser {
             }
             vps.vps_num_hrd_parameters = r.read_ue()?;
 
-            // Skip HRD parameters (complex nested structure, not needed for Vulkan decode)
-            // C++ parses hrd_parameters for each of vps_num_hrd_parameters
-            // For now we skip them as they're not used for decode
-            for _ in 0..vps.vps_num_hrd_parameters {
-                let _hrd_layer_set_idx = r.read_ue().ok();
-                // Skip HRD sub-parameters
+            // Parse HRD parameters properly to advance bitstream position correctly
+            // Per H.265 spec Table 7.3 and cros-codecs reference implementation
+            for i in 0..vps.vps_num_hrd_parameters {
+                let _hrd_layer_set_idx = r.read_ue()?;
+                if i > 0 {
+                    let _cprms_present_flag = r.read_bit()?;
+                }
+                Self::parse_hrd_parameters(i > 0, vps.vps_max_sub_layers_minus1, &mut r)?;
             }
         }
 
         // vps_extension_flag (only present when vps_max_layers_minus1 > 0)
         if vps.vps_max_layers_minus1 > 0 {
-            vps.vps_extension_flag = r.read_bit().unwrap_or(false);
+            vps.vps_extension_flag = r.read_bit()?;
         }
 
         self.vps_cache.insert(vps.vps_video_parameter_set_id, vps.clone());
@@ -530,8 +650,8 @@ impl H265Parser {
         let sps_max_sub_layers_minus1 = r.read_bits(3)? as u8;
         let sps_temporal_id_nesting_flag = r.read_bit()?;
 
-        // Parse profile_tier_level (SPS: SubLayerLevelPresentFlag=0)
-        let (sps_profile_idc, sps_level_idc, sps_tier_flag) = Self::parse_ptl(&mut r, sps_max_sub_layers_minus1, false)?;
+        // Parse profile_tier_level (SPS: SubLayerLevelPresentFlag=1 per H.265 spec)
+        let (sps_profile_idc, sps_level_idc, sps_tier_flag) = Self::parse_ptl(&mut r, sps_max_sub_layers_minus1, true)?;
 
         let mut sps = vk_video_core::picture::H265Sps::new();
         sps.sps_video_parameter_set_id = sps_video_parameter_set_id;
@@ -570,10 +690,19 @@ impl H265Parser {
         // Read max_dec_pic_buffering_minus1, max_num_reorder_pics, max_latency_increase_plus1
         // for sub-layers [sps_sub_layer_ordering_info_present_flag ? 0 : sps_max_sub_layers_minus1 .. sps_max_sub_layers_minus1]
         let dpb_start = if sps.sps_sub_layer_ordering_info_present_flag { 0 } else { sps_max_sub_layers_minus1 as usize };
-        for i in dpb_start..=(sps_max_sub_layers_minus1 as usize) {
-            sps.max_dec_pic_buffering_minus1[i] = r.read_ue()? as u8;
-            sps.max_num_reorder_pics[i] = r.read_ue()? as u8;
-            sps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
+         for i in dpb_start..=(sps_max_sub_layers_minus1 as usize) {
+             sps.max_dec_pic_buffering_minus1[i] = r.read_ue()? as u8;
+              sps.max_num_reorder_pics[i] = r.read_ue()? as u8;
+              sps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
+          }
+        // Propagate DPB params from highest sublayer to all lower sublayers when flag=0 (spec NOTE)
+        if !sps.sps_sub_layer_ordering_info_present_flag {
+            let highest = sps_max_sub_layers_minus1 as usize;
+            for i in 0..highest {
+                sps.max_dec_pic_buffering_minus1[i] = sps.max_dec_pic_buffering_minus1[highest];
+                sps.max_num_reorder_pics[i] = sps.max_num_reorder_pics[highest];
+                sps.max_latency_increase_plus1[i] = sps.max_latency_increase_plus1[highest];
+            }
         }
 
         // Additional SPS fields (per VulkanH265Parser.cpp:541-562)
@@ -696,9 +825,9 @@ impl H265Parser {
                 }
                 sps.vui.vui_hrd_parameters_present_flag = r.read_bit()?;
                 if sps.vui.vui_hrd_parameters_present_flag {
-                    // Skip hrd_parameters() - complex nested structure
-                    // Matches C++: hrd_parameters(&sps->stdHrdParameters, 1, sps_max_sub_layers_minus1)
-                    // For decode, HRD params are not needed
+                    // Parse HRD parameters to advance bitstream position correctly.
+                    // common_inf_present_flag=1 for VUI HRD params per H.265 spec.
+                    Self::parse_hrd_parameters(true, sps_max_sub_layers_minus1, &mut r)?;
                 }
             }
 
@@ -719,41 +848,29 @@ impl H265Parser {
             // Must consume all sps_extension bits even if not storing values
             // Per H.265 spec: sps_range_extension_flag(1) + sps_multilayer_extension_flag(1) + sps_extension_6bits(6)
             // Then conditional extension data based on flags
-            sps.sps_range_extension_flag = r.read_bit().unwrap_or(false);
-            let sps_multilayer_extension_flag = r.read_bit().unwrap_or(false);
-            let _sps_extension_6bits = r.read_bits(6).unwrap_or(0);
+            sps.sps_range_extension_flag = r.read_bit()?;
+            let sps_multilayer_extension_flag = r.read_bit()?;
+            let _sps_extension_6bits = r.read_bits(6)?;
 
             if sps.sps_range_extension_flag {
                 // Parse range extension flags per H.265 spec Table 7-8
-                // transform_skip_rotation_enabled_flag (16)
-                let _ = r.read_bit().unwrap_or(false);
-                // transform_skip_context_enabled_flag (17)
-                let _ = r.read_bit().unwrap_or(false);
-                // implicit_rdpcm_enabled_flag (18)
-                let _ = r.read_bit().unwrap_or(false);
-                // explicit_rdpcm_enabled_flag (19)
-                let _ = r.read_bit().unwrap_or(false);
-                // extended_precision_processing_flag (20)
-                let _ = r.read_bit().unwrap_or(false);
-                // intra_smoothing_disabled_flag (21)
-                sps.intra_smoothing_disabled_flag = r.read_bit().unwrap_or(false);
-                // high_precision_offsets_enabled_flag (22)
-                let _ = r.read_bit().unwrap_or(false);
-                // persistent_rice_adaptation_enabled_flag (23)
-                let _ = r.read_bit().unwrap_or(false);
-                // cabac_bypass_alignment_enabled_flag (24)
-                let _ = r.read_bit().unwrap_or(false);
-                // sps_scc_extension_flag (25)
-                let sps_scc_extension_flag = r.read_bit().unwrap_or(false);
+                let _ = r.read_bit()?; // transform_skip_rotation_enabled_flag
+                let _ = r.read_bit()?; // transform_skip_context_enabled_flag
+                let _ = r.read_bit()?; // implicit_rdpcm_enabled_flag
+                let _ = r.read_bit()?; // explicit_rdpcm_enabled_flag
+                let _ = r.read_bit()?; // extended_precision_processing_flag
+                sps.intra_smoothing_disabled_flag = r.read_bit()?; // intra_smoothing_disabled_flag
+                let _ = r.read_bit()?; // high_precision_offsets_enabled_flag
+                let _ = r.read_bit()?; // persistent_rice_adaptation_enabled_flag
+                let _ = r.read_bit()?; // cabac_bypass_alignment_enabled_flag
+                let sps_scc_extension_flag = r.read_bit()?; // sps_scc_extension_flag
                 if sps_scc_extension_flag {
-                    // sps_curr_pic_ref_enabled_flag (26)
-                    let _ = r.read_bit().unwrap_or(false);
-                    // palette_mode_enabled_flag (27)
-                    sps.palette_mode_enabled_flag = r.read_bit().unwrap_or(false);
+                    let _ = r.read_bit()?; // sps_curr_pic_ref_enabled_flag
+                    sps.palette_mode_enabled_flag = r.read_bit()?; // palette_mode_enabled_flag
                 }
             }
             if sps_multilayer_extension_flag {
-                let _ = r.read_bit().unwrap_or(false);
+                let _ = r.read_bit()?;
             }
         }
 
@@ -788,89 +905,98 @@ impl H265Parser {
         pps.num_ref_idx_l1_default_active_minus1 = r.read_ue()? as u8;
 
         // pps_init_qp_minus26 (SE(V))
-        pps.pps_init_qp_minus26 = r.read_se().unwrap_or(0);
+        pps.pps_init_qp_minus26 = r.read_se()?;
 
         // Additional PPS fields (per VulkanH265Parser.cpp:762-882)
-        pps.constrained_intra_pred_flag = r.read_bit().unwrap_or(false);
-        pps.transform_skip_enabled_flag = r.read_bit().unwrap_or(false);
-        pps.cu_qp_delta_enabled_flag = r.read_bit().unwrap_or(false);
+        pps.constrained_intra_pred_flag = r.read_bit()?;
+        pps.transform_skip_enabled_flag = r.read_bit()?;
+        pps.cu_qp_delta_enabled_flag = r.read_bit()?;
         if pps.cu_qp_delta_enabled_flag {
-            pps.diff_cu_qp_delta_depth = r.read_ue().unwrap_or(0) as u8;
+            pps.diff_cu_qp_delta_depth = r.read_ue()? as u8;
         }
-        pps.pps_cb_qp_offset = r.read_se().unwrap_or(0) as i8;
-        pps.pps_cr_qp_offset = r.read_se().unwrap_or(0) as i8;
-        pps.pps_slice_chroma_qp_offsets_present_flag = r.read_bit().unwrap_or(false);
-        pps.weighted_pred_flag = r.read_bit().unwrap_or(false);
-        pps.weighted_bipred_flag = r.read_bit().unwrap_or(false);
-        pps.transquant_bypass_enabled_flag = r.read_bit().unwrap_or(false);
-        pps.tiles_enabled_flag = r.read_bit().unwrap_or(false);
-        pps.entropy_coding_sync_enabled_flag = r.read_bit().unwrap_or(false);
+        pps.pps_cb_qp_offset = r.read_se()? as i8;
+        pps.pps_cr_qp_offset = r.read_se()? as i8;
+        pps.pps_slice_chroma_qp_offsets_present_flag = r.read_bit()?;
+        pps.weighted_pred_flag = r.read_bit()?;
+        pps.weighted_bipred_flag = r.read_bit()?;
+        pps.transquant_bypass_enabled_flag = r.read_bit()?;
+        pps.tiles_enabled_flag = r.read_bit()?;
+        pps.entropy_coding_sync_enabled_flag = r.read_bit()?;
 
         if pps.tiles_enabled_flag {
-            pps.num_tile_columns_minus1 = r.read_ue().unwrap_or(0) as u8;
-            pps.num_tile_rows_minus1 = r.read_ue().unwrap_or(0) as u8;
-            pps.uniform_spacing_flag = r.read_bit().unwrap_or(true);
+            pps.num_tile_columns_minus1 = r.read_ue()? as u8;
+            pps.num_tile_rows_minus1 = r.read_ue()? as u8;
+            pps.uniform_spacing_flag = r.read_bit()?;
             if !pps.uniform_spacing_flag {
                 for i in 0..pps.num_tile_columns_minus1 {
-                    pps.column_width_minus1[i as usize] = r.read_ue().unwrap_or(0) as u16;
+                    pps.column_width_minus1[i as usize] = r.read_ue()? as u16;
                 }
                 for i in 0..pps.num_tile_rows_minus1 {
-                    pps.row_height_minus1[i as usize] = r.read_ue().unwrap_or(0) as u16;
+                    pps.row_height_minus1[i as usize] = r.read_ue()? as u16;
                 }
             }
-            pps.loop_filter_across_tiles_enabled_flag = r.read_bit().unwrap_or(false);
+            pps.loop_filter_across_tiles_enabled_flag = r.read_bit()?;
         }
 
-        pps.pps_loop_filter_across_slices_enabled_flag = r.read_bit().unwrap_or(false);
-        pps.deblocking_filter_control_present_flag = r.read_bit().unwrap_or(false);
+        pps.pps_loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        pps.deblocking_filter_control_present_flag = r.read_bit()?;
         if pps.deblocking_filter_control_present_flag {
-            pps.deblocking_filter_override_enabled_flag = r.read_bit().unwrap_or(false);
-            pps.pps_deblocking_filter_disabled_flag = r.read_bit().unwrap_or(false);
+            pps.deblocking_filter_override_enabled_flag = r.read_bit()?;
+            pps.pps_deblocking_filter_disabled_flag = r.read_bit()?;
             if !pps.pps_deblocking_filter_disabled_flag {
-                pps.pps_beta_offset_div2 = r.read_se().unwrap_or(0) as i8;
-                pps.pps_tc_offset_div2 = r.read_se().unwrap_or(0) as i8;
+                pps.pps_beta_offset_div2 = r.read_se()? as i8;
+                pps.pps_tc_offset_div2 = r.read_se()? as i8;
             }
         }
 
-        pps.pps_scaling_list_data_present_flag = r.read_bit().unwrap_or(false);
+        // Get associated SPS for scaling list inheritance
+        let sps = self.sps_cache.get(&pps.pps_seq_parameter_set_id)
+            .ok_or(ParserError::InvalidBitstream)?;
+
+        pps.pps_scaling_list_data_present_flag = r.read_bit()?;
         if pps.pps_scaling_list_data_present_flag {
-            // Skip scaling_list_data - complex structure, not needed for Vulkan decode
+            // Parse scaling_list_data to advance bitstream position correctly
+            Self::parse_scaling_list_data(&mut r, &mut pps.scaling_lists)?;
+        } else if sps.sps_scaling_list_data_present_flag {
+            // Per H.265 spec 7.3.4.2: when pps_scaling_list_data_present_flag is 0
+            // and sps_scaling_list_data_present_flag is 1, PPS scaling lists are
+            // copied from SPS scaling lists.
+            pps.scaling_lists = sps.scaling_lists.clone();
         }
 
-        pps.lists_modification_present_flag = r.read_bit().unwrap_or(false);
-        pps.log2_parallel_merge_level_minus2 = r.read_ue().unwrap_or(0) as u8;
-        pps.slice_segment_header_extension_present_flag = r.read_bit().unwrap_or(false);
-        pps.pps_extension_present_flag = r.read_bit().unwrap_or(false);
+        pps.lists_modification_present_flag = r.read_bit()?;
+        pps.log2_parallel_merge_level_minus2 = r.read_ue()? as u8;
+        pps.slice_segment_header_extension_present_flag = r.read_bit()?;
+        pps.pps_extension_present_flag = r.read_bit()?;
         if pps.pps_extension_present_flag {
             // Parse pps_extension per H.265 spec Table 7.9
-            // Matches C++ pic_parameter_set_rbsp() lines 842-882
-            pps.pps_range_extension_flag = r.read_bit().unwrap_or(false);
-            let pps_multilayer_extension_flag = r.read_bit().unwrap_or(false);
-            let _pps_extension_6bits = r.read_bits(6).unwrap_or(0);
+            pps.pps_range_extension_flag = r.read_bit()?;
+            let pps_multilayer_extension_flag = r.read_bit()?;
+            let _pps_extension_4bits = r.read_bits(4)?;
 
             if pps.pps_range_extension_flag {
                 if pps.transform_skip_enabled_flag {
-                    pps.log2_max_transform_skip_block_size_minus2 = r.read_ue().unwrap_or(0) as u8;
+                    pps.log2_max_transform_skip_block_size_minus2 = r.read_ue()? as u8;
                 }
-                pps.cross_component_prediction_enabled_flag = r.read_bit().unwrap_or(false);
-                pps.chroma_qp_offset_list_enabled_flag = r.read_bit().unwrap_or(false);
+                pps.cross_component_prediction_enabled_flag = r.read_bit()?;
+                pps.chroma_qp_offset_list_enabled_flag = r.read_bit()?;
                 if pps.chroma_qp_offset_list_enabled_flag {
-                    pps.diff_cu_chroma_qp_offset_depth = r.read_ue().unwrap_or(0) as u8;
-                    pps.chroma_qp_offset_list_len_minus1 = r.read_ue().unwrap_or(0) as u8;
+                    pps.diff_cu_chroma_qp_offset_depth = r.read_ue()? as u8;
+                    pps.chroma_qp_offset_list_len_minus1 = r.read_ue()? as u8;
                     for i in 0..=(pps.chroma_qp_offset_list_len_minus1 as usize).min(5) {
-                        pps.cb_qp_offset_list[i] = r.read_se().unwrap_or(0) as i8;
-                        pps.cr_qp_offset_list[i] = r.read_se().unwrap_or(0) as i8;
+                        pps.cb_qp_offset_list[i] = r.read_se()? as i8;
+                        pps.cr_qp_offset_list[i] = r.read_se()? as i8;
                     }
                 }
-                pps.log2_sao_offset_scale_luma = r.read_ue().unwrap_or(0) as u8;
-                pps.log2_sao_offset_scale_chroma = r.read_ue().unwrap_or(0) as u8;
+                pps.log2_sao_offset_scale_luma = r.read_ue()? as u8;
+                pps.log2_sao_offset_scale_chroma = r.read_ue()? as u8;
             }
             if pps_multilayer_extension_flag {
-                let _poc_reset_info_present_flag = r.read_bit().unwrap_or(false);
-                if r.read_bit().unwrap_or(false) { // infer_scaling_list_flag
-                    let _ = r.read_bits(6).ok(); // scaling_list_ref_layer_id
+                let _poc_reset_info_present_flag = r.read_bit()?;
+                if r.read_bit()? { // infer_scaling_list_flag
+                    let _ = r.read_bits(6)?; // scaling_list_ref_layer_id
                 }
-                let _ = r.read_ue().ok(); // num_ref_loc_offsets
+                let _ = r.read_ue()?; // num_ref_loc_offsets
             }
         }
 
@@ -1037,10 +1163,11 @@ impl H265Parser {
 
         // Update prevPicOrderCntMsb/Lsb for non-temporal-id pictures
         // Per VulkanH265Parser.cpp:2792-2798
-        let temporal_id = 0; // Would be from nuh_temporal_id_plus1 - 1
+        // Extract temporal_id from NAL header (nuh_temporal_id_plus1 is in 2nd byte)
+        let temporal_id = (nal_data[1] & 0x07) - 1; // nuh_temporal_id_plus1 - 1
         let is_sub_layer_non_ref = nal_unit_type % 2 == 0; // Even NAL types are non-ref
         if temporal_id == 0
-            && !(nal_unit_type >= 6 && nal_unit_type <= 9) // Not RADL/RASL
+            && !(nal_unit_type >= 6 && nal_unit_type <= 15) // Not RADL/RASL/SLNR
             && !is_sub_layer_non_ref
         {
             self.prev_pic_order_cnt_lsb = info.pic_order_cnt_lsb as i32;
@@ -1068,8 +1195,14 @@ impl H265Parser {
             }
 
             // Long-term reference pictures
-            if sps.long_term_ref_pics_present_flag && sps.num_long_term_ref_pics_sps > 0 {
-                let num_long_term_sps = r.read_ue()? as u8;
+            // Per H.265 spec 7.3.7: num_long_term_sps is read only when long_term_ref_pics_present_flag is true
+            // and num_long_term_ref_pics_sps > 0. num_long_term_pics is always read when long_term_ref_pics_present_flag is true.
+            if sps.long_term_ref_pics_present_flag {
+                let num_long_term_sps = if sps.num_long_term_ref_pics_sps > 0 {
+                    r.read_ue()? as u8
+                } else {
+                    0
+                };
                 let num_long_term_pics = r.read_ue()? as u8;
 
                 for i in 0u8..(num_long_term_sps + num_long_term_pics) {

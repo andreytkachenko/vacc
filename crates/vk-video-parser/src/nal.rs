@@ -18,8 +18,8 @@ pub enum H264NalUnitType {
     StreamEnd = 11,
     FillerData = 12,
     SpsExt = 13,
-    AuxiliaryCodecLayer = 14,
-    CodedSliceExtension = 15,
+    PrefixNalUnit = 14,
+    SubsetSps = 15,
     // 16-23 are reserved
     // 24-31 are undefined
 }
@@ -41,8 +41,8 @@ impl H264NalUnitType {
             11 => Some(Self::StreamEnd),
             12 => Some(Self::FillerData),
             13 => Some(Self::SpsExt),
-            14 => Some(Self::AuxiliaryCodecLayer),
-            15 => Some(Self::CodedSliceExtension),
+            14 => Some(Self::PrefixNalUnit),
+            15 => Some(Self::SubsetSps),
             _ => None,
         }
     }
@@ -98,16 +98,16 @@ pub enum H265NalUnitType {
     /// Coded slice segment of a RASL picture (RASL_R) - reference
     RaslR = 9,
     // 10-15: Reserved or extension types
-    /// Coded slice segment of an IDR picture (IDR_W_RADL) - reference
-    CodNalSliceIdrW = 16,
-    /// Coded slice segment of an IDR picture (IDR_N_LP) - reference
-    CodNalSliceIdrN = 17,
     /// Coded slice segment of a BLA picture (BLA_W_LP) - reference
-    CodNalSliceBlaW = 18,
+    CodNalSliceBlaW = 16,
     /// Coded slice segment of a BLA picture (BLA_W_RADL) - reference
-    CodNalSliceBlaRadl = 19,
+    CodNalSliceBlaRadl = 17,
     /// Coded slice segment of a BLA picture (BLA_N_LP) - reference
-    CodNalSliceBlaN = 20,
+    CodNalSliceBlaN = 18,
+    /// Coded slice segment of an IDR picture (IDR_W_RADL) - reference
+    CodNalSliceIdrW = 19,
+    /// Coded slice segment of an IDR picture (IDR_N_LP) - reference
+    CodNalSliceIdrN = 20,
     /// Coded slice segment of a CRA picture (CRA_NUT) - reference
     CodNalSliceCra = 21,
     // 22-25: Reserved
@@ -152,11 +152,11 @@ impl H265NalUnitType {
             7 => Some(Self::RadlR),
             8 => Some(Self::RaslN),
             9 => Some(Self::RaslR),
-            16 => Some(Self::CodNalSliceIdrW),
-            17 => Some(Self::CodNalSliceIdrN),
-            18 => Some(Self::CodNalSliceBlaW),
-            19 => Some(Self::CodNalSliceBlaRadl),
-            20 => Some(Self::CodNalSliceBlaN),
+            16 => Some(Self::CodNalSliceBlaW),
+            17 => Some(Self::CodNalSliceBlaRadl),
+            18 => Some(Self::CodNalSliceBlaN),
+            19 => Some(Self::CodNalSliceIdrW),
+            20 => Some(Self::CodNalSliceIdrN),
             21 => Some(Self::CodNalSliceCra),
             32 => Some(Self::Vps),
             33 => Some(Self::Sps),

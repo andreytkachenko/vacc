@@ -583,83 +583,51 @@ impl VulkanDevice {
     ) -> VideoResult<vk::VideoCapabilitiesKHR> {
         let codec_op = codec.to_vk_flag();
 
-        // Build profile info chain
-        let profile_ptr: *const vk::VideoProfileInfoKHR = match codec {
-            VideoCodec::DecodeH264 => {
-                let h264_profile = vk::VideoDecodeH264ProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    std_profile_idc: profile_idc,
-                    picture_layout: vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE,
-                    _marker: Default::default(),
-                };
-                let profile_info = vk::VideoProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
-                    p_next: &h264_profile as *const _ as *const _,
-                    video_codec_operation: codec_op,
-                    chroma_subsampling,
-                    luma_bit_depth,
-                    chroma_bit_depth,
-                    _marker: Default::default(),
-                };
-                &profile_info as *const vk::VideoProfileInfoKHR
-            }
-            VideoCodec::DecodeH265 => {
-                let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H265_PROFILE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    std_profile_idc: profile_idc,
-                    _marker: Default::default(),
-                };
-                let profile_info = vk::VideoProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
-                    p_next: &h265_profile as *const _ as *const _,
-                    video_codec_operation: codec_op,
-                    chroma_subsampling,
-                    luma_bit_depth,
-                    chroma_bit_depth,
-                    _marker: Default::default(),
-                };
-                &profile_info as *const vk::VideoProfileInfoKHR
-            }
-            VideoCodec::DecodeAv1 => {
-                let av1_profile = vk::VideoDecodeAV1ProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_AV1_PROFILE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    std_profile: profile_idc,
-                    film_grain_support: 0,
-                    _marker: Default::default(),
-                };
-                let profile_info = vk::VideoProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
-                    p_next: &av1_profile as *const _ as *const _,
-                    video_codec_operation: codec_op,
-                    chroma_subsampling,
-                    luma_bit_depth,
-                    chroma_bit_depth,
-                    _marker: Default::default(),
-                };
-                &profile_info as *const vk::VideoProfileInfoKHR
-            }
-            VideoCodec::DecodeVp9 => {
-                let vp9_profile = VideoDecodeVP9ProfileInfoKHR {
-                    s_type: vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR),
-                    p_next: std::ptr::null(),
-                    std_profile: profile_idc,
-                    _marker: Default::default(),
-                };
-                let profile_info = vk::VideoProfileInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
-                    p_next: &vp9_profile as *const _ as *const _,
-                    video_codec_operation: codec_op,
-                    chroma_subsampling,
-                    luma_bit_depth,
-                    chroma_bit_depth,
-                    _marker: Default::default(),
-                };
-                &profile_info as *const vk::VideoProfileInfoKHR
-            }
+        // Build profile info chain - structs must live for entire function duration
+        // to avoid dangling pointers when passed to Vulkan.
+        let h264_profile = vk::VideoDecodeH264ProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            std_profile_idc: profile_idc,
+            picture_layout: vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE,
+            _marker: Default::default(),
         };
+        let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_H265_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            std_profile_idc: profile_idc,
+            _marker: Default::default(),
+        };
+        let av1_profile = vk::VideoDecodeAV1ProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_AV1_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            std_profile: profile_idc,
+            film_grain_support: 0,
+            _marker: Default::default(),
+        };
+        let vp9_profile = VideoDecodeVP9ProfileInfoKHR {
+            s_type: vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR),
+            p_next: std::ptr::null(),
+            std_profile: profile_idc,
+            _marker: Default::default(),
+        };
+
+        let profile_info = vk::VideoProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+            p_next: match codec {
+                VideoCodec::DecodeH264 => &h264_profile as *const _ as *const _,
+                VideoCodec::DecodeH265 => &h265_profile as *const _ as *const _,
+                VideoCodec::DecodeAv1 => &av1_profile as *const _ as *const _,
+                VideoCodec::DecodeVp9 => &vp9_profile as *const _ as *const _,
+            },
+            video_codec_operation: codec_op,
+            chroma_subsampling,
+            luma_bit_depth,
+            chroma_bit_depth,
+            _marker: Default::default(),
+        };
+        let profile_ptr: *const vk::VideoProfileInfoKHR = &profile_info;
+
         // Get function pointer
         let get_caps_fn = unsafe {
             self.entry.get_instance_proc_addr(

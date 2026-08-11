@@ -30,6 +30,10 @@ pub struct DecodedFrame {
     pub pixels: DecodedPixels,
     pub coded_width: u32,
     pub coded_height: u32,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub crop_left: u32,
+    pub crop_top: u32,
 }
 
 /// Parsed bitstream information.
@@ -302,11 +306,13 @@ impl VideoDecoder {
             return Err(VideoError::DecoderInit("No access units found".to_string()));
         }
 
+        let items: Vec<_> = items.into_iter().take(max_frames * 2).collect();
+
         let mut frames = Vec::new();
         let mut is_first_frame = true;
         let mut access_unit_count = 0;
 
-        for item in items.iter().take(max_frames * 2) {
+        for (idx, item) in items.iter().enumerate() {
             match item {
                 ExtractedItem::ParameterSet(ps) => {
                     // Handle in-band parameter set update
@@ -335,7 +341,8 @@ impl VideoDecoder {
                     } else {
                         // For H.264: ref_pocs from access_unit is empty (no RPS concept).
                         // Use all valid DPB entries as protected references since any could be needed.
-                        // For H.265: use ref_pocs from RPS parsing.
+                        // For H.265: collect ref_pocs from ALL remaining access units to protect
+                        // frames needed by future frames, not just the current one.
                         let protected_pocs: Vec<i32> = if self.decoded_codec == AccessUnitCodec::H264 {
                             self.dpb_manager
                                 .entries
@@ -350,7 +357,16 @@ impl VideoDecoder {
                                 })
                                 .collect()
                         } else {
-                            au.ref_pocs.clone()
+                            // Collect all POCs referenced by current and future access units
+                            let mut all_ref_pocs = std::collections::HashSet::new();
+                            for future_item in items[idx..].iter() {
+                                if let ExtractedItem::AccessUnit(future_au) = future_item {
+                                    for poc in &future_au.ref_pocs {
+                                        all_ref_pocs.insert(*poc);
+                                    }
+                                }
+                            }
+                            all_ref_pocs.into_iter().collect()
                         };
                         self.dpb_manager
                             .find_or_recycle_slot(&protected_pocs)
@@ -432,6 +448,10 @@ impl VideoDecoder {
                         pixels,
                         coded_width: self.coded_extent.width,
                         coded_height: self.coded_extent.height,
+                        display_width: self.parsed.display_width,
+                        display_height: self.parsed.display_height,
+                        crop_left: self.parsed.crop_left,
+                        crop_top: self.parsed.crop_top,
                     });
                 }
             }
@@ -559,15 +579,19 @@ impl VideoDecoder {
                         frame_coded_extent.width,
                         frame_coded_extent.height,
                     )?;
-                    decoded_frames.push(DecodedFrame {
-                        poc: frame_count as i32,
-                        frame_num: frame_count,
-                        is_idr: false,
-                        is_reference: false,
-                        pixels,
-                        coded_width: frame_coded_extent.width,
-                        coded_height: frame_coded_extent.height,
-                    });
+                     decoded_frames.push(DecodedFrame {
+                          poc: frame_count as i32,
+                          frame_num: frame_count,
+                          is_idr: false,
+                          is_reference: false,
+                          pixels,
+                          coded_width: frame_coded_extent.width,
+                          coded_height: frame_coded_extent.height,
+                          display_width: self.parsed.display_width,
+                          display_height: self.parsed.display_height,
+                          crop_left: self.parsed.crop_left,
+                          crop_top: self.parsed.crop_top,
+                      });
                 }
                 continue;
             }
@@ -727,15 +751,19 @@ impl VideoDecoder {
 
             self.dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
-            decoded_frames.push(DecodedFrame {
-                poc: frame_count as i32,
-                frame_num: frame_count,
-                is_idr: is_key_frame,
-                is_reference: true,
-                pixels,
-                coded_width: frame_coded_extent.width,
-                coded_height: frame_coded_extent.height,
-            });
+             decoded_frames.push(DecodedFrame {
+                  poc: frame_count as i32,
+                  frame_num: frame_count,
+                  is_idr: is_key_frame,
+                  is_reference: true,
+                  pixels,
+                  coded_width: frame_coded_extent.width,
+                  coded_height: frame_coded_extent.height,
+                  display_width: self.parsed.display_width,
+                  display_height: self.parsed.display_height,
+                  crop_left: self.parsed.crop_left,
+                  crop_top: self.parsed.crop_top,
+              });
 
             frame_count += 1;
         }
@@ -985,7 +1013,7 @@ impl VideoDecoder {
             au.num_bits_for_st_ref_pic_set_in_slice,
             au.num_delta_pocs_of_ref_rps_idx,
             &au.ref_pocs,
-            &self.dpb_manager.entries,
+            &self.dpb_manager.get_references(),
         )?;
 
         Ok(())

@@ -228,6 +228,14 @@ impl DpbManager {
             }
         }
 
+        // Invalidate the recycled slot's DPB entry. This is safe because:
+        // 1. The slot's POC is NOT in protected_pocs, meaning no future frame needs it.
+        // 2. Without this, stale entries cause wrong references when non-reference frames
+        //    are decoded into recycled slots (their DPB entries aren't updated).
+        if let Some(idx) = oldest_idx {
+            self.invalidate_slot(idx);
+        }
+
         oldest_idx
     }
 
@@ -265,6 +273,15 @@ impl DpbManager {
             entry.is_valid = false;
             entry.current_layout = vk::ImageLayout::UNDEFINED;
             entry.last_access = LastAccessType::None;
+        }
+    }
+
+    /// Mark a single slot as invalid (when recycling).
+    pub fn invalidate_slot(&mut self, slot_index: u32) {
+        if (slot_index as usize) < self.entries.len() {
+            self.entries[slot_index as usize].is_valid = false;
+            self.entries[slot_index as usize].current_layout = vk::ImageLayout::UNDEFINED;
+            self.entries[slot_index as usize].last_access = LastAccessType::None;
         }
     }
 

@@ -164,7 +164,7 @@ impl H265Decoder {
         num_bits_for_st_ref_pic_set_in_slice: i32,
         num_delta_pocs_of_ref_rps_idx: i32,
         ref_pocs: &[i32],
-        dpb_entries: &[super::dpb::DpbEntry],
+        dpb_entries: &[&super::dpb::DpbEntry],
     ) -> VideoResult<()> {
         let (effective_poc, effective_is_intra, effective_is_ref, effective_is_idr) =
             if let (Some(poc), Some(intra), Some(ref_), Some(idr)) =
@@ -476,7 +476,7 @@ impl H265Decoder {
         num_bits_for_st_ref_pic_set_in_slice: i32,
         num_delta_pocs_of_ref_rps_idx: i32,
         ref_pocs: &[i32],
-        dpb_entries: &[super::dpb::DpbEntry],
+        dpb_entries: &[&super::dpb::DpbEntry],
     ) -> StdVideoDecodeH265PictureInfo {
         let sps = self.sps.as_ref().expect("H265 SPS not set before decode");
         let pps = self.pps.as_ref().expect("H265 PPS not set before decode");
@@ -525,8 +525,8 @@ impl H265Decoder {
 
         for &ref_poc in ref_pocs {
             // Find the DPB entry with this POC
-            if let Some(entry) = dpb_entries.iter().find(|e| e.pic_order_cnt[0] == ref_poc) {
-                let slot_idx = (entry.slot_index & 0xf) as u8;
+            if let Some(entry) = dpb_entries.iter().find(|e| (*e).pic_order_cnt[0] == ref_poc) {
+                let slot_idx = ((*entry).slot_index & 0xf) as u8;
 
                 if ref_poc < pic_order_cnt_val {
                     // Reference with POC < current POC goes to StCurrBefore

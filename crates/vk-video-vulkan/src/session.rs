@@ -388,106 +388,80 @@ impl VideoSessionParameters {
     ) -> VideoResult<Self> {
         use super::codec_types::*;
 
-        let params_create_info = match codec {
+        // All structs must live for the entire function duration to avoid dangling pointers
+        // when passed to Vulkan. Declare them here, initialize based on codec below.
+        let std_sps_h264: Option<StdVideoH264SequenceParameterSet> =
+            sps.map(super::h264::convert_h264_sps);
+        let std_pps_h264: Option<StdVideoH264PictureParameterSet> =
+            pps.map(super::h264::convert_h264_pps);
+        let std_vps_h265: Option<StdVideoH265VideoParameterSet> =
+            vps.map(super::h265::convert_h265_vps);
+        let std_sps_h265: Option<StdVideoH265SequenceParameterSet> =
+            sps_h265.map(super::h265::convert_h265_sps);
+        let std_pps_h265: Option<StdVideoH265PictureParameterSet> =
+            pps_h265.map(super::h265::convert_h265_pps);
+
+        let mut h264_add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR::default();
+        let mut h264_params = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default();
+        let mut h265_add_info = vk::VideoDecodeH265SessionParametersAddInfoKHR::default();
+        let mut h265_params = vk::VideoDecodeH265SessionParametersCreateInfoKHR::default();
+        let mut av1_params = vk::VideoDecodeAV1SessionParametersCreateInfoKHR::default();
+
+        // Initialize codec-specific structs
+        match codec {
             VideoCodec::DecodeH264 => {
-                let std_sps: Option<StdVideoH264SequenceParameterSet> =
-                    sps.map(super::h264::convert_h264_sps);
-                let std_pps: Option<StdVideoH264PictureParameterSet> =
-                    pps.map(super::h264::convert_h264_pps);
+                h264_add_info.s_type = vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR;
+                h264_add_info.p_next = std::ptr::null();
+                h264_add_info.std_sps_count = std_sps_h264.is_some() as u32;
+                h264_add_info.p_std_sp_ss = std_sps_h264.as_ref().map_or(std::ptr::null(), |s| s as *const _);
+                h264_add_info.std_pps_count = std_pps_h264.is_some() as u32;
+                h264_add_info.p_std_pp_ss = std_pps_h264.as_ref().map_or(std::ptr::null(), |p| p as *const _);
 
-                let add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    std_sps_count: std_sps.is_some() as u32,
-                    p_std_sp_ss: std_sps.as_ref().map_or(std::ptr::null(), |s| s as *const _),
-                    std_pps_count: std_pps.is_some() as u32,
-                    p_std_pp_ss: std_pps.as_ref().map_or(std::ptr::null(), |p| p as *const _),
-                    _marker: Default::default(),
-                };
-
-                let h264_params = vk::VideoDecodeH264SessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    max_std_sps_count: 32,
-                    max_std_pps_count: 256,
-                    p_parameters_add_info: &add_info as *const _ as *const _,
-                    _marker: Default::default(),
-                };
-                vk::VideoSessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: &h264_params as *const _ as *const _,
-                    flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
-                    _marker: Default::default(),
-                }
+                h264_params.s_type = vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                h264_params.p_next = std::ptr::null();
+                h264_params.max_std_sps_count = 32;
+                h264_params.max_std_pps_count = 256;
+                h264_params.p_parameters_add_info = &h264_add_info as *const _ as *const _;
             }
             VideoCodec::DecodeH265 => {
-                let std_vps: Option<StdVideoH265VideoParameterSet> =
-                    vps.map(super::h265::convert_h265_vps);
-                let std_sps: Option<StdVideoH265SequenceParameterSet> =
-                    sps_h265.map(super::h265::convert_h265_sps);
-                let std_pps: Option<StdVideoH265PictureParameterSet> =
-                    pps_h265.map(super::h265::convert_h265_pps);
+                h265_add_info.s_type = vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR;
+                h265_add_info.p_next = std::ptr::null();
+                h265_add_info.std_vps_count = std_vps_h265.is_some() as u32;
+                h265_add_info.p_std_vp_ss = std_vps_h265.as_ref().map_or(std::ptr::null(), |v| v as *const _);
+                h265_add_info.std_sps_count = std_sps_h265.is_some() as u32;
+                h265_add_info.p_std_sp_ss = std_sps_h265.as_ref().map_or(std::ptr::null(), |s| s as *const _);
+                h265_add_info.std_pps_count = std_pps_h265.is_some() as u32;
+                h265_add_info.p_std_pp_ss = std_pps_h265.as_ref().map_or(std::ptr::null(), |p| p as *const _);
 
-                let add_info = vk::VideoDecodeH265SessionParametersAddInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    std_vps_count: std_vps.is_some() as u32,
-                    p_std_vp_ss: std_vps.as_ref().map_or(std::ptr::null(), |v| v as *const _),
-                    std_sps_count: std_sps.is_some() as u32,
-                    p_std_sp_ss: std_sps.as_ref().map_or(std::ptr::null(), |s| s as *const _),
-                    std_pps_count: std_pps.is_some() as u32,
-                    p_std_pp_ss: std_pps.as_ref().map_or(std::ptr::null(), |p| p as *const _),
-                    _marker: Default::default(),
-                };
-
-                let h265_params = vk::VideoDecodeH265SessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    max_std_vps_count: 16,
-                    max_std_sps_count: 32,
-                    max_std_pps_count: 256,
-                    p_parameters_add_info: &add_info as *const _ as *const _,
-                    _marker: Default::default(),
-                };
-                vk::VideoSessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: &h265_params as *const _ as *const _,
-                    flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
-                    _marker: Default::default(),
-                }
+                h265_params.s_type = vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                h265_params.p_next = std::ptr::null();
+                h265_params.max_std_vps_count = 16;
+                h265_params.max_std_sps_count = 32;
+                h265_params.max_std_pps_count = 256;
+                h265_params.p_parameters_add_info = &h265_add_info as *const _ as *const _;
             }
             VideoCodec::DecodeAv1 => {
-                let av1_params = vk::VideoDecodeAV1SessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    p_std_sequence_header: std::ptr::null(),
-                    _marker: Default::default(),
-                };
-                vk::VideoSessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: &av1_params as *const _ as *const _,
-                    flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
-                    _marker: Default::default(),
-                }
+                av1_params.s_type = vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                av1_params.p_next = std::ptr::null();
+                av1_params.p_std_sequence_header = std::ptr::null();
             }
             VideoCodec::DecodeVp9 => {
                 // VP9 doesn't need codec-specific session parameters create info
-                // (unlike H264/H265 which need SPS/PPS counts, or AV1 which needs SPS)
-                vk::VideoSessionParametersCreateInfoKHR {
-                    s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
-                    _marker: Default::default(),
-                }
             }
+        }
+
+        let params_create_info = vk::VideoSessionParametersCreateInfoKHR {
+            s_type: vk::StructureType::VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
+            p_next: match codec {
+                VideoCodec::DecodeH264 => &h264_params as *const _ as *const _,
+                VideoCodec::DecodeH265 => &h265_params as *const _ as *const _,
+                VideoCodec::DecodeAv1 => &av1_params as *const _ as *const _,
+                VideoCodec::DecodeVp9 => std::ptr::null(),
+            },
+            flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
+            video_session: session,
+            video_session_parameters_template: vk::VideoSessionParametersKHR::null(),
+            _marker: Default::default(),
         };
 
         let create_fn = unsafe {

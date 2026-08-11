@@ -23,7 +23,7 @@ pub fn readback_decoded_image(
     width: u32,
     height: u32,
 ) -> Result<DecodedPixels, VideoError> {
-    eprintln!("[DEBUG] readback_decoded_image: image={:?}, size={}x{}", image, width, height);
+
     let y_size = (width * height) as usize;
     let uv_width = (width + 1) / 2;
     let uv_height = (height + 1) / 2;

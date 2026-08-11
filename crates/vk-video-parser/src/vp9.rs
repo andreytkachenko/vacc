@@ -40,6 +40,8 @@ pub struct Vp9Parser {
     loop_filter_mode_deltas: [i8; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
     /// Reference frame sizes indexed by DPB slot (for inter frame size inheritance).
     reference_frame_sz: [(u32, u32); VP9_NUM_REF_FRAMES as usize],
+    /// Cached color config (updated on intra/intra-only frames, used for inter frames).
+    cached_color_config: Vp9ColorConfig,
 }
 
 impl Vp9Parser {
@@ -55,6 +57,7 @@ impl Vp9Parser {
             loop_filter_ref_deltas: [0; VP9_MAX_REF_FRAMES as usize],
             loop_filter_mode_deltas: [0; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
             reference_frame_sz: [(0, 0); VP9_NUM_REF_FRAMES as usize],
+            cached_color_config: Vp9ColorConfig::default(),
         }
     }
 
@@ -118,8 +121,7 @@ impl Vp9Parser {
             // Key frame: read frame sync code (24 bits)
             let sync_code = r.read_bits(24)?;
             if sync_code != VP9_FRAME_SYNC_CODE {
-                eprintln!("[VP9] Invalid frame sync code: 0x{:06x} (expected 0x{:06x})",
-                    sync_code, VP9_FRAME_SYNC_CODE);
+                return Err(ParserError::InvalidBitstream);
             }
 
             self.parse_color_config(&mut r, &mut frame_data.color_config,
@@ -152,8 +154,7 @@ impl Vp9Parser {
                 // Intra-only non-key frame: read sync code
                 let sync_code = r.read_bits(24)?;
                 if sync_code != VP9_FRAME_SYNC_CODE {
-                    eprintln!("[VP9] Invalid intra frame sync code: 0x{:06x} (expected 0x{:06x})",
-                        sync_code, VP9_FRAME_SYNC_CODE);
+                    return Err(ParserError::InvalidBitstream);
                 }
 
                 if (frame_data.picture_info.profile as u32) > (Vp9Profile::Profile0 as u32) {
@@ -165,6 +166,8 @@ impl Vp9Parser {
                     frame_data.color_config.subsampling_y = 1;
                     frame_data.color_config.bit_depth = 8;
                 }
+                // Cache color config for subsequent inter frames
+                self.cached_color_config = frame_data.color_config;
 
                 // refresh_frame_flags comes AFTER color_config but BEFORE frame_size
                 // for intra-only frames (per VP9 spec section 7.2.4.1 and cros-codecs)
@@ -172,6 +175,9 @@ impl Vp9Parser {
 
                 self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
             } else {
+                // Inter frame: use cached color config from last intra/intra-only frame
+                frame_data.color_config = self.cached_color_config;
+
                 // Inter frame: refresh_frame_flags comes before ref_frame_idx
                 frame_data.picture_info.refresh_frame_flags = r.read_bits(8)? as u8;
 
@@ -194,13 +200,13 @@ impl Vp9Parser {
                         Vp9InterpolationFilter::Switchable;
                 } else {
                     let filter_literal = r.read_bits(2)?;
-                    // Mapping per C++ reference: 0->SMOOTH, 1->EIGHTTAP, 2->SHARP, 3->BILINEAR
+                    // VP9 spec: 0=EIGHTTAP, 1=SMOOTH, 2=SHARP, 3=BILINEAR
                     frame_data.picture_info.interpolation_filter = match filter_literal {
-                        0 => Vp9InterpolationFilter::EightTapSmooth,
-                        1 => Vp9InterpolationFilter::EightTap,
+                        0 => Vp9InterpolationFilter::EightTap,
+                        1 => Vp9InterpolationFilter::EightTapSmooth,
                         2 => Vp9InterpolationFilter::EightTapSharp,
                         3 => Vp9InterpolationFilter::Bilinear,
-                        _ => Vp9InterpolationFilter::EightTapSmooth,
+                        _ => Vp9InterpolationFilter::EightTap,
                     };
                 }
             }
@@ -423,45 +429,54 @@ impl Vp9Parser {
     ) -> ParserResult<()> {
         let loop_filter = &mut frame_data.loop_filter;
 
-        if frame_data.frame_is_intra
-            || frame_data.picture_info.flags.error_resilient_mode != 0
-        {
+        loop_filter.loop_filter_level = r.read_bits(6)? as u8;
+        loop_filter.loop_filter_sharpness = r.read_bits(3)? as u8;
+
+        let is_past_independent = frame_data.frame_is_intra
+            || frame_data.picture_info.flags.error_resilient_mode != 0;
+
+        // For past-independent frames (intra or error_resilient_mode), delta_enabled and
+        // delta_update are inferred as 1 per VP9 spec, and deltas are set to defaults.
+        if is_past_independent {
+            loop_filter.flags.loop_filter_delta_enabled = 1;
+            loop_filter.flags.loop_filter_delta_update = 1;
+            loop_filter.flags.update_ref_delta = 0b1111;
+            loop_filter.flags.update_mode_delta = 0b11;
             self.loop_filter_ref_deltas.fill(0);
             self.loop_filter_mode_deltas.fill(0);
             self.loop_filter_ref_deltas[0] = 1;
             self.loop_filter_ref_deltas[1] = 0;
             self.loop_filter_ref_deltas[2] = -1;
             self.loop_filter_ref_deltas[3] = -1;
-        }
+        } else {
+            // Past-dependent frames: read delta_enabled from bitstream
+            loop_filter.flags.loop_filter_delta_enabled = r.read_bits(1)? as u8;
+            if loop_filter.flags.loop_filter_delta_enabled != 0 {
+                // Read delta_update and deltas from bitstream
+                loop_filter.flags.loop_filter_delta_update = r.read_bits(1)? as u8;
 
-        loop_filter.loop_filter_level = r.read_bits(6)? as u8;
-        loop_filter.loop_filter_sharpness = r.read_bits(3)? as u8;
-
-        loop_filter.flags.loop_filter_delta_enabled = r.read_bits(1)? as u8;
-        if loop_filter.flags.loop_filter_delta_enabled != 0 {
-            loop_filter.flags.loop_filter_delta_update = r.read_bits(1)? as u8;
-
-            if loop_filter.flags.loop_filter_delta_update != 0 {
-                loop_filter.flags.update_ref_delta = 0;
-                for i in 0..VP9_MAX_REF_FRAMES as usize {
-                    let update_ref_delta = r.read_bits(1)?;
-                    loop_filter.flags.update_ref_delta |= (update_ref_delta as u8) << i;
-                    if update_ref_delta != 0 {
-                        self.loop_filter_ref_deltas[i] = r.read_bits(6)? as i8;
-                        if r.read_bits(1)? != 0 {
-                            self.loop_filter_ref_deltas[i] = -self.loop_filter_ref_deltas[i];
+                if loop_filter.flags.loop_filter_delta_update != 0 {
+                    loop_filter.flags.update_ref_delta = 0;
+                    for i in 0..VP9_MAX_REF_FRAMES as usize {
+                        let update_ref_delta = r.read_bits(1)?;
+                        loop_filter.flags.update_ref_delta |= (update_ref_delta as u8) << i;
+                        if update_ref_delta != 0 {
+                            self.loop_filter_ref_deltas[i] = r.read_bits(6)? as u8 as i8;
+                            if r.read_bits(1)? != 0 {
+                                self.loop_filter_ref_deltas[i] = -self.loop_filter_ref_deltas[i];
+                            }
                         }
                     }
-                }
 
-                loop_filter.flags.update_mode_delta = 0;
-                for i in 0..VP9_LOOP_FILTER_ADJUSTMENTS as usize {
-                    let update_mode_delta = r.read_bits(1)?;
-                    loop_filter.flags.update_mode_delta |= (update_mode_delta as u8) << i;
-                    if update_mode_delta != 0 {
-                        self.loop_filter_mode_deltas[i] = r.read_bits(6)? as i8;
-                        if r.read_bits(1)? != 0 {
-                            self.loop_filter_mode_deltas[i] = -self.loop_filter_mode_deltas[i];
+                    loop_filter.flags.update_mode_delta = 0;
+                    for i in 0..VP9_LOOP_FILTER_ADJUSTMENTS as usize {
+                        let update_mode_delta = r.read_bits(1)?;
+                        loop_filter.flags.update_mode_delta |= (update_mode_delta as u8) << i;
+                        if update_mode_delta != 0 {
+                            self.loop_filter_mode_deltas[i] = r.read_bits(6)? as u8 as i8;
+                            if r.read_bits(1)? != 0 {
+                                self.loop_filter_mode_deltas[i] = -self.loop_filter_mode_deltas[i];
+                            }
                         }
                     }
                 }
@@ -484,7 +499,16 @@ impl Vp9Parser {
         frame_data.picture_info.delta_q_y_dc = Self::read_delta_q(r)?;
         frame_data.picture_info.delta_q_uv_dc = Self::read_delta_q(r)?;
         frame_data.picture_info.delta_q_uv_ac = Self::read_delta_q(r)?;
+
         Ok(())
+    }
+
+    /// Check if this frame is lossless (VP9 spec: all quant params zero).
+    pub fn is_lossless(frame_data: &Vp9FrameData) -> bool {
+        frame_data.picture_info.base_q_idx == 0
+            && frame_data.picture_info.delta_q_y_dc == 0
+            && frame_data.picture_info.delta_q_uv_dc == 0
+            && frame_data.picture_info.delta_q_uv_ac == 0
     }
 
     /// Read a delta Q value.
@@ -513,26 +537,26 @@ impl Vp9Parser {
             return Ok(());
         }
 
-        segmentation.flags.segmentation_update_map = r.read_bits(1)? as u8;
+          segmentation.flags.segmentation_update_map = r.read_bits(1)? as u8;
 
-        if segmentation.flags.segmentation_update_map != 0 {
-            for i in 0..VP9_MAX_SEGMENTATION_TREE_PROBS as usize {
-                let prob_coded = r.read_bits(1)?;
-                segmentation.segmentation_tree_probs[i] =
-                    if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
-            }
+          if segmentation.flags.segmentation_update_map != 0 {
+              for i in 0..VP9_MAX_SEGMENTATION_TREE_PROBS as usize {
+                  let prob_coded = r.read_bits(1)?;
+                  segmentation.segmentation_tree_probs[i] =
+                      if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
+              }
 
-            segmentation.flags.segmentation_temporal_update = r.read_bits(1)? as u8;
-            for i in 0..VP9_MAX_SEGMENTATION_PRED_PROB as usize {
-                if segmentation.flags.segmentation_temporal_update != 0 {
-                    let prob_coded = r.read_bits(1)?;
-                    segmentation.segmentation_pred_prob[i] =
-                        if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
-                } else {
-                    segmentation.segmentation_pred_prob[i] = VP9_MAX_PROBABILITY;
-                }
-            }
-        }
+              segmentation.flags.segmentation_temporal_update = r.read_bits(1)? as u8;
+              for i in 0..VP9_MAX_SEGMENTATION_PRED_PROB as usize {
+                  if segmentation.flags.segmentation_temporal_update != 0 {
+                      let prob_coded = r.read_bits(1)?;
+                      segmentation.segmentation_pred_prob[i] =
+                          if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
+                  } else {
+                      segmentation.segmentation_pred_prob[i] = VP9_MAX_PROBABILITY;
+                  }
+              }
+          }
 
         // segmentation_update_data is read unconditionally when segmentation is enabled
         segmentation.flags.segmentation_update_data = r.read_bits(1)? as u8;
@@ -567,10 +591,10 @@ impl Vp9Parser {
                     }
                 }
             }
-        }
+          }
 
-        Ok(())
-    }
+          Ok(())
+      }
 
     /// Parse tile information.
     fn parse_tile_info(
@@ -744,14 +768,15 @@ impl VideoParser for Vp9Parser {
     }
 
     fn reset(&mut self) {
-        self.frame_count = 0;
-        self.last_frame_width = 0;
-        self.last_frame_height = 0;
-        self.last_show_frame = false;
-        self.loop_filter_ref_deltas.fill(0);
-        self.loop_filter_mode_deltas.fill(0);
-        self.reference_frame_sz.fill((0, 0));
-    }
+         self.frame_count = 0;
+         self.last_frame_width = 0;
+         self.last_frame_height = 0;
+         self.last_show_frame = false;
+         self.loop_filter_ref_deltas.fill(0);
+         self.loop_filter_mode_deltas.fill(0);
+         self.reference_frame_sz.fill((0, 0));
+         self.cached_color_config = Vp9ColorConfig::default();
+      }
 
     fn detected_format(&self) -> &DetectedVideoFormat {
         &self.detected_format
