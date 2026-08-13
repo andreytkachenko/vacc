@@ -26,11 +26,10 @@ pub struct Vp9Decoder {
     session_params: Option<super::session::VideoSessionParameters>,
     /// Frame counter.
     frame_count: u32,
-    /// DPB reference frame name to picture index mapping.
-    /// Maps VP9 reference frame names (LAST, GOLDEN, ALTREF, LAST2, LAST3, BACKWARD, KEY)
-    /// to picture indices. Updated after each decode via update_frame_pointers().
-    /// -1 means the reference frame name is not currently assigned.
-    pic_idx: [i32; vk_video_core::picture::VP9_NUM_REF_FRAMES as usize],
+    /// Frame buffer to DPB slot mapping.
+    /// Maps VP9 frame buffer indices (0-7) to DPB slot indices.
+    /// -1 means the frame buffer is not currently assigned to any DPB slot.
+    frame_buffer_to_dpb_slot: [i32; vk_video_core::picture::VP9_NUM_REF_FRAMES as usize],
     /// Maximum DPB slots available.
     max_dpb_slots: u32,
 }
@@ -43,7 +42,7 @@ impl Vp9Decoder {
             session: vk::VideoSessionKHR::null(),
             session_params: None,
             frame_count: 0,
-            pic_idx: [-1; vk_video_core::picture::VP9_NUM_REF_FRAMES as usize],
+            frame_buffer_to_dpb_slot: [-1; vk_video_core::picture::VP9_NUM_REF_FRAMES as usize],
             max_dpb_slots: 8, // Default VP9 DPB size
         }
     }
@@ -53,58 +52,46 @@ impl Vp9Decoder {
         self.max_dpb_slots = max_dpb_slots;
     }
 
-    /// Get current pic_idx state (for debugging).
-    pub fn get_pic_idx(&self) -> &[i32; vk_video_core::picture::VP9_NUM_REF_FRAMES as usize] {
-        &self.pic_idx
-    }
-
     /// Get the DPB slot index for a VP9 frame buffer index.
     ///
-    /// VP9 has 8 frame buffers (indexed 0-7). The pic_idx array maps each
-    /// frame buffer to its DPB slot index. Returns -1 if the frame buffer
-    /// is not currently assigned to any DPB slot.
+    /// VP9 has 8 frame buffers (indexed 0-7). This maps each frame buffer
+    /// to its DPB slot index. Returns -1 if the frame buffer is not currently
+    /// assigned to any DPB slot.
     ///
     /// Used for show_existing_frame: frame_to_show_map_idx indicates which
     /// VP9 frame buffer to display, and this method maps it to the actual
     /// DPB slot containing that frame.
     pub fn get_pic_idx_for_frame_buffer(&self, frame_buffer_idx: usize) -> i32 {
-        if frame_buffer_idx < self.pic_idx.len() {
-            self.pic_idx[frame_buffer_idx]
+        if frame_buffer_idx < self.frame_buffer_to_dpb_slot.len() {
+            self.frame_buffer_to_dpb_slot[frame_buffer_idx]
         } else {
             -1
         }
     }
 
-    /// Update reference frame pointers after decode.
+    /// Set the DPB slot for a VP9 frame buffer.
     ///
-    /// Per VP9 spec section 7.10: When a frame is decoded, the reference frame
-    /// slots specified by refresh_frame_flags are updated to point to the
-    /// current decoded frame.
-    ///
-    /// # Arguments
-    /// * `refresh_frame_flags` - Bitmask of which ref frame names to update
-    /// * `current_pic_idx` - Picture index of the current decoded frame
-    pub fn update_frame_pointers(&mut self, refresh_frame_flags: u8, current_pic_idx: i32) {
-        let mut mask = refresh_frame_flags;
-        let mut ref_index: u32 = 0;
-        while mask != 0 {
-            if mask & 1 != 0 {
-                if ref_index < vk_video_core::picture::VP9_NUM_REF_FRAMES as u32 {
-                    self.pic_idx[ref_index as usize] = current_pic_idx;
-                }
-            }
-            mask >>= 1;
-            ref_index += 1;
+    /// Called after each decode to record which DPB slot contains the
+    /// frame buffer for the current frame.
+    pub fn set_frame_buffer_dpb_slot(&mut self, frame_buffer_idx: usize, dpb_slot: i32) {
+        if frame_buffer_idx < self.frame_buffer_to_dpb_slot.len() {
+            self.frame_buffer_to_dpb_slot[frame_buffer_idx] = dpb_slot;
         }
     }
 
-    /// Compute reference_name_slot_indices for Vulkan decode command.
+    /// Compute reference DPB slot indices for building Vulkan decode command.
     ///
     /// Maps the 3 VP9 primary reference frame names (LAST, GOLDEN, ALTREF)
-    /// to their DPB slot indices via pic_idx and ref_frame_idx.
+    /// to their DPB slot indices using ref_frame_idx and frame_buffer_to_dpb_slot.
     ///
     /// Per the Vulkan spec and Vulkan-Video-Samples (VulkanVideoParser.cpp:2672-2682):
     /// referenceNameSlotIndices[i] = GetPicDpbSlot(pic_idx[ref_frame_idx[i]])
+    ///
+    /// Lookup chain:
+    /// 1. ref_frame_idx[i] -> VP9 frame buffer index that ref name i points to
+    /// 2. frame_buffer_to_dpb_slot[frame_buffer_idx] -> DPB slot for that frame buffer
+    ///
+    /// Returns -1 for any reference name whose frame buffer is not mapped to a valid DPB slot.
     ///
     /// # Arguments
     /// * `is_key_frame` - true for key frames (no references)
@@ -117,20 +104,22 @@ impl Vp9Decoder {
         if is_key_frame {
             return [-1, -1, -1];
         }
-        // For each reference name (LAST, GOLDEN, ALTREF), look up the actual
-        // frame buffer via ref_frame_idx, then get its DPB slot via pic_idx.
-        // ref_frame_idx[i] is the VP9 frame buffer index for reference name i.
-        // pic_idx[frame_buffer] is the DPB slot for that frame buffer.
-        [
-            self.pic_idx[ref_frame_idx[0] as usize], // LAST reference
-            self.pic_idx[ref_frame_idx[1] as usize], // GOLDEN reference
-            self.pic_idx[ref_frame_idx[2] as usize], // ALTREF reference
-        ]
+        let mut result = [-1i32; 3];
+        for i in 0..3 {
+            // ref_frame_idx[i] is the VP9 frame buffer index that reference name i points to
+            let frame_buffer_idx = ref_frame_idx[i] as usize;
+            if frame_buffer_idx >= self.frame_buffer_to_dpb_slot.len() {
+                continue;
+            }
+            // frame_buffer_to_dpb_slot gives the actual DPB slot for that frame buffer
+            result[i] = self.frame_buffer_to_dpb_slot[frame_buffer_idx];
+        }
+        result
     }
 
     /// Reset DPB state (e.g., on key frame or discontinuity).
     pub fn reset_dpb(&mut self) {
-        self.pic_idx.fill(-1);
+        self.frame_buffer_to_dpb_slot.fill(-1);
     }
 
     /// Set the session handle.
@@ -175,10 +164,10 @@ impl Vp9Decoder {
     /// 7. End command buffer
     ///
     /// # Slot index semantics
-    ///
-    /// `output_slot_index` and `dpb_ref_slot_indices` must be actual DPB slot indices
-    /// (typically 0..max_dpb_slots-1). These values are stored in the decoder's `pic_idx`
-    /// array via `update_frame_pointers` and returned by `compute_reference_name_slot_indices`.
+        ///
+        /// `output_slot_index` and `dpb_ref_slot_indices` must be actual DPB slot indices
+        /// (typically 0..max_dpb_slots-1). These are computed via
+        /// `compute_reference_name_slot_indices` using frame_buffer_to_dpb_slot.
     /// The slot index uniquely identifies a DPB entry in the Vulkan video session.
     ///
     /// # Arguments
@@ -200,11 +189,12 @@ impl Vp9Decoder {
         dpb_ref_pictures: &[vk::VideoPictureResourceInfoKHR<'static>],
         dpb_ref_slot_indices: &[i32],
         dpb_ref_images: &[vk::Image],
+        dpb_ref_slot_layouts: &[vk::ImageLayout],
         picture_info_container: &Vp9PictureInfoContainer,
         vp9_decode_info: &VideoDecodeVP9PictureInfoKHR,
         is_first_frame: bool,
         output_slot_index: i32,
-        _output_slot_old_layout: vk::ImageLayout,
+        output_slot_old_layout: vk::ImageLayout,
     ) -> VideoResult<()> {
         let picture_info_ptr = picture_info_container.std_picture_info();
 
@@ -269,6 +259,90 @@ impl Vp9Decoder {
             Box::leak(all_slots.into_boxed_slice()).as_ptr()
         };
         let all_slots_count = if all_slots_ptr.is_null() { 0 } else { has_setup_slot as u32 + dpb_ref_pictures.len() as u32 };
+
+        // ========================================================================
+        // DEBUG: Print Vulkan structures being used for decode command
+        // ========================================================================
+        {
+            println!("\n  [DEBUG] ===== Vulkan Command Recording =====");
+            
+            // VideoBeginCodingInfoKHR
+            println!("  [DEBUG] VkVideoBeginCodingInfoKHR:");
+            println!("    sType = VIDEO_BEGIN_CODING_INFO_KHR");
+            println!("    pNext = {:?}", std::ptr::null::<std::ffi::c_void>());
+            println!("    flags = 0x{:X}", vk::VideoBeginCodingFlagsKHR::empty().as_raw());
+            println!("    videoSession = {:?}", session);
+            println!("    videoSessionParameters = {:?}", session_params);
+            println!("    referenceSlotCount = {}", all_slots_count);
+            println!("    pReferenceSlots = {:?}", all_slots_ptr);
+            
+            if !all_slots_ptr.is_null() && all_slots_count > 0 {
+                let slots = unsafe { std::slice::from_raw_parts(all_slots_ptr, all_slots_count as usize) };
+                for (i, slot) in slots.iter().enumerate() {
+                    println!("      [{}] slotIndex={}, pPictureResource={:?}",
+                        i, slot.slot_index, slot.p_picture_resource);
+                    if !slot.p_picture_resource.is_null() {
+                        let res = unsafe { &*slot.p_picture_resource };
+                        println!("          codedOffset=({},{}), codedExtent={}x{}, baseArrayLayer={}, imageViewBinding={:?}",
+                            res.coded_offset.x, res.coded_offset.y,
+                            res.coded_extent.width, res.coded_extent.height,
+                            res.base_array_layer, res.image_view_binding);
+                    }
+                }
+            }
+            
+            // Barriers
+            println!("  [DEBUG] VkBufferMemoryBarrier2 (bitstream):");
+            println!("    srcStageMask = 0x{:X} (HOST)", vk::PipelineStageFlags2::HOST.as_raw());
+            println!("    srcAccessMask = 0x{:X} (HOST_WRITE)", vk::AccessFlags2::HOST_WRITE.as_raw());
+            println!("    dstStageMask = 0x{:X} (VIDEO_DECODE)", vk::PipelineStageFlags2::VIDEO_DECODE_KHR.as_raw());
+            println!("    dstAccessMask = 0x{:X} (VIDEO_DECODE_READ)", vk::AccessFlags2::VIDEO_DECODE_READ_KHR.as_raw());
+            println!("    buffer = {:?}, offset={}, size={}", bitstream_buffer, bitstream_offset, bitstream_range);
+            
+            println!("  [DEBUG] VkImageMemoryBarrier2 (output):");
+            println!("    oldLayout = {:?}, newLayout = {:?}", output_slot_old_layout,
+                if dpb_setup_picture.is_some() { vk::ImageLayout::VIDEO_DECODE_DPB_KHR } else { vk::ImageLayout::VIDEO_DECODE_DST_KHR });
+            println!("    aspectMask = COLOR, baseArrayLayer=0");
+            
+            for (i, (&img, &layout)) in dpb_ref_images.iter().zip(dpb_ref_slot_layouts.iter()).enumerate() {
+                if img != vk::Image::null() && layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                    println!("  [DEBUG] VkImageMemoryBarrier2 (ref[{}]): oldLayout={:?}, newLayout=VIDEO_DECODE_DPB_KHR, image={:?}",
+                        i, layout, img);
+                }
+            }
+            
+            // VideoDecodeInfoKHR
+            println!("  [DEBUG] VkVideoDecodeInfoKHR:");
+            println!("    srcBuffer = {:?}, offset={}, range={}", bitstream_buffer, bitstream_offset, bitstream_range);
+            println!("    dstPictureResource: codedExtent={}x{}, imageViewBinding={:?}",
+                coded_extent.width, coded_extent.height, output_image_view);
+            println!("    pSetupReferenceSlot = {:?}", setup_slot_ptr);
+            println!("    referenceSlotCount = {}", dpb_ref_pictures.len());
+            
+            // VideoDecodeVP9PictureInfoKHR
+            println!("  [DEBUG] VkVideoDecodeVP9PictureInfoKHR:");
+            println!("    referenceNameSlotIndices = [{}, {}, {}]",
+                vp9_decode_info.reference_name_slot_indices[0],
+                vp9_decode_info.reference_name_slot_indices[1],
+                vp9_decode_info.reference_name_slot_indices[2]);
+            println!("    uncompressedHeaderOffset = {}", vp9_decode_info.uncompressed_header_offset);
+            println!("    compressedHeaderOffset = {}", vp9_decode_info.compressed_header_offset);
+            println!("    tilesOffset = {}", vp9_decode_info.tiles_offset);
+            
+            // StdVideoDecodeVP9PictureInfo
+            let std_pic = unsafe { &*picture_info_ptr };
+            println!("  [DEBUG] StdVideoDecodeVP9PictureInfo:");
+            println!("    profile={:?}, frameType={:?}, frameContextIdx={}",
+                std_pic.profile, std_pic.frame_type, std_pic.frame_context_idx);
+            println!("    refreshFrameFlags=0x{:02X} ({:08b})",
+                std_pic.refresh_frame_flags, std_pic.refresh_frame_flags);
+            println!("    tileColsLog2={}, tileRowsLog2={}, numTiles={}x{}={}",
+                std_pic.tile_cols_log2, std_pic.tile_rows_log2,
+                1u32 << std_pic.tile_cols_log2, 1u32 << std_pic.tile_rows_log2,
+                (1u32 << std_pic.tile_cols_log2) * (1u32 << std_pic.tile_rows_log2));
+            
+            println!("  [DEBUG] ===== END Vulkan Command Recording =====\n");
+        }
 
         unsafe {
             // Begin command buffer
@@ -336,7 +410,12 @@ impl Vp9Decoder {
                 vk::ImageLayout::VIDEO_DECODE_DST_KHR
             };
 
-            let old_layout = vk::ImageLayout::UNDEFINED;
+            // Use the actual current layout of the output slot.
+            // For first use of a slot, this will be UNDEFINED.
+            // For reused slots (after readback or as reference), this will be VIDEO_DECODE_DPB_KHR.
+            // This matches C++ reference VkVideoDecoder.cpp:970-973 which checks
+            // currentImageLayout and only uses UNDEFINED if the slot was never used.
+            let old_layout = output_slot_old_layout;
 
             let image_barrier = vk::ImageMemoryBarrier2 {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
@@ -363,10 +442,13 @@ impl Vp9Decoder {
             );
             image_barriers.push(image_barrier);
 
-            for &ref_image in dpb_ref_images {
-                // Reference images are already in VIDEO_DECODE_DPB_KHR layout from previous
-                // decode operations. This barrier ensures proper synchronization with previous
-                // decode writes before they're used as references.
+            for (&ref_image, &ref_layout) in dpb_ref_images.iter().zip(dpb_ref_slot_layouts.iter()) {
+                // Only add barrier if reference image is valid and not already in correct layout.
+                // This matches C++ reference which checks currentImageLayout before adding barriers.
+                if ref_image == vk::Image::null() || ref_layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                    continue;
+                }
+
                 let ref_barrier = vk::ImageMemoryBarrier2 {
                     s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
                     p_next: std::ptr::null(),
@@ -378,7 +460,7 @@ impl Vp9Decoder {
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     image: ref_image,
-                    old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                    old_layout: ref_layout,
                     new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,

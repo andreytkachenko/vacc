@@ -58,15 +58,24 @@ fn main() {
     let data = std::fs::read(bitstream_path).expect("Failed to read file");
 
     // Check if this is an IVF container first
-    let raw_frames = if data.len() >= 32 && data[0..4] == *b"DKIF" {
-        parse_ivf_container(&data).expect("Failed to parse IVF container")
+    let raw_frames: Vec<FrameInfo> = if data.len() >= 32 && data[0..4] == *b"DKIF" {
+        let packets = parse_ivf_container(&data).expect("Failed to parse IVF container");
+        println!("  IVF container: {} packets", packets.len());
+        // IVF packets may contain superframes - expand them
+        let expanded = expand_superframes(&packets);
+        println!("  After superframe expansion: {} frames", expanded.len());
+        expanded
     } else {
-        // Expand superframes BEFORE splitting — superframe index at end of data
-        // must be detected and removed before frame splitting
-        let expanded_packets = expand_superframes(&[data.to_vec()]);
-
-        // Split bitstream into individual frames using sequential parsing
-        split_vp9_bitstream(&expanded_packets)
+        // For raw VP9 files, split bitstream into individual frames
+         // No packet offset tracking for raw files
+         split_vp9_bitstream(&[data.to_vec()])
+             .into_iter()
+             .map(|f| FrameInfo {
+                 data: f,
+                 packet_file_offset: 0,
+                 superframe_frame_offset: 0,
+             })
+             .collect()
     };
 
     if raw_frames.is_empty() {
@@ -82,7 +91,7 @@ fn main() {
         ))
         .expect("Failed to init VP9 parser");
 
-    let first_frame = &raw_frames[0];
+    let first_frame = &raw_frames[0].data;
     let first_parsed = parser.parse_frame(first_frame).expect("Failed to parse first frame");
 
     let coded_width = first_parsed.frame_width;
@@ -243,12 +252,14 @@ fn main() {
     let session_params_handle = vk::VideoSessionParametersKHR::null();
     let session_parameters: Option<VideoSessionParameters> = None;
 
-    // Step 7: Create output image
+    // Step 7: Create output image with raw frame dimensions (not aligned).
+    // The image extent must match the codedExtent used in decode commands.
+    // Session max_coded_extent is aligned, but images can be smaller.
     let (output_image, output_image_view, output_memory) = create_vp9_output_image(
         &vulkan.device,
         &vulkan.memory_properties,
-        coded_extent.width,
-        coded_extent.height,
+        coded_width,
+        coded_height,
         output_format,
         use_profile,
         chroma_subsampling,
@@ -267,8 +278,8 @@ fn main() {
         let (img, view, mem) = create_vp9_output_image(
             &vulkan.device,
             &vulkan.memory_properties,
-            coded_extent.width,
-            coded_extent.height,
+            coded_width,
+            coded_height,
             output_format,
             use_profile,
             chroma_subsampling,
@@ -294,8 +305,10 @@ fn main() {
 
 
     // Step 9: Create bitstream buffer
-    let max_frame_size = raw_frames.iter().map(|f| f.len()).max().unwrap_or(0);
+    let max_frame_size = raw_frames.iter().map(|f| f.data.len()).max().unwrap_or(0);
     let bs_size_align = video_caps.min_bitstream_buffer_size_alignment;
+    println!("  min_bitstream_buffer_size_alignment = {}", bs_size_align);
+    println!("  min_bitstream_buffer_offset_alignment = {}", video_caps.min_bitstream_buffer_offset_alignment);
     // Align buffer size to minBitstreamBufferSizeAlignment
     let max_frame_size_aligned = ((max_frame_size as u64 + bs_size_align as u64 - 1) / bs_size_align as u64 * bs_size_align as u64).max(bs_size_align as u64);
     let mut bs_buffer = create_vp9_bitstream_buffer(
@@ -369,23 +382,41 @@ fn main() {
 
 
     // Reset parser for fresh parsing
-    parser.reset();
+     parser.reset();
 
-    for (frame_idx, frame_data) in raw_frames.iter().enumerate().take(frames_to_decode) {
+     for (frame_idx, frame_info) in raw_frames.iter().enumerate().take(frames_to_decode) {
+         let frame_data = &frame_info.data;
+         let packet_offset = frame_info.packet_file_offset;
+         let superframe_offset = frame_info.superframe_frame_offset as u32;
 
-        // Parse frame header
-        let parsed = match parser.parse_frame(frame_data) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  Failed to parse frame header: {:?}", e);
-                continue;
-            }
-        };
+         eprintln!("  [Frame {}] packet_offset={}, superframe_offset={}", frame_idx, packet_offset, superframe_offset);
 
-        // Compute per-frame coded extent aligned to picture access granularity
+         // DEBUG: Dump first 128 bytes of raw frame data for frame 1
+         if frame_idx == 1 {
+             println!("  [DEBUG] Raw frame data len={}", frame_data.len());
+             println!("  [DEBUG] First 32 bytes as hex:");
+             for i in 0..frame_data.len().min(32) {
+                 print!("{:02X} ", frame_data[i]);
+                 if (i + 1) % 16 == 0 { println!(); }
+             }
+             println!();
+         }
+
+         // Parse frame header directly from extracted frame data
+         let parsed = match parser.parse_frame_with_offset(frame_data.as_slice(), superframe_offset) {
+             Ok(p) => p,
+             Err(e) => {
+                 eprintln!("  Failed to parse frame header: {:?}", e);
+                 continue;
+             }
+         };
+
+        // Use raw frame dimensions for coded extent (not aligned).
+        // Vulkan spec: codedExtent is the actual coded dimensions of the frame.
+        // picture_access_granularity alignment is only required for session max_coded_extent.
         let frame_coded_extent = vk::Extent2D {
-            width: (parsed.frame_width + align_width - 1) & !(align_width - 1),
-            height: (parsed.frame_height + align_height - 1) & !(align_height - 1),
+            width: parsed.frame_width,
+            height: parsed.frame_height,
         };
 
         // Handle show_existing_frame
@@ -407,13 +438,14 @@ fn main() {
                     command_pool,
                     fence,
                     img,
-                    coded_extent.width,
-                    coded_extent.height,
-                    parsed.frame_width,
-                    parsed.frame_height,
-                    frame_idx,
-                    bitstream_path,
-                );
+                    coded_width,
+                    coded_height,
+                     parsed.frame_width,
+                     parsed.frame_height,
+                     frame_idx,
+                     frame_count as usize,  // Use display order index
+                     bitstream_path,
+                 );
             } else {
                 eprintln!(
                     "  Warning: frame_to_show_map_idx={} not mapped to any DPB slot",
@@ -431,21 +463,68 @@ fn main() {
             frame_idx,
             if is_key_frame { "KEY" } else { "INTER" }
         );
+        println!(
+            "  tile_cols_log2={}, tile_rows_log2={}, num_tiles={}, sb64_cols={}, tiles_offset={}",
+            parsed.picture_info.tile_cols_log2,
+            parsed.picture_info.tile_rows_log2,
+            parsed.num_tiles,
+            parsed.sb64_cols,
+            parsed.tiles_offset
+        );
+        println!(
+            "  uncomp_hdr_offset={}, comp_hdr_offset={}, comp_hdr_size={}, frame_data_len={}",
+            parsed.uncompressed_header_offset,
+            parsed.compressed_header_offset,
+            parsed.compressed_header_size,
+            frame_data.len()
+        );
 
-        // Write bitstream data to buffer
-        // Zero the aligned range first to clear any leftover data from previous frames.
-        // Then flush the FULL aligned range to ensure GPU sees clean data.
+        // Write bitstream data to buffer - only the current frame's data
         let bs_align = bs_size_align as u64;
         let actual_size = frame_data.len() as u64;
         let aligned_size = ((actual_size + bs_align - 1) / bs_align * bs_align).max(bs_align);
+        
         bs_buffer.zero_range(0, aligned_size);
         bs_buffer.write(frame_data).expect("Failed to write bitstream");
         bs_buffer.flush_range(0, aligned_size).ok();
+
+        // DEBUG: Dump first 128 bytes of bitstream buffer for frame 1
+        if frame_idx == 1 {
+            if let Some(ptr) = bs_buffer.data_ptr() {
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, aligned_size.min(32) as usize) };
+                println!("  [DEBUG] Bitstream buffer first 32 bytes for frame 1:");
+                for i in 0..bytes.len() {
+                    print!("{:02X} ", bytes[i]);
+                    if (i + 1) % 16 == 0 { println!(); }
+                }
+                println!();
+            }
+        }
+
+        // srcBufferRange MUST be aligned to minBitstreamBufferSizeAlignment per Vulkan spec.
+        let bs_range = aligned_size;
+
+        println!(
+            "  BS: offset=0, range={}, tiles_offset={}",
+            bs_range, parsed.tiles_offset
+        );
 
         // Compute reference name slot indices FIRST (before selecting output slot)
         // so we can avoid using a reference slot as output (prevents self-reference).
         let reference_name_slot_indices =
             vp9_decoder.compute_reference_name_slot_indices(is_key_frame, &parsed.ref_frame_idx);
+
+        // DEBUG: Print reference frame state BEFORE decode
+        {
+            println!("  ref_frame_idx=[{}, {}, {}, {}, {}, {}, {}]",
+                parsed.ref_frame_idx[0], parsed.ref_frame_idx[1], parsed.ref_frame_idx[2],
+                parsed.ref_frame_idx[3], parsed.ref_frame_idx[4], parsed.ref_frame_idx[5], parsed.ref_frame_idx[6]);
+            println!("  refresh_frame_flags=0x{:02X} ({:08b})",
+                parsed.picture_info.refresh_frame_flags, parsed.picture_info.refresh_frame_flags);
+            println!("  reference_name_slot_indices=[{}, {}, {}]",
+                reference_name_slot_indices[0], reference_name_slot_indices[1], reference_name_slot_indices[2]);
+            println!("  frame_context_idx={}", parsed.picture_info.frame_context_idx);
+        }
 
         // Select DPB slot for this frame, avoiding slots needed as references
         let output_slot;
@@ -484,10 +563,6 @@ fn main() {
             &reference_name_slot_indices,
         );
 
-        // srcBufferRange MUST be aligned to minBitstreamBufferSizeAlignment per Vulkan spec.
-        // VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07139
-        let bs_range = aligned_size;
-
         // Convert parsed frame data to Vulkan picture info container
         // Allocate on heap to ensure lifetime through command execution
         let mut picture_info_container = Box::new(convert_vp9_picture_info(
@@ -500,28 +575,155 @@ fn main() {
         // point to heap-allocated fields, not stack temporaries
         picture_info_container.init_pointers();
 
-          // Build VP9 decode picture info on heap alongside the container.
-          // CRITICAL: Both must stay alive until after fence wait, otherwise the
-          // command buffer holds dangling pointers to freed stack memory.
-          // IMPORTANT: referenceNameSlotIndices must be DPB slot indices (matching
-          // VkVideoBeginCodingInfoKHR::pReferenceSlots[i].slot_index), NOT indices
-          // into p_reference_slots. This matches Vulkan-Video-Samples behavior.
-              let vp9_decode_info = Box::new(VideoDecodeVP9PictureInfoKHR::new(
-                  picture_info_container.std_picture_info(),
-                  reference_name_slot_indices,
-                  parsed.uncompressed_header_offset,
-                  parsed.compressed_header_offset,
-                  parsed.tiles_offset,
-              ));
+             // Build VP9 decode picture info on heap alongside the container.
+             // CRITICAL: Both must stay alive until after fence wait, otherwise the
+             // command buffer holds dangling pointers to freed stack memory.
+             // IMPORTANT: referenceNameSlotIndices must be DPB slot indices (matching
+             // VkVideoBeginCodingInfoKHR::pReferenceSlots[i].slot_index), NOT indices
+             // into p_reference_slots. This matches Vulkan-Video-Samples behavior.
+
+              // The parser computes offsets relative to the extracted frame data,
+              // which is exactly what we write to the bitstream buffer.
+              // No offset adjustment needed - use parser offsets directly.
+              let uncomp_offset = parsed.uncompressed_header_offset;
+              let comp_offset = parsed.compressed_header_offset;
+              let tiles_offset = parsed.tiles_offset;
+
+                 let vp9_decode_info = Box::new(VideoDecodeVP9PictureInfoKHR::new(
+                     picture_info_container.std_picture_info(),
+                     reference_name_slot_indices,
+                     uncomp_offset,
+                     comp_offset,
+                     tiles_offset,
+                 ));
 
         // Record decode command
          // Build reference image handles from slot indices
-         let dpb_ref_images: Vec<vk::Image> = dpb_ref_slot_indices
+          let dpb_ref_images: Vec<vk::Image> = dpb_ref_slot_indices
+              .iter()
+              .map(|&slot_idx| {
+                  dpb_image_handles[slot_idx as usize]
+              })
+              .collect();
+
+         // Get actual layouts of reference slots for proper memory barriers.
+         // This ensures we use correct old_layout in barriers (not always UNDEFINED).
+         let dpb_ref_slot_layouts: Vec<vk::ImageLayout> = dpb_ref_slot_indices
              .iter()
-             .map(|&slot_idx| {
-                 dpb_image_handles[slot_idx as usize]
-             })
+             .map(|&slot_idx| dpb_manager.get_slot_layout(slot_idx as u32))
              .collect();
+
+        // ========================================================================
+        // DEBUG: Dump ALL Vulkan decode structures for this frame
+        // ========================================================================
+        {
+            // use vk_video_vulkan::vp9::{StdVideoVP9FrameType, StdVideoVP9InterpolationFilter};
+            
+            println!("\n  ===== DEBUG: Vulkan Decode Structures =====");
+            
+            // VideoDecodeVP9ProfileInfoKHR (used in session creation)
+            println!("  VideoDecodeVP9ProfileInfoKHR:");
+            println!("    std_profile = {}", use_profile);
+            
+            // StdVideoDecodeVP9PictureInfo (from picture_info_container)
+            let std_pic = unsafe { &*picture_info_container.std_picture_info() };
+            println!("  StdVideoDecodeVP9PictureInfo:");
+            println!("    profile = {:?}", std_pic.profile);
+            println!("    frame_type = {:?}", std_pic.frame_type);
+            println!("    frame_context_idx = {}", std_pic.frame_context_idx);
+            println!("    reset_frame_context = {}", std_pic.reset_frame_context);
+            println!("    refresh_frame_flags = 0x{:02X} ({:08b})", std_pic.refresh_frame_flags, std_pic.refresh_frame_flags);
+            println!("    ref_frame_sign_bias_mask = 0x{:02X}", std_pic.ref_frame_sign_bias_mask);
+            println!("    interpolation_filter = {:?}", std_pic.interpolation_filter);
+            println!("    base_q_idx = {}", std_pic.base_q_idx);
+            println!("    delta_q_y_dc = {}", std_pic.delta_q_y_dc);
+            println!("    delta_q_uv_dc = {}", std_pic.delta_q_uv_dc);
+            println!("    delta_q_uv_ac = {}", std_pic.delta_q_uv_ac);
+            println!("    tile_cols_log2 = {}", std_pic.tile_cols_log2);
+            println!("    tile_rows_log2 = {}", std_pic.tile_rows_log2);
+            println!("    num_tile_cols = {}", 1u32 << std_pic.tile_cols_log2);
+            println!("    num_tile_rows = {}", 1u32 << std_pic.tile_rows_log2);
+            println!("    flags.bits = 0x{:08X}", std_pic.flags.bits);
+            
+            // Color config
+            if !std_pic.p_color_config.is_null() {
+                let cc = unsafe { &*std_pic.p_color_config };
+                println!("    ColorConfig: bit_depth={}, subsampling_x={}, subsampling_y={}, color_space={:?}", 
+                    cc.bit_depth, cc.subsampling_x, cc.subsampling_y, cc.color_space);
+            }
+            
+            // Loop filter
+            if !std_pic.p_loop_filter.is_null() {
+                let lf = unsafe { &*std_pic.p_loop_filter };
+                let delta_enabled = (lf.flags.loop_filter_delta_enabled & 1) as u32;
+                let delta_update = ((lf.flags.loop_filter_delta_enabled >> 1) & 1) as u32;
+                println!("    LoopFilter: level={}, sharpness={}, delta_enabled={}, delta_update={}, update_ref_delta={}, update_mode_delta={}",
+                    lf.loop_filter_level, lf.loop_filter_sharpness, 
+                    delta_enabled, delta_update,
+                    lf.update_ref_delta, lf.update_mode_delta);
+                println!("      ref_deltas=[{}, {}, {}, {}]",
+                    lf.loop_filter_ref_deltas[0], lf.loop_filter_ref_deltas[1],
+                    lf.loop_filter_ref_deltas[2], lf.loop_filter_ref_deltas[3]);
+                println!("      mode_deltas=[{}, {}]",
+                    lf.loop_filter_mode_deltas[0], lf.loop_filter_mode_deltas[1]);
+            }
+            
+            // VideoDecodeVP9PictureInfoKHR
+            println!("  VideoDecodeVP9PictureInfoKHR:");
+            println!("    p_std_picture_info = {:?}", vp9_decode_info.p_std_picture_info);
+            println!("    referenceNameSlotIndices = [{}, {}, {}]",
+                vp9_decode_info.reference_name_slot_indices[0],
+                vp9_decode_info.reference_name_slot_indices[1],
+                vp9_decode_info.reference_name_slot_indices[2]);
+            println!("    uncompressedHeaderOffset = {}", vp9_decode_info.uncompressed_header_offset);
+            println!("    compressedHeaderOffset = {}", vp9_decode_info.compressed_header_offset);
+            println!("    tilesOffset = {}", vp9_decode_info.tiles_offset);
+            
+            // VideoDecodeInfoKHR
+            println!("  VideoDecodeInfoKHR:");
+            println!("    src_buffer = {:?}", bs_buffer.buffer());
+            println!("    src_buffer_offset = {}", 0);
+            println!("    src_buffer_range = {}", bs_range);
+            println!("    dstPictureResource:");
+            println!("      coded_offset = (0, 0)");
+            println!("      coded_extent = {}x{}", frame_coded_extent.width, frame_coded_extent.height);
+            println!("      base_array_layer = 0");
+            println!("      imageViewBinding = {:?}", output_image_view);
+            println!("    p_setup_reference_slot = {}", dpb_setup_picture.is_some());
+            println!("    referenceSlotCount = {}", dpb_ref_pictures.len());
+            
+            // VideoReferenceSlotInfoKHR for each ref slot
+            println!("  VideoReferenceSlotInfoKHR (reference slots):");
+            for (i, (res, &slot_idx)) in dpb_ref_pictures.iter().zip(dpb_ref_slot_indices.iter()).enumerate() {
+                println!("    [{}] slot_index={}, coded_extent={}x{}",
+                    i, slot_idx, res.coded_extent.width, res.coded_extent.height);
+            }
+            
+            // VideoPictureResourceInfoKHR for setup picture
+            if let Some(setup) = &dpb_setup_picture {
+                println!("  VideoPictureResourceInfoKHR (setup):");
+                println!("    coded_extent = {}x{}", setup.coded_extent.width, setup.coded_extent.height);
+                println!("    imageViewBinding = {:?}", setup.image_view_binding);
+            }
+            
+            // DPB state
+            println!("  DPB State:");
+            println!("    output_slot = {}", output_slot);
+            println!("    is_first_frame = {}", is_first_frame);
+            println!("    dpb_valid_count = {}", dpb_manager.get_valid_count());
+            
+            // Parser raw data for comparison
+            println!("  Parser Raw Data:");
+            println!("    frame_width={}, frame_height={}", parsed.frame_width, parsed.frame_height);
+            println!("    sb64_cols={}, sb64_rows={}, num_tiles={}", parsed.sb64_cols, parsed.sb64_rows, parsed.num_tiles);
+            println!("    uncompressed_header_offset={}, compressed_header_offset={}, tiles_offset={}",
+                parsed.uncompressed_header_offset, parsed.compressed_header_offset, parsed.tiles_offset);
+            println!("    ref_frame_idx=[{}, {}, {}, {}, {}, {}, {}]",
+                parsed.ref_frame_idx[0], parsed.ref_frame_idx[1], parsed.ref_frame_idx[2],
+                parsed.ref_frame_idx[3], parsed.ref_frame_idx[4], parsed.ref_frame_idx[5], parsed.ref_frame_idx[6]);
+            
+            println!("  ===== END DEBUG =====\n");
+        }
 
         // Reset command buffer before recording for this frame
         unsafe {
@@ -531,14 +733,14 @@ fn main() {
                 .expect("Failed to reset command buffer");
         }
 
-          let output_slot_old_layout = dpb_manager.get_slot_layout(output_slot as u32);
-          let result = vp9_decoder.record_decode_command(
-               command_buffer,
-               session.handle(),
-               session_params_handle,
-               bs_buffer.buffer(),
-               0,
-               bs_range,
+           let output_slot_old_layout = dpb_manager.get_slot_layout(output_slot as u32);
+           let result = vp9_decoder.record_decode_command(
+                command_buffer,
+                session.handle(),
+                session_params_handle,
+                bs_buffer.buffer(),
+                0,
+                bs_range,
                output_view,
               output_img,
               frame_coded_extent,
@@ -546,6 +748,7 @@ fn main() {
               &dpb_ref_pictures,
               &dpb_ref_slot_indices,
               &dpb_ref_images,
+              &dpb_ref_slot_layouts,
               &picture_info_container,
               &vp9_decode_info,
               is_first_frame,
@@ -596,12 +799,10 @@ fn main() {
                 .expect("Failed to wait for fence");
         }
 
-        // Update frame pointers based on refresh_frame_flags
-        let current_pic_idx = output_slot as i32;
-        vp9_decoder.update_frame_pointers(
-            parsed.picture_info.refresh_frame_flags,
-            current_pic_idx,
-        );
+        // Record which DPB slot contains this frame buffer
+        // The VP9 frame buffer index equals the output DPB slot (1:1 mapping)
+        let current_frame_buffer_idx = output_slot as i32;
+        vp9_decoder.set_frame_buffer_dpb_slot(output_slot as usize, current_frame_buffer_idx);
 
 
         // Register this frame in DPB manager
@@ -613,30 +814,38 @@ fn main() {
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
         );
 
-        // Readback and verify decoded pixels
-        readback_and_verify(
-            &vulkan.instance,
-            &vulkan.device,
-            &vulkan.memory_properties,
-            decode_qf,
-            command_pool,
-            fence,
-            output_img,
-            coded_extent.width,
-            coded_extent.height,
-            parsed.frame_width,
-            parsed.frame_height,
-            frame_idx,
-            bitstream_path,
-        );
+        // VP9 show_frame handling: only display frames with show_frame=1
+        // Frames with show_frame=0 are decoded to update reference buffers but not displayed
+        let show_frame = parsed.picture_info.flags.show_frame != 0;
+        if show_frame {
+            // Readback and verify decoded pixels
+            readback_and_verify(
+                &vulkan.instance,
+                &vulkan.device,
+                &vulkan.memory_properties,
+                decode_qf,
+                command_pool,
+                fence,
+                output_img,
+                coded_width,
+                coded_height,
+                parsed.frame_width,
+                parsed.frame_height,
+                frame_idx,
+                frame_count as usize,  // Use display order index
+                bitstream_path,
+            );
 
-        // Restore DPB layout after readback
-        dpb_manager.set_slot_layout(
-            output_slot,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-        );
+            // Restore DPB layout after readback
+            dpb_manager.set_slot_layout(
+                output_slot,
+                vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            );
 
-        frame_count += 1;
+            frame_count += 1;
+        } else {
+            eprintln!("  [Frame {}] show_frame=0 - decoded but not displayed (reference frame only)", frame_idx);
+        }
     }
 
     println!("\nDecoded {} frames", frame_count);
@@ -684,15 +893,15 @@ fn main() {
 // IVF container parsing
 // ============================================================================
 
-/// Parse an IVF container file and extract raw VP9 frame data.
+/// Parse an IVF container file and extract raw VP9 frame data with file offsets.
 ///
 /// IVF (On2 IVF) is a simple container format used for VP8/VP9 video.
 /// File layout:
 ///   - 32-byte file header
 ///   - Repeated frame packets (4-byte size + 8-byte timestamp + data)
 ///
-/// Returns a vector of raw VP9 frame data bytes.
-fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+/// Returns a vector of (frame_data, file_offset) tuples.
+fn parse_ivf_container(data: &[u8]) -> Result<Vec<(Vec<u8>, usize)>, String> {
     if data.len() < 32 {
         return Err("File too small for IVF header".to_string());
     }
@@ -730,7 +939,16 @@ fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         }
 
         let frame_data = data[offset..offset + packet_size].to_vec();
-        frames.push(frame_data);
+        eprintln!("    IVF packet at file offset {}: size={}", offset, packet_size);
+        
+        // DEBUG: Show first 16 bytes of each packet
+        if !frame_data.is_empty() {
+            let first_bytes = &frame_data[..frame_data.len().min(16)];
+            let hex: String = first_bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+            eprintln!("      First 16 bytes: {}", hex);
+        }
+        
+        frames.push((frame_data, offset));
         offset += packet_size;
     }
 
@@ -825,68 +1043,116 @@ fn split_vp9_bitstream(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
     frames
 }
 
-/// Expand superframes into individual frames.
+/// Frame data with superframe information.
+#[derive(Clone)]
+struct FrameInfo {
+    /// The frame data (extracted from superframe if applicable)
+    data: Vec<u8>,
+    /// The packet's file offset in the IVF container
+    packet_file_offset: usize,
+    /// Offset of this frame within a superframe (0 if not from superframe)
+    superframe_frame_offset: usize,
+}
+
+/// Expand superframes into individual frames while tracking packet offsets.
 ///
 /// A superframe contains multiple VP9 frames concatenated together,
 /// with a superframe index at the end that specifies the size of each
 /// constituent frame. This function detects the superframe index at the
-/// end of the data and splits the superframe into its component frames.
-fn expand_superframes(data: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let mut expanded = Vec::new();
+/// end of the data and splits the superframe into its component frames,
+/// extracting only each frame's individual data.
+fn expand_superframes(data: &[(Vec<u8>, usize)]) -> Vec<FrameInfo> {
+     let mut expanded = Vec::new();
 
-    for frame in data {
-        let data_len = frame.len();
-        if data_len < 2 {
-            expanded.push(frame.clone());
-            continue;
-        }
+     for (frame, packet_off) in data.iter() {
+         let packet_offset = *packet_off;
+         let data_len = frame.len();
+         if data_len < 2 {
+             expanded.push(FrameInfo {
+                 data: frame.clone(),
+                 packet_file_offset: packet_offset,
+                 superframe_frame_offset: 0,
+             });
+             continue;
+         }
 
-        // Check for superframe index at the end of the data
-        let final_byte = frame[data_len - 1];
-        if (final_byte & 0xE0) != 0xC0 {
-            // Not a superframe
-            expanded.push(frame.clone());
-            continue;
-        }
+         // Check for superframe index at the end of the data
+         let final_byte = frame[data_len - 1];
+         if (final_byte & 0xE0) != 0xC0 {
+             // Not a superframe
+             expanded.push(FrameInfo {
+                 data: frame.clone(),
+                 packet_file_offset: packet_offset,
+                 superframe_frame_offset: 0,
+             });
+             continue;
+         }
 
-        let num_frames = (final_byte & 0x07) as usize + 1;
-        if num_frames <= 1 {
-            expanded.push(frame.clone());
-            continue;
-        }
+         let num_frames = (final_byte & 0x07) as usize + 1;
+         if num_frames <= 1 {
+             expanded.push(FrameInfo {
+                 data: frame.clone(),
+                 packet_file_offset: packet_offset,
+                 superframe_frame_offset: 0,
+             });
+             continue;
+         }
 
-        let mag = (((final_byte >> 3) & 0x03) as usize) + 1;
-        let index_size = 2 + mag * num_frames;
+         let mag = (((final_byte >> 3) & 0x03) as usize) + 1;
+         let index_size = 2 + mag * num_frames;
 
-        if data_len < index_size {
-            expanded.push(frame.clone());
-            continue;
-        }
+         if data_len < index_size {
+             expanded.push(FrameInfo {
+                 data: frame.clone(),
+                 packet_file_offset: packet_offset,
+                 superframe_frame_offset: 0,
+             });
+             continue;
+         }
 
-        let index_start = data_len - index_size;
-        if frame[index_start] != final_byte {
-            expanded.push(frame.clone());
-            continue;
-        }
+         let index_start = data_len - index_size;
+         if frame[index_start] != final_byte {
+             expanded.push(FrameInfo {
+                 data: frame.clone(),
+                 packet_file_offset: packet_offset,
+                 superframe_frame_offset: 0,
+             });
+             continue;
+         }
 
-        // Parse frame sizes from the superframe index
-        let frame_data_size = data_len - index_size;
-        let mut offset = 0;
-        let mut x = index_start + 1;
-        for _ in 0..num_frames {
-            let mut this_sz: usize = 0;
-            for j in 0..mag {
-                this_sz |= (frame[x + j] as usize) << (j * 8);
-            }
-            x += mag;
+         // Parse frame sizes from the superframe index
+         let frame_data_size = data_len - index_size;
+         let mut offset = 0;
+         let mut x = index_start + 1;
+         for i in 0..num_frames {
+             let mut this_sz: usize = 0;
+             for j in 0..mag {
+                 this_sz |= (frame[x + j] as usize) << (j * 8);
+             }
+             x += mag;
 
-            if offset + this_sz <= frame_data_size {
-                expanded
-                    .push(frame[offset..offset + this_sz].to_vec());
-            }
-            offset += this_sz;
-        }
-    }
+             if offset + this_sz <= frame_data_size {
+                 eprintln!("    Superframe packet offset {} expanded frame {}: size={}, frame_offset={}", 
+                     packet_offset, i, this_sz, offset);
+                 // Extract only this frame's data from the superframe
+                 let extracted = frame[offset..offset + this_sz].to_vec();
+                 
+                 // DEBUG: Show first bytes of extracted frame
+                 if !extracted.is_empty() {
+                     let first_bytes = &extracted[..extracted.len().min(16)];
+                     let hex: String = first_bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                     eprintln!("      Extracted frame {} first 16 bytes: {}", i, hex);
+                 }
+                 
+                 expanded.push(FrameInfo {
+                     data: extracted,
+                     packet_file_offset: packet_offset,
+                     superframe_frame_offset: offset,
+                 });
+             }
+             offset += this_sz;
+         }
+     }
 
     expanded
 }
@@ -1026,8 +1292,7 @@ impl Vp9DpbManager {
 ///
 /// IMPORTANT: referenceNameSlotIndices passed to Vulkan must be DPB slot indices
 /// (matching VkVideoBeginCodingInfoKHR::pReferenceSlots[i].slot_index), NOT indices
-/// into p_reference_slots. This is handled by the caller using the original
-/// reference_name_slot_indices directly.
+/// into p_reference_slots. This matches Vulkan-Video-Samples behavior.
 fn build_dpb_picture_resources(
     dpb_manager: &Vp9DpbManager,
     dpb_views: &[vk::ImageView],
@@ -1251,7 +1516,8 @@ fn readback_and_verify(
     height: u32,
     frame_width: u32,
     frame_height: u32,
-    frame_idx: usize,
+    _frame_idx: usize,  // Bitstream frame index (kept for debugging)
+    display_frame_idx: usize,  // Display order index (used for naming)
     bitstream_path: &str,
 ) {
     let y_size = (width * height) as usize;
@@ -1594,7 +1860,7 @@ fn readback_and_verify(
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "output".to_string());
-        let output_path = format!("{}_frame_{}.yuv", stem, frame_idx);
+        let output_path = format!("{}_frame_{}.yuv", stem, display_frame_idx);
         match std::fs::write(&output_path, yuv_data) {
             Ok(()) => println!("    Saved YUV to {}", output_path),
             Err(e) => eprintln!("    Failed to save YUV: {}", e),

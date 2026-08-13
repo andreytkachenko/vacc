@@ -242,6 +242,34 @@ impl<'a> BitReader<'a> {
         self.bits_left = 8;
         Ok(())
     }
+
+    /// Calculate the number of bytes consumed (rounded up to full byte).
+    pub fn bytes_consumed(&self) -> usize {
+        // pos tracks bytes loaded, bits_left tracks remaining bits in current byte
+        if self.pos == 0 {
+            0
+        } else if self.bits_left == 8 {
+            self.pos - 1  // Loaded but not consumed current byte
+        } else {
+            self.pos  // Partially consumed current byte
+        }
+    }
+
+    /// Debug: get current read position in bits.
+    #[cfg(debug_assertions)]
+    pub fn debug_bit_pos(&self) -> usize {
+        if self.pos == 0 {
+            0
+        } else {
+            (self.pos - 1) * 8 + (8 - self.bits_left)
+        }
+    }
+
+    /// Debug: get current byte being read.
+    #[cfg(debug_assertions)]
+    pub fn debug_curr_byte(&self) -> u8 {
+        self.curr_byte
+    }
 }
 
 /// Errors from bit reading.

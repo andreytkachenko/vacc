@@ -201,6 +201,24 @@ pub struct BitstreamBuffer {
         Ok(())
     }
 
+    /// Write data at a specific offset in the mapped buffer.
+    pub fn write_at(&mut self, data: &[u8], offset: u64) -> VideoResult<()> {
+        if let Some(ptr) = self.mapped_ptr {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    ptr.add(offset as usize),
+                    data.len(),
+                );
+            }
+        } else {
+            return Err(VideoError::BufferAllocation(
+                "Buffer is not host-mapped".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn data_ptr(&self) -> Option<*mut u8> {
         self.mapped_ptr
     }

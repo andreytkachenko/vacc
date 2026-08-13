@@ -9,6 +9,7 @@ pub struct DecodedFrame {
     pub timestamp: i64,
     /// Frame dimensions.
     pub width: u32,
+    /// Frame height.
     pub height: u32,
     /// Whether the frame was skipped (not decoded).
     pub skipped: bool,
@@ -20,6 +21,8 @@ pub struct DecodedFrame {
     pub field_flags: FieldFlags,
     /// Frame sync information.
     pub sync_info: FrameSyncInfo,
+    /// Pixel data for the decoded frame (if available).
+    pub pixel_data: Option<PixelData>,
 }
 
 impl DecodedFrame {
@@ -41,6 +44,7 @@ impl DecodedFrame {
             poc: 0,
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
+            pixel_data: None,
         }
     }
 
@@ -67,6 +71,7 @@ impl Default for DecodedFrame {
             poc: 0,
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
+            pixel_data: None,
         }
     }
 }
@@ -141,4 +146,32 @@ pub struct FrameSyncInfo {
     pub sync_to_first_field: bool,
     /// Debug interface pointer (reserved for future use).
     pub debug_interface: Option<*mut std::ffi::c_void>,
+}
+
+/// A single plane of pixel data (Y, U, or V).
+#[derive(Debug, Clone)]
+pub struct PixelPlane {
+    /// Pointer to plane data.
+    pub data: *const u8,
+    /// Row pitch in bytes.
+    pub pitch: usize,
+    /// Plane width in pixels.
+    pub width: usize,
+    /// Plane height in pixels.
+    pub height: usize,
+}
+
+/// Planar pixel data for a decoded frame.
+#[derive(Debug, Clone)]
+pub struct PixelData {
+    /// Format string (e.g., "NV12", "YV12", "I420").
+    pub format: String,
+    /// Luma (Y) plane.
+    pub y: PixelPlane,
+    /// Chroma U plane.
+    pub u: PixelPlane,
+    /// Chroma V plane (None for semi-planar formats like NV12).
+    pub v: Option<PixelPlane>,
+    /// Owned buffer backing the planes.
+    pub buffer: Vec<u8>,
 }

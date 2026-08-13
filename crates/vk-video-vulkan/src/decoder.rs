@@ -160,11 +160,9 @@ impl VideoDecoder {
         let bs_buffer_size_alignment = caps.min_bitstream_buffer_size_alignment;
         let picture_access_granularity = caps.picture_access_granularity;
 
-        // Align coded_extent to picture_access_granularity.
-        // Vulkan requires coded extent to be a multiple of picture_access_granularity.
-        // Without this alignment, decode writes to a different extent than the image was created with,
-        // causing pixel offset artifacts.
-        let coded_extent = {
+        // Align coded_extent for session max_coded_extent (required by Vulkan spec).
+        // But use raw dimensions for images and per-frame decode commands.
+        let session_coded_extent = {
             let align_width = picture_access_granularity.width;
             let align_height = picture_access_granularity.height;
             vk::Extent2D {
@@ -177,7 +175,7 @@ impl VideoDecoder {
             &vulkan,
             codec,
             &parsed,
-            coded_extent,
+            session_coded_extent,
             session_dpb_slots,
         )?;
 
@@ -197,12 +195,15 @@ impl VideoDecoder {
         )?;
 
         let command_pool = create_command_pool(&vulkan.device, decode_queue_family)?;
+
         let fence = create_fence(&vulkan.device)?;
 
         let mut dpb_views = Vec::new();
         let mut dpb_images = Vec::new();
         let mut dpb_memories = Vec::new();
 
+        // Create images with raw frame dimensions (not aligned).
+        // Image extent must match the codedExtent used in decode commands.
         for _ in 0..session_dpb_slots {
             let (img, view, mem) = create_output_image_with_profile(
                 &vulkan.device,
@@ -556,9 +557,12 @@ impl VideoDecoder {
                 VideoError::DecoderInit(format!("Failed to parse VP9 frame {}: {:?}", frame_idx, e))
             })?;
 
+            // Use raw frame dimensions for coded extent (not aligned).
+            // Vulkan spec: codedExtent is the actual coded dimensions of the frame.
+            // picture_access_granularity alignment is only required for session max_coded_extent.
             let frame_coded_extent = vk::Extent2D {
-                width: (parsed.frame_width + align_width - 1) & !(align_width - 1),
-                height: (parsed.frame_height + align_height - 1) & !(align_height - 1),
+                width: parsed.frame_width,
+                height: parsed.frame_height,
             };
 
             // Handle show_existing_frame
@@ -651,6 +655,13 @@ impl VideoDecoder {
                 .map(|&slot_idx| self.dpb_images[slot_idx as usize])
                 .collect();
 
+            // Get actual layouts of reference slots for proper memory barriers.
+            // This ensures we use correct old_layout in barriers (not always UNDEFINED).
+            let dpb_ref_slot_layouts: Vec<vk::ImageLayout> = dpb_ref_slot_indices
+                .iter()
+                .map(|&slot_idx| self.dpb_manager.get_slot_layout(slot_idx as u32))
+                .collect();
+
             // Convert to Vulkan picture info
             let mut picture_info_container = Box::new(convert_vp9_picture_info(
                 &parsed.picture_info,
@@ -694,6 +705,7 @@ impl VideoDecoder {
                 &dpb_ref_pictures,
                 &dpb_ref_slot_indices,
                 &dpb_ref_images,
+                &dpb_ref_slot_layouts,
                 &picture_info_container,
                 &vp9_decode_info,
                 is_first_frame,
@@ -726,12 +738,9 @@ impl VideoDecoder {
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
             }
 
-            // Update frame pointers
-            let current_pic_idx = output_slot as i32;
-            vp9_decoder.update_frame_pointers(
-                parsed.picture_info.refresh_frame_flags,
-                current_pic_idx,
-            );
+            // Record which DPB slot contains this frame buffer
+            let current_frame_buffer_idx = output_slot as i32;
+            vp9_decoder.set_frame_buffer_dpb_slot(output_slot as usize, current_frame_buffer_idx);
 
             self.dpb_manager.register_frame(output_slot, frame_count);
             self.dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
@@ -1666,6 +1675,8 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
 
     let coded_width = parsed.frame_width;
     let coded_height = parsed.frame_height;
+    let display_width = parsed.render_width;
+    let display_height = parsed.render_height;
     let profile = parsed.picture_info.profile as u32;
     let bit_depth = parsed.color_config.bit_depth;
 
@@ -1704,8 +1715,8 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
             pps: None,
             coded_width,
             coded_height,
-            display_width: coded_width,
-            display_height: coded_height,
+            display_width,
+            display_height,
             crop_left: 0,
             crop_top: 0,
             profile_idc: profile,
