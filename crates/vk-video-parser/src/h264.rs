@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::nal::{self, H264NalUnitType, NalUnit};
 use crate::{
-    DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser,
+    DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser, SliceEntry, SliceHeader as ParserSliceHeader,
 };
 use crate::bitreader::BitReader;
 
@@ -24,6 +24,10 @@ pub struct H264Parser {
     prev_pic_order_cnt_msb: i32,
     frame_count: u32,
     idr_found: bool,
+    /// Offset up to which NAL units have been processed (to avoid re-parsing SPS/PPS).
+    processed_up_to: usize,
+    /// Current frame number being collected (to group slices by frame).
+    current_frame_num: Option<u32>,
 }
 
 impl H264Parser {
@@ -42,7 +46,19 @@ impl H264Parser {
             prev_pic_order_cnt_msb: 0,
             frame_count: 0,
             idr_found: false,
+            processed_up_to: 0,
+            current_frame_num: None,
         }
+    }
+
+    /// Returns a reference to the active SPS, if any.
+    pub fn active_sps(&self) -> Option<&vk_video_core::picture::H264Sps> {
+        self.active_sps.as_ref()
+    }
+
+    /// Returns a reference to the active PPS, if any.
+    pub fn active_pps(&self) -> Option<&vk_video_core::picture::H264Pps> {
+        self.active_pps.as_ref()
     }
 
     /// Parse VUI parameters from the bitstream.
@@ -529,6 +545,7 @@ impl H264Parser {
     ) -> ParserResult<SliceHeader> {
         // Skip NAL header byte (1 byte), enable EPB removal
         let mut r = BitReader::new(&data[1..], true);
+        let header_start_pos = r.position();
 
         let first_mb_in_slice = r.read_ue()?;
         let slice_type = r.read_ue()? % 5;
@@ -543,6 +560,11 @@ impl H264Parser {
             .active_sps
             .as_ref()
             .ok_or(ParserError::ParameterSetParse)?;
+
+        // colour_plane_id is present when separate_colour_plane_flag is set (H.264 spec 7.4.3)
+        if sps.separate_colour_plane_flag {
+            r.read_bits(2)?;
+        }
 
         let frame_num_bits = sps.log2_max_frame_num_minus4 as u32 + 4;
         let frame_num = r.read_bits(frame_num_bits as u8)?;
@@ -575,6 +597,21 @@ impl H264Parser {
             dec_ref_pic_marking: Vec::new(),
             no_output_of_prior_pics_flag: false,
             long_term_reference_flag: false,
+            header_bit_size: 0,
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: 0,
+            luma_weight_l0_flag: 0,
+            luma_weight_l0: [0i16; 32],
+            luma_offset_l0: [0i16; 32],
+            chroma_weight_l0_flag: 0,
+            chroma_weight_l0: [[0i16; 2]; 32],
+            chroma_offset_l0: [[0i16; 2]; 32],
+            luma_weight_l1_flag: 0,
+            luma_weight_l1: [0i16; 32],
+            luma_offset_l1: [0i16; 32],
+            chroma_weight_l1_flag: 0,
+            chroma_weight_l1: [[0i16; 2]; 32],
+            chroma_offset_l1: [[0i16; 2]; 32],
         };
 
         // field_pic_flag and bottom_field_flag (when not frame-only)
@@ -637,21 +674,41 @@ impl H264Parser {
             }
         }
 
-        // Reference picture list modification (for P/SP/B slices with ref_idc > 0)
-        if (is_p || is_sp || is_b) && nal_ref_idc > 0 {
+        // Reference picture list modification (for P/SP/B slices, H.264 spec 7.4.3)
+        if is_p || is_sp || is_b {
             let (mod_l0, mod_l1) = Self::parse_ref_pic_list_modification(&mut r, slice_type)?;
             slh.ref_pic_list_modification_l0 = mod_l0;
             slh.ref_pic_list_modification_l1 = mod_l1;
         }
 
         // Pred weight table
-        let has_pred_weight_table =
-            (pps.weighted_pred_flag && (is_p || is_sp))
-                || (pps.weighted_bipred_idc == 1 && is_b);
-        if has_pred_weight_table {
-            Self::parse_pred_weight_table(&mut r, sps, slice_type,
-                slh.num_ref_idx_l0_active_minus1, slh.num_ref_idx_l1_active_minus1)?;
-        }
+         let has_pred_weight_table =
+             (pps.weighted_pred_flag && (is_p || is_sp))
+                 || (pps.weighted_bipred_idc == 1 && is_b);
+         if has_pred_weight_table {
+             let (
+                 luma_log2_weight_denom, chroma_log2_weight_denom,
+                 luma_weight_l0_flag, luma_weight_l0, luma_offset_l0,
+                 chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0,
+                 luma_weight_l1_flag, luma_weight_l1, luma_offset_l1,
+                 chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1,
+             ) = Self::parse_pred_weight_table(&mut r, sps, slice_type,
+                 slh.num_ref_idx_l0_active_minus1, slh.num_ref_idx_l1_active_minus1)?;
+             slh.luma_log2_weight_denom = luma_log2_weight_denom;
+             slh.chroma_log2_weight_denom = chroma_log2_weight_denom;
+             slh.luma_weight_l0_flag = luma_weight_l0_flag;
+             slh.luma_weight_l0 = luma_weight_l0;
+             slh.luma_offset_l0 = luma_offset_l0;
+             slh.chroma_weight_l0_flag = chroma_weight_l0_flag;
+             slh.chroma_weight_l0 = chroma_weight_l0;
+             slh.chroma_offset_l0 = chroma_offset_l0;
+             slh.luma_weight_l1_flag = luma_weight_l1_flag;
+             slh.luma_weight_l1 = luma_weight_l1;
+             slh.luma_offset_l1 = luma_offset_l1;
+             slh.chroma_weight_l1_flag = chroma_weight_l1_flag;
+             slh.chroma_weight_l1 = chroma_weight_l1;
+             slh.chroma_offset_l1 = chroma_offset_l1;
+         }
 
         // Decoded reference picture marking (for reference pictures)
         if nal_ref_idc > 0 {
@@ -677,6 +734,9 @@ impl H264Parser {
                 slh.slice_beta_offset_div2 = r.read_se()?;
             }
         }
+
+        // Calculate header bit size (bits consumed from slice header start)
+        slh.header_bit_size = (r.position() - header_start_pos) as u16;
 
         Ok(slh)
     }
@@ -731,54 +791,86 @@ impl H264Parser {
         slice_type: u32,
         num_ref_idx_l0_active_minus1: u32,
         num_ref_idx_l1_active_minus1: u32,
-    ) -> ParserResult<()> {
+    ) -> ParserResult<(
+        u8, u8, // luma_log2_weight_denom, chroma_log2_weight_denom
+        u8, [i16; 32], [i16; 32], // luma_weight_l0_flag, luma_weight_l0, luma_offset_l0
+        u8, [[i16; 2]; 32], [[i16; 2]; 32], // chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0
+        u8, [i16; 32], [i16; 32], // luma_weight_l1_flag, luma_weight_l1, luma_offset_l1
+        u8, [[i16; 2]; 32], [[i16; 2]; 32], // chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1
+    )> {
         let is_b = slice_type == 1; // B-slice after modulo 5
         let luma_log2_weight_denom = r.read_ue()? as u8;
 
-        if sps.chroma_format_idc != 0 {
-            let _chroma_log2_weight_denom = r.read_ue()? as u8;
-        }
+        let chroma_log2_weight_denom = if sps.chroma_format_idc != 0 {
+            r.read_ue()? as u8
+        } else {
+            0
+        };
 
         // L0 weights: loop count based on actual num_ref_idx_l0_active_minus1
         // Per H.264 spec 7.4.4
-        for _ in 0..=(num_ref_idx_l0_active_minus1 as usize) {
-            let luma_weight_l0_flag = r.read_bit()?;
-            if luma_weight_l0_flag {
-                r.read_se()?; // luma_weight_l0
-                r.read_se()?; // luma_offset_l0
+        let mut luma_weight_l0_flag: u8 = 0;
+        let mut luma_weight_l0 = [0i16; 32];
+        let mut luma_offset_l0 = [0i16; 32];
+        let mut chroma_weight_l0_flag: u8 = 0;
+        let mut chroma_weight_l0 = [[0i16; 2]; 32];
+        let mut chroma_offset_l0 = [[0i16; 2]; 32];
+
+        for i in 0..=(num_ref_idx_l0_active_minus1 as usize) {
+            let lw_flag = r.read_bit()?;
+            if lw_flag {
+                luma_weight_l0_flag |= 1 << i;
+                luma_weight_l0[i] = r.read_se()? as i16;
+                luma_offset_l0[i] = r.read_se()? as i16;
             }
             if sps.chroma_format_idc != 0 {
-                let chroma_weight_l0_flag = r.read_bit()?;
-                if chroma_weight_l0_flag {
-                    r.read_se()?; // chroma_weight_l0[0]
-                    r.read_se()?; // chroma_offset_l0[0]
-                    r.read_se()?; // chroma_weight_l0[1]
-                    r.read_se()?; // chroma_offset_l0[1]
+                let cw_flag = r.read_bit()?;
+                if cw_flag {
+                    chroma_weight_l0_flag |= 1 << i;
+                    chroma_weight_l0[i][0] = r.read_se()? as i16;
+                    chroma_offset_l0[i][0] = r.read_se()? as i16;
+                    chroma_weight_l0[i][1] = r.read_se()? as i16;
+                    chroma_offset_l0[i][1] = r.read_se()? as i16;
                 }
             }
         }
 
         // L1 weights (B slices only)
+        let mut luma_weight_l1_flag: u8 = 0;
+        let mut luma_weight_l1 = [0i16; 32];
+        let mut luma_offset_l1 = [0i16; 32];
+        let mut chroma_weight_l1_flag: u8 = 0;
+        let mut chroma_weight_l1 = [[0i16; 2]; 32];
+        let mut chroma_offset_l1 = [[0i16; 2]; 32];
+
         if is_b {
-            for _ in 0..=(num_ref_idx_l1_active_minus1 as usize) {
-                let luma_weight_l1_flag = r.read_bit()?;
-                if luma_weight_l1_flag {
-                    r.read_se()?; // luma_weight_l1
-                    r.read_se()?; // luma_offset_l1
+            for i in 0..=(num_ref_idx_l1_active_minus1 as usize) {
+                let lw_flag = r.read_bit()?;
+                if lw_flag {
+                    luma_weight_l1_flag |= 1 << i;
+                    luma_weight_l1[i] = r.read_se()? as i16;
+                    luma_offset_l1[i] = r.read_se()? as i16;
                 }
                 if sps.chroma_format_idc != 0 {
-                    let chroma_weight_l1_flag = r.read_bit()?;
-                    if chroma_weight_l1_flag {
-                        r.read_se()?; // chroma_weight_l1[0]
-                        r.read_se()?; // chroma_offset_l1[0]
-                        r.read_se()?; // chroma_weight_l1[1]
-                        r.read_se()?; // chroma_offset_l1[1]
+                    let cw_flag = r.read_bit()?;
+                    if cw_flag {
+                        chroma_weight_l1_flag |= 1 << i;
+                        chroma_weight_l1[i][0] = r.read_se()? as i16;
+                        chroma_offset_l1[i][0] = r.read_se()? as i16;
+                        chroma_weight_l1[i][1] = r.read_se()? as i16;
+                        chroma_offset_l1[i][1] = r.read_se()? as i16;
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok((
+            luma_log2_weight_denom, chroma_log2_weight_denom,
+            luma_weight_l0_flag, luma_weight_l0, luma_offset_l0,
+            chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0,
+            luma_weight_l1_flag, luma_weight_l1, luma_offset_l1,
+            chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1,
+        ))
     }
 
     /// Parse decoded reference picture marking (H.264 spec 7.4.5).
@@ -795,27 +887,31 @@ impl H264Parser {
             no_output_of_prior_pics_flag = r.read_bit()?;
             long_term_reference_flag = r.read_bit()?;
         } else {
-            // Non-IDR picture marking
-            loop {
-                let memory_management_control_operation = r.read_ue()?;
-                if memory_management_control_operation == 0 {
-                    break;
-                }
-                let value = match memory_management_control_operation {
-                    1 | 3 => r.read_ue()?, // difference_of_pic_nums_minus1
-                    2 => r.read_ue()?, // long_term_pic_num
-                    4 => r.read_ue()?, // max_long_term_frame_idx_plus1
-                    5 => {
-                        let lt_idx = r.read_ue()?; // long_term_frame_idx
-                        let _used_for_reference_field_flag = r.read_bit()?;
-                        lt_idx
+            // Non-IDR picture marking: first read adaptive_ref_pic_marking_mode_flag (H.264 spec 7.4.5)
+            let adaptive_ref_pic_marking_mode_flag = r.read_bit()?;
+            if adaptive_ref_pic_marking_mode_flag {
+                // Adaptive memory management: read operations until memory_management_control_operation=0
+                loop {
+                    let memory_management_control_operation = r.read_ue()?;
+                    if memory_management_control_operation == 0 {
+                        break;
                     }
-                    _ => 0,
-                };
-                marking.push(DecRefPicMarkingEntry {
-                    memory_management_control_operation,
-                    value,
-                });
+                    let value = match memory_management_control_operation {
+                        1 | 3 => r.read_ue()?, // difference_of_pic_nums_minus1
+                        2 => r.read_ue()?, // long_term_pic_num
+                        4 => r.read_ue()?, // max_long_term_frame_idx_plus1
+                        5 => {
+                            let lt_idx = r.read_ue()?; // long_term_frame_idx
+                            let _used_for_reference_field_flag = r.read_bit()?;
+                            lt_idx
+                        }
+                        _ => 0,
+                    };
+                    marking.push(DecRefPicMarkingEntry {
+                        memory_management_control_operation,
+                        value,
+                    });
+                }
             }
         }
 
@@ -872,6 +968,7 @@ impl VideoParser for H264Parser {
     }
 
     fn parse(&mut self, packet: &crate::bitstream::BitstreamPacket) -> ParserResult<ParseResult> {
+        eprintln!("[parse] Called with packet size={}, processed_up_to={}, parser_ptr={:p}", packet.payload.len(), self.processed_up_to, self as *const _);
         if packet.is_eos() {
             return Ok(ParseResult::EndOfStream);
         }
@@ -880,11 +977,19 @@ impl VideoParser for H264Parser {
 
         let mut result_sps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut result_pps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
-        let mut last_slice_offset: Option<usize> = None;
-        let mut last_slice_len: Option<usize> = None;
-        let mut slice_count: u32 = 0;
+        let mut slices: Vec<SliceEntry> = Vec::new();
+        let mut first_slice_offset: Option<usize> = None;
+        let mut last_slice_end: Option<usize> = None;
 
         for nal in &nal_units {
+            // Skip NALs that have already been processed
+            eprintln!("[parse] Checking NAL at offset={}, size={}, type={}, processed_up_to={}", 
+                nal.offset, nal.size, nal.nal_unit_type, self.processed_up_to);
+            if nal.offset + nal.size <= self.processed_up_to {
+                eprintln!("[parse] Skipping already-processed NAL");
+                continue;
+            }
+
             match H264NalUnitType::from_u8(nal.nal_unit_type) {
                 Some(H264NalUnitType::Sps) => {
                     eprintln!("[parse] Found SPS NAL, size={}", nal.data.len());
@@ -900,6 +1005,8 @@ impl VideoParser for H264Parser {
                             result_sps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
                                 self.active_sps.clone().unwrap(),
                             ));
+                            // Mark this NAL as processed
+                            self.processed_up_to = nal.offset + nal.size;
                         }
                         Err(e) => {
                             eprintln!("[parse] SPS parse ERROR: {:?}", e);
@@ -920,6 +1027,8 @@ impl VideoParser for H264Parser {
                             result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
                                 self.active_pps.clone().unwrap(),
                             ));
+                            // Mark this NAL as processed
+                            self.processed_up_to = nal.offset + nal.size;
                         }
                         Err(e) => {
                             eprintln!("[parse] PPS parse ERROR: {:?}", e);
@@ -944,9 +1053,44 @@ impl VideoParser for H264Parser {
                         }
                     }
 
-                    last_slice_offset = Some(nal.offset);
-                    last_slice_len = Some(nal.size);
-                    slice_count += 1;
+                    // Parse slice header for this NAL
+                    let slice_header = if let Ok(slh) = self.parse_slice_header(&nal.data, nal_ref_idc, nal_unit_type) {
+                        Some(ParserSliceHeader::H264(slh))
+                    } else {
+                        None
+                    };
+
+                    // Track the first frame's frame_num
+                    let current_frame_num = if let Some(ParserSliceHeader::H264(slh)) = &slice_header {
+                        slh.frame_num
+                    } else {
+                        continue;
+                    };
+
+                    // Only collect slices for the first frame
+                    if slices.is_empty() {
+                        // First slice - record its frame_num
+                        self.current_frame_num = Some(current_frame_num);
+                    }
+
+                    // Stop collecting if frame_num changes (new frame)
+                    if let Some(first_frame_num) = self.current_frame_num {
+                        if current_frame_num != first_frame_num {
+                            // New frame detected, stop collecting
+                            break;
+                        }
+                    }
+
+                    // Track offsets for bytes_consumed calculation
+                    if first_slice_offset.is_none() {
+                        first_slice_offset = Some(nal.offset);
+                    }
+                    last_slice_end = Some(nal.offset + nal.size);
+
+                    slices.push(SliceEntry {
+                        slice_header,
+                        nal_data: nal.data.clone(),
+                    });
                 }
                 Some(H264NalUnitType::FillerData) | Some(H264NalUnitType::SeqEnd) | Some(H264NalUnitType::StreamEnd) => {
                     // Skip filler and end codes
@@ -956,24 +1100,35 @@ impl VideoParser for H264Parser {
         }
 
         if result_sps.is_some() || result_pps.is_some() {
+            eprintln!("[parse] Returning ParameterSet, processed_up_to={}", self.processed_up_to);
             Ok(ParseResult::ParameterSet {
                 sps: result_sps,
                 pps: result_pps,
                 vps: None,
             })
-        } else if let (Some(offset), Some(len)) = (last_slice_offset, last_slice_len) {
-            Ok(ParseResult::Slice {
-                slice_data_offset: offset,
-                slice_data_len: len,
-                num_slices: slice_count,
-                slice_header: None,
-            })
+        } else if !slices.is_empty() {
+            // Calculate bytes consumed: from first slice start to last slice end
+            let bytes_consumed = if let (Some(first), Some(last)) = (first_slice_offset, last_slice_end) {
+                last - first
+            } else {
+                0
+            };
+            // Update processed_up_to to the end of the last slice in this frame
+            if let Some(last) = last_slice_end {
+                self.processed_up_to = last;
+            }
+            eprintln!("[parse] Returning {} slices, bytes_consumed={}, processed_up_to={}", slices.len(), bytes_consumed, self.processed_up_to);
+            // Clear current_frame_num for next frame
+            self.current_frame_num = None;
+            Ok(ParseResult::Slice { slices, bytes_consumed })
         } else {
+            eprintln!("[parse] Returning Nothing, processed_up_to={}", self.processed_up_to);
             Ok(ParseResult::Nothing)
         }
     }
 
     fn reset(&mut self) {
+        eprintln!("[parser] reset() called, clearing processed_up_to={}", self.processed_up_to);
         self.sps_cache.clear();
         self.pps_cache.clear();
         self.active_sps = None;
@@ -984,6 +1139,8 @@ impl VideoParser for H264Parser {
         self.prev_frame_num = 0;
         self.prev_pic_order_cnt_lsb = 0;
         self.prev_pic_order_cnt_msb = 0;
+        self.processed_up_to = 0;
+        self.current_frame_num = None;
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {
@@ -1041,6 +1198,23 @@ pub struct SliceHeader {
     pub dec_ref_pic_marking: Vec<DecRefPicMarkingEntry>,
     pub no_output_of_prior_pics_flag: bool,
     pub long_term_reference_flag: bool,
+    // Slice header size in bits (excluding NAL header)
+    pub header_bit_size: u16,
+    // Weighted prediction parameters (H.264 spec 7.4.4)
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
 }
 
 // TODO: Add PPS/slice header tests with verified bitstream data from real streams

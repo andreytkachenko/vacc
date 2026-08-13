@@ -160,7 +160,20 @@ impl<'a> BitReader<'a> {
 
     /// Get current bit position in the stream.
     pub fn position(&self) -> u64 {
-        (self.pos as u64) * 8 - (8 - self.bits_left) as u64
+        if self.bits_left == 0 && self.pos == 0 {
+            // No byte loaded yet
+            return 0;
+        }
+        // bits_left is in range 0..=8
+        // When bits_left == 0, we've consumed all bits of current byte, so we're at pos*8
+        // When bits_left == 8, we haven't consumed any bits of current byte, so we're at (pos-1)*8
+        // The formula: pos*8 - (8 - bits_left) works for bits_left > 0
+        // For bits_left == 0, we need special handling: we're at pos*8
+        if self.bits_left == 0 {
+            (self.pos as u64) * 8
+        } else {
+            (self.pos as u64) * 8 - (8 - self.bits_left) as u64
+        }
     }
 
     /// Check if there is more data to read.

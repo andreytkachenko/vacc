@@ -1361,7 +1361,6 @@ impl VideoParser for H265Parser {
                     last_slice_offset = Some(nal.offset);
                     last_slice_len = Some(nal.size);
                     slice_count += 1;
-                    self.frame_count += 1;
                 }
                 _ => {}
             }
@@ -1374,11 +1373,17 @@ impl VideoParser for H265Parser {
                 vps: result_vps,
             })
         } else if let (Some(offset), Some(len)) = (last_slice_offset, last_slice_len) {
+            self.frame_count += 1;
+            // For now, return a single SliceEntry with the first slice header
+            let slices = vec![crate::SliceEntry {
+                slice_header: self.first_slice_header
+                    .clone()
+                    .map(crate::SliceHeader::H265),
+                nal_data: Vec::new(), // Will be filled by caller from offset/len
+            }];
             Ok(ParseResult::Slice {
-                slice_data_offset: offset,
-                slice_data_len: len,
-                num_slices: slice_count,
-                slice_header: self.first_slice_header.clone(),
+                slices,
+                bytes_consumed: len,
             })
         } else {
             Ok(ParseResult::Nothing)

@@ -1038,11 +1038,13 @@ impl VideoParser for Av1Parser {
                             if self.active_sps.is_some() {
                                 self.frame_count += 1;
                                 offset += obu_data_offset + obu_size;
+                                let bytes_consumed = data.len().saturating_sub(offset);
                                 return Ok(ParseResult::Slice {
-                                    slice_data_offset: offset,
-                                    slice_data_len: data.len() - offset,
-                                    num_slices: 1,
-                                    slice_header: None,
+                                    slices: vec![crate::SliceEntry {
+                                        slice_header: None,
+                                        nal_data: Vec::new(),
+                                    }],
+                                    bytes_consumed,
                                 });
                             }
                         }
@@ -1067,10 +1069,11 @@ impl VideoParser for Av1Parser {
         if self.active_sps.is_some() && !data.is_empty() {
             self.frame_count += 1;
             return Ok(ParseResult::Slice {
-                slice_data_offset: 0,
-                slice_data_len: data.len(),
-                num_slices: 1,
-                slice_header: None,
+                slices: vec![crate::SliceEntry {
+                    slice_header: None,
+                    nal_data: Vec::new(),
+                }],
+                bytes_consumed: data.len(),
             });
         }
 

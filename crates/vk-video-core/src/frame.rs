@@ -1,7 +1,35 @@
 //! Decoded frame representation and metadata.
 
+/// A single plane of pixel data.
+#[derive(Debug)]
+pub struct PixelPlane {
+    /// Pointer to plane data (points into PixelData.buffer).
+    pub data: *const u8,
+    /// Pitch (bytes per row).
+    pub pitch: usize,
+    /// Width in pixels.
+    pub width: usize,
+    /// Height in pixels.
+    pub height: usize,
+}
+
+/// Pixel data for a decoded frame.
+#[derive(Debug)]
+pub struct PixelData {
+    /// Format string (e.g., "NV12", "I420", "YV12").
+    pub format: String,
+    /// Y (luma) plane.
+    pub y: PixelPlane,
+    /// U (chroma) plane.
+    pub u: PixelPlane,
+    /// V (chroma) plane, if separate from U (None for NV12).
+    pub v: Option<PixelPlane>,
+    /// Owned buffer backing the planes.
+    pub buffer: Vec<u8>,
+}
+
 /// Presentation information for a decoded frame.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DecodedFrame {
     /// Frame index in the output sequence.
     pub frame_index: u32,
@@ -20,6 +48,8 @@ pub struct DecodedFrame {
     pub field_flags: FieldFlags,
     /// Frame sync information.
     pub sync_info: FrameSyncInfo,
+    /// Pixel data (if available).
+    pub pixel_data: Option<PixelData>,
 }
 
 impl DecodedFrame {
@@ -41,6 +71,7 @@ impl DecodedFrame {
             poc: 0,
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
+            pixel_data: None,
         }
     }
 
@@ -67,6 +98,7 @@ impl Default for DecodedFrame {
             poc: 0,
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
+            pixel_data: None,
         }
     }
 }

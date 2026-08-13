@@ -81,7 +81,12 @@ pub struct H264Sps {
     pub pic_width_in_mbs_minus1: u16,
     pub pic_height_in_map_units_minus1: u16,
     pub frame_mbs_only_flag: bool,
+    pub mb_adaptive_frame_field_flag: bool,
     pub direct_8x8_inference_flag: bool,
+    /// Scaling lists: 6 x 4x4 matrices (luma 0-3, chroma 4-5)
+    pub scaling_list_4x4: [[u8; 16]; 6],
+    /// Scaling lists: 2 x 8x8 matrices (luma 0-1)
+    pub scaling_list_8x8: [[u8; 64]; 2],
     pub frame_cropping_flag: bool,
     pub frame_crop_left_offset: u32,
     pub frame_crop_right_offset: u32,
@@ -167,7 +172,10 @@ impl H264Sps {
             pic_width_in_mbs_minus1: 0,
             pic_height_in_map_units_minus1: 0,
             frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
             direct_8x8_inference_flag: false,
+            scaling_list_4x4: [[0u8; 16]; 6],
+            scaling_list_8x8: [[0u8; 64]; 2],
             frame_cropping_flag: false,
             frame_crop_left_offset: 0,
             frame_crop_right_offset: 0,

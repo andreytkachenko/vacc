@@ -19,3 +19,8 @@ vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
 vk-video-vulkan = { workspace = true }
 ash = { workspace = true }
+vaapi-decode = { workspace = true }
+
+[[example]]
+name = "decode_vaapi"
+path = "src/decode_vaapi.rs"

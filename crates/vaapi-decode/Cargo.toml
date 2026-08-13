@@ -1,0 +1,19 @@
+[package]
+name = "vaapi-decode"
+description = "VAAPI Video Decode implementation with Decoder trait"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vk-video-core = { workspace = true }
+vk-video-parser = { workspace = true }
+libva = { package = "cros-libva", version = "0.0.7" }
+memmap2 = "0.9"
+bitflags = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+pkg-config = "0.3"
