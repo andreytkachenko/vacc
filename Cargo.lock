@@ -195,6 +195,7 @@ name = "examples"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "nvdec-decode",
  "vk-video-core",
  "vk-video-parser",
  "vk-video-vulkan",
@@ -571,6 +572,17 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "nvdec-decode"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "log",
+ "thiserror 2.0.18",
+ "vk-video-core",
+ "vk-video-parser",
 ]
 
 [[package]]

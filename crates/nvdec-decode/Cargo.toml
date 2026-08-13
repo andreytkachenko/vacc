@@ -1,0 +1,13 @@
+[package]
+name = "nvdec-decode"
+description = "NVDEC (NVIDIA Video Decode) backend for vk-video"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vk-video-core = { workspace = true }
+vk-video-parser = { workspace = true }
+libloading = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

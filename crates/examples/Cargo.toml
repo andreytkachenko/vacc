@@ -18,4 +18,12 @@ path = "src/vulkan_decode_vp9.rs"
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
 vk-video-vulkan = { workspace = true }
+nvdec-decode = { workspace = true }
 ash = { workspace = true }
+[[example]]
+name = "decode_nvdec"
+path = "src/decode_nvdec.rs"
+
+[[example]]
+name = "test_nvdec_edge"
+path = "src/test_nvdec_edge.rs"

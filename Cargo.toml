@@ -3,6 +3,7 @@ members = [
     "crates/vk-video-core",
     "crates/vk-video-parser",
     "crates/vk-video-vulkan",
+    "crates/nvdec-decode",
     "crates/examples",
 ]
 resolver = "2"
@@ -18,6 +19,7 @@ repository = "https://github.com/andreytkachenko/vk-video"
 vk-video-core = { path = "crates/vk-video-core", version = "0.1.0" }
 vk-video-vulkan = { path = "crates/vk-video-vulkan", version = "0.1.0" }
 vk-video-parser = { path = "crates/vk-video-parser", version = "0.1.0" }
+nvdec-decode = { path = "crates/nvdec-decode", version = "0.1.0" }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2"
