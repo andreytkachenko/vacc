@@ -11,6 +11,7 @@ pub struct BitstreamBuffer {
     offset_alignment: u32,
     size_alignment: u32,
     device: ash::Device,
+    #[allow(dead_code)]
     memory_properties: ash::vk::PhysicalDeviceMemoryProperties,
     mapped_ptr: Option<*mut u8>,
 }
@@ -116,7 +117,7 @@ impl BitstreamBuffer {
             offset_alignment,
             size_alignment,
             device: device.clone(),
-            memory_properties: memory_properties.clone(),
+            memory_properties: *memory_properties,
             mapped_ptr,
         })
     }
@@ -148,16 +149,10 @@ impl BitstreamBuffer {
         type_bits: u32,
         required_flags: ash::vk::MemoryPropertyFlags,
     ) -> Option<u32> {
-        for i in 0..mem_props.memory_type_count {
-            if (type_bits & (1 << i)) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(required_flags)
-            {
-                return Some(i);
-            }
-        }
-        None
+        (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(required_flags))
     }
 
     fn aligned_size(size: u64, alignment: u32) -> u64 {

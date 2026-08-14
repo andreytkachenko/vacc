@@ -2,6 +2,11 @@
 //!
 //! Vulkan Video Decoder implementation using `ash` for Vulkan bindings.
 
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::field_reassign_with_default)]
+
 pub mod access_unit;
 pub mod av1;
 pub mod buffer;

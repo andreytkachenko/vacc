@@ -2,7 +2,7 @@
 
 use super::vp9::vp9_vk_constants;
 use super::{buffer::BitstreamBuffer, device::VideoCodec, VideoError, VideoResult};
-use ash::vk::{self, Handle};
+use ash::vk;
 
 /// Create an output image with VkVideoProfileListInfoKHR in the pNext chain.
 pub fn create_output_image_with_profile(
@@ -235,14 +235,8 @@ fn find_memory_type(
     type_bits: u32,
     required_flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    for i in 0..mem_props.memory_type_count {
-        if (type_bits & (1 << i)) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(required_flags)
-        {
-            return Some(i);
-        }
-    }
-    None
+    (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
+        && mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(required_flags))
 }

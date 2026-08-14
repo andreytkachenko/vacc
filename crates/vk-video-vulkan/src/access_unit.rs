@@ -144,6 +144,7 @@ impl<'a> SliceBitReader<'a> {
         Some((1 << leading_zeros) - 1 + value)
     }
 
+    #[allow(dead_code)]
     fn read_se(&mut self) -> Option<i32> {
         let ue = self.read_ue()?;
         if ue & 1 != 0 {
@@ -230,6 +231,7 @@ fn parse_h264_slice_header(
     // See H.264 spec 7.3.3 and 8.2.5.4
     let mut mmco_commands = Vec::new();
     if adaptive_ref_pic_marking_mode_flag {
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(memory_management_control_operation) = r.read_ue() else {
                 break;
@@ -307,7 +309,7 @@ fn parse_h265_slice_header(
     sps: &vk_video_core::picture::H265Sps,
     pps: &vk_video_core::picture::H265Pps,
     nal_unit_type: u8,
-    nuh_temporal_id_plus1: u8,
+    _nuh_temporal_id_plus1: u8,
     prev_pic_order_cnt_lsb: i32,
     prev_pic_order_cnt_msb: i32,
 ) -> Option<(
@@ -333,7 +335,7 @@ fn parse_h265_slice_header(
 
     let first_slice_segment_in_pic_flag = r.read_bit()? == 1;
 
-    let is_rap = nal_unit_type >= 16 && nal_unit_type <= 23;
+    let is_rap = (16..=23).contains(&nal_unit_type);
     let no_output_of_prior_pics_flag = if is_rap {
         r.read_bit().unwrap_or(0) == 1
     } else {
@@ -371,7 +373,7 @@ fn parse_h265_slice_header(
         r.read_bits(pic_order_cnt_lsb_bits)? as i32
     };
 
-    let pic_order_cnt_msb = if nal_unit_type >= 16 && nal_unit_type <= 20 {
+    let pic_order_cnt_msb = if (16..=20).contains(&nal_unit_type) {
         0
     } else {
         let max_pic_order_cnt_lsb = 1i32 << pic_order_cnt_lsb_bits;
@@ -426,7 +428,7 @@ fn parse_h265_slice_header(
                 if r_idx < sps.short_term_ref_pic_sets.len() {
                     let ref_strps = &sps.short_term_ref_pic_sets[r_idx];
                     num_delta_pocs_of_ref_rps_idx =
-                        (ref_strps.num_negative_pics as i32 + ref_strps.num_positive_pics as i32);
+                        ref_strps.num_negative_pics as i32 + ref_strps.num_positive_pics as i32;
 
                     let num_ref_entries =
                         ref_strps.num_negative_pics as usize + ref_strps.num_positive_pics as usize;
@@ -461,7 +463,7 @@ fn parse_h265_slice_header(
                         ref_poc_s1.push(curr_poc + delta);
                     }
 
-                    let mut new_num_neg: usize = 0;
+                    let mut _new_num_neg: usize = 0;
                     for j in (0..ref_strps.num_positive_pics as usize).rev() {
                         let new_poc = ref_poc_s1[j] + delta_rps;
                         let entry_idx = ref_strps.num_negative_pics as usize + j;
@@ -469,7 +471,7 @@ fn parse_h265_slice_header(
                             if used_by_curr_pic_flag[entry_idx] {
                                 ref_pocs.push(new_poc);
                             }
-                            new_num_neg += 1;
+                            _new_num_neg += 1;
                         }
                     }
                     if delta_rps < 0 && use_delta_flag[num_ref_entries] {
@@ -477,7 +479,7 @@ fn parse_h265_slice_header(
                         if used_by_curr_pic_flag[num_ref_entries] {
                             ref_pocs.push(new_poc);
                         }
-                        new_num_neg += 1;
+                        _new_num_neg += 1;
                     }
                     for j in 0..ref_strps.num_negative_pics as usize {
                         let new_poc = ref_poc_s0[j] + delta_rps;
@@ -485,17 +487,16 @@ fn parse_h265_slice_header(
                             if used_by_curr_pic_flag[j] {
                                 ref_pocs.push(new_poc);
                             }
-                            new_num_neg += 1;
+                            _new_num_neg += 1;
                         }
                     }
 
                     for j in (0..ref_strps.num_negative_pics as usize).rev() {
                         let new_poc = ref_poc_s0[j] + delta_rps;
-                        if new_poc > curr_poc && use_delta_flag[j] {
-                            if used_by_curr_pic_flag[j] {
+                        if new_poc > curr_poc && use_delta_flag[j]
+                            && used_by_curr_pic_flag[j] {
                                 ref_pocs.push(new_poc);
                             }
-                        }
                     }
                     if delta_rps > 0 && use_delta_flag[num_ref_entries] {
                         let new_poc = curr_poc + delta_rps;
@@ -503,14 +504,13 @@ fn parse_h265_slice_header(
                             ref_pocs.push(new_poc);
                         }
                     }
-                    for j in 0..ref_strps.num_positive_pics as usize {
-                        let new_poc = ref_poc_s1[j] + delta_rps;
+                    for (j, &poc) in ref_poc_s1.iter().enumerate().take(ref_strps.num_positive_pics as usize) {
+                        let new_poc = poc + delta_rps;
                         let entry_idx = ref_strps.num_negative_pics as usize + j;
-                        if new_poc > curr_poc && use_delta_flag[entry_idx] {
-                            if used_by_curr_pic_flag[entry_idx] {
+                        if new_poc > curr_poc && use_delta_flag[entry_idx]
+                            && used_by_curr_pic_flag[entry_idx] {
                                 ref_pocs.push(new_poc);
                             }
-                        }
                     }
                 }
             } else {
@@ -519,7 +519,7 @@ fn parse_h265_slice_header(
                 let curr_poc = pic_order_cnt_val;
 
                 let mut cumulative_delta_poc_s0: i32 = 0;
-                for i in 0..num_negative_pics {
+                for _i in 0..num_negative_pics {
                     let delta = r.read_ue().unwrap_or(0) as i32;
                     cumulative_delta_poc_s0 += delta + 1;
                     let used = r.read_bit().unwrap_or(0);
@@ -530,7 +530,7 @@ fn parse_h265_slice_header(
                 }
 
                 let mut cumulative_delta_poc_s1: i32 = 0;
-                for i in 0..num_positive_pics {
+                for _i in 0..num_positive_pics {
                     let delta = r.read_ue().unwrap_or(0) as i32;
                     cumulative_delta_poc_s1 += delta + 1;
                     let used = r.read_bit().unwrap_or(0);
@@ -590,6 +590,7 @@ fn parse_h265_slice_header(
             let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
 
             for i in 0u32..(num_long_term_sps + num_long_term_pics) {
+                #[allow(unused_assignments)]
                 let mut poc_lsb: i32 = 0;
                 if i < num_long_term_sps {
                     if lt_idx_bits > 0 {
@@ -699,17 +700,17 @@ pub fn extract_all_access_units(
 
     // Initialize seen IDs from initial parameter sets
     if let Some(sps) = h264_sps {
-        seen_h264_sps_ids.insert(sps.seq_parameter_set_id as u32);
+        seen_h264_sps_ids.insert(sps.seq_parameter_set_id);
         max_pic_order_cnt_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
     }
     if let Some(pps) = h264_pps {
-        seen_h264_pps_ids.insert(pps.pic_parameter_set_id as u32);
+        seen_h264_pps_ids.insert(pps.pic_parameter_set_id);
     }
     if let Some(sps) = h265_sps {
-        seen_h265_sps_ids.insert(sps.sps_seq_parameter_set_id as u32);
+        seen_h265_sps_ids.insert(sps.sps_seq_parameter_set_id);
     }
     if let Some(pps) = h265_pps {
-        seen_h265_pps_ids.insert(pps.pps_pic_parameter_set_id as u32);
+        seen_h265_pps_ids.insert(pps.pps_pic_parameter_set_id);
     }
 
     while offset < data.len() && items.len() < max_frames * 2 {
@@ -812,20 +813,20 @@ pub fn extract_all_access_units(
                 if let Some(ref sps) = ps.sps {
                     match sps {
                         H264OrH265Sps::H264(s) => {
-                            seen_h264_sps_ids.insert(s.seq_parameter_set_id as u32);
+                            seen_h264_sps_ids.insert(s.seq_parameter_set_id);
                         }
                         H264OrH265Sps::H265(s) => {
-                            seen_h265_sps_ids.insert(s.sps_seq_parameter_set_id as u32);
+                            seen_h265_sps_ids.insert(s.sps_seq_parameter_set_id);
                         }
                     }
                 }
                 if let Some(ref pps) = ps.pps {
                     match pps {
                         H264OrH265Pps::H264(p) => {
-                            seen_h264_pps_ids.insert(p.pic_parameter_set_id as u32);
+                            seen_h264_pps_ids.insert(p.pic_parameter_set_id);
                         }
                         H264OrH265Pps::H265(p) => {
-                            seen_h265_pps_ids.insert(p.pps_pic_parameter_set_id as u32);
+                            seen_h265_pps_ids.insert(p.pps_pic_parameter_set_id);
                         }
                     }
                 }
@@ -869,19 +870,11 @@ pub fn extract_all_access_units(
                         ) {
                             let is_idr_slice = nal_unit_type == 5;
 
-                            is_new_frame = if !in_frame || current_slice_offsets.is_empty() {
-                                true
-                            } else if first_mb == 0 {
-                                true
-                            } else if frame_num != prev_frame_num {
-                                true
-                            } else if current_is_idr && !is_idr_slice {
-                                // Non-IDR slice after IDR slice must be a new frame
-                                // (IDR frames cannot contain Non-IDR slices)
-                                true
-                            } else {
-                                false
-                            };
+                            is_new_frame = !in_frame
+                                || current_slice_offsets.is_empty()
+                                || first_mb == 0
+                                || frame_num != prev_frame_num
+                                || (current_is_idr && !is_idr_slice);
 
                             if is_new_frame {
                                 if in_frame && !current_au_data.is_empty() {
@@ -944,7 +937,7 @@ pub fn extract_all_access_units(
                         true
                     } else if let Some((_, _, nal_type)) = parse_h264_nal_header(nal_data) {
                         let is_idr_slice = nal_type == 5;
-                        (current_is_idr && !is_idr_slice) || is_idr_slice
+                        current_is_idr || is_idr_slice
                     } else {
                         false
                     };
@@ -976,15 +969,10 @@ pub fn extract_all_access_units(
                             prev_pic_order_cnt_lsb,
                             prev_pic_order_cnt_msb,
                         ) {
-                            is_new_frame = if !in_frame || current_slice_offsets.is_empty() {
-                                true
-                            } else if first_slice_in_pic {
-                                true
-                            } else if is_irap {
-                                true
-                            } else {
-                                false
-                            };
+                            is_new_frame = !in_frame
+                                || current_slice_offsets.is_empty()
+                                || first_slice_in_pic
+                                || is_irap;
 
                             if is_new_frame {
                                 if in_frame && !current_au_data.is_empty() {
@@ -1040,25 +1028,13 @@ pub fn extract_all_access_units(
                                 in_frame = true;
                             }
                         } else {
-                            is_new_frame = if !in_frame || current_slice_offsets.is_empty() {
-                                true
-                            } else if is_irap {
-                                true
-                            } else {
-                                false
-                            };
+                            is_new_frame = !in_frame || current_slice_offsets.is_empty() || is_irap;
                         }
                     } else {
                         is_new_frame = !in_frame || current_slice_offsets.is_empty();
                     }
                 } else {
-                    is_new_frame = if !in_frame || current_slice_offsets.is_empty() {
-                        true
-                    } else if is_irap {
-                        true
-                    } else {
-                        false
-                    };
+                    is_new_frame = !in_frame || current_slice_offsets.is_empty() || is_irap;
                 }
             }
 
@@ -1106,7 +1082,7 @@ pub fn extract_all_access_units(
                     if let Some((_, nal_type, _, _)) = parse_h265_nal_header(nal_data) {
                         current_is_idr = nal_type == 19 || nal_type == 20;
                         current_is_reference =
-                            (nal_type >= 16 && nal_type <= 23) || nal_type % 2 == 1;
+                            (16..=23).contains(&nal_type) || nal_type % 2 == 1;
                         prev_frame_num += 1;
                         current_frame_num = prev_frame_num;
                         current_slice_type = if current_is_idr {
@@ -1155,7 +1131,7 @@ pub fn extract_all_access_units(
 /// Parse H.264 in-band SPS/PPS from NAL unit data.
 fn parse_h264_inband_params(
     nal_data: &[u8],
-    nal_type: usize,
+    _nal_type: usize,
     seen_sps_ids: &std::collections::HashSet<u32>,
     seen_pps_ids: &std::collections::HashSet<u32>,
 ) -> Option<InBandParameterSet> {
@@ -1176,7 +1152,7 @@ fn parse_h264_inband_params(
     }
 
     let packet = BitstreamPacket::new(nal_data.to_vec());
-    let mut vps: Option<H265VpsOpt> = None;
+    let vps: Option<H265VpsOpt> = None;
     let mut sps: Option<H264OrH265Sps> = None;
     let mut pps: Option<H264OrH265Pps> = None;
 
@@ -1185,7 +1161,7 @@ fn parse_h264_inband_params(
             if let Some(s) = s {
                 if let Some(h264_sps) = s.downcast_ref::<vk_video_core::picture::H264Sps>() {
                     // Only report if this is a new SPS ID
-                    if !seen_sps_ids.contains(&(h264_sps.seq_parameter_set_id as u32)) {
+                    if !seen_sps_ids.contains(&{ h264_sps.seq_parameter_set_id }) {
                         sps = Some(H264OrH265Sps::H264(h264_sps.clone()));
                     }
                 }
@@ -1193,7 +1169,7 @@ fn parse_h264_inband_params(
             if let Some(p) = p {
                 if let Some(h264_pps) = p.downcast_ref::<vk_video_core::picture::H264Pps>() {
                     // Only report if this is a new PPS ID
-                    if !seen_pps_ids.contains(&(h264_pps.pic_parameter_set_id as u32)) {
+                    if !seen_pps_ids.contains(&{ h264_pps.pic_parameter_set_id }) {
                         pps = Some(H264OrH265Pps::H264(h264_pps.clone()));
                     }
                 }
@@ -1212,7 +1188,7 @@ fn parse_h264_inband_params(
 /// Parse H.265 in-band VPS/SPS/PPS from NAL unit data.
 fn parse_h265_inband_params(
     nal_data: &[u8],
-    nal_type: usize,
+    _nal_type: usize,
     seen_vps_ids: &std::collections::HashSet<u32>,
     seen_sps_ids: &std::collections::HashSet<u32>,
     seen_pps_ids: &std::collections::HashSet<u32>,
@@ -1256,7 +1232,7 @@ fn parse_h265_inband_params(
             if let Some(s) = s {
                 if let Some(h265_sps) = s.downcast_ref::<vk_video_core::picture::H265Sps>() {
                     // Only report if this is a new SPS ID
-                    if !seen_sps_ids.contains(&(h265_sps.sps_seq_parameter_set_id as u32)) {
+                    if !seen_sps_ids.contains(&{ h265_sps.sps_seq_parameter_set_id }) {
                         sps = Some(H264OrH265Sps::H265(h265_sps.clone()));
                     }
                 }
@@ -1264,7 +1240,7 @@ fn parse_h265_inband_params(
             if let Some(p) = p {
                 if let Some(h265_pps) = p.downcast_ref::<vk_video_core::picture::H265Pps>() {
                     // Only report if this is a new PPS ID
-                    if !seen_pps_ids.contains(&(h265_pps.pps_pic_parameter_set_id as u32)) {
+                    if !seen_pps_ids.contains(&{ h265_pps.pps_pic_parameter_set_id }) {
                         pps = Some(H264OrH265Pps::H265(h265_pps.clone()));
                     }
                 }
@@ -1310,7 +1286,7 @@ pub fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 
     // Read header_size from file instead of hardcoding
     let header_size = u16::from_le_bytes([data[6], data[7]]) as usize;
-    if header_size < 32 || header_size > 256 {
+    if !(32..=256).contains(&header_size) {
         return Err(format!(
             "Invalid IVF header_size: {} (expected 32)",
             header_size

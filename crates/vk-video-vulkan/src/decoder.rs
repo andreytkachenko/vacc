@@ -1,12 +1,11 @@
 //! High-level video decoder that wraps H.264/H.265/VP9 Vulkan decode.
 
 use ash::vk::{self, Handle};
-use std::ffi::CString;
 
 use super::{
     access_unit::{
         AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet,
-        VideoCodec as AccessUnitCodec, Vp9Frame,
+        VideoCodec as AccessUnitCodec,
     },
     buffer::BitstreamBuffer,
     device::{VideoCodec, VulkanDevice},
@@ -17,8 +16,7 @@ use super::{
     readback::DecodedPixels,
     session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams},
     vp9::{
-        convert_vp9_picture_info, vp9_vk_constants, VideoDecodeVP9PictureInfoKHR,
-        VideoDecodeVP9ProfileInfoKHR, Vp9Decoder, Vp9PictureInfoContainer,
+        convert_vp9_picture_info, VideoDecodeVP9PictureInfoKHR, Vp9Decoder,
     },
     VideoError, VideoResult,
 };
@@ -76,16 +74,25 @@ pub struct VideoDecoder {
     dpb_views: Vec<vk::ImageView>,
     dpb_images: Vec<vk::Image>,
     dpb_memories: Vec<vk::DeviceMemory>,
+    #[allow(dead_code)]
     output_format: vk::Format,
     bitstream_data: Vec<u8>,
     /// Persistent storage for codec-specific Vulkan structs.
+    #[allow(dead_code)]
     h265_pic_info_vec: Vec<ash::vk::native::StdVideoDecodeH265PictureInfo>,
+    #[allow(dead_code)]
     h265_decode_info_vec: Vec<vk::VideoDecodeH265PictureInfoKHR<'static>>,
+    #[allow(dead_code)]
     h265_ref_info_vec: Vec<ash::vk::native::StdVideoDecodeH265ReferenceInfo>,
+    #[allow(dead_code)]
     h265_dpb_slot_info_vec: Vec<vk::VideoDecodeH265DpbSlotInfoKHR<'static>>,
+    #[allow(dead_code)]
     h264_pic_info_vec: Vec<ash::vk::native::StdVideoDecodeH264PictureInfo>,
+    #[allow(dead_code)]
     h264_decode_info_vec: Vec<vk::VideoDecodeH264PictureInfoKHR<'static>>,
+    #[allow(dead_code)]
     h264_ref_info_vec: Vec<ash::vk::native::StdVideoDecodeH264ReferenceInfo>,
+    #[allow(dead_code)]
     h264_dpb_slot_info_vec: Vec<vk::VideoDecodeH264DpbSlotInfoKHR<'static>>,
     decoder_reset_done: bool,
     /// Bitstream buffer size alignment from device capabilities.
@@ -101,7 +108,7 @@ impl VideoDecoder {
     pub fn new(data: Vec<u8>, max_frames: usize) -> VideoResult<Self> {
         let decoded_codec = detect_codec_from_data(&data);
 
-        let (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent) =
+        let (parsed, codec, vulkan, session_dpb_slots, _dpb_slots, coded_extent) =
             match decoded_codec {
                 AccessUnitCodec::H264 => {
                     let parsed = parse_h264(&data)?;
@@ -520,9 +527,8 @@ impl VideoDecoder {
 
         // Update cached parameter sets
         if let Some(ref vps_opt) = ps.vps {
-            if let H265VpsOpt::H265(vps) = vps_opt {
-                self.parsed.vps = Some(vps.clone());
-            }
+            let H265VpsOpt::H265(vps) = vps_opt;
+            self.parsed.vps = Some(vps.clone());
         }
         if let Some(ref sps) = ps.sps {
             self.parsed.sps = Some(sps.clone());
@@ -594,8 +600,8 @@ impl VideoDecoder {
         let mut is_first_frame = true;
         let mut frame_count: u32 = 0;
 
-        let align_width = self.picture_access_granularity.width;
-        let align_height = self.picture_access_granularity.height;
+        let _align_width = self.picture_access_granularity.width;
+        let _align_height = self.picture_access_granularity.height;
 
         for (frame_idx, vp9_frame) in frames.iter().enumerate().take(max_frames) {
             // Parse frame header
@@ -666,24 +672,22 @@ impl VideoDecoder {
                 .compute_reference_name_slot_indices(is_key_frame, &parsed.ref_frame_idx);
 
             // Select DPB slot
-            let output_slot;
-            if is_key_frame || is_first_frame {
+            let output_slot = if is_key_frame || is_first_frame {
                 if is_key_frame {
                     self.dpb_manager.invalidate_all();
                     vp9_decoder.reset_dpb();
                 }
-                output_slot = 0;
+                0
             } else {
                 let exclude_slots: Vec<i32> = reference_name_slot_indices
                     .iter()
                     .filter(|&&s| s >= 0)
                     .copied()
                     .collect();
-                output_slot = self
-                    .dpb_manager
+                self.dpb_manager
                     .find_or_recycle_slot_excluding(&exclude_slots)
-                    .unwrap_or(0);
-            }
+                    .unwrap_or(0)
+            };
 
             let output_view = self.dpb_views[output_slot as usize];
             let output_img = self.dpb_images[output_slot as usize];
@@ -1028,7 +1032,7 @@ impl VideoDecoder {
         output_img: vk::Image,
         bs_size: u64,
         output_slot: u32,
-        is_first_frame: bool,
+        _is_first_frame: bool,
     ) -> VideoResult<()> {
         let vps = &self.parsed.vps;
         let sps = match &self.parsed.sps {
@@ -1171,9 +1175,7 @@ impl Drop for VideoDecoder {
             {
                 let debug_utils =
                     ash::ext::debug_utils::Instance::new(&self.vulkan.entry, &self.vulkan.instance);
-                let _ = unsafe {
-                    debug_utils.destroy_debug_utils_messenger(self.vulkan.debug_messenger, None);
-                };
+                debug_utils.destroy_debug_utils_messenger(self.vulkan.debug_messenger, None);
                 self.vulkan.debug_messenger = vk::DebugUtilsMessengerEXT::null();
             }
 
@@ -1195,11 +1197,11 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
 
     // Check for VP9 frame marker (top 2 bits = 0b10)
     // Skip leading zeros and check for frame marker
-    for i in 0..data.len().min(256) {
-        if data[i] == 0 {
+    for &byte in &data[..data.len().min(256)] {
+        if byte == 0 {
             continue;
         }
-        if (data[i] & 0xC0) == 0x80 {
+        if (byte & 0xC0) == 0x80 {
             return AccessUnitCodec::Vp9;
         }
         break;
@@ -1397,8 +1399,8 @@ fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
                 1 | 2 => (1, 1),
                 _ => (0, 0),
             };
-            let sub_width_c = 1u32 << log2_sub_width_c;
-            let sub_height_c = 1u32 << log2_sub_height_c;
+            let _sub_width_c = 1u32 << log2_sub_width_c;
+            let _sub_height_c = 1u32 << log2_sub_height_c;
 
             let ctb_size = 1u32 << (s.log2_min_luma_coding_block_size_minus3 as u32 + 3);
 
@@ -1603,7 +1605,7 @@ fn build_std_header_version(extension_name: &str) -> vk::ExtensionProperties {
         .iter_mut()
         .zip(bytes.iter())
         .for_each(|(c, &b)| *c = b as std::os::raw::c_char);
-    props.spec_version = (1u32 << 22) | (0u32 << 12) | 0u32;
+    props.spec_version = 1u32 << 22;
     props
 }
 
@@ -1658,7 +1660,7 @@ fn destroy_session_parameters(
     if let Some(ptr) = unsafe {
         instance.get_device_proc_addr(
             device,
-            b"vkDestroyVideoSessionParametersKHR\0".as_ptr().cast(),
+            c"vkDestroyVideoSessionParametersKHR".as_ptr(),
         )
     } {
         unsafe {
@@ -1678,7 +1680,7 @@ fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::Vi
         return;
     }
     if let Some(ptr) = unsafe {
-        instance.get_device_proc_addr(device, b"vkDestroyVideoSessionKHR\0".as_ptr().cast())
+        instance.get_device_proc_addr(device, c"vkDestroyVideoSessionKHR".as_ptr())
     } {
         unsafe {
             type FnType = unsafe extern "system" fn(
@@ -1692,6 +1694,7 @@ fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::Vi
     }
 }
 
+#[allow(dead_code)]
 fn extract_max_au_size(
     data: &[u8],
     codec: AccessUnitCodec,

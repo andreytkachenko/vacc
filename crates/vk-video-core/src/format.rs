@@ -283,18 +283,15 @@ pub enum VkVideoFormat {
 /// H.264 picture layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[derive(Default)]
 pub enum H264PictureLayout {
+    #[default]
     Progressive = 1,
     Colocated = 2,
     TopField = 4,
     BottomField = 8,
 }
 
-impl Default for H264PictureLayout {
-    fn default() -> Self {
-        Self::Progressive
-    }
-}
 
 /// Video profile - a complete specification of video capabilities.
 ///

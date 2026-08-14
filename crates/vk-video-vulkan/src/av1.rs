@@ -3,8 +3,7 @@
 use ash::vk;
 use ash::vk::native::*;
 
-use super::codec_types::*;
-use super::{VideoError, VideoResult};
+use super::VideoResult;
 
 /// AV1 decoder state.
 pub struct Av1Decoder {
@@ -60,139 +59,137 @@ impl Av1Decoder {
     ) -> VideoResult<()> {
         let pic_info = self.build_picture_info(coded_extent);
 
-        unsafe {
-            // Bitstream buffer barrier
-            let buffer_barrier = vk::BufferMemoryBarrier2 {
-                s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
-                p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::HOST,
-                src_access_mask: vk::AccessFlags2::HOST_WRITE,
-                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                buffer: bitstream_buffer,
-                offset: bitstream_offset,
-                size: bitstream_range,
-                _marker: Default::default(),
-            };
+        // Bitstream buffer barrier
+        let buffer_barrier = vk::BufferMemoryBarrier2 {
+            s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::HOST,
+            src_access_mask: vk::AccessFlags2::HOST_WRITE,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            buffer: bitstream_buffer,
+            offset: bitstream_offset,
+            size: bitstream_range,
+            _marker: Default::default(),
+        };
 
-            let dep_info = vk::DependencyInfo {
-                s_type: vk::StructureType::DEPENDENCY_INFO,
-                p_next: std::ptr::null(),
-                dependency_flags: vk::DependencyFlags::BY_REGION,
-                memory_barrier_count: 0,
-                p_memory_barriers: std::ptr::null(),
-                buffer_memory_barrier_count: 1,
-                p_buffer_memory_barriers: &buffer_barrier,
-                image_memory_barrier_count: 0,
-                p_image_memory_barriers: std::ptr::null(),
-                _marker: Default::default(),
-            };
-            self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
+        let dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 1,
+            p_buffer_memory_barriers: &buffer_barrier,
+            image_memory_barrier_count: 0,
+            p_image_memory_barriers: std::ptr::null(),
+            _marker: Default::default(),
+        };
+        self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
 
-            // Output image barrier
-            let subresource_range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let image_barrier = vk::ImageMemoryBarrier2 {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::HOST,
-                src_access_mask: vk::AccessFlags2::NONE,
-                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: output_image,
-                old_layout: vk::ImageLayout::UNDEFINED,
-                new_layout: vk::ImageLayout::VIDEO_DECODE_DST_KHR,
-                subresource_range,
-                _marker: Default::default(),
-            };
+        // Output image barrier
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let image_barrier = vk::ImageMemoryBarrier2 {
+            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::HOST,
+            src_access_mask: vk::AccessFlags2::NONE,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: output_image,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::VIDEO_DECODE_DST_KHR,
+            subresource_range,
+            _marker: Default::default(),
+        };
 
-            let dep_info = vk::DependencyInfo {
-                s_type: vk::StructureType::DEPENDENCY_INFO,
-                p_next: std::ptr::null(),
-                dependency_flags: vk::DependencyFlags::BY_REGION,
-                memory_barrier_count: 0,
-                p_memory_barriers: std::ptr::null(),
-                buffer_memory_barrier_count: 0,
-                p_buffer_memory_barriers: std::ptr::null(),
-                image_memory_barrier_count: 1,
-                p_image_memory_barriers: &image_barrier,
-                _marker: Default::default(),
-            };
-            self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
+        let dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 0,
+            p_buffer_memory_barriers: std::ptr::null(),
+            image_memory_barrier_count: 1,
+            p_image_memory_barriers: &image_barrier,
+            _marker: Default::default(),
+        };
+        self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
 
-            // Begin video coding
-            let begin_coding_info = vk::VideoBeginCodingInfoKHR {
-                s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
-                p_next: std::ptr::null(),
-                flags: vk::VideoBeginCodingFlagsKHR::empty(),
-                video_session: session,
-                video_session_parameters: session_params,
-                reference_slot_count: 0,
-                p_reference_slots: std::ptr::null(),
-                _marker: Default::default(),
-            };
+        // Begin video coding
+        let begin_coding_info = vk::VideoBeginCodingInfoKHR {
+            s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
+            p_next: std::ptr::null(),
+            flags: vk::VideoBeginCodingFlagsKHR::empty(),
+            video_session: session,
+            video_session_parameters: session_params,
+            reference_slot_count: 0,
+            p_reference_slots: std::ptr::null(),
+            _marker: Default::default(),
+        };
 
-            self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
+        self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
 
-            // Build AV1 picture info
-            let dst_picture_resource = vk::VideoPictureResourceInfoKHR {
-                s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
-                p_next: std::ptr::null(),
-                coded_offset: vk::Offset2D::default(),
-                coded_extent,
-                base_array_layer: 0,
-                image_view_binding: output_image_view,
-                _marker: Default::default(),
-            };
+        // Build AV1 picture info
+        let dst_picture_resource = vk::VideoPictureResourceInfoKHR {
+            s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
+            p_next: std::ptr::null(),
+            coded_offset: vk::Offset2D::default(),
+            coded_extent,
+            base_array_layer: 0,
+            image_view_binding: output_image_view,
+            _marker: Default::default(),
+        };
 
-            let pic_ptr = &pic_info as *const StdVideoDecodeAV1PictureInfo;
+        let pic_ptr = &pic_info as *const StdVideoDecodeAV1PictureInfo;
 
-            let av1_decode_info = vk::VideoDecodeAV1PictureInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR,
-                p_next: std::ptr::null(),
-                p_std_picture_info: pic_ptr,
-                reference_name_slot_indices: [-1; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR],
-                frame_header_offset: 0,
-                tile_count: 0,
-                p_tile_offsets: std::ptr::null(),
-                p_tile_sizes: std::ptr::null(),
-                _marker: Default::default(),
-            };
+        let av1_decode_info = vk::VideoDecodeAV1PictureInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR,
+            p_next: std::ptr::null(),
+            p_std_picture_info: pic_ptr,
+            reference_name_slot_indices: [-1; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR],
+            frame_header_offset: 0,
+            tile_count: 0,
+            p_tile_offsets: std::ptr::null(),
+            p_tile_sizes: std::ptr::null(),
+            _marker: Default::default(),
+        };
 
-            let decode_info = vk::VideoDecodeInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: &av1_decode_info as *const _ as *const _,
-                flags: vk::VideoDecodeFlagsKHR::empty(),
-                src_buffer: bitstream_buffer,
-                src_buffer_offset: bitstream_offset,
-                src_buffer_range: bitstream_range,
-                dst_picture_resource: dst_picture_resource,
-                p_setup_reference_slot: std::ptr::null(),
-                reference_slot_count: 0,
-                p_reference_slots: std::ptr::null(),
-                _marker: Default::default(),
-            };
+        let decode_info = vk::VideoDecodeInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+            p_next: &av1_decode_info as *const _ as *const _,
+            flags: vk::VideoDecodeFlagsKHR::empty(),
+            src_buffer: bitstream_buffer,
+            src_buffer_offset: bitstream_offset,
+            src_buffer_range: bitstream_range,
+            dst_picture_resource,
+            p_setup_reference_slot: std::ptr::null(),
+            reference_slot_count: 0,
+            p_reference_slots: std::ptr::null(),
+            _marker: Default::default(),
+        };
 
-            self.cmd_decode_video(cmd_buffer, &decode_info);
+        self.cmd_decode_video(cmd_buffer, &decode_info);
 
-            // End video coding
-            self.cmd_end_video_coding(cmd_buffer);
-        }
+        // End video coding
+        self.cmd_end_video_coding(cmd_buffer);
 
         self.frame_count += 1;
         Ok(())
     }
 
-    fn build_picture_info(&self, coded_extent: vk::Extent2D) -> StdVideoDecodeAV1PictureInfo {
+    fn build_picture_info(&self, _coded_extent: vk::Extent2D) -> StdVideoDecodeAV1PictureInfo {
         let mut pic_info = unsafe { std::mem::zeroed::<StdVideoDecodeAV1PictureInfo>() };
         pic_info.frame_type = StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY;
         pic_info.current_frame_id = self.frame_count;
@@ -223,7 +220,7 @@ impl Av1Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+                c"vkCmdPipelineBarrier2KHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -244,7 +241,7 @@ impl Av1Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdBeginVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -263,7 +260,7 @@ impl Av1Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+                c"vkCmdDecodeVideoKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -287,7 +284,7 @@ impl Av1Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdEndVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {

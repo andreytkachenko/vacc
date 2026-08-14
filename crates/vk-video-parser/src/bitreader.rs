@@ -462,8 +462,8 @@ mod tests {
         let frame_mbs_only = r.read_bit().unwrap();
         assert!(frame_mbs_only, "expected frame_mbs_only_flag=true");
 
-        let width = (pic_w as u32 + 1) * 16;
-        let height = (pic_h as u32 + 1) * 16; // frame_mbs_only = 1
+        let width = (pic_w + 1) * 16;
+        let height = (pic_h + 1) * 16; // frame_mbs_only = 1
         assert_eq!(width, 1920);
         assert_eq!(height, 816);
     }
@@ -514,11 +514,11 @@ mod tests {
         println!("frame_mbs_only_flag: {}", frame_mbs_only);
 
         // Verify the video dimensions
-        let width = (pic_w as u32 + 1) * 16;
+        let width = (pic_w + 1) * 16;
         let height = if frame_mbs_only {
-            (pic_h as u32 + 1) * 16
+            (pic_h + 1) * 16
         } else {
-            (pic_h as u32 + 1) * 16 * 2
+            (pic_h + 1) * 16 * 2
         };
         println!("Width: {}, Height: {}", width, height);
         assert_eq!(width, 1920, "expected width=1920");

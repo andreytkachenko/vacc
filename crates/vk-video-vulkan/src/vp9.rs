@@ -196,7 +196,7 @@ impl Vp9Decoder {
         output_slot_index: i32,
         output_slot_old_layout: vk::ImageLayout,
     ) -> VideoResult<()> {
-        let picture_info_ptr = picture_info_container.std_picture_info();
+        let _picture_info_ptr = picture_info_container.std_picture_info();
 
         // Build reference slots for BeginVideoCoding (setup + references)
         // Per Vulkan spec: DPB slots become active when used in BeginVideoCodingKHR.
@@ -210,7 +210,7 @@ impl Vp9Decoder {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                 p_next: std::ptr::null(),
                 slot_index: slot_idx,
-                p_picture_resource: &*res as *const _,
+                p_picture_resource: res as *const _,
                 _marker: Default::default(),
             })
             .collect();
@@ -427,7 +427,7 @@ impl Vp9Decoder {
                 src_buffer: bitstream_buffer,
                 src_buffer_offset: bitstream_offset,
                 src_buffer_range: bitstream_range,
-                dst_picture_resource: dst_picture_resource,
+                dst_picture_resource,
                 p_setup_reference_slot: setup_slot_ptr,
                 reference_slot_count: dpb_ref_pictures.len() as u32,
                 p_reference_slots: ref_slots_ptr,
@@ -461,7 +461,7 @@ impl Vp9Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+                c"vkCmdPipelineBarrier2KHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -483,7 +483,7 @@ impl Vp9Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdBeginVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -503,7 +503,7 @@ impl Vp9Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+                c"vkCmdDecodeVideoKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -527,7 +527,7 @@ impl Vp9Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdControlVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -554,7 +554,7 @@ impl Vp9Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdEndVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -753,6 +753,7 @@ pub struct StdVideoVP9LoopFilterFlags {
 /// VP9 Loop filter (from vulkan_video_codec_vp9std.h).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct StdVideoVP9LoopFilter {
     pub flags: StdVideoVP9LoopFilterFlags,
     pub loop_filter_level: u8,
@@ -763,19 +764,6 @@ pub struct StdVideoVP9LoopFilter {
     pub loop_filter_mode_deltas: [i8; 2], // STD_VIDEO_VP9_LOOP_FILTER_ADJUSTMENTS = 2
 }
 
-impl Default for StdVideoVP9LoopFilter {
-    fn default() -> Self {
-        Self {
-            flags: StdVideoVP9LoopFilterFlags::default(),
-            loop_filter_level: 0,
-            loop_filter_sharpness: 0,
-            update_ref_delta: 0,
-            loop_filter_ref_deltas: [0; 4],
-            update_mode_delta: 0,
-            loop_filter_mode_deltas: [0; 2],
-        }
-    }
-}
 
 /// VP9 Segmentation flags (from vulkan_video_codec_vp9std.h).
 /// Bitfield: 4 flags + 28 reserved = 4 bytes.
@@ -1002,7 +990,7 @@ pub fn convert_vp9_picture_info(
             loop_filter_delta_enabled: loop_filter.flags.loop_filter_delta_enabled as u32
                 | (loop_filter.flags.loop_filter_delta_update as u32) << 1,
         },
-        loop_filter_level: loop_filter.loop_filter_level as u8,
+        loop_filter_level: loop_filter.loop_filter_level,
         loop_filter_sharpness: loop_filter.loop_filter_sharpness,
         update_ref_delta: loop_filter.flags.update_ref_delta,
         loop_filter_ref_deltas: loop_filter.loop_filter_ref_deltas,
@@ -1058,7 +1046,7 @@ pub fn convert_vp9_picture_info(
                     StdVideoVP9InterpolationFilter::Switchable
                 }
             },
-            base_q_idx: info.base_q_idx as u8,
+            base_q_idx: info.base_q_idx,
             delta_q_y_dc: info.delta_q_y_dc,
             delta_q_uv_dc: info.delta_q_uv_dc,
             delta_q_uv_ac: info.delta_q_uv_ac,

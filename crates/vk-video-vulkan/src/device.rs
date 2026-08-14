@@ -349,7 +349,7 @@ impl VideoDeviceBuilder {
 
     fn select_physical_device(
         instance: &ash::Instance,
-        builder: &VideoDeviceBuilder,
+        _builder: &VideoDeviceBuilder,
     ) -> VideoResult<(vk::PhysicalDevice, QueueFamilies)> {
         let physical_devices = unsafe { instance.enumerate_physical_devices() }.map_err(|e| {
             VideoError::VulkanInit(format!("Failed to enumerate physical devices: {}", e))
@@ -408,7 +408,7 @@ impl VideoDeviceBuilder {
     }
 
     fn create_device(
-        entry: &ash::Entry,
+        _entry: &ash::Entry,
         instance: &ash::Instance,
         physical_device: &vk::PhysicalDevice,
         queue_families: &QueueFamilies,
@@ -469,25 +469,21 @@ impl VideoDeviceBuilder {
         if builder
             .video_codecs
             .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-        {
-            if available_names
+            && available_names
                 .iter()
                 .any(|n| n.as_str() == "VK_KHR_video_decode_h264")
             {
                 extensions.push("VK_KHR_video_decode_h264");
             }
-        }
         if builder
             .video_codecs
             .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
-        {
-            if available_names
+            && available_names
                 .iter()
                 .any(|n| n.as_str() == "VK_KHR_video_decode_h265")
             {
                 extensions.push("VK_KHR_video_decode_h265");
             }
-        }
         if builder
             .video_codecs
             .contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
@@ -581,6 +577,7 @@ impl VideoDeviceBuilder {
             }
         }
 
+        #[allow(deprecated)]
         let device_create_info = vk::DeviceCreateInfo {
             s_type: vk::StructureType::DEVICE_CREATE_INFO,
             p_next: &features2 as *const _ as *const _,
@@ -634,7 +631,7 @@ impl VulkanDevice {
         chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
         luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
         chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
-    ) -> VideoResult<vk::VideoCapabilitiesKHR> {
+    ) -> VideoResult<vk::VideoCapabilitiesKHR<'_>> {
         let codec_op = codec.to_vk_flag();
 
         // Build profile info chain - structs must live for entire function duration
@@ -688,7 +685,7 @@ impl VulkanDevice {
         let get_caps_fn = unsafe {
             self.entry.get_instance_proc_addr(
                 self.instance.handle(),
-                b"vkGetPhysicalDeviceVideoCapabilitiesKHR\0".as_ptr().cast(),
+                c"vkGetPhysicalDeviceVideoCapabilitiesKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -755,7 +752,7 @@ impl VulkanDevice {
     }
 
     /// Query supported video formats for a codec.
-    pub fn query_supported_formats(&self, codec: VideoCodec) -> Vec<vk::VideoFormatPropertiesKHR> {
+    pub fn query_supported_formats(&self, codec: VideoCodec) -> Vec<vk::VideoFormatPropertiesKHR<'_>> {
         let codec_op = codec.to_vk_flag();
 
         // Common semi-planar 420 formats
@@ -789,12 +786,12 @@ impl VulkanDevice {
     fn get_physical_device_video_format_properties(
         &self,
         video_operation: vk::VideoCodecOperationFlagsKHR,
-        image_tiling: vk::ImageTiling,
-        image_format: vk::Format,
+        _image_tiling: vk::ImageTiling,
+        _image_format: vk::Format,
         chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
         luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
         chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
-    ) -> Vec<vk::VideoFormatPropertiesKHR> {
+    ) -> Vec<vk::VideoFormatPropertiesKHR<'_>> {
         // Chain: PhysicalDeviceVideoFormatInfoKHR -> VideoProfileInfoKHR
         let profile_info = vk::VideoProfileInfoKHR {
             s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
@@ -817,9 +814,8 @@ impl VulkanDevice {
         let get_format_props_fn = unsafe {
             self.entry.get_instance_proc_addr(
                 self.instance.handle(),
-                b"vkGetPhysicalDeviceVideoFormatPropertiesKHR\0"
-                    .as_ptr()
-                    .cast(),
+                c"vkGetPhysicalDeviceVideoFormatPropertiesKHR"
+                    .as_ptr(),
             )
         };
 
@@ -877,7 +873,7 @@ impl Drop for VulkanDevice {
             let debug_utils = ash::ext::debug_utils::Instance::new(&self.entry, &self.instance);
             unsafe {
                 // Ignore errors - instance may already be destroyed
-                let _ = debug_utils.destroy_debug_utils_messenger(self.debug_messenger, None);
+                debug_utils.destroy_debug_utils_messenger(self.debug_messenger, None);
             }
             self.debug_messenger = vk::DebugUtilsMessengerEXT::null();
         }

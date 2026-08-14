@@ -1,7 +1,7 @@
 //! Pixel readback from decoded video images.
 
 use super::VideoError;
-use ash::vk::{self, Handle};
+use ash::vk::{self};
 
 /// Decoded pixel data for YUV 420 planar format.
 #[derive(Debug, Clone)]
@@ -24,8 +24,8 @@ pub fn readback_decoded_image(
     height: u32,
 ) -> Result<DecodedPixels, VideoError> {
     let y_size = (width * height) as usize;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let uv_size = (uv_width * uv_height * 2) as usize;
     let total_size = (y_size + uv_size) as u64;
 
@@ -76,8 +76,7 @@ pub fn readback_decoded_image(
         device
             .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
             .map_err(|e| {
-                VideoError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                VideoError::Io(std::io::Error::other(
                     e.to_string(),
                 ))
             })?
@@ -343,16 +342,10 @@ fn find_memory_type(
     type_bits: u32,
     required_flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    for i in 0..mem_props.memory_type_count {
-        if (type_bits & (1 << i)) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(required_flags)
-        {
-            return Some(i);
-        }
-    }
-    None
+    (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
+        && mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(required_flags))
 }
 
 fn cmd_pipeline_barrier_2(
@@ -362,7 +355,7 @@ fn cmd_pipeline_barrier_2(
     dep_info: &vk::DependencyInfo<'_>,
 ) {
     let fn_ptr = unsafe {
-        instance.get_device_proc_addr(device, b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast())
+        instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr())
     };
     if let Some(ptr) = fn_ptr {
         unsafe {

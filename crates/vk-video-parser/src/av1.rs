@@ -102,6 +102,7 @@ pub struct Av1FrameHeader {
 
 /// Annex B state for tracking temporal and frame units.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 struct AnnexBState {
     temporal_unit_size: u32,
     frame_unit_size: u32,
@@ -109,16 +110,6 @@ struct AnnexBState {
     frame_unit_consumed: u32,
 }
 
-impl Default for AnnexBState {
-    fn default() -> Self {
-        Self {
-            temporal_unit_size: 0,
-            frame_unit_size: 0,
-            temporal_unit_consumed: 0,
-            frame_unit_consumed: 0,
-        }
-    }
-}
 
 /// Stream format detected for the bitstream.
 #[derive(Debug, Clone)]
@@ -143,6 +134,12 @@ pub struct Av1Parser {
     ref_frame_sizes: [(u32, u32); 8],
     /// Reference frame order hints for short signaling derivation.
     ref_frame_order_hints: [u32; 8],
+}
+
+impl Default for Av1Parser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Av1Parser {
@@ -300,11 +297,10 @@ impl Av1Parser {
 
         let header = Self::parse_obu_header(&mut reader)?;
 
-        if matches!(self.stream_format, StreamFormat::LowOverhead) {
-            if !header.has_size_field {
+        if matches!(self.stream_format, StreamFormat::LowOverhead)
+            && !header.has_size_field {
                 return Err(ParserError::InvalidBitstream);
             }
-        }
 
         let obu_size: usize = if header.has_size_field {
             reader.read_leb128()? as usize
@@ -450,8 +446,8 @@ impl Av1Parser {
                         // Parse operating parameters info
                         // Use buffer_delay_length_minus_1 from decoder_model_info per AV1 spec 5.3.2
                         let n = sps.buffer_delay_length_minus_1 + 1;
-                        let _decoder_buffer_delay = r.read_bits(n as u8)?;
-                        let _encoder_buffer_delay = r.read_bits(n as u8)?;
+                        let _decoder_buffer_delay = r.read_bits(n)?;
+                        let _encoder_buffer_delay = r.read_bits(n)?;
                         let _low_delay_mode_flag = r.read_bit()?;
                     }
                 }
@@ -475,10 +471,10 @@ impl Av1Parser {
         sps.frame_height_bits = frame_height_bits_minus_1 + 1;
 
         // max_frame_width_minus_1 (frame_width_bits_minus_1 + 1 bits)
-        sps.max_frame_width_minus_1 = r.read_bits(frame_width_bits_minus_1 as u8 + 1)? as u16;
+        sps.max_frame_width_minus_1 = r.read_bits(frame_width_bits_minus_1 + 1)? as u16;
 
         // max_frame_height_minus_1 (frame_height_bits_minus_1 + 1 bits)
-        sps.max_frame_height_minus_1 = r.read_bits(frame_height_bits_minus_1 as u8 + 1)? as u16;
+        sps.max_frame_height_minus_1 = r.read_bits(frame_height_bits_minus_1 + 1)? as u16;
 
         // frame_id_numbers_present_flag (1 bit) - implicit in reduced_still_picture_header
         let frame_id_numbers_present_flag = if sps.reduced_still_picture_header {
@@ -800,7 +796,7 @@ impl Av1Parser {
         } else {
             // short_frame_id
             let frame_id_length = sps.delta_frame_id_length_minus2 + 2 + 1;
-            let _short_frame_id = r.read_bits(frame_id_length as u8)?;
+            let _short_frame_id = r.read_bits(frame_id_length)?;
         }
 
         // export_tile_stream_flag (1 bit)
@@ -820,8 +816,8 @@ impl Av1Parser {
         };
 
         if frame_size_override {
-            fh.frame_width = r.read_bits(sps.frame_width_bits as u8)? as u32 + 1;
-            fh.frame_height = r.read_bits(sps.frame_height_bits as u8)? as u32 + 1;
+            fh.frame_width = r.read_bits(sps.frame_width_bits)? + 1;
+            fh.frame_height = r.read_bits(sps.frame_height_bits)? + 1;
         } else {
             // Frame size inherited from the primary reference frame (AV1 spec 7.20).
             // In error_resilient_mode, use the first available reference frame.
@@ -848,15 +844,11 @@ impl Av1Parser {
         }
 
         // render_and_frame_size_different
-        let render_size_different = if fh.error_resilient_mode {
-            r.read_bit()?
-        } else {
-            r.read_bit()?
-        };
+        let render_size_different = r.read_bit()?;
 
         if render_size_different {
-            fh.render_width = r.read_bits(16)? as u32 + 1;
-            fh.render_height = r.read_bits(16)? as u32 + 1;
+            fh.render_width = r.read_bits(16)? + 1;
+            fh.render_height = r.read_bits(16)? + 1;
         } else {
             fh.render_width = fh.frame_width;
             fh.render_height = fh.frame_height;
@@ -888,7 +880,7 @@ impl Av1Parser {
             // BWDREF_FRAME = most recent frame by order hint > current order_hint
             // ALTREF2_FRAME, ALTREF_FRAME = 2 most recent frames by order hint > current
             let cur_order_hint = fh.order_hint;
-            let mut candidates: Vec<(u32, u8)> = (0..8)
+            let candidates: Vec<(u32, u8)> = (0..8)
                 .map(|i| (self.ref_frame_order_hints[i], i as u8))
                 .filter(|(oh, _)| *oh != cur_order_hint)
                 .collect();
@@ -930,7 +922,7 @@ impl Av1Parser {
         // order_hint (if enable_order_hint)
         if sps.enable_order_hint {
             let order_hint_bits = sps.order_hint_bits_minus1 + 1;
-            fh.order_hint = r.read_bits(order_hint_bits as u8)?;
+            fh.order_hint = r.read_bits(order_hint_bits)?;
         }
 
         // refresh_frame_flags (8 bits) - which ref slots this frame refreshes
@@ -966,6 +958,7 @@ impl Av1Parser {
     }
 
     /// Update reference frame tracking state after parsing a frame header (AV1 spec 7.20).
+    #[allow(dead_code)]
     fn update_ref_frames(&mut self, fh: &Av1FrameHeader) {
         // Update sizes for refreshed frame slots
         for i in 0..8usize {
@@ -1039,7 +1032,6 @@ impl VideoParser for Av1Parser {
                         ObuType::SequenceHeader => {
                             if self.active_sps.is_none() {
                                 let seq_header = self.parse_sequence_header_obu(obu_data)?;
-                                offset += obu_data_offset + obu_size;
                                 return Ok(ParseResult::ParameterSet {
                                     sps: Some(
                                         vk_video_core::picture::BoxedPictureParametersSet::new(
@@ -1051,9 +1043,9 @@ impl VideoParser for Av1Parser {
                                 });
                             }
                         }
-                        ObuType::Frame | ObuType::FrameHeader => {
+                        ObuType::Frame | ObuType::FrameHeader
                             // If we have a sequence header, treat remaining data as frame data
-                            if self.active_sps.is_some() {
+                            if self.active_sps.is_some() => {
                                 self.frame_count += 1;
                                 offset += obu_data_offset + obu_size;
                                 return Ok(ParseResult::Slice {
@@ -1063,7 +1055,6 @@ impl VideoParser for Av1Parser {
                                     slice_header: None,
                                 });
                             }
-                        }
                         _ => {
                             // Skip other OBU types
                         }

@@ -98,7 +98,7 @@ impl DecodedImage {
             extent: ash::vk::Extent2D { width, height },
             device: device.clone(),
             instance: instance.clone(),
-            memory_properties: memory_properties.clone(),
+            memory_properties: *memory_properties,
         })
     }
 
@@ -303,7 +303,7 @@ pub fn create_staging_image(
         extent: ash::vk::Extent2D { width, height },
         device: device.clone(),
         instance: instance.clone(),
-        memory_properties: memory_properties.clone(),
+        memory_properties: *memory_properties,
     })
 }
 
@@ -393,14 +393,8 @@ fn find_memory_type(
     type_bits: u32,
     required_flags: ash::vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    for i in 0..mem_props.memory_type_count {
-        if (type_bits & (1 << i)) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(required_flags)
-        {
-            return Some(i);
-        }
-    }
-    None
+    (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
+        && mem_props.memory_types[i as usize]
+            .property_flags
+            .contains(required_flags))
 }

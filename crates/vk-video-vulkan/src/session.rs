@@ -4,7 +4,7 @@ use ash::vk;
 use ash::vk::Handle;
 
 use super::vp9::{
-    vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9SessionParametersCreateInfoKHR,
+    vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR,
 };
 use super::{device::VideoCodec, VideoError, VideoResult};
 
@@ -63,7 +63,7 @@ impl VideoSession {
         let get_req_fn = unsafe {
             instance.get_device_proc_addr(
                 device.handle(),
-                b"vkGetVideoSessionMemoryRequirementsKHR\0".as_ptr().cast(),
+                c"vkGetVideoSessionMemoryRequirementsKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -177,7 +177,7 @@ impl VideoSession {
         let bind_fn = unsafe {
             instance.get_device_proc_addr(
                 device.handle(),
-                b"vkBindVideoSessionMemoryKHR\0".as_ptr().cast(),
+                c"vkBindVideoSessionMemoryKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -293,7 +293,7 @@ impl VideoSession {
         let create_fn = unsafe {
             instance.get_device_proc_addr(
                 device.handle(),
-                b"vkCreateVideoSessionKHR\0".as_ptr().cast(),
+                c"vkCreateVideoSessionKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -363,7 +363,7 @@ impl Drop for VideoSession {
         let destroy_fn = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkDestroyVideoSessionKHR\0".as_ptr().cast(),
+                c"vkDestroyVideoSessionKHR".as_ptr(),
             )
         };
 
@@ -505,7 +505,7 @@ impl VideoSessionParameters {
         let create_fn = unsafe {
             instance.get_device_proc_addr(
                 device.handle(),
-                b"vkCreateVideoSessionParametersKHR\0".as_ptr().cast(),
+                c"vkCreateVideoSessionParametersKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -581,7 +581,7 @@ impl Drop for VideoSessionParameters {
         let destroy_fn = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkDestroyVideoSessionParametersKHR\0".as_ptr().cast(),
+                c"vkDestroyVideoSessionParametersKHR".as_ptr(),
             )
         };
 

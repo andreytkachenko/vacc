@@ -3,7 +3,6 @@
 use ash::vk;
 use ash::vk::native::*;
 
-use super::codec_types::*;
 use super::dpb::LastAccessType;
 use super::{VideoError, VideoResult};
 
@@ -108,7 +107,7 @@ impl H264Decoder {
         let update_fn = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkUpdateVideoSessionParametersKHR\0".as_ptr().cast(),
+                c"vkUpdateVideoSessionParametersKHR".as_ptr(),
             )
         }
         .ok_or_else(|| {
@@ -163,8 +162,8 @@ impl H264Decoder {
         is_reference: Option<bool>,
         is_idr: Option<bool>,
         is_first_frame: bool,
-        max_dpb_slots: u32,
-        dpb_images: &[vk::Image],
+        _max_dpb_slots: u32,
+        _dpb_images: &[vk::Image],
         dpb_views: &[vk::ImageView],
     ) -> VideoResult<()> {
         // Use provided values or compute from internal state
@@ -206,353 +205,59 @@ impl H264Decoder {
             effective_is_idr,
         );
 
-        unsafe {
-            // Begin video coding (BEFORE memory barriers, matches C++ reference)
-            //
-            // CRITICAL: On first frame (RESET), activate ALL DPB slots to satisfy
-            // VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239. Subsequent frames
-            // reference slots that were activated on the RESET frame.
-            //
-            // Matches working example: vulkan_decode.rs lines 4061-4140
+        // Begin video coding (BEFORE memory barriers, matches C++ reference)
+        //
+        // CRITICAL: On first frame (RESET), activate ALL DPB slots to satisfy
+        // VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239. Subsequent frames
+        // reference slots that were activated on the RESET frame.
+        //
+        // Matches working example: vulkan_decode.rs lines 4061-4140
 
-            let max_frame_num = 1u32
-                << (self
-                    .sps
-                    .as_ref()
-                    .ok_or(VideoError::InvalidState("H264 SPS not set".into()))?
-                    .log2_max_frame_num_minus4 as u32
-                    + 4);
+        let max_frame_num = 1u32
+            << (self
+                .sps
+                .as_ref()
+                .ok_or(VideoError::InvalidState("H264 SPS not set".into()))?
+                .log2_max_frame_num_minus4 as u32
+                + 4);
 
-            // Build reference slots for begin coding
-            //
-            // CRITICAL FIX: Match C++ reference VkVideoDecoder.cpp:1079-1084 exactly:
-            //   decodeBeginInfo.referenceSlotCount = decodeFrameInfo.referenceSlotCount +
-            //       (decodeFrameInfo.pSetupReferenceSlot ? 1 : 0);
-            //   decodeBeginInfo.pReferenceSlots = (decodeFrameInfo.referenceSlotCount > 0) ?
-            //       decodeFrameInfo.pReferenceSlots : decodeFrameInfo.pSetupReferenceSlot;
-            //
-            // When refs exist: BeginVideoCoding uses SAME slots as DecodeVideo's p_reference_slots.
-            // When no refs: BeginVideoCoding uses only the setup slot.
-            //
-            // The setup picture is NOT in the reference slots array when refs exist;
-            // it's passed separately via DecodeVideo's p_setup_reference_slot.
-            let all_begin_slots: Vec<vk::VideoReferenceSlotInfoKHR>;
+        // Build reference slots for begin coding
+        //
+        // CRITICAL FIX: Match C++ reference VkVideoDecoder.cpp:1079-1084 exactly:
+        //   decodeBeginInfo.referenceSlotCount = decodeFrameInfo.referenceSlotCount +
+        //       (decodeFrameInfo.pSetupReferenceSlot ? 1 : 0);
+        //   decodeBeginInfo.pReferenceSlots = (decodeFrameInfo.referenceSlotCount > 0) ?
+        //       decodeFrameInfo.pReferenceSlots : decodeFrameInfo.pSetupReferenceSlot;
+        //
+        // When refs exist: BeginVideoCoding uses SAME slots as DecodeVideo's p_reference_slots.
+        // When no refs: BeginVideoCoding uses only the setup slot.
+        //
+        // The setup picture is NOT in the reference slots array when refs exist;
+        // it's passed separately via DecodeVideo's p_setup_reference_slot.
+        let all_begin_slots: Vec<vk::VideoReferenceSlotInfoKHR>;
 
-            if is_first_frame {
-                // RESET frame: activate ALL DPB slots
+        if is_first_frame {
+            // RESET frame: activate ALL DPB slots
 
-                // Build picture resources for all slots
-                let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> =
-                    (0..dpb_views.len() as u32)
-                        .map(|slot_idx| vk::VideoPictureResourceInfoKHR {
-                            s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
-                            p_next: std::ptr::null(),
-                            coded_offset: vk::Offset2D::default(),
-                            coded_extent,
-                            base_array_layer: 0,
-                            image_view_binding: dpb_views[slot_idx as usize],
-                            _marker: Default::default(),
-                        })
-                        .collect();
-
-                // Build setup slot with DPB info
-                let setup_slot_idx = dpb_setup_picture
-                    .as_ref()
-                    .map_or(0, |s| s.slot_index as usize);
-
-                let mut setup_ref_info =
-                    unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
-                setup_ref_info.PicOrderCnt = effective_poc;
-                // For progressive frames: both fields are available for prediction
-                setup_ref_info.flags.set_top_field_flag(1);
-                setup_ref_info.flags.set_bottom_field_flag(1);
-                let setup_dpb_slot_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
-                    .std_reference_info(&setup_ref_info);
-
-                // Build all slots
-                all_begin_slots = (0..dpb_views.len() as u32)
-                    .map(|slot_idx| {
-                        let is_setup = slot_idx as usize == setup_slot_idx;
-                        let pr = &all_picture_resources[slot_idx as usize];
-                        let p_next = if is_setup {
-                            &setup_dpb_slot_info as *const _ as *const _
-                        } else {
-                            // Non-setup slots on RESET: no DPB slot info needed for H.264
-                            std::ptr::null()
-                        };
-                        vk::VideoReferenceSlotInfoKHR {
-                            s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                            p_next,
-                            slot_index: slot_idx as i32,
-                            p_picture_resource: pr,
-                            _marker: Default::default(),
-                        }
-                    })
-                    .collect();
-
-                let begin_coding_info = vk::VideoBeginCodingInfoKHR {
-                    s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    flags: vk::VideoBeginCodingFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters: session_params,
-                    reference_slot_count: all_begin_slots.len() as u32,
-                    p_reference_slots: all_begin_slots.as_ptr(),
-                    _marker: Default::default(),
-                };
-
-                self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
-            } else {
-                // Non-RESET frame: Build DPB slot info for reference pictures
-                //
-                // Match C++ pattern: BeginVideoCoding gets only the ref slots (same as DecodeVideo),
-                // NOT the setup picture. Setup picture is only in DecodeVideo's p_setup_reference_slot.
-                let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
-                for ref_pic in dpb_ref_pictures.iter() {
-                    let mut ref_info =
-                        unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                    ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
-                    ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
-                    // For progressive frames: both fields are available for prediction
-                    ref_info.flags.set_top_field_flag(1);
-                    ref_info.flags.set_bottom_field_flag(1);
-                    ref_infos.push(ref_info);
-                }
-                let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
-                    .iter()
-                    .map(|ref_info| {
-                        vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(ref_info)
-                    })
-                    .collect();
-
-                // Build reference slots with DPB slot info in pNext chain
-                // These are the SAME slots that will be used in DecodeVideo's p_reference_slots
-                all_begin_slots = dpb_ref_pictures
-                    .iter()
-                    .zip(ref_dpb_slot_infos.iter())
-                    .map(|(ref_pic, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
-                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                        p_next: dpb_slot_info as *const _ as *const _,
-                        slot_index: ref_pic.slot_index as i32,
-                        p_picture_resource: &ref_pic.picture_resource as *const _,
-                        _marker: Default::default(),
-                    })
-                    .collect();
-
-                // C++ pattern: count = ref_count + (setup ? 1 : 0), ptr = refs when refs exist
-                // Setup must be adjacent to refs in memory (driver reads count elements from ptr)
-                //
-                // CRITICAL: All structs must stay alive until after cmd_begin_video_coding!
-                // We use Box::leak to ensure pointers remain valid.
-
-                // Build setup DPB info (leaked to ensure pointer validity)
-                let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo = if dpb_setup_picture
-                    .is_some()
-                {
-                    let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                    info.FrameNum = (effective_frame_num % max_frame_num) as u16;
-                    info.PicOrderCnt = effective_poc;
-                    info.flags.set_top_field_flag(1);
-                    info.flags.set_bottom_field_flag(1);
-                    Box::leak(Box::new(info))
-                } else {
-                    std::ptr::null()
-                };
-
-                let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR =
-                    if !setup_ref_info.is_null() {
-                        let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
-                            .std_reference_info(unsafe { &*setup_ref_info });
-                        Box::leak(Box::new(dpb_info))
-                    } else {
-                        std::ptr::null()
-                    };
-
-                // Build setup slot info (if setup picture exists)
-                let setup_slot_info = if !setup_dpb_slot_info.is_null() {
-                    Some(vk::VideoReferenceSlotInfoKHR {
-                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                        p_next: setup_dpb_slot_info as *const _ as *const _,
-                        slot_index: dpb_setup_picture
-                            .as_ref()
-                            .map_or(0, |s| s.slot_index as i32),
-                        p_picture_resource: dpb_setup_picture
-                            .as_ref()
-                            .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
-                        _marker: Default::default(),
-                    })
-                } else {
-                    None
-                };
-
-                // Build combined slots array for BeginVideoCoding
-                // MUST keep this alive until after cmd_begin_video_coding is called!
-                let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
-                    if all_begin_slots.is_empty() {
-                        // No refs: use only setup slot
-                        setup_slot_info.into_iter().collect()
-                    } else {
-                        // Has refs: combine refs + setup
-                        let mut combined = all_begin_slots.clone();
-                        if let Some(slot) = setup_slot_info {
-                            combined.push(slot);
-                        }
-                        combined
-                    };
-
-                let slot_count = begin_video_coding_slots.len() as u32;
-                let slot_ptr = if begin_video_coding_slots.is_empty() {
-                    std::ptr::null()
-                } else {
-                    begin_video_coding_slots.as_ptr()
-                };
-
-                let begin_coding_info = vk::VideoBeginCodingInfoKHR {
-                    s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    flags: vk::VideoBeginCodingFlagsKHR::empty(),
-                    video_session: session,
-                    video_session_parameters: session_params,
-                    reference_slot_count: slot_count,
-                    p_reference_slots: slot_ptr,
-                    _marker: Default::default(),
-                };
-
-                self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
-            }
-
-            // RESET decoder before first frame (required by Vulkan spec)
-            // Must be INSIDE video coding block (after Begin, before Decode)
-            if is_first_frame {
-                self.cmd_control_video_coding(cmd_buffer);
-            }
-
-            // Barriers AFTER BeginVideoCoding and BEFORE DecodeVideo
-            // This matches C++ reference VkVideoDecoder.cpp:1216-1227
-            // Bitstream buffer barrier
-            let buffer_barrier = vk::BufferMemoryBarrier2 {
-                s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
-                p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::NONE,
-                src_access_mask: vk::AccessFlags2::HOST_WRITE,
-                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                buffer: bitstream_buffer,
-                offset: bitstream_offset,
-                size: bitstream_range,
-                _marker: Default::default(),
-            };
-
-            // Output image barrier
-            // Use COLOR aspect (matches C++ reference VkVideoDecoder.cpp:857)
-            // When dpb_setup_picture points to the same image as dstPictureResource,
-            // use VIDEO_DECODE_DPB_KHR layout (per Vulkan spec).
-            let subresource_range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-
-            let new_layout = if dpb_setup_picture.is_some() {
-                // dpb_setup_picture points to the same image, so use DPB layout
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR
-            } else {
-                vk::ImageLayout::VIDEO_DECODE_DST_KHR
-            };
-
-            let image_barrier = vk::ImageMemoryBarrier2 {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-                p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::NONE,
-                src_access_mask: vk::AccessFlags2::NONE,
-                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: output_image,
-                old_layout: vk::ImageLayout::UNDEFINED,
-                new_layout,
-                subresource_range,
-                _marker: Default::default(),
-            };
-
-            // Add barriers for reference images (matches C++ VkVideoDecoder.cpp:1044-1056)
-            let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
-            for ref_pic in dpb_ref_pictures.iter() {
-                // Only add barrier if image is valid and not already in DPB layout
-                if ref_pic.image != vk::Image::null()
-                    && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR
-                {
-                    all_image_barriers.push(vk::ImageMemoryBarrier2 {
-                        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+            // Build picture resources for all slots
+            let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> =
+                (0..dpb_views.len() as u32)
+                    .map(|slot_idx| vk::VideoPictureResourceInfoKHR {
+                        s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                         p_next: std::ptr::null(),
-                        src_stage_mask: vk::PipelineStageFlags2::NONE,
-                        src_access_mask: vk::AccessFlags2::empty(),
-                        dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                        dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
-                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        image: ref_pic.image,
-                        old_layout: ref_pic.current_layout,
-                        new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                        subresource_range,
+                        coded_offset: vk::Offset2D::default(),
+                        coded_extent,
+                        base_array_layer: 0,
+                        image_view_binding: dpb_views[slot_idx as usize],
                         _marker: Default::default(),
-                    });
-                }
-            }
+                    })
+                    .collect();
 
-            // Single DependencyInfo with ALL barriers (matches C++ VkVideoDecoder.cpp:1229-1240)
-            let dep_info = vk::DependencyInfo {
-                s_type: vk::StructureType::DEPENDENCY_INFO,
-                p_next: std::ptr::null(),
-                dependency_flags: vk::DependencyFlags::BY_REGION,
-                memory_barrier_count: 0,
-                p_memory_barriers: std::ptr::null(),
-                buffer_memory_barrier_count: 1,
-                p_buffer_memory_barriers: &buffer_barrier,
-                image_memory_barrier_count: all_image_barriers.len() as u32,
-                p_image_memory_barriers: all_image_barriers.as_ptr(),
-                _marker: Default::default(),
-            };
-            self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
+            // Build setup slot with DPB info
+            let setup_slot_idx = dpb_setup_picture
+                .as_ref()
+                .map_or(0, |s| s.slot_index as usize);
 
-            // Build H.264 picture info
-            let dst_picture_resource = vk::VideoPictureResourceInfoKHR {
-                s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
-                p_next: std::ptr::null(),
-                coded_offset: vk::Offset2D::default(),
-                coded_extent,
-                base_array_layer: 0,
-                image_view_binding: output_image_view,
-                _marker: Default::default(),
-            };
-
-            let pic_ptr = &pic_info as *const StdVideoDecodeH264PictureInfo;
-
-            let h264_decode_info = vk::VideoDecodeH264PictureInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_H264_PICTURE_INFO_KHR,
-                p_next: std::ptr::null(),
-                p_std_picture_info: pic_ptr,
-                slice_count: slice_offsets.len() as u32,
-                p_slice_offsets: if slice_offsets.is_empty() {
-                    std::ptr::null()
-                } else {
-                    slice_offsets.as_ptr()
-                },
-                _marker: Default::default(),
-            };
-
-            // Build reference slots - use same indices as in begin coding
-            // Each slot needs a VkVideoDecodeH264DpbSlotInfoKHR in its pNext chain
-            let max_frame_num =
-                1u32 << (self.sps.as_ref().expect("SPS").log2_max_frame_num_minus4 as u32 + 4);
-
-            // Setup slot DPB info
             let mut setup_ref_info =
                 unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
             setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
@@ -560,27 +265,51 @@ impl H264Decoder {
             // For progressive frames: both fields are available for prediction
             setup_ref_info.flags.set_top_field_flag(1);
             setup_ref_info.flags.set_bottom_field_flag(1);
-            let setup_dpb_slot_info = dpb_setup_picture.as_ref().map(|_| {
-                vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info)
-            });
+            let setup_dpb_slot_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
+                .std_reference_info(&setup_ref_info);
 
-            let setup_slot = dpb_setup_picture
-                .as_ref()
-                .map(|info| vk::VideoReferenceSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                    p_next: setup_dpb_slot_info
-                        .as_ref()
-                        .map(|s| s as *const _ as *const _)
-                        .unwrap_or(std::ptr::null()),
-                    slot_index: info.slot_index as i32,
-                    p_picture_resource: &info.picture_resource as *const _,
-                    _marker: Default::default(),
-                });
+            // Build all slots
+            all_begin_slots = (0..dpb_views.len() as u32)
+                .map(|slot_idx| {
+                    let is_setup = slot_idx as usize == setup_slot_idx;
+                    let pr = &all_picture_resources[slot_idx as usize];
+                    let p_next = if is_setup {
+                        &setup_dpb_slot_info as *const _ as *const _
+                    } else {
+                        // Non-setup slots on RESET: no DPB slot info needed for H.264
+                        std::ptr::null()
+                    };
+                    vk::VideoReferenceSlotInfoKHR {
+                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                        p_next,
+                        slot_index: slot_idx as i32,
+                        p_picture_resource: pr,
+                        _marker: Default::default(),
+                    }
+                })
+                .collect();
 
-            // Reference slots with their DPB info - store everything in Vecs so pointers remain valid
+            let begin_coding_info = vk::VideoBeginCodingInfoKHR {
+                s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
+                p_next: std::ptr::null(),
+                flags: vk::VideoBeginCodingFlagsKHR::empty(),
+                video_session: session,
+                video_session_parameters: session_params,
+                reference_slot_count: all_begin_slots.len() as u32,
+                p_reference_slots: all_begin_slots.as_ptr(),
+                _marker: Default::default(),
+            };
+
+            self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
+        } else {
+            // Non-RESET frame: Build DPB slot info for reference pictures
+            //
+            // Match C++ pattern: BeginVideoCoding gets only the ref slots (same as DecodeVideo),
+            // NOT the setup picture. Setup picture is only in DecodeVideo's p_setup_reference_slot.
             let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
             for ref_pic in dpb_ref_pictures.iter() {
-                let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                let mut ref_info =
+                    unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                 ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
                 ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
                 // For progressive frames: both fields are available for prediction
@@ -588,8 +317,6 @@ impl H264Decoder {
                 ref_info.flags.set_bottom_field_flag(1);
                 ref_infos.push(ref_info);
             }
-
-            // Build DPB slot infos first (so pointers remain valid)
             let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
                 .iter()
                 .map(|ref_info| {
@@ -597,7 +324,9 @@ impl H264Decoder {
                 })
                 .collect();
 
-            let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
+            // Build reference slots with DPB slot info in pNext chain
+            // These are the SAME slots that will be used in DecodeVideo's p_reference_slots
+            all_begin_slots = dpb_ref_pictures
                 .iter()
                 .zip(ref_dpb_slot_infos.iter())
                 .map(|(ref_pic, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
@@ -609,27 +338,295 @@ impl H264Decoder {
                 })
                 .collect();
 
-            let decode_info = vk::VideoDecodeInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: &h264_decode_info as *const _ as *const _,
-                flags: vk::VideoDecodeFlagsKHR::empty(),
-                src_buffer: bitstream_buffer,
-                src_buffer_offset: bitstream_offset,
-                src_buffer_range: bitstream_range,
-                dst_picture_resource: dst_picture_resource,
-                p_setup_reference_slot: setup_slot
-                    .as_ref()
-                    .map_or(std::ptr::null(), |s| s as *const _),
-                reference_slot_count: ref_slots.len() as u32,
-                p_reference_slots: ref_slots.as_ptr(),
+            // C++ pattern: count = ref_count + (setup ? 1 : 0), ptr = refs when refs exist
+            // Setup must be adjacent to refs in memory (driver reads count elements from ptr)
+            //
+            // CRITICAL: All structs must stay alive until after cmd_begin_video_coding!
+            // We use Box::leak to ensure pointers remain valid.
+
+            // Build setup DPB info (leaked to ensure pointer validity)
+            let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo = if dpb_setup_picture
+                .is_some()
+            {
+                let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                info.FrameNum = (effective_frame_num % max_frame_num) as u16;
+                info.PicOrderCnt = effective_poc;
+                info.flags.set_top_field_flag(1);
+                info.flags.set_bottom_field_flag(1);
+                Box::leak(Box::new(info))
+            } else {
+                std::ptr::null()
+            };
+
+            let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR =
+                if !setup_ref_info.is_null() {
+                    let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
+                        .std_reference_info(unsafe { &*setup_ref_info });
+                    Box::leak(Box::new(dpb_info))
+                } else {
+                    std::ptr::null()
+                };
+
+            // Build setup slot info (if setup picture exists)
+            let setup_slot_info = if !setup_dpb_slot_info.is_null() {
+                Some(vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: setup_dpb_slot_info as *const _ as *const _,
+                    slot_index: dpb_setup_picture
+                        .as_ref()
+                        .map_or(0, |s| s.slot_index as i32),
+                    p_picture_resource: dpb_setup_picture
+                        .as_ref()
+                        .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
+                    _marker: Default::default(),
+                })
+            } else {
+                None
+            };
+
+            // Build combined slots array for BeginVideoCoding
+            // MUST keep this alive until after cmd_begin_video_coding is called!
+            let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
+                if all_begin_slots.is_empty() {
+                    // No refs: use only setup slot
+                    setup_slot_info.into_iter().collect()
+                } else {
+                    // Has refs: combine refs + setup
+                    let mut combined = all_begin_slots.clone();
+                    if let Some(slot) = setup_slot_info {
+                        combined.push(slot);
+                    }
+                    combined
+                };
+
+            let slot_count = begin_video_coding_slots.len() as u32;
+            let slot_ptr = if begin_video_coding_slots.is_empty() {
+                std::ptr::null()
+            } else {
+                begin_video_coding_slots.as_ptr()
+            };
+
+            let begin_coding_info = vk::VideoBeginCodingInfoKHR {
+                s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
+                p_next: std::ptr::null(),
+                flags: vk::VideoBeginCodingFlagsKHR::empty(),
+                video_session: session,
+                video_session_parameters: session_params,
+                reference_slot_count: slot_count,
+                p_reference_slots: slot_ptr,
                 _marker: Default::default(),
             };
 
-            self.cmd_decode_video(cmd_buffer, &decode_info);
-
-            // End video coding
-            self.cmd_end_video_coding(cmd_buffer);
+            self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
         }
+
+        // RESET decoder before first frame (required by Vulkan spec)
+        // Must be INSIDE video coding block (after Begin, before Decode)
+        if is_first_frame {
+            self.cmd_control_video_coding(cmd_buffer);
+        }
+
+        // Barriers AFTER BeginVideoCoding and BEFORE DecodeVideo
+        // This matches C++ reference VkVideoDecoder.cpp:1216-1227
+        // Bitstream buffer barrier
+        let buffer_barrier = vk::BufferMemoryBarrier2 {
+            s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::NONE,
+            src_access_mask: vk::AccessFlags2::HOST_WRITE,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            buffer: bitstream_buffer,
+            offset: bitstream_offset,
+            size: bitstream_range,
+            _marker: Default::default(),
+        };
+
+        // Output image barrier
+        // Use COLOR aspect (matches C++ reference VkVideoDecoder.cpp:857)
+        // When dpb_setup_picture points to the same image as dstPictureResource,
+        // use VIDEO_DECODE_DPB_KHR layout (per Vulkan spec).
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        let new_layout = if dpb_setup_picture.is_some() {
+            // dpb_setup_picture points to the same image, so use DPB layout
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+        } else {
+            vk::ImageLayout::VIDEO_DECODE_DST_KHR
+        };
+
+        let image_barrier = vk::ImageMemoryBarrier2 {
+            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+            p_next: std::ptr::null(),
+            src_stage_mask: vk::PipelineStageFlags2::NONE,
+            src_access_mask: vk::AccessFlags2::NONE,
+            dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+            dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: output_image,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout,
+            subresource_range,
+            _marker: Default::default(),
+        };
+
+        // Add barriers for reference images (matches C++ VkVideoDecoder.cpp:1044-1056)
+        let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
+        for ref_pic in dpb_ref_pictures.iter() {
+            // Only add barrier if image is valid and not already in DPB layout
+            if ref_pic.image != vk::Image::null()
+                && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+            {
+                all_image_barriers.push(vk::ImageMemoryBarrier2 {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                    p_next: std::ptr::null(),
+                    src_stage_mask: vk::PipelineStageFlags2::NONE,
+                    src_access_mask: vk::AccessFlags2::empty(),
+                    dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                    dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image: ref_pic.image,
+                    old_layout: ref_pic.current_layout,
+                    new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                    subresource_range,
+                    _marker: Default::default(),
+                });
+            }
+        }
+
+        // Single DependencyInfo with ALL barriers (matches C++ VkVideoDecoder.cpp:1229-1240)
+        let dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 1,
+            p_buffer_memory_barriers: &buffer_barrier,
+            image_memory_barrier_count: all_image_barriers.len() as u32,
+            p_image_memory_barriers: all_image_barriers.as_ptr(),
+            _marker: Default::default(),
+        };
+        self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info);
+
+        // Build H.264 picture info
+        let dst_picture_resource = vk::VideoPictureResourceInfoKHR {
+            s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
+            p_next: std::ptr::null(),
+            coded_offset: vk::Offset2D::default(),
+            coded_extent,
+            base_array_layer: 0,
+            image_view_binding: output_image_view,
+            _marker: Default::default(),
+        };
+
+        let pic_ptr = &pic_info as *const StdVideoDecodeH264PictureInfo;
+
+        let h264_decode_info = vk::VideoDecodeH264PictureInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_H264_PICTURE_INFO_KHR,
+            p_next: std::ptr::null(),
+            p_std_picture_info: pic_ptr,
+            slice_count: slice_offsets.len() as u32,
+            p_slice_offsets: if slice_offsets.is_empty() {
+                std::ptr::null()
+            } else {
+                slice_offsets.as_ptr()
+            },
+            _marker: Default::default(),
+        };
+
+        // Build reference slots - use same indices as in begin coding
+        // Each slot needs a VkVideoDecodeH264DpbSlotInfoKHR in its pNext chain
+        let max_frame_num =
+            1u32 << (self.sps.as_ref().expect("SPS").log2_max_frame_num_minus4 as u32 + 4);
+
+        // Setup slot DPB info
+        let mut setup_ref_info =
+            unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+        setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
+        setup_ref_info.PicOrderCnt = effective_poc;
+        // For progressive frames: both fields are available for prediction
+        setup_ref_info.flags.set_top_field_flag(1);
+        setup_ref_info.flags.set_bottom_field_flag(1);
+        let setup_dpb_slot_info = dpb_setup_picture.as_ref().map(|_| {
+            vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info)
+        });
+
+        let setup_slot = dpb_setup_picture
+            .as_ref()
+            .map(|info| vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: setup_dpb_slot_info
+                    .as_ref()
+                    .map(|s| s as *const _ as *const _)
+                    .unwrap_or(std::ptr::null()),
+                slot_index: info.slot_index as i32,
+                p_picture_resource: &info.picture_resource as *const _,
+                _marker: Default::default(),
+            });
+
+        // Reference slots with their DPB info - store everything in Vecs so pointers remain valid
+        let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
+        for ref_pic in dpb_ref_pictures.iter() {
+            let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+            ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
+            ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
+            // For progressive frames: both fields are available for prediction
+            ref_info.flags.set_top_field_flag(1);
+            ref_info.flags.set_bottom_field_flag(1);
+            ref_infos.push(ref_info);
+        }
+
+        // Build DPB slot infos first (so pointers remain valid)
+        let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
+            .iter()
+            .map(|ref_info| {
+                vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(ref_info)
+            })
+            .collect();
+
+        let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
+            .iter()
+            .zip(ref_dpb_slot_infos.iter())
+            .map(|(ref_pic, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: dpb_slot_info as *const _ as *const _,
+                slot_index: ref_pic.slot_index as i32,
+                p_picture_resource: &ref_pic.picture_resource as *const _,
+                _marker: Default::default(),
+            })
+            .collect();
+
+        let decode_info = vk::VideoDecodeInfoKHR {
+            s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+            p_next: &h264_decode_info as *const _ as *const _,
+            flags: vk::VideoDecodeFlagsKHR::empty(),
+            src_buffer: bitstream_buffer,
+            src_buffer_offset: bitstream_offset,
+            src_buffer_range: bitstream_range,
+            dst_picture_resource,
+            p_setup_reference_slot: setup_slot
+                .as_ref()
+                .map_or(std::ptr::null(), |s| s as *const _),
+            reference_slot_count: ref_slots.len() as u32,
+            p_reference_slots: ref_slots.as_ptr(),
+            _marker: Default::default(),
+        };
+
+        self.cmd_decode_video(cmd_buffer, &decode_info);
+
+        // End video coding
+        self.cmd_end_video_coding(cmd_buffer);
 
         // Update POC tracking
         self.prev_frame_num = effective_frame_num;
@@ -683,7 +680,7 @@ impl H264Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+                c"vkCmdPipelineBarrier2KHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -705,7 +702,7 @@ impl H264Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdBeginVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -725,7 +722,7 @@ impl H264Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+                c"vkCmdDecodeVideoKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -750,7 +747,7 @@ impl H264Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdEndVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {
@@ -776,7 +773,7 @@ impl H264Decoder {
         let fn_ptr = unsafe {
             self.instance.get_device_proc_addr(
                 self.device.handle(),
-                b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
+                c"vkCmdControlVideoCodingKHR".as_ptr(),
             )
         };
         if let Some(ptr) = fn_ptr {

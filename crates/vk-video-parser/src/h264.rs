@@ -24,6 +24,12 @@ pub struct H264Parser {
     idr_found: bool,
 }
 
+impl Default for H264Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H264Parser {
     pub fn new() -> Self {
         Self {
@@ -757,7 +763,7 @@ impl H264Parser {
         num_ref_idx_l1_active_minus1: u32,
     ) -> ParserResult<()> {
         let is_b = slice_type == 1; // B-slice after modulo 5
-        let luma_log2_weight_denom = r.read_ue()? as u8;
+        let _luma_log2_weight_denom = r.read_ue()? as u8;
 
         if sps.chroma_format_idc != 0 {
             let _chroma_log2_weight_denom = r.read_ue()? as u8;
@@ -984,7 +990,7 @@ impl VideoParser for H264Parser {
                 | Some(H264NalUnitType::DataPartitionA)
                 | Some(H264NalUnitType::DataPartitionB)
                 | Some(H264NalUnitType::DataPartitionC) => {
-                    let (is_trailing, nal_ref_idc, nal_unit_type) =
+                    let (_is_trailing, nal_ref_idc, nal_unit_type) =
                         nal::parse_h264_nal_header(&nal.data).unwrap_or((false, 0, 0));
 
                     if self.first_slice_header.is_none() {

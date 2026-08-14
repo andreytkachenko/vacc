@@ -88,14 +88,15 @@ impl DecodedFrame {
 
     pub fn frame_size(&self) -> usize {
         let y_size = self.y_plane.row_pitch * self.coded_height as usize;
-        let chroma_height = (self.coded_height as usize + 1) / 2;
-        let _chroma_width = (self.coded_width as usize + 1) / 2;
+        let chroma_height = (self.coded_height as usize).div_ceil(2);
+        let _chroma_width = (self.coded_width as usize).div_ceil(2);
         let uv_size = self.uv_plane.row_pitch * chroma_height;
         y_size + uv_size
     }
 }
 
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct YCbCrConversionParams {
     pub model_conversion: u32,
     pub range: u32,
@@ -105,18 +106,6 @@ pub struct YCbCrConversionParams {
     pub video_full_range: bool,
 }
 
-impl Default for YCbCrConversionParams {
-    fn default() -> Self {
-        Self {
-            model_conversion: 0,
-            range: 0,
-            x_chroma_offset: 0,
-            y_chroma_offset: 0,
-            matrix_coefficients: 0,
-            video_full_range: false,
-        }
-    }
-}
 
 /// Decoded frame pool.
 pub struct DecodedFramePool {
@@ -161,6 +150,10 @@ impl DecodedFramePool {
 
     pub fn len(&self) -> usize {
         self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
     }
 
     pub fn available_count(&self) -> usize {

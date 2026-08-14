@@ -77,8 +77,6 @@ impl fmt::Display for VideoCodec {
     }
 }
 
-/// Video codec operations as bitflags.
-#[allow(unused_doc_comments)]
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct VideoCodecFlagBits: u32 {

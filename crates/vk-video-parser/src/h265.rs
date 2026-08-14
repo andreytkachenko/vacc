@@ -67,6 +67,12 @@ pub struct H265Parser {
     has_prev_pic: bool,
 }
 
+impl Default for H265Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H265Parser {
     /// Get the first slice header info from the current access unit (if available).
     pub fn first_slice_header(&self) -> Option<&SliceHeaderInfo> {
@@ -137,7 +143,7 @@ impl H265Parser {
 
         // Padding bits: (8 - MaxNumSubLayersMinus1 - 1) * 2 per H.265 spec
         if max_sub_layers > 0 && max_sub_layers < 8 {
-            let _ = r.read_bits(((8 - max_sub_layers - 1) * 2) as u8)?;
+            let _ = r.read_bits((8 - max_sub_layers - 1) * 2)?;
         }
 
         // --- Sub-layer level info (SubLayerLevelPresentFlag) ---
@@ -292,7 +298,7 @@ impl H265Parser {
             }
         }
 
-        for i in 0..=max_num_sublayers_minus1 as usize {
+        for _i in 0..=max_num_sublayers_minus1 as usize {
             let fixed_pic_rate_general_flag = r.read_bit()?;
             let mut fixed_pic_rate_within_cvs_flag = false;
             if !fixed_pic_rate_general_flag {
@@ -416,7 +422,7 @@ impl H265Parser {
                     strps.used_by_curr_pic_s0_flag |= 1 << i;
                 }
                 // Compute cumulative POC offset (negative for S0)
-                cum_delta_poc_s0 -= (raw_delta + 1);
+                cum_delta_poc_s0 -= raw_delta + 1;
                 // Store directly like C++: (uint16_t)DeltaPocS0[i]
                 strps.delta_poc_s0_minus1[i as usize] = cum_delta_poc_s0 as u16;
             }
@@ -432,7 +438,7 @@ impl H265Parser {
                     strps.used_by_curr_pic_s1_flag |= 1 << i;
                 }
                 // Compute cumulative POC offset (positive for S1)
-                cum_delta_poc_s1 += (raw_delta + 1);
+                cum_delta_poc_s1 += raw_delta + 1;
                 // Store directly like C++: (uint16_t)DeltaPocS1[i]
                 strps.delta_poc_s1_minus1[i as usize] = cum_delta_poc_s1 as u16;
             }
@@ -490,7 +496,7 @@ impl H265Parser {
         // Matches C++: VulkanH265Parser.cpp:1758-1769
         let mut used_by_curr_pic_flag: Vec<bool> = Vec::with_capacity(num_ref_entries + 1);
         let mut use_delta_flag: Vec<bool> = Vec::with_capacity(num_ref_entries + 1);
-        for j in 0..=num_ref_entries {
+        for _j in 0..=num_ref_entries {
             let used = r.read_bit()?;
             used_by_curr_pic_flag.push(used);
             if used {
@@ -639,9 +645,9 @@ impl H265Parser {
 
         // layer_id_included_flag[layer_set_idx][layer_id]
         vps.layer_id_included_flag.clear();
-        for i in 1..vps.vps_num_layer_sets {
+        for _i in 1..vps.vps_num_layer_sets {
             let mut layer_flags = Vec::new();
-            for j in 0..=(vps.vps_max_layer_id) {
+            for _j in 0..=(vps.vps_max_layer_id) {
                 layer_flags.push(r.read_bit()?);
             }
             vps.layer_id_included_flag.push(layer_flags);
@@ -717,10 +723,10 @@ impl H265Parser {
         // Parse conformance_window_flag and offsets
         sps.conformance_window_flag = r.read_bit()?;
         if sps.conformance_window_flag {
-            sps.conf_win_left_offset = r.read_ue()? as u32;
-            sps.conf_win_right_offset = r.read_ue()? as u32;
-            sps.conf_win_top_offset = r.read_ue()? as u32;
-            sps.conf_win_bottom_offset = r.read_ue()? as u32;
+            sps.conf_win_left_offset = r.read_ue()?;
+            sps.conf_win_right_offset = r.read_ue()?;
+            sps.conf_win_top_offset = r.read_ue()?;
+            sps.conf_win_bottom_offset = r.read_ue()?;
         }
 
         sps.bit_depth_luma_minus8 = r.read_ue()? as u8;
@@ -803,7 +809,7 @@ impl H265Parser {
 
             let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
             for i in 0..num_long_term_ref_pics_sps {
-                sps.lt_ref_pic_poc_lsb_sps[i as usize] = r.read_bits(poc_lsb_bits as u8)? as u32;
+                sps.lt_ref_pic_poc_lsb_sps[i as usize] = r.read_bits(poc_lsb_bits as u8)?;
                 let used_by_curr_pic_lt_sps_flag = r.read_bit()?;
                 if used_by_curr_pic_lt_sps_flag {
                     sps.used_by_curr_pic_lt_sps_flag |= 1 << i;
@@ -938,8 +944,8 @@ impl H265Parser {
 
         let mut pps = vk_video_core::picture::H265Pps::new();
 
-        pps.pps_pic_parameter_set_id = r.read_ue()? as u32;
-        pps.pps_seq_parameter_set_id = r.read_ue()? as u32;
+        pps.pps_pic_parameter_set_id = r.read_ue()?;
+        pps.pps_seq_parameter_set_id = r.read_ue()?;
         pps.dependent_slice_segments_enabled_flag = r.read_bit()?;
         pps.output_flag_present_flag = r.read_bit()?;
         // num_extra_slice_header_bits is u(3), not ue(v) per H.265 spec 7.3.6
@@ -1091,14 +1097,14 @@ impl H265Parser {
 
         // Determine RapPicFlag from NAL unit type
         // RapPicFlag = (nal_unit_type >= 16 && nal_unit_type <= 23)
-        info.is_rap = nal_unit_type >= 16 && nal_unit_type <= 23;
+        info.is_rap = (16..=23).contains(&nal_unit_type);
 
         // Determine is_reference from NAL unit type
         // Per H.265 spec:
         // - VCL NAL types 0-15: odd types (1,3,5,7,9,11,13,15) are reference
         // - IRAP NAL types 16-23: all are reference pictures
         // Based on VulkanH265Parser.cpp:2783-2791 for sub-layer non-ref determination
-        info.is_reference = (nal_unit_type >= 16 && nal_unit_type <= 23)
+        info.is_reference = (16..=23).contains(&nal_unit_type)
             || (nal_unit_type < 16 && (nal_unit_type & 1) == 1);
 
         // --- slice_segment_header parsing (per VulkanH265Parser.cpp:2130-2133) ---
@@ -1111,13 +1117,13 @@ impl H265Parser {
         // - IDR (19,20): inferred as 1, NOT in bitstream
         // - BLA (16,17,18) / CRA (21): present in bitstream
         // - RADL (22) / RASL (23): inferred as 0, NOT in bitstream
-        let mut no_output_of_prior_pics_flag = false;
+        let mut _no_output_of_prior_pics_flag = false;
         let is_idr_pic = nal_unit_type == 19 || nal_unit_type == 20;
-        let is_bla_or_cra = (nal_unit_type >= 16 && nal_unit_type <= 18) || nal_unit_type == 21;
+        let is_bla_or_cra = (16..=18).contains(&nal_unit_type) || nal_unit_type == 21;
         if is_idr_pic {
-            no_output_of_prior_pics_flag = true; // Inferred
+            _no_output_of_prior_pics_flag = true; // Inferred
         } else if is_bla_or_cra {
-            no_output_of_prior_pics_flag = r.read_bit()?; // Read from bitstream
+            _no_output_of_prior_pics_flag = r.read_bit()?; // Read from bitstream
         }
         // RADL/RASL: inferred as 0, don't read
 
@@ -1188,8 +1194,8 @@ impl H265Parser {
 
         // Compute full POC value per H.265 spec section 8.3.1
         // (based on VulkanH265Parser.cpp:2757-2799)
-        let is_irap = nal_unit_type >= 16 && nal_unit_type <= 23;
-        let mut pic_order_cnt_msb: i32;
+        let is_irap = (16..=23).contains(&nal_unit_type);
+        let pic_order_cnt_msb: i32;
 
         // NoRaslOutputFlag: true for BLA (16-18) or IDR (19-20) per C++ reference VulkanH265Parser.cpp:324
         let no_rasl_output_flag = is_irap && nal_unit_type <= 20;
@@ -1203,14 +1209,14 @@ impl H265Parser {
 
             if ((info.pic_order_cnt_lsb as i32) < self.prev_pic_order_cnt_lsb)
                 && (self.prev_pic_order_cnt_lsb - info.pic_order_cnt_lsb as i32
-                    >= max_pic_order_cnt_lsb as i32 / 2)
+                    >= max_pic_order_cnt_lsb / 2)
             {
-                pic_order_cnt_msb = self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb as i32;
+                pic_order_cnt_msb = self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb;
             } else if (info.pic_order_cnt_lsb as i32 > self.prev_pic_order_cnt_lsb)
                 && (info.pic_order_cnt_lsb as i32 - self.prev_pic_order_cnt_lsb
-                    > max_pic_order_cnt_lsb as i32 / 2)
+                    > max_pic_order_cnt_lsb / 2)
             {
-                pic_order_cnt_msb = self.prev_pic_order_cnt_msb - max_pic_order_cnt_lsb as i32;
+                pic_order_cnt_msb = self.prev_pic_order_cnt_msb - max_pic_order_cnt_lsb;
             } else {
                 pic_order_cnt_msb = self.prev_pic_order_cnt_msb;
             }
@@ -1222,9 +1228,9 @@ impl H265Parser {
         // Per VulkanH265Parser.cpp:2792-2798
         // Extract temporal_id from NAL header (nuh_temporal_id_plus1 is in 2nd byte)
         let temporal_id = (nal_data[1] & 0x07) - 1; // nuh_temporal_id_plus1 - 1
-        let is_sub_layer_non_ref = nal_unit_type % 2 == 0; // Even NAL types are non-ref
+        let is_sub_layer_non_ref = nal_unit_type.is_multiple_of(2); // Even NAL types are non-ref
         if temporal_id == 0
-            && !(nal_unit_type >= 6 && nal_unit_type <= 15) // Not RADL/RASL/SLNR
+            && !(6..=15).contains(&nal_unit_type) // Not RADL/RASL/SLNR
             && !is_sub_layer_non_ref
         {
             self.prev_pic_order_cnt_lsb = info.pic_order_cnt_lsb as i32;
@@ -1268,7 +1274,7 @@ impl H265Parser {
                             (sps.num_long_term_ref_pics_sps as f64).log2().ceil() as u8;
                         let _ = r.read_bits(lt_idx_bits)?;
                     } else if i >= num_long_term_sps {
-                        let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u8 + 4;
+                        let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
                         let _ = r.read_bits(poc_lsb_bits)?; // poc_lsb_lt
                         let _ = r.read_bit()?; // used_by_curr_pic_lt_flag
                     }
@@ -1352,71 +1358,62 @@ impl VideoParser for H265Parser {
 
         for nal in &nal_units {
             match H265NalUnitType::from_u8(nal.nal_unit_type) {
-                Some(H265NalUnitType::Vps) => match self.parse_vps(&nal.data) {
-                    Ok(vps) => {
-                        result_vps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                            self.active_vps.clone().unwrap(),
-                        ));
-                    }
-                    Err(_) => {}
+                Some(H265NalUnitType::Vps) => if let Ok(_vps) = self.parse_vps(&nal.data) {
+                    result_vps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                        self.active_vps.clone().unwrap(),
+                    ));
                 },
                 Some(H265NalUnitType::Sps) => {
-                    match self.parse_sps(&nal.data) {
-                        Ok(sps) => {
-                            result_sps =
-                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_sps.clone().unwrap(),
-                                ));
-                            // Update detected format from SPS
-                            self.detected_format.coded_width = sps.pic_width_in_luma_samples as u32;
-                            self.detected_format.coded_height =
-                                sps.pic_height_in_luma_samples as u32;
-                            match sps.chroma_format_idc {
-                                0 => {
-                                    self.detected_format.chroma_subsampling =
-                                        vk_video_core::format::ChromaSubsampling::Monochrome
-                                }
-                                1 => {
-                                    self.detected_format.chroma_subsampling =
-                                        vk_video_core::format::ChromaSubsampling::_420
-                                }
-                                2 => {
-                                    self.detected_format.chroma_subsampling =
-                                        vk_video_core::format::ChromaSubsampling::_422
-                                }
-                                3 => {
-                                    self.detected_format.chroma_subsampling =
-                                        vk_video_core::format::ChromaSubsampling::_444
-                                }
-                                _ => {}
+                    if let Ok(sps) = self.parse_sps(&nal.data) {
+                        result_sps =
+                            Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                self.active_sps.clone().unwrap(),
+                            ));
+                        // Update detected format from SPS
+                        self.detected_format.coded_width = sps.pic_width_in_luma_samples as u32;
+                        self.detected_format.coded_height =
+                            sps.pic_height_in_luma_samples as u32;
+                        match sps.chroma_format_idc {
+                            0 => {
+                                self.detected_format.chroma_subsampling =
+                                    vk_video_core::format::ChromaSubsampling::Monochrome
                             }
-                            let luma_bd = 8 + sps.bit_depth_luma_minus8;
-                            let chroma_bd = 8 + sps.bit_depth_chroma_minus8;
-                            self.detected_format.luma_bit_depth = match luma_bd {
-                                8 => vk_video_core::format::ComponentBitDepth::Bit8,
-                                10 => vk_video_core::format::ComponentBitDepth::Bit10,
-                                12 => vk_video_core::format::ComponentBitDepth::Bit12,
-                                _ => vk_video_core::format::ComponentBitDepth::Bit8,
-                            };
-                            self.detected_format.chroma_bit_depth = match chroma_bd {
-                                8 => vk_video_core::format::ComponentBitDepth::Bit8,
-                                10 => vk_video_core::format::ComponentBitDepth::Bit10,
-                                12 => vk_video_core::format::ComponentBitDepth::Bit12,
-                                _ => vk_video_core::format::ComponentBitDepth::Bit8,
-                            };
-                            self.detected_format.codec_profile = sps.profile_idc as u32;
-                            self.detected_format.progressive_sequence = !sps.vui.field_seq_flag;
+                            1 => {
+                                self.detected_format.chroma_subsampling =
+                                    vk_video_core::format::ChromaSubsampling::_420
+                            }
+                            2 => {
+                                self.detected_format.chroma_subsampling =
+                                    vk_video_core::format::ChromaSubsampling::_422
+                            }
+                            3 => {
+                                self.detected_format.chroma_subsampling =
+                                    vk_video_core::format::ChromaSubsampling::_444
+                            }
+                            _ => {}
                         }
-                        Err(_) => {}
+                        let luma_bd = 8 + sps.bit_depth_luma_minus8;
+                        let chroma_bd = 8 + sps.bit_depth_chroma_minus8;
+                        self.detected_format.luma_bit_depth = match luma_bd {
+                            8 => vk_video_core::format::ComponentBitDepth::Bit8,
+                            10 => vk_video_core::format::ComponentBitDepth::Bit10,
+                            12 => vk_video_core::format::ComponentBitDepth::Bit12,
+                            _ => vk_video_core::format::ComponentBitDepth::Bit8,
+                        };
+                        self.detected_format.chroma_bit_depth = match chroma_bd {
+                            8 => vk_video_core::format::ComponentBitDepth::Bit8,
+                            10 => vk_video_core::format::ComponentBitDepth::Bit10,
+                            12 => vk_video_core::format::ComponentBitDepth::Bit12,
+                            _ => vk_video_core::format::ComponentBitDepth::Bit8,
+                        };
+                        self.detected_format.codec_profile = sps.profile_idc as u32;
+                        self.detected_format.progressive_sequence = !sps.vui.field_seq_flag;
                     }
                 }
-                Some(H265NalUnitType::Pps) => match self.parse_pps(&nal.data) {
-                    Ok(pps) => {
-                        result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                            self.active_pps.clone().unwrap(),
-                        ));
-                    }
-                    Err(_) => {}
+                Some(H265NalUnitType::Pps) => if let Ok(_pps) = self.parse_pps(&nal.data) {
+                    result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                        self.active_pps.clone().unwrap(),
+                    ));
                 },
                 Some(t) if t.is_slice() => {
                     // Parse the first slice header of this frame
@@ -1811,7 +1808,7 @@ mod tests {
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, false).unwrap();
         assert_eq!(profile, 1, "SPS profile_idc");
         assert_eq!(level, 120, "SPS level_idc");
-        assert_eq!(tier, false, "SPS tier_flag");
+        assert!(!tier, "SPS tier_flag");
 
         // Test VPS PTL (max_sub_layers=0, sub_layer_level_present=true)
         let vps_ptl_data: Vec<u8> = vec![
@@ -1825,7 +1822,7 @@ mod tests {
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, true).unwrap();
         assert_eq!(profile, 1, "VPS profile_idc");
         assert_eq!(level, 120, "VPS level_idc");
-        assert_eq!(tier, false, "VPS tier_flag");
+        assert!(!tier, "VPS tier_flag");
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! Demonstrates a complete Vulkan VP9 video decode pipeline:
 //!
 //! 1. Read raw VP9 bitstream file (no container)
+
+#![allow(clippy::too_many_arguments)]
 //! 2. Expand superframes (detect superframe index at end of data)
 //! 3. Split bitstream using sequential frame header parsing
 //! 4. Parse each frame header with Vp9Parser
@@ -353,10 +355,9 @@ fn main() {
         video_caps.min_bitstream_buffer_offset_alignment
     );
     // Align buffer size to minBitstreamBufferSizeAlignment
-    let max_frame_size_aligned = ((max_frame_size as u64 + bs_size_align as u64 - 1)
-        / bs_size_align as u64
-        * bs_size_align as u64)
-        .max(bs_size_align as u64);
+    let max_frame_size_aligned = ((max_frame_size as u64).div_ceil(bs_size_align)
+        * bs_size_align)
+        .max(bs_size_align);
     let mut bs_buffer = create_vp9_bitstream_buffer(
         &vulkan.device,
         &vulkan.memory_properties,
@@ -438,8 +439,8 @@ fn main() {
         if frame_idx == 1 {
             println!("  [DEBUG] Raw frame data len={}", frame_data.len());
             println!("  [DEBUG] First 32 bytes as hex:");
-            for i in 0..frame_data.len().min(32) {
-                print!("{:02X} ", frame_data[i]);
+            for (i, &byte) in frame_data.iter().enumerate().take(frame_data.len().min(32)) {
+                print!("{:02X} ", byte);
                 if (i + 1) % 16 == 0 {
                     println!();
                 }
@@ -526,9 +527,9 @@ fn main() {
         );
 
         // Write bitstream data to buffer - only the current frame's data
-        let bs_align = bs_size_align as u64;
+        let bs_align = bs_size_align;
         let actual_size = frame_data.len() as u64;
-        let aligned_size = ((actual_size + bs_align - 1) / bs_align * bs_align).max(bs_align);
+        let aligned_size = (actual_size.div_ceil(bs_align) * bs_align).max(bs_align);
 
         bs_buffer.zero_range(0, aligned_size);
         bs_buffer
@@ -542,8 +543,8 @@ fn main() {
                 let bytes =
                     unsafe { std::slice::from_raw_parts(ptr, aligned_size.min(32) as usize) };
                 println!("  [DEBUG] Bitstream buffer first 32 bytes for frame 1:");
-                for i in 0..bytes.len() {
-                    print!("{:02X} ", bytes[i]);
+                for (i, &byte) in bytes.iter().enumerate() {
+                    print!("{:02X} ", byte);
                     if (i + 1) % 16 == 0 {
                         println!();
                     }
@@ -594,14 +595,13 @@ fn main() {
         }
 
         // Select DPB slot for this frame, avoiding slots needed as references
-        let output_slot;
-        if is_key_frame || is_first_frame {
+        let output_slot = if is_key_frame || is_first_frame {
             // Key frame or first frame: reset DPB and use slot 0
             if is_key_frame {
                 dpb_manager.invalidate_all();
                 vp9_decoder.reset_dpb();
             }
-            output_slot = 0;
+            0
         } else {
             // Inter frame: find or recycle a slot that is NOT a reference
             let exclude_slots: Vec<i32> = reference_name_slot_indices
@@ -609,10 +609,10 @@ fn main() {
                 .filter(|&&s| s >= 0)
                 .copied()
                 .collect();
-            output_slot = dpb_manager
+            dpb_manager
                 .find_or_recycle_slot(&exclude_slots)
-                .unwrap_or(0);
-        }
+                .unwrap_or(0)
+        };
 
         let output_slot_usize = output_slot as usize;
         let output_view = dpb_views[output_slot_usize];
@@ -685,7 +685,7 @@ fn main() {
                 .expect("Failed to reset command buffer");
         }
 
-        let output_slot_old_layout = dpb_manager.get_slot_layout(output_slot as u32);
+        let output_slot_old_layout = dpb_manager.get_slot_layout(output_slot);
         let result = vp9_decoder.record_decode_command(
             command_buffer,
             session.handle(),
@@ -759,7 +759,7 @@ fn main() {
         }
 
         // Register this frame in DPB manager
-        dpb_manager.register_frame(output_slot as u32, frame_count);
+        dpb_manager.register_frame(output_slot, frame_count);
 
         // Update DPB slot layout
         dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
@@ -1459,8 +1459,8 @@ fn readback_and_verify(
     bitstream_path: &str,
 ) {
     let y_size = (width * height) as usize;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let uv_size = (uv_width * uv_height * 2) as usize;
     let total_size = (y_size + uv_size) as u64;
 
@@ -1766,13 +1766,13 @@ fn readback_and_verify(
         let mut _max_val = u8::MIN;
         let pixel_count = (frame_width * frame_height) as usize;
 
-        for i in 0..pixel_count.min(y_data.len()) {
-            _sum += y_data[i] as u64;
-            if y_data[i] < _min_val {
-                _min_val = y_data[i];
+        for &byte in y_data.iter().take(pixel_count.min(y_data.len())) {
+            _sum += byte as u64;
+            if byte < _min_val {
+                _min_val = byte;
             }
-            if y_data[i] > _max_val {
-                _max_val = y_data[i];
+            if byte > _max_val {
+                _max_val = byte;
             }
         }
 
@@ -1832,7 +1832,7 @@ fn cmd_pipeline_barrier_2(
     dep_info: &vk::DependencyInfo<'_>,
 ) {
     let fn_ptr = unsafe {
-        instance.get_device_proc_addr(device, b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast())
+        instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr())
     };
     if let Some(ptr) = fn_ptr {
         unsafe {

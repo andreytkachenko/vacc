@@ -562,6 +562,7 @@ pub struct H265Sps {
 /// H.265 Short-Term Reference Picture Set.
 /// Matches StdVideoH265ShortTermRefPicSet layout.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct H265ShortTermRefPicSet {
     pub inter_ref_pic_set_prediction_flag: bool,
     pub delta_idx_minus1: u32,
@@ -576,23 +577,6 @@ pub struct H265ShortTermRefPicSet {
     pub delta_poc_s1_minus1: [u16; 16],
 }
 
-impl Default for H265ShortTermRefPicSet {
-    fn default() -> Self {
-        Self {
-            inter_ref_pic_set_prediction_flag: false,
-            delta_idx_minus1: 0,
-            use_delta_flag: 0,
-            abs_delta_rps_minus1: 0,
-            used_by_curr_pic_flag: 0,
-            used_by_curr_pic_s0_flag: 0,
-            used_by_curr_pic_s1_flag: 0,
-            num_negative_pics: 0,
-            num_positive_pics: 0,
-            delta_poc_s0_minus1: [0; 16],
-            delta_poc_s1_minus1: [0; 16],
-        }
-    }
-}
 
 impl H265Sps {
     pub fn new() -> Self {

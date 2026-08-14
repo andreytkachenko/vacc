@@ -14,8 +14,7 @@ use vk_video_core::picture::{
     Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType, Vp9InterpolationFilter, Vp9Profile,
     VP9_FRAME_MARKER, VP9_FRAME_SYNC_CODE, VP9_LOOP_FILTER_ADJUSTMENTS, VP9_MAX_PROBABILITY,
     VP9_MAX_REF_FRAMES, VP9_MAX_SEGMENTATION_PRED_PROB, VP9_MAX_SEGMENTATION_TREE_PROBS,
-    VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES,
-    VP9_REFERENCE_NAME_LAST_FRAME, VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
+    VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES, VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
 };
 
 /// VP9 parser state.
@@ -36,6 +35,12 @@ pub struct Vp9Parser {
     loop_filter_mode_deltas: [i8; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
     /// Reference frame sizes indexed by DPB slot (for inter frame size inheritance).
     reference_frame_sz: [(u32, u32); VP9_NUM_REF_FRAMES as usize],
+}
+
+impl Default for Vp9Parser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Vp9Parser {
@@ -94,11 +99,10 @@ impl Vp9Parser {
         };
 
         // Profile 3: check zero bit
-        if profile == 3 {
-            if r.read_bits(1)? != 0 {
+        if profile == 3
+            && r.read_bits(1)? != 0 {
                 return Err(ParserError::InvalidBitstream);
             }
-        }
 
         // show_existing_frame
         frame_data.show_existing_frame = r.read_bit()?;
@@ -260,7 +264,7 @@ impl Vp9Parser {
         self.parse_tile_info(&mut r, &mut frame_data)?;
 
         // compressed_header_size
-        frame_data.compressed_header_size = r.read_bits(16)? as u32;
+        frame_data.compressed_header_size = r.read_bits(16)?;
 
         // Compute offsets
         frame_data.uncompressed_header_offset = 0;
@@ -344,14 +348,14 @@ impl Vp9Parser {
         r: &mut BitReader,
         frame_data: &mut Vp9FrameData,
     ) -> ParserResult<()> {
-        frame_data.frame_width = r.read_bits(16)? as u32 + 1;
-        frame_data.frame_height = r.read_bits(16)? as u32 + 1;
+        frame_data.frame_width = r.read_bits(16)? + 1;
+        frame_data.frame_height = r.read_bits(16)? + 1;
 
         self.compute_image_size(frame_data);
 
         if r.read_bits(1)? != 0 {
-            frame_data.render_width = r.read_bits(16)? as u32 + 1;
-            frame_data.render_height = r.read_bits(16)? as u32 + 1;
+            frame_data.render_width = r.read_bits(16)? + 1;
+            frame_data.render_height = r.read_bits(16)? + 1;
         } else {
             frame_data.render_width = frame_data.frame_width;
             frame_data.render_height = frame_data.frame_height;
@@ -384,8 +388,8 @@ impl Vp9Parser {
 
         if !found_ref {
             // No reference frame size available, read from bitstream
-            frame_data.frame_width = r.read_bits(16)? as u32 + 1;
-            frame_data.frame_height = r.read_bits(16)? as u32 + 1;
+            frame_data.frame_width = r.read_bits(16)? + 1;
+            frame_data.frame_height = r.read_bits(16)? + 1;
 
             self.compute_image_size(frame_data);
         } else {
@@ -394,8 +398,8 @@ impl Vp9Parser {
 
         // Per cros-codecs: always read render_size_flag for inter frames
         if r.read_bits(1)? != 0 {
-            frame_data.render_width = r.read_bits(16)? as u32 + 1;
-            frame_data.render_height = r.read_bits(16)? as u32 + 1;
+            frame_data.render_width = r.read_bits(16)? + 1;
+            frame_data.render_height = r.read_bits(16)? + 1;
         } else {
             frame_data.render_width = frame_data.frame_width;
             frame_data.render_height = frame_data.frame_height;

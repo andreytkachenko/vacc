@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-/// Packet flags for bitstream data.
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PacketFlags: u32 {
