@@ -4,9 +4,7 @@ use vk_video_parser::nal::{
     find_next_start_code, parse_h264_nal_header, parse_h265_nal_header,
     remove_emulation_prevention_bytes,
 };
-use vk_video_parser::{
-    bitstream::BitstreamPacket, DetectedVideoFormat, VideoParser,
-};
+use vk_video_parser::{bitstream::BitstreamPacket, DetectedVideoFormat, VideoParser};
 
 /// An access unit (single frame) extracted from the bitstream.
 #[derive(Debug, Clone)]
@@ -50,7 +48,10 @@ pub enum H264MmcoCommand {
     /// MMCO 2: Unmark long-term reference with long_term_frame_idx
     UnmarkLongTerm { long_term_frame_idx: u32 },
     /// MMCO 3: Assign LongTermFrameIdx to short-term reference
-    AssignLongTerm { difference_of_pic_nums_minus1: u32, long_term_frame_idx: u32 },
+    AssignLongTerm {
+        difference_of_pic_nums_minus1: u32,
+        long_term_frame_idx: u32,
+    },
     /// MMCO 4: Set MaxLongTermFrameIdx
     SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: u32 },
     /// MMCO 5: Unmark all references
@@ -166,7 +167,16 @@ fn parse_h264_slice_header(
     prev_pic_order_cnt_lsb: i32,
     prev_pic_order_cnt_msb: i32,
     max_pic_order_cnt_lsb: u32,
-) -> Option<(u32, u32, i32, i32, [i32; 2], u32, bool, Vec<H264MmcoCommand>)> {
+) -> Option<(
+    u32,
+    u32,
+    i32,
+    i32,
+    [i32; 2],
+    u32,
+    bool,
+    Vec<H264MmcoCommand>,
+)> {
     if nal_data.len() < 4 {
         return None;
     }
@@ -234,30 +244,41 @@ fn parse_h264_slice_header(
                 // MMCO 1: Unmark short-term reference
                 1 => {
                     let difference_of_pic_nums_minus1 = r.read_ue().unwrap_or(0);
-                    H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1 }
+                    H264MmcoCommand::UnmarkShortTerm {
+                        difference_of_pic_nums_minus1,
+                    }
                 }
                 // MMCO 2: Unmark long-term reference
                 2 => {
                     let long_term_frame_idx = r.read_ue().unwrap_or(0);
-                    H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx }
+                    H264MmcoCommand::UnmarkLongTerm {
+                        long_term_frame_idx,
+                    }
                 }
                 // MMCO 3: Assign LongTermFrameIdx to short-term reference
                 3 => {
                     let difference_of_pic_nums_minus1 = r.read_ue().unwrap_or(0);
                     let long_term_frame_idx = r.read_ue().unwrap_or(0);
-                    H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1, long_term_frame_idx }
+                    H264MmcoCommand::AssignLongTerm {
+                        difference_of_pic_nums_minus1,
+                        long_term_frame_idx,
+                    }
                 }
                 // MMCO 4: Set MaxLongTermFrameIdx
                 4 => {
                     let long_term_frame_idx = r.read_ue().unwrap_or(0);
-                    H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: long_term_frame_idx }
+                    H264MmcoCommand::SetMaxLongTermFrameIdx {
+                        max_long_term_frame_idx_plus1: long_term_frame_idx,
+                    }
                 }
                 // MMCO 5: Unmark all references
                 5 => H264MmcoCommand::UnmarkAll,
                 // MMCO 6: Assign LongTermFrameIdx to current picture
                 6 => {
                     let long_term_frame_idx = r.read_ue().unwrap_or(0);
-                    H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx }
+                    H264MmcoCommand::AssignLongTermToCurrent {
+                        long_term_frame_idx,
+                    }
                 }
                 _ => {
                     // Unknown MMCO, stop parsing
@@ -289,7 +310,20 @@ fn parse_h265_slice_header(
     nuh_temporal_id_plus1: u8,
     prev_pic_order_cnt_lsb: i32,
     prev_pic_order_cnt_msb: i32,
-) -> Option<(bool, i32, i32, [i32; 2], bool, bool, u32, i32, i32, bool, Vec<i32>, bool)> {
+) -> Option<(
+    bool,
+    i32,
+    i32,
+    [i32; 2],
+    bool,
+    bool,
+    u32,
+    i32,
+    i32,
+    bool,
+    Vec<i32>,
+    bool,
+)> {
     if nal_data.len() < 3 {
         return None;
     }
@@ -313,7 +347,9 @@ fn parse_h265_slice_header(
     }
 
     if pps.num_extra_slice_header_bits > 0 {
-        let _extra_bits = r.read_bits(pps.num_extra_slice_header_bits as u32).unwrap_or(0);
+        let _extra_bits = r
+            .read_bits(pps.num_extra_slice_header_bits as u32)
+            .unwrap_or(0);
     }
 
     let slice_type = r.read_ue().unwrap_or(0);
@@ -355,11 +391,7 @@ fn parse_h265_slice_header(
     let pic_order_cnt_val = pic_order_cnt_msb + pic_order_cnt_lsb;
     let pic_order_cnt = [pic_order_cnt_val, pic_order_cnt_val];
 
-    let is_reference = if is_rap {
-        true
-    } else {
-        nal_unit_type % 2 == 1
-    };
+    let is_reference = if is_rap { true } else { nal_unit_type % 2 == 1 };
 
     let mut num_bits_for_st_ref_pic_set_in_slice: i32 = 0;
     let mut num_delta_pocs_of_ref_rps_idx: i32 = 0;
@@ -712,7 +744,13 @@ pub fn extract_all_access_units(
                     let is_aud = t == 38;
                     let is_slice_type = matches!(t, 0..=31);
                     let is_params_type = matches!(t, 32..=34);
-                    (t as usize, is_irap_type, is_aud, is_slice_type, is_params_type)
+                    (
+                        t as usize,
+                        is_irap_type,
+                        is_aud,
+                        is_slice_type,
+                        is_params_type,
+                    )
                 } else {
                     (0, false, false, false, false)
                 }
@@ -733,7 +771,8 @@ pub fn extract_all_access_units(
                     is_idr: current_is_idr,
                     is_reference: current_is_reference,
                     slice_type: current_slice_type,
-                    num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                    num_bits_for_st_ref_pic_set_in_slice:
+                        current_num_bits_for_st_ref_pic_set_in_slice,
                     num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
                     short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
                     ref_pocs: current_ref_pocs.clone(),
@@ -752,8 +791,19 @@ pub fn extract_all_access_units(
         // Handle in-band parameter sets
         if is_params {
             let param_set = match codec {
-                VideoCodec::H264 => parse_h264_inband_params(nal_data, nal_type, &seen_h264_sps_ids, &seen_h264_pps_ids),
-                VideoCodec::H265 => parse_h265_inband_params(nal_data, nal_type, &seen_h265_vps_ids, &seen_h265_sps_ids, &seen_h265_pps_ids),
+                VideoCodec::H264 => parse_h264_inband_params(
+                    nal_data,
+                    nal_type,
+                    &seen_h264_sps_ids,
+                    &seen_h264_pps_ids,
+                ),
+                VideoCodec::H265 => parse_h265_inband_params(
+                    nal_data,
+                    nal_type,
+                    &seen_h265_vps_ids,
+                    &seen_h265_sps_ids,
+                    &seen_h265_pps_ids,
+                ),
                 VideoCodec::Vp9 => None,
             };
 
@@ -761,19 +811,29 @@ pub fn extract_all_access_units(
                 // Update seen IDs
                 if let Some(ref sps) = ps.sps {
                     match sps {
-                        H264OrH265Sps::H264(s) => { seen_h264_sps_ids.insert(s.seq_parameter_set_id as u32); }
-                        H264OrH265Sps::H265(s) => { seen_h265_sps_ids.insert(s.sps_seq_parameter_set_id as u32); }
+                        H264OrH265Sps::H264(s) => {
+                            seen_h264_sps_ids.insert(s.seq_parameter_set_id as u32);
+                        }
+                        H264OrH265Sps::H265(s) => {
+                            seen_h265_sps_ids.insert(s.sps_seq_parameter_set_id as u32);
+                        }
                     }
                 }
                 if let Some(ref pps) = ps.pps {
                     match pps {
-                        H264OrH265Pps::H264(p) => { seen_h264_pps_ids.insert(p.pic_parameter_set_id as u32); }
-                        H264OrH265Pps::H265(p) => { seen_h265_pps_ids.insert(p.pps_pic_parameter_set_id as u32); }
+                        H264OrH265Pps::H264(p) => {
+                            seen_h264_pps_ids.insert(p.pic_parameter_set_id as u32);
+                        }
+                        H264OrH265Pps::H265(p) => {
+                            seen_h265_pps_ids.insert(p.pps_pic_parameter_set_id as u32);
+                        }
                     }
                 }
                 if let Some(ref vps) = ps.vps {
                     match vps {
-                        H265VpsOpt::H265(v) => { seen_h265_vps_ids.insert(v.vps_video_parameter_set_id as u32); }
+                        H265VpsOpt::H265(v) => {
+                            seen_h265_vps_ids.insert(v.vps_video_parameter_set_id as u32);
+                        }
                     }
                 }
                 items.push(ExtractedItem::ParameterSet(ps));
@@ -789,17 +849,24 @@ pub fn extract_all_access_units(
             if codec == VideoCodec::H264 {
                 if let Some(H264OrH265Sps::H264(sps)) = sps {
                     if let Some((_, ref_idc, nal_unit_type)) = parse_h264_nal_header(nal_data) {
-                        if let Some((first_mb, frame_num, poc_lsb, poc_msb, poc, slice_type, adaptive_ref_pic_marking_mode_flag, mmco_commands)) =
-                            parse_h264_slice_header(
-                                nal_data,
-                                sps,
-                                ref_idc,
-                                nal_unit_type,
-                                prev_pic_order_cnt_lsb,
-                                prev_pic_order_cnt_msb,
-                                max_pic_order_cnt_lsb,
-                            )
-                        {
+                        if let Some((
+                            first_mb,
+                            frame_num,
+                            poc_lsb,
+                            poc_msb,
+                            poc,
+                            slice_type,
+                            adaptive_ref_pic_marking_mode_flag,
+                            mmco_commands,
+                        )) = parse_h264_slice_header(
+                            nal_data,
+                            sps,
+                            ref_idc,
+                            nal_unit_type,
+                            prev_pic_order_cnt_lsb,
+                            prev_pic_order_cnt_msb,
+                            max_pic_order_cnt_lsb,
+                        ) {
                             let is_idr_slice = nal_unit_type == 5;
 
                             is_new_frame = if !in_frame || current_slice_offsets.is_empty() {
@@ -826,13 +893,18 @@ pub fn extract_all_access_units(
                                         is_idr: current_is_idr,
                                         is_reference: current_is_reference,
                                         slice_type: current_slice_type,
-                                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                        num_bits_for_st_ref_pic_set_in_slice:
+                                            current_num_bits_for_st_ref_pic_set_in_slice,
+                                        num_delta_pocs_of_ref_rps_idx:
+                                            current_num_delta_pocs_of_ref_rps_idx,
+                                        short_term_ref_pic_set_sps_flag:
+                                            current_short_term_ref_pic_set_sps_flag,
                                         ref_pocs: current_ref_pocs.clone(),
-                                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                        adaptive_ref_pic_marking_mode_flag:
+                                            current_adaptive_ref_pic_marking_mode_flag,
                                         mmco_commands: current_mmco_commands.clone(),
-                                        no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                                        no_output_of_prior_pics_flag:
+                                            current_no_output_of_prior_pics_flag,
                                     }));
                                     current_au_data.clear();
                                     current_slice_offsets.clear();
@@ -844,7 +916,8 @@ pub fn extract_all_access_units(
                                 current_frame_num = frame_num;
                                 current_poc = poc;
                                 current_slice_type = slice_type;
-                                current_adaptive_ref_pic_marking_mode_flag = adaptive_ref_pic_marking_mode_flag;
+                                current_adaptive_ref_pic_marking_mode_flag =
+                                    adaptive_ref_pic_marking_mode_flag;
                                 current_mmco_commands = mmco_commands;
 
                                 if ref_idc != 0 {
@@ -923,13 +996,18 @@ pub fn extract_all_access_units(
                                         is_idr: current_is_idr,
                                         is_reference: current_is_reference,
                                         slice_type: current_slice_type,
-                                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
-                                        num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
-                                        short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
+                                        num_bits_for_st_ref_pic_set_in_slice:
+                                            current_num_bits_for_st_ref_pic_set_in_slice,
+                                        num_delta_pocs_of_ref_rps_idx:
+                                            current_num_delta_pocs_of_ref_rps_idx,
+                                        short_term_ref_pic_set_sps_flag:
+                                            current_short_term_ref_pic_set_sps_flag,
                                         ref_pocs: current_ref_pocs.clone(),
-                                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                                        adaptive_ref_pic_marking_mode_flag:
+                                            current_adaptive_ref_pic_marking_mode_flag,
                                         mmco_commands: current_mmco_commands.clone(),
-                                        no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
+                                        no_output_of_prior_pics_flag:
+                                            current_no_output_of_prior_pics_flag,
                                     }));
                                     current_au_data.clear();
                                     current_slice_offsets.clear();
@@ -942,9 +1020,11 @@ pub fn extract_all_access_units(
                                 current_slice_type = slice_type;
                                 current_num_bits_for_st_ref_pic_set_in_slice = slice_num_bits_strps;
                                 current_num_delta_pocs_of_ref_rps_idx = slice_num_delta_pocs;
-                                current_short_term_ref_pic_set_sps_flag = slice_short_term_ref_pic_set_sps_flag;
+                                current_short_term_ref_pic_set_sps_flag =
+                                    slice_short_term_ref_pic_set_sps_flag;
                                 current_ref_pocs = slice_ref_pocs;
-                                current_no_output_of_prior_pics_flag = slice_no_output_of_prior_pics_flag;
+                                current_no_output_of_prior_pics_flag =
+                                    slice_no_output_of_prior_pics_flag;
                                 prev_frame_num += 1;
                                 current_frame_num = prev_frame_num;
 
@@ -992,11 +1072,13 @@ pub fn extract_all_access_units(
                         is_idr: current_is_idr,
                         is_reference: current_is_reference,
                         slice_type: current_slice_type,
-                        num_bits_for_st_ref_pic_set_in_slice: current_num_bits_for_st_ref_pic_set_in_slice,
+                        num_bits_for_st_ref_pic_set_in_slice:
+                            current_num_bits_for_st_ref_pic_set_in_slice,
                         num_delta_pocs_of_ref_rps_idx: current_num_delta_pocs_of_ref_rps_idx,
                         short_term_ref_pic_set_sps_flag: current_short_term_ref_pic_set_sps_flag,
                         ref_pocs: current_ref_pocs.clone(),
-                        adaptive_ref_pic_marking_mode_flag: current_adaptive_ref_pic_marking_mode_flag,
+                        adaptive_ref_pic_marking_mode_flag:
+                            current_adaptive_ref_pic_marking_mode_flag,
                         mmco_commands: current_mmco_commands.clone(),
                         no_output_of_prior_pics_flag: current_no_output_of_prior_pics_flag,
                     }));
@@ -1084,7 +1166,12 @@ fn parse_h264_inband_params(
     }
 
     let mut parser = H264Parser::new();
-    if parser.init(&DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH264)).is_err() {
+    if parser
+        .init(&DetectedVideoFormat::new(
+            vk_video_core::codec::VideoCodec::DecodeH264,
+        ))
+        .is_err()
+    {
         return None;
     }
 
@@ -1137,7 +1224,12 @@ fn parse_h265_inband_params(
     }
 
     let mut parser = H265Parser::new();
-    if parser.init(&DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH265)).is_err() {
+    if parser
+        .init(&DetectedVideoFormat::new(
+            vk_video_core::codec::VideoCodec::DecodeH265,
+        ))
+        .is_err()
+    {
         return None;
     }
 
@@ -1147,7 +1239,12 @@ fn parse_h265_inband_params(
     let mut pps: Option<H264OrH265Pps> = None;
 
     match parser.parse(&packet) {
-        Ok(ParseResult::ParameterSet { vps: v, sps: s, pps: p, .. }) => {
+        Ok(ParseResult::ParameterSet {
+            vps: v,
+            sps: s,
+            pps: p,
+            ..
+        }) => {
             if let Some(v) = v {
                 if let Some(h265_vps) = v.downcast_ref::<vk_video_core::picture::H265Vps>() {
                     // Only report if this is a new VPS ID
@@ -1214,7 +1311,10 @@ pub fn parse_ivf_container(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     // Read header_size from file instead of hardcoding
     let header_size = u16::from_le_bytes([data[6], data[7]]) as usize;
     if header_size < 32 || header_size > 256 {
-        return Err(format!("Invalid IVF header_size: {} (expected 32)", header_size));
+        return Err(format!(
+            "Invalid IVF header_size: {} (expected 32)",
+            header_size
+        ));
     }
     if data.len() < header_size {
         return Err("File too small for IVF header".to_string());
@@ -1326,9 +1426,9 @@ pub fn expand_superframes(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
 
 /// Split a VP9 bitstream into individual frame packets.
 pub fn split_vp9_bitstream(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use vk_video_core::codec::VideoCodec as CoreCodec;
     use vk_video_parser::vp9::Vp9Parser;
     use vk_video_parser::{DetectedVideoFormat, VideoParser};
-    use vk_video_core::codec::VideoCodec as CoreCodec;
 
     let mut frames = Vec::new();
 
@@ -1373,7 +1473,9 @@ pub fn split_vp9_bitstream(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
                     continue;
                 }
                 let mut validator = Vp9Parser::new();
-                if validator.init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9)).is_ok()
+                if validator
+                    .init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9))
+                    .is_ok()
                     && validator.parse_frame(&data[i..]).is_ok()
                 {
                     next_frame = i;

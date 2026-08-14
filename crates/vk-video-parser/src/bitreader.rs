@@ -249,9 +249,9 @@ impl<'a> BitReader<'a> {
         if self.pos == 0 {
             0
         } else if self.bits_left == 8 {
-            self.pos - 1  // Loaded but not consumed current byte
+            self.pos - 1 // Loaded but not consumed current byte
         } else {
-            self.pos  // Partially consumed current byte
+            self.pos // Partially consumed current byte
         }
     }
 
@@ -399,15 +399,7 @@ mod tests {
             0x33, // pic_width_in_mbs_minus1 cont.
             0xD0, // pic_height_in_map_units_minus1
             0x80, // frame_mbs_only_flag, direct_8x8_inference_flag
-            0x00,
-            0xCB,
-            0xA7,
-            0x80,
-            0x26,
-            0x25,
-            0xA0,
-            0x47,
-            0x8C,
+            0x00, 0xCB, 0xA7, 0x80, 0x26, 0x25, 0xA0, 0x47, 0x8C,
         ];
 
         let mut r = BitReader::new(&data, true);
@@ -442,7 +434,10 @@ mod tests {
 
         // log2_max_pic_order_cnt_lsb_minus4 (ue(v))
         let log2_max_poc = r.read_ue().unwrap();
-        assert_eq!(log2_max_poc, 6, "expected log2_max_pic_order_cnt_lsb_minus4=6");
+        assert_eq!(
+            log2_max_poc, 6,
+            "expected log2_max_pic_order_cnt_lsb_minus4=6"
+        );
 
         // max_num_ref_frames (ue(v))
         let max_ref = r.read_ue().unwrap();
@@ -454,7 +449,10 @@ mod tests {
 
         // pic_width_in_mbs_minus1 (ue(v))
         let pic_w = r.read_ue().unwrap();
-        assert_eq!(pic_w, 119, "expected pic_width_in_mbs_minus1=119 (1920/16-1)");
+        assert_eq!(
+            pic_w, 119,
+            "expected pic_width_in_mbs_minus1=119 (1920/16-1)"
+        );
 
         // pic_height_in_map_units_minus1 (ue(v))
         let pic_h = r.read_ue().unwrap();
@@ -475,8 +473,8 @@ mod tests {
         // Parse the ACTUAL SPS from born_trailer.h264
         // Data starts after NAL header (0x67)
         let data = [
-            0x42, 0xC0, 0x29, 0x9A, 0x74, 0x03, 0xC0, 0x33, 0xD0, 0x80,
-            0x00, 0xCB, 0xA7, 0x80, 0x26, 0x25, 0xA0, 0x47, 0x8C, 0x19,
+            0x42, 0xC0, 0x29, 0x9A, 0x74, 0x03, 0xC0, 0x33, 0xD0, 0x80, 0x00, 0xCB, 0xA7, 0x80,
+            0x26, 0x25, 0xA0, 0x47, 0x8C, 0x19,
         ];
 
         let mut r = BitReader::new(&data, true);
@@ -502,7 +500,6 @@ mod tests {
 
         let max_ref = r.read_ue().unwrap();
         println!("max_num_ref_frames: {}", max_ref);
-
 
         let gaps = r.read_bit().unwrap();
         println!("gaps_in_frame_num: {}", gaps);

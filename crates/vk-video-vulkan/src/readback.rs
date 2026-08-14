@@ -1,7 +1,7 @@
 //! Pixel readback from decoded video images.
 
-use ash::vk::{self, Handle};
 use super::VideoError;
+use ash::vk::{self, Handle};
 
 /// Decoded pixel data for YUV 420 planar format.
 #[derive(Debug, Clone)]
@@ -23,7 +23,6 @@ pub fn readback_decoded_image(
     width: u32,
     height: u32,
 ) -> Result<DecodedPixels, VideoError> {
-
     let y_size = (width * height) as usize;
     let uv_width = (width + 1) / 2;
     let uv_height = (height + 1) / 2;
@@ -76,7 +75,12 @@ pub fn readback_decoded_image(
     let mapped_ptr = unsafe {
         device
             .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-            .map_err(|e| VideoError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?
+            .map_err(|e| {
+                VideoError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?
     };
 
     let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -358,12 +362,12 @@ fn cmd_pipeline_barrier_2(
     dep_info: &vk::DependencyInfo<'_>,
 ) {
     let fn_ptr = unsafe {
-        instance
-            .get_device_proc_addr(device, b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast())
+        instance.get_device_proc_addr(device, b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast())
     };
     if let Some(ptr) = fn_ptr {
         unsafe {
-            type FnType = unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
+            type FnType =
+                unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
             let f: FnType = std::mem::transmute(ptr);
             f(cmd_buffer, dep_info);
         }

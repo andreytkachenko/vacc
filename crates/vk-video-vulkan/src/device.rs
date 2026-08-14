@@ -3,8 +3,8 @@
 use ash::vk;
 use std::ffi::CString;
 
+use super::vp9::{vp9_vk_constants, VideoDecodeVP9CapabilitiesKHR, VideoDecodeVP9ProfileInfoKHR};
 use super::{AppInfo, VideoError, VideoResult};
-use super::vp9::{VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9CapabilitiesKHR, vp9_vk_constants};
 
 /// PhysicalDeviceVideoDecodeFeaturesKHR - not available in ash 0.38, define manually.
 #[repr(C)]
@@ -20,7 +20,6 @@ struct PhysicalDeviceVideoDecodeFeaturesKHR {
 
 const PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR: vk::StructureType =
     vk::StructureType::from_raw(1000346000);
-
 
 /// Queue family indices found during device selection.
 #[derive(Debug, Clone, Default)]
@@ -70,7 +69,9 @@ impl VideoCodec {
             Self::DecodeH264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
             Self::DecodeH265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
             Self::DecodeAv1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
-            Self::DecodeVp9 => vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9),
+            Self::DecodeVp9 => {
+                vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9)
+            }
         }
     }
 }
@@ -138,16 +139,14 @@ impl VideoDeviceBuilder {
     }
 
     pub fn build(self) -> VideoResult<VulkanDevice> {
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
+        let entry =
+            unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
         let (instance, has_validation) = Self::create_instance(&entry, &self)?;
-        let (physical_device, queue_families) =
-            Self::select_physical_device(&instance, &self)?;
-        let (device, enabled_extensions) = Self::create_device(
-            &entry, &instance, &physical_device, &queue_families, &self,
-        )?;
-        let memory_properties = unsafe {
-            instance.get_physical_device_memory_properties(physical_device)
-        };
+        let (physical_device, queue_families) = Self::select_physical_device(&instance, &self)?;
+        let (device, enabled_extensions) =
+            Self::create_device(&entry, &instance, &physical_device, &queue_families, &self)?;
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
         let debug_messenger = if has_validation {
             Self::create_debug_messenger(&entry, &instance)?
@@ -187,14 +186,17 @@ impl VideoDeviceBuilder {
             .api_version(api_version);
 
         // Check available instance layers
-        let available_layers = unsafe {
-            entry.enumerate_instance_layer_properties()
-        }.map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate instance layers: {}", e)))?;
+        let available_layers =
+            unsafe { entry.enumerate_instance_layer_properties() }.map_err(|e| {
+                VideoError::VulkanInit(format!("Failed to enumerate instance layers: {}", e))
+            })?;
 
         let available_layer_names: Vec<String> = available_layers
             .iter()
             .map(|layer| {
-                let name_bytes: Vec<u8> = layer.layer_name.iter()
+                let name_bytes: Vec<u8> = layer
+                    .layer_name
+                    .iter()
                     .take_while(|&&b| b != 0)
                     .map(|&b| b as u8)
                     .collect();
@@ -203,14 +205,17 @@ impl VideoDeviceBuilder {
             .collect();
 
         // Check available instance extensions
-        let available_extensions = unsafe {
-            entry.enumerate_instance_extension_properties(None)
-        }.map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate instance extensions: {}", e)))?;
+        let available_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map_err(|e| {
+            VideoError::VulkanInit(format!("Failed to enumerate instance extensions: {}", e))
+        })?;
 
         let available_ext_names: Vec<String> = available_extensions
             .iter()
             .map(|ext| {
-                let name_bytes: Vec<u8> = ext.extension_name.iter()
+                let name_bytes: Vec<u8> = ext
+                    .extension_name
+                    .iter()
                     .take_while(|&&b| b != 0)
                     .map(|&b| b as u8)
                     .collect();
@@ -231,7 +236,10 @@ impl VideoDeviceBuilder {
                 layers.push(CString::new(validation_layer).unwrap());
                 has_validation = true;
             } else {
-                eprintln!("[VideoDeviceBuilder] WARNING: Validation layer {} not available", validation_layer);
+                eprintln!(
+                    "[VideoDeviceBuilder] WARNING: Validation layer {} not available",
+                    validation_layer
+                );
             }
 
             // Check if debug utils extension is available
@@ -239,7 +247,10 @@ impl VideoDeviceBuilder {
             if available_ext_names.contains(&debug_ext.to_string()) {
                 instance_extensions.push(CString::new(debug_ext).unwrap());
             } else {
-                eprintln!("[VideoDeviceBuilder] WARNING: Debug extension {} not available", debug_ext);
+                eprintln!(
+                    "[VideoDeviceBuilder] WARNING: Debug extension {} not available",
+                    debug_ext
+                );
                 has_validation = false;
             }
         }
@@ -274,13 +285,17 @@ impl VideoDeviceBuilder {
             }
             let data = *p_callback_data;
             let message = if !data.p_message.is_null() {
-                std::ffi::CStr::from_ptr(data.p_message).to_string_lossy().into_owned()
+                std::ffi::CStr::from_ptr(data.p_message)
+                    .to_string_lossy()
+                    .into_owned()
             } else {
                 String::new()
             };
 
             // Format severity level
-            let severity = if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+            let severity = if message_severity
+                .contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+            {
                 "ERROR"
             } else if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
                 "WARN"
@@ -291,7 +306,8 @@ impl VideoDeviceBuilder {
             };
 
             // Format message type
-            let msg_type = if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+            let msg_type = if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE)
+            {
                 "PERF"
             } else if message_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION) {
                 "VALID"
@@ -299,7 +315,10 @@ impl VideoDeviceBuilder {
                 "GEN"
             };
 
-            eprintln!("[Vulkan Validation] [{}] [{}] {}", severity, msg_type, message);
+            eprintln!(
+                "[Vulkan Validation] [{}] [{}] {}",
+                severity, msg_type, message
+            );
             0 // VK_FALSE - don't abort
         }
 
@@ -322,7 +341,9 @@ impl VideoDeviceBuilder {
         unsafe {
             debug_utils
                 .create_debug_utils_messenger(&create_info, None)
-                .map_err(|e| VideoError::VulkanInit(format!("Failed to create debug messenger: {}", e)))
+                .map_err(|e| {
+                    VideoError::VulkanInit(format!("Failed to create debug messenger: {}", e))
+                })
         }
     }
 
@@ -330,11 +351,14 @@ impl VideoDeviceBuilder {
         instance: &ash::Instance,
         builder: &VideoDeviceBuilder,
     ) -> VideoResult<(vk::PhysicalDevice, QueueFamilies)> {
-        let physical_devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| VideoError::VulkanInit(format!("Failed to enumerate physical devices: {}", e)))?;
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }.map_err(|e| {
+            VideoError::VulkanInit(format!("Failed to enumerate physical devices: {}", e))
+        })?;
 
         if physical_devices.is_empty() {
-            return Err(VideoError::VulkanInit("No physical devices found".to_string()));
+            return Err(VideoError::VulkanInit(
+                "No physical devices found".to_string(),
+            ));
         }
 
         // Find a physical device with video decode support
@@ -391,14 +415,17 @@ impl VideoDeviceBuilder {
         builder: &VideoDeviceBuilder,
     ) -> VideoResult<(ash::Device, Vec<String>)> {
         // Query available device extensions
-        let available_extensions = unsafe {
-            instance.enumerate_device_extension_properties(*physical_device)
-        }.map_err(|e| VideoError::DeviceCreation(format!("Failed to enumerate extensions: {}", e)))?;
+        let available_extensions =
+            unsafe { instance.enumerate_device_extension_properties(*physical_device) }.map_err(
+                |e| VideoError::DeviceCreation(format!("Failed to enumerate extensions: {}", e)),
+            )?;
 
         let available_names: Vec<String> = available_extensions
             .iter()
             .map(|ext| {
-                let name_bytes: Vec<u8> = ext.extension_name.iter()
+                let name_bytes: Vec<u8> = ext
+                    .extension_name
+                    .iter()
                     .take_while(|&&b| b != 0)
                     .map(|&b| b as u8)
                     .collect();
@@ -431,36 +458,64 @@ impl VideoDeviceBuilder {
             if available_names.iter().any(|n| n.as_str() == *ext) {
                 extensions.push(ext);
             } else {
-                eprintln!("[VideoDeviceBuilder] WARNING: Required extension {} not available", ext);
+                eprintln!(
+                    "[VideoDeviceBuilder] WARNING: Required extension {} not available",
+                    ext
+                );
             }
         }
 
         // Add codec-specific extensions only if available
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h264") {
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        {
+            if available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_h264")
+            {
                 extensions.push("VK_KHR_video_decode_h264");
             }
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h265") {
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
+        {
+            if available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_h265")
+            {
                 extensions.push("VK_KHR_video_decode_h265");
             }
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_av1") {
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
+        {
+            if available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_av1")
+            {
                 extensions.push("VK_KHR_video_decode_av1");
             } else {
                 eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)");
             }
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9)) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_vp9") {
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::from_raw(
+                vp9_vk_constants::DECODE_VP9,
+            ))
+        {
+            if available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_vp9")
+            {
                 extensions.push("VK_KHR_video_decode_vp9");
             } else {
                 eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_vp9 not available (VP9 decode not supported)");
             }
         }
-
 
         let c_extensions: Vec<CString> = extensions
             .iter()
@@ -481,8 +536,10 @@ impl VideoDeviceBuilder {
         video_decode_features.video_decode_av1 = 1;
         video_decode_features.video_decode_vp9 = 1;
 
-        let mut sampler_ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-        sampler_ycbcr_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+        let mut sampler_ycbcr_features =
+            vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        sampler_ycbcr_features.s_type =
+            vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
         sampler_ycbcr_features.p_next = &mut video_decode_features as *mut _ as *mut _;
         sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
 
@@ -538,11 +595,8 @@ impl VideoDeviceBuilder {
             _marker: Default::default(),
         };
 
-        let device = unsafe {
-            instance
-                .create_device(*physical_device, &device_create_info, None)
-        }
-        .map_err(|e| VideoError::DeviceCreation(e.to_string()))?;
+        let device = unsafe { instance.create_device(*physical_device, &device_create_info, None) }
+            .map_err(|e| VideoError::DeviceCreation(e.to_string()))?;
 
         let ext_names: Vec<String> = c_extensions
             .iter()
@@ -606,7 +660,9 @@ impl VulkanDevice {
             _marker: Default::default(),
         };
         let vp9_profile = VideoDecodeVP9ProfileInfoKHR {
-            s_type: vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR),
+            s_type: vk::StructureType::from_raw(
+                vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR,
+            ),
             p_next: std::ptr::null(),
             std_profile: profile_idc,
             _marker: Default::default(),
@@ -674,7 +730,9 @@ impl VulkanDevice {
                     decode_caps.p_next = &mut av1_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeVp9 => {
-                    vp9_caps.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_CAPABILITIES_KHR);
+                    vp9_caps.s_type = vk::StructureType::from_raw(
+                        vp9_vk_constants::VIDEO_DECODE_VP9_CAPABILITIES_KHR,
+                    );
                     decode_caps.p_next = &mut vp9_caps as *mut _ as *mut _;
                 }
             }
@@ -697,10 +755,7 @@ impl VulkanDevice {
     }
 
     /// Query supported video formats for a codec.
-    pub fn query_supported_formats(
-        &self,
-        codec: VideoCodec,
-    ) -> Vec<vk::VideoFormatPropertiesKHR> {
+    pub fn query_supported_formats(&self, codec: VideoCodec) -> Vec<vk::VideoFormatPropertiesKHR> {
         let codec_op = codec.to_vk_flag();
 
         // Common semi-planar 420 formats
@@ -711,7 +766,10 @@ impl VulkanDevice {
         ];
 
         let mut formats = Vec::new();
-        eprintln!("[VideoDeviceBuilder] Querying supported video formats for codec {:?}", codec_op);
+        eprintln!(
+            "[VideoDeviceBuilder] Querying supported video formats for codec {:?}",
+            codec_op
+        );
         for fmt in candidate_formats {
             eprintln!("  Trying format: {:?}", fmt);
             let format_props = self.get_physical_device_video_format_properties(
@@ -759,7 +817,9 @@ impl VulkanDevice {
         let get_format_props_fn = unsafe {
             self.entry.get_instance_proc_addr(
                 self.instance.handle(),
-                b"vkGetPhysicalDeviceVideoFormatPropertiesKHR\0".as_ptr().cast(),
+                b"vkGetPhysicalDeviceVideoFormatPropertiesKHR\0"
+                    .as_ptr()
+                    .cast(),
             )
         };
 
@@ -800,23 +860,26 @@ impl VulkanDevice {
 
             props.truncate(count as usize);
             for p in &props {
-                eprintln!("    Supported: format={:?}, usage={:?}", p.format, p.image_usage_flags);
+                eprintln!(
+                    "    Supported: format={:?}, usage={:?}",
+                    p.format, p.image_usage_flags
+                );
             }
             props
         }
     }
 }
 
- impl Drop for VulkanDevice {
-      fn drop(&mut self) {
-          // Destroy debug messenger BEFORE instance (if not already destroyed)
-          if self.has_validation && self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
-              let debug_utils = ash::ext::debug_utils::Instance::new(&self.entry, &self.instance);
-              unsafe {
-                  // Ignore errors - instance may already be destroyed
-                  let _ = debug_utils.destroy_debug_utils_messenger(self.debug_messenger, None);
-              }
-              self.debug_messenger = vk::DebugUtilsMessengerEXT::null();
-          }
-      }
-  }
+impl Drop for VulkanDevice {
+    fn drop(&mut self) {
+        // Destroy debug messenger BEFORE instance (if not already destroyed)
+        if self.has_validation && self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
+            let debug_utils = ash::ext::debug_utils::Instance::new(&self.entry, &self.instance);
+            unsafe {
+                // Ignore errors - instance may already be destroyed
+                let _ = debug_utils.destroy_debug_utils_messenger(self.debug_messenger, None);
+            }
+            self.debug_messenger = vk::DebugUtilsMessengerEXT::null();
+        }
+    }
+}

@@ -15,22 +15,22 @@ pub struct BitstreamBuffer {
     mapped_ptr: Option<*mut u8>,
 }
 
- impl BitstreamBuffer {
-     /// Create a null BitstreamBuffer (for cleanup purposes).
-     pub fn null(device: &ash::Device) -> Self {
-         Self {
-             buffer: ash::vk::Buffer::null(),
-             memory: ash::vk::DeviceMemory::null(),
-             size: 0,
-             offset_alignment: 0,
-             size_alignment: 0,
-             device: device.clone(),
-             memory_properties: ash::vk::PhysicalDeviceMemoryProperties::default(),
-             mapped_ptr: None,
-         }
-     }
+impl BitstreamBuffer {
+    /// Create a null BitstreamBuffer (for cleanup purposes).
+    pub fn null(device: &ash::Device) -> Self {
+        Self {
+            buffer: ash::vk::Buffer::null(),
+            memory: ash::vk::DeviceMemory::null(),
+            size: 0,
+            offset_alignment: 0,
+            size_alignment: 0,
+            device: device.clone(),
+            memory_properties: ash::vk::PhysicalDeviceMemoryProperties::default(),
+            mapped_ptr: None,
+        }
+    }
 
-     pub fn create(
+    pub fn create(
         device: &ash::Device,
         memory_properties: &ash::vk::PhysicalDeviceMemoryProperties,
         size: u64,
@@ -71,10 +71,8 @@ pub struct BitstreamBuffer {
             _marker: std::marker::PhantomData,
         };
 
-        let buffer = unsafe {
-            device.create_buffer(&buffer_create_info, None)
-        }
-        .map_err(|e| VideoError::BufferAllocation(e.to_string()))?;
+        let buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
+            .map_err(|e| VideoError::BufferAllocation(e.to_string()))?;
 
         let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
@@ -84,9 +82,7 @@ pub struct BitstreamBuffer {
             ash::vk::MemoryPropertyFlags::HOST_VISIBLE
                 | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
         )
-        .ok_or_else(|| {
-            VideoError::MemoryAllocation("No suitable memory type found".to_string())
-        })?;
+        .ok_or_else(|| VideoError::MemoryAllocation("No suitable memory type found".to_string()))?;
 
         let alloc_info = ash::vk::MemoryAllocateInfo {
             s_type: ash::vk::StructureType::MEMORY_ALLOCATE_INFO,
@@ -96,18 +92,19 @@ pub struct BitstreamBuffer {
             _marker: std::marker::PhantomData,
         };
 
-        let memory = unsafe {
-            device.allocate_memory(&alloc_info, None)
-        }
-        .map_err(|e| VideoError::MemoryAllocation(e.to_string()))?;
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+            .map_err(|e| VideoError::MemoryAllocation(e.to_string()))?;
 
-        unsafe {
-            device.bind_buffer_memory(buffer, memory, 0)
-        }
-        .map_err(|e| VideoError::BufferAllocation(e.to_string()))?;
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|e| VideoError::BufferAllocation(e.to_string()))?;
 
         let mapped_ptr = unsafe {
-            device.map_memory(memory, 0, ash::vk::WHOLE_SIZE, ash::vk::MemoryMapFlags::empty())
+            device.map_memory(
+                memory,
+                0,
+                ash::vk::WHOLE_SIZE,
+                ash::vk::MemoryMapFlags::empty(),
+            )
         }
         .map(|p| p as *mut u8)
         .ok();
@@ -205,11 +202,7 @@ pub struct BitstreamBuffer {
     pub fn write_at(&mut self, data: &[u8], offset: u64) -> VideoResult<()> {
         if let Some(ptr) = self.mapped_ptr {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    ptr.add(offset as usize),
-                    data.len(),
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset as usize), data.len());
             }
         } else {
             return Err(VideoError::BufferAllocation(
@@ -227,11 +220,7 @@ pub struct BitstreamBuffer {
     pub fn zero_range(&self, offset: u64, size: u64) {
         if let Some(ptr) = self.mapped_ptr {
             unsafe {
-                std::ptr::write_bytes(
-                    ptr.add(offset as usize),
-                    0,
-                    size as usize,
-                );
+                std::ptr::write_bytes(ptr.add(offset as usize), 0, size as usize);
             }
         }
     }

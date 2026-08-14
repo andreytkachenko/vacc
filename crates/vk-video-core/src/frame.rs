@@ -27,13 +27,7 @@ pub struct DecodedFrame {
 
 impl DecodedFrame {
     /// Create a new decoded frame.
-    pub fn new(
-        frame_index: u32,
-        timestamp: i64,
-        width: u32,
-        height: u32,
-        skipped: bool,
-    ) -> Self {
+    pub fn new(frame_index: u32, timestamp: i64, width: u32, height: u32, skipped: bool) -> Self {
         Self {
             frame_index,
             timestamp,
@@ -106,17 +100,37 @@ pub struct FieldFlags {
 impl FieldFlags {
     pub fn as_u32(&self) -> u32 {
         let mut flags = 0u32;
-        if self.progressive_frame { flags |= 1 << 0; }
-        if self.field_pic { flags |= 1 << 1; }
-        if self.bottom_field { flags |= 1 << 2; }
-        if self.second_field { flags |= 1 << 3; }
-        if self.top_field_first { flags |= 1 << 4; }
-        if self.unpaired_field { flags |= 1 << 5; }
-        if self.sync_first_ready { flags |= 1 << 6; }
-        if self.sync_to_first_field { flags |= 1 << 7; }
+        if self.progressive_frame {
+            flags |= 1 << 0;
+        }
+        if self.field_pic {
+            flags |= 1 << 1;
+        }
+        if self.bottom_field {
+            flags |= 1 << 2;
+        }
+        if self.second_field {
+            flags |= 1 << 3;
+        }
+        if self.top_field_first {
+            flags |= 1 << 4;
+        }
+        if self.unpaired_field {
+            flags |= 1 << 5;
+        }
+        if self.sync_first_ready {
+            flags |= 1 << 6;
+        }
+        if self.sync_to_first_field {
+            flags |= 1 << 7;
+        }
         flags |= (self.repeat_first_field as u32) << 8;
-        if self.ref_pic { flags |= 1 << 11; }
-        if self.apply_film_grain { flags |= 1 << 12; }
+        if self.ref_pic {
+            flags |= 1 << 11;
+        }
+        if self.apply_film_grain {
+            flags |= 1 << 12;
+        }
         flags
     }
 

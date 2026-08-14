@@ -4,7 +4,10 @@ use ash::vk::{self, Handle};
 use std::ffi::CString;
 
 use super::{
-    access_unit::{AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet, VideoCodec as AccessUnitCodec, Vp9Frame},
+    access_unit::{
+        AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet,
+        VideoCodec as AccessUnitCodec, Vp9Frame,
+    },
     buffer::BitstreamBuffer,
     device::{VideoCodec, VulkanDevice},
     dpb::{DpbEntry, DpbManager, LastAccessType},
@@ -12,10 +15,10 @@ use super::{
     h265::H265Decoder,
     profile_chain::{create_bitstream_buffer_with_profile, create_output_image_with_profile},
     readback::DecodedPixels,
-    session::{CodecProfileInfo, VideoSession, VideoSessionParams, VideoSessionParameters},
+    session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams},
     vp9::{
-        convert_vp9_picture_info, vp9_vk_constants, Vp9Decoder, Vp9PictureInfoContainer,
-        VideoDecodeVP9PictureInfoKHR, VideoDecodeVP9ProfileInfoKHR,
+        convert_vp9_picture_info, vp9_vk_constants, VideoDecodeVP9PictureInfoKHR,
+        VideoDecodeVP9ProfileInfoKHR, Vp9Decoder, Vp9PictureInfoContainer,
     },
     VideoError, VideoResult,
 };
@@ -98,37 +101,74 @@ impl VideoDecoder {
     pub fn new(data: Vec<u8>, max_frames: usize) -> VideoResult<Self> {
         let decoded_codec = detect_codec_from_data(&data);
 
-        let (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent) = match decoded_codec {
-            AccessUnitCodec::H264 => {
-                let parsed = parse_h264(&data)?;
-                if parsed.coded_width == 0 || parsed.coded_height == 0 {
-                    return Err(VideoError::DecoderInit("Failed to parse video dimensions".to_string()));
+        let (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent) =
+            match decoded_codec {
+                AccessUnitCodec::H264 => {
+                    let parsed = parse_h264(&data)?;
+                    if parsed.coded_width == 0 || parsed.coded_height == 0 {
+                        return Err(VideoError::DecoderInit(
+                            "Failed to parse video dimensions".to_string(),
+                        ));
+                    }
+                    let vulkan = super::VideoDeviceBuilder::new()
+                        .with_validation(false)
+                        .build()?;
+                    let coded_extent = vk::Extent2D {
+                        width: parsed.coded_width,
+                        height: parsed.coded_height,
+                    };
+                    let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
+                    let codec = VideoCodec::DecodeH264;
+                    let dpb_slots = parsed.max_dpb_slots.min(4);
+                    (
+                        parsed,
+                        codec,
+                        vulkan,
+                        session_dpb_slots,
+                        dpb_slots,
+                        coded_extent,
+                    )
                 }
-                let vulkan = super::VideoDeviceBuilder::new().with_validation(false).build()?;
-                let coded_extent = vk::Extent2D { width: parsed.coded_width, height: parsed.coded_height };
-                let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
-                let codec = VideoCodec::DecodeH264;
-                let dpb_slots = parsed.max_dpb_slots.min(4);
-                (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent)
-            }
-            AccessUnitCodec::H265 => {
-                let parsed = parse_h265(&data)?;
-                if parsed.coded_width == 0 || parsed.coded_height == 0 {
-                    return Err(VideoError::DecoderInit("Failed to parse video dimensions".to_string()));
+                AccessUnitCodec::H265 => {
+                    let parsed = parse_h265(&data)?;
+                    if parsed.coded_width == 0 || parsed.coded_height == 0 {
+                        return Err(VideoError::DecoderInit(
+                            "Failed to parse video dimensions".to_string(),
+                        ));
+                    }
+                    let vulkan = super::VideoDeviceBuilder::new()
+                        .with_validation(false)
+                        .build()?;
+                    let coded_extent = vk::Extent2D {
+                        width: parsed.coded_width,
+                        height: parsed.coded_height,
+                    };
+                    let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
+                    let codec = VideoCodec::DecodeH265;
+                    let dpb_slots = parsed.max_dpb_slots.min(4);
+                    (
+                        parsed,
+                        codec,
+                        vulkan,
+                        session_dpb_slots,
+                        dpb_slots,
+                        coded_extent,
+                    )
                 }
-                let vulkan = super::VideoDeviceBuilder::new().with_validation(false).build()?;
-                let coded_extent = vk::Extent2D { width: parsed.coded_width, height: parsed.coded_height };
-                let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
-                let codec = VideoCodec::DecodeH265;
-                let dpb_slots = parsed.max_dpb_slots.min(4);
-                (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent)
-            }
-            AccessUnitCodec::Vp9 => {
-                let (parsed, vulkan, session_dpb_slots, dpb_slots, coded_extent) = parse_vp9_init(&data)?;
-                let codec = VideoCodec::DecodeVp9;
-                (parsed, codec, vulkan, session_dpb_slots, dpb_slots, coded_extent)
-            }
-        };
+                AccessUnitCodec::Vp9 => {
+                    let (parsed, vulkan, session_dpb_slots, dpb_slots, coded_extent) =
+                        parse_vp9_init(&data)?;
+                    let codec = VideoCodec::DecodeVp9;
+                    (
+                        parsed,
+                        codec,
+                        vulkan,
+                        session_dpb_slots,
+                        dpb_slots,
+                        coded_extent,
+                    )
+                }
+            };
 
         let decode_queue_family = vulkan
             .queue_families
@@ -231,9 +271,13 @@ impl VideoDecoder {
 
         let vp9_parser = if decoded_codec == AccessUnitCodec::Vp9 {
             let mut parser = vk_video_parser::vp9::Vp9Parser::new();
-            vk_video_parser::VideoParser::init(&mut parser, &vk_video_parser::DetectedVideoFormat::new(
-                vk_video_core::codec::VideoCodec::DecodeVp9,
-            )).map_err(|e| VideoError::DecoderInit(format!("VP9 parser init error: {e}")))?;
+            vk_video_parser::VideoParser::init(
+                &mut parser,
+                &vk_video_parser::DetectedVideoFormat::new(
+                    vk_video_core::codec::VideoCodec::DecodeVp9,
+                ),
+            )
+            .map_err(|e| VideoError::DecoderInit(format!("VP9 parser init error: {e}")))?;
             Some(parser)
         } else {
             None
@@ -273,7 +317,7 @@ impl VideoDecoder {
         })
     }
 
-      /// Decode all frames from the bitstream.
+    /// Decode all frames from the bitstream.
     ///
     /// Returns frames in decoding order. Use `reorder_to_presentation` to
     /// reorder by presentation order (POC).
@@ -328,7 +372,8 @@ impl VideoDecoder {
                     self.bs_buffer.write(&au.data)?;
 
                     let alignment = self.bs_buffer_size_alignment.max(1);
-                    let aligned_size = ((au.data.len() as u64 + alignment - 1) & !(alignment - 1)).max(alignment);
+                    let aligned_size =
+                        ((au.data.len() as u64 + alignment - 1) & !(alignment - 1)).max(alignment);
                     let padding_start = au.data.len() as u64;
                     let padding_size = aligned_size - padding_start;
                     if padding_size > 0 {
@@ -344,31 +389,32 @@ impl VideoDecoder {
                         // Use all valid DPB entries as protected references since any could be needed.
                         // For H.265: collect ref_pocs from ALL remaining access units to protect
                         // frames needed by future frames, not just the current one.
-                        let protected_pocs: Vec<i32> = if self.decoded_codec == AccessUnitCodec::H264 {
-                            self.dpb_manager
-                                .entries
-                                .iter()
-                                .filter(|e| e.is_valid)
-                                .flat_map(|e| {
-                                    if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
-                                        vec![e.pic_order_cnt[0]]
-                                    } else {
-                                        vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            // Collect all POCs referenced by current and future access units
-                            let mut all_ref_pocs = std::collections::HashSet::new();
-                            for future_item in items[idx..].iter() {
-                                if let ExtractedItem::AccessUnit(future_au) = future_item {
-                                    for poc in &future_au.ref_pocs {
-                                        all_ref_pocs.insert(*poc);
+                        let protected_pocs: Vec<i32> =
+                            if self.decoded_codec == AccessUnitCodec::H264 {
+                                self.dpb_manager
+                                    .entries
+                                    .iter()
+                                    .filter(|e| e.is_valid)
+                                    .flat_map(|e| {
+                                        if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
+                                            vec![e.pic_order_cnt[0]]
+                                        } else {
+                                            vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                // Collect all POCs referenced by current and future access units
+                                let mut all_ref_pocs = std::collections::HashSet::new();
+                                for future_item in items[idx..].iter() {
+                                    if let ExtractedItem::AccessUnit(future_au) = future_item {
+                                        for poc in &future_au.ref_pocs {
+                                            all_ref_pocs.insert(*poc);
+                                        }
                                     }
                                 }
-                            }
-                            all_ref_pocs.into_iter().collect()
-                        };
+                                all_ref_pocs.into_iter().collect()
+                            };
                         self.dpb_manager
                             .find_or_recycle_slot(&protected_pocs)
                             .unwrap_or(0)
@@ -418,7 +464,11 @@ impl VideoDecoder {
                         // When adaptive_ref_pic_marking_mode_flag is true, use MMCO commands.
                         // When false, use sliding window.
                         if au.adaptive_ref_pic_marking_mode_flag && !au.mmco_commands.is_empty() {
-                            self.dpb_manager.apply_mmco(au.frame_num, output_slot, &au.mmco_commands);
+                            self.dpb_manager.apply_mmco(
+                                au.frame_num,
+                                output_slot,
+                                &au.mmco_commands,
+                            );
                         } else {
                             self.dpb_manager.apply_sliding_window(au.frame_num);
                         }
@@ -498,10 +548,8 @@ impl VideoDecoder {
                     _ => None,
                 };
 
-                let mut h264_decoder = H264Decoder::new(
-                    self.vulkan.device.clone(),
-                    self.vulkan.instance.clone(),
-                );
+                let mut h264_decoder =
+                    H264Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
                 h264_decoder.update_session_parameters(session_params, sps_ref, pps_ref)?;
             }
             VideoCodec::DecodeH265 => {
@@ -515,11 +563,14 @@ impl VideoDecoder {
                     _ => None,
                 };
 
-                let mut h265_decoder = H265Decoder::new(
-                    self.vulkan.device.clone(),
-                    self.vulkan.instance.clone(),
-                );
-                h265_decoder.update_session_parameters(session_params, vps_ref, sps_ref, pps_ref)?;
+                let mut h265_decoder =
+                    H265Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
+                h265_decoder.update_session_parameters(
+                    session_params,
+                    vps_ref,
+                    sps_ref,
+                    pps_ref,
+                )?;
             }
             _ => {}
         }
@@ -534,10 +585,8 @@ impl VideoDecoder {
             return Err(VideoError::DecoderInit("No VP9 frames found".to_string()));
         }
 
-        let mut vp9_decoder = Vp9Decoder::new(
-            self.vulkan.device.clone(),
-            self.vulkan.instance.clone(),
-        );
+        let mut vp9_decoder =
+            Vp9Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
         vp9_decoder.set_session(&self.session);
         vp9_decoder.set_max_dpb_slots(self.parsed.max_dpb_slots);
 
@@ -550,9 +599,10 @@ impl VideoDecoder {
 
         for (frame_idx, vp9_frame) in frames.iter().enumerate().take(max_frames) {
             // Parse frame header
-            let parser = self.vp9_parser.as_mut().ok_or_else(|| {
-                VideoError::DecoderInit("VP9 parser not initialized".to_string())
-            })?;
+            let parser = self
+                .vp9_parser
+                .as_mut()
+                .ok_or_else(|| VideoError::DecoderInit("VP9 parser not initialized".to_string()))?;
             let parsed = parser.parse_frame(&vp9_frame.data).map_err(|e| {
                 VideoError::DecoderInit(format!("Failed to parse VP9 frame {}: {:?}", frame_idx, e))
             })?;
@@ -583,25 +633,25 @@ impl VideoDecoder {
                         frame_coded_extent.width,
                         frame_coded_extent.height,
                     )?;
-                     decoded_frames.push(DecodedFrame {
-                          poc: frame_count as i32,
-                          frame_num: frame_count,
-                          is_idr: false,
-                          is_reference: false,
-                          pixels,
-                          coded_width: frame_coded_extent.width,
-                          coded_height: frame_coded_extent.height,
-                          display_width: self.parsed.display_width,
-                          display_height: self.parsed.display_height,
-                          crop_left: self.parsed.crop_left,
-                          crop_top: self.parsed.crop_top,
-                      });
+                    decoded_frames.push(DecodedFrame {
+                        poc: frame_count as i32,
+                        frame_num: frame_count,
+                        is_idr: false,
+                        is_reference: false,
+                        pixels,
+                        coded_width: frame_coded_extent.width,
+                        coded_height: frame_coded_extent.height,
+                        display_width: self.parsed.display_width,
+                        display_height: self.parsed.display_height,
+                        crop_left: self.parsed.crop_left,
+                        crop_top: self.parsed.crop_top,
+                    });
                 }
                 continue;
             }
 
-            let is_key_frame = parsed.picture_info.frame_type
-                == vk_video_core::picture::Vp9FrameType::Key;
+            let is_key_frame =
+                parsed.picture_info.frame_type == vk_video_core::picture::Vp9FrameType::Key;
 
             // Write bitstream data
             let bs_align = self.bs_buffer_size_alignment.max(1);
@@ -612,10 +662,8 @@ impl VideoDecoder {
             self.bs_buffer.flush_range(0, aligned_size).ok();
 
             // Compute reference name slot indices
-            let reference_name_slot_indices = vp9_decoder.compute_reference_name_slot_indices(
-                is_key_frame,
-                &parsed.ref_frame_idx,
-            );
+            let reference_name_slot_indices = vp9_decoder
+                .compute_reference_name_slot_indices(is_key_frame, &parsed.ref_frame_idx);
 
             // Select DPB slot
             let output_slot;
@@ -631,7 +679,8 @@ impl VideoDecoder {
                     .filter(|&&s| s >= 0)
                     .copied()
                     .collect();
-                output_slot = self.dpb_manager
+                output_slot = self
+                    .dpb_manager
                     .find_or_recycle_slot_excluding(&exclude_slots)
                     .unwrap_or(0);
             }
@@ -694,7 +743,10 @@ impl VideoDecoder {
             let result = vp9_decoder.record_decode_command(
                 cmd_buffer,
                 self.session.handle(),
-                self.session_params.as_ref().map(|p| p.handle()).unwrap_or(vk::VideoSessionParametersKHR::null()),
+                self.session_params
+                    .as_ref()
+                    .map(|p| p.handle())
+                    .unwrap_or(vk::VideoSessionParametersKHR::null()),
                 self.bs_buffer.buffer(),
                 0,
                 aligned_size,
@@ -724,17 +776,29 @@ impl VideoDecoder {
 
             // Submit
             unsafe {
-                self.vulkan.device.end_command_buffer(cmd_buffer)
+                self.vulkan
+                    .device
+                    .end_command_buffer(cmd_buffer)
                     .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
-                self.vulkan.device.reset_fences(&[self.fence])
+                self.vulkan
+                    .device
+                    .reset_fences(&[self.fence])
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
-                let queue = self.vulkan.device.get_device_queue(self.decode_queue_family, 0);
-                self.vulkan.device.queue_submit(
-                    queue,
-                    &[vk::SubmitInfo::default().command_buffers(&[cmd_buffer])],
-                    self.fence,
-                ).map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
-                self.vulkan.device.wait_for_fences(&[self.fence], true, u64::MAX)
+                let queue = self
+                    .vulkan
+                    .device
+                    .get_device_queue(self.decode_queue_family, 0);
+                self.vulkan
+                    .device
+                    .queue_submit(
+                        queue,
+                        &[vk::SubmitInfo::default().command_buffers(&[cmd_buffer])],
+                        self.fence,
+                    )
+                    .map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
+                self.vulkan
+                    .device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
             }
 
@@ -743,7 +807,8 @@ impl VideoDecoder {
             vp9_decoder.set_frame_buffer_dpb_slot(output_slot as usize, current_frame_buffer_idx);
 
             self.dpb_manager.register_frame(output_slot, frame_count);
-            self.dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+            self.dpb_manager
+                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
             // Readback
             let pixels = super::readback::readback_decoded_image(
@@ -758,21 +823,22 @@ impl VideoDecoder {
                 frame_coded_extent.height,
             )?;
 
-            self.dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+            self.dpb_manager
+                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
-             decoded_frames.push(DecodedFrame {
-                  poc: frame_count as i32,
-                  frame_num: frame_count,
-                  is_idr: is_key_frame,
-                  is_reference: true,
-                  pixels,
-                  coded_width: frame_coded_extent.width,
-                  coded_height: frame_coded_extent.height,
-                  display_width: self.parsed.display_width,
-                  display_height: self.parsed.display_height,
-                  crop_left: self.parsed.crop_left,
-                  crop_top: self.parsed.crop_top,
-              });
+            decoded_frames.push(DecodedFrame {
+                poc: frame_count as i32,
+                frame_num: frame_count,
+                is_idr: is_key_frame,
+                is_reference: true,
+                pixels,
+                coded_width: frame_coded_extent.width,
+                coded_height: frame_coded_extent.height,
+                display_width: self.parsed.display_width,
+                display_height: self.parsed.display_height,
+                crop_left: self.parsed.crop_left,
+                crop_top: self.parsed.crop_top,
+            });
 
             frame_count += 1;
         }
@@ -806,10 +872,26 @@ impl VideoDecoder {
 
         match self.codec {
             VideoCodec::DecodeH264 => {
-                self.record_h264_decode(cmd_buffer, au, output_view, output_img, bs_size, output_slot, is_first_frame)?;
+                self.record_h264_decode(
+                    cmd_buffer,
+                    au,
+                    output_view,
+                    output_img,
+                    bs_size,
+                    output_slot,
+                    is_first_frame,
+                )?;
             }
             VideoCodec::DecodeH265 => {
-                self.record_h265_decode(cmd_buffer, au, output_view, output_img, bs_size, output_slot, is_first_frame)?;
+                self.record_h265_decode(
+                    cmd_buffer,
+                    au,
+                    output_view,
+                    output_img,
+                    bs_size,
+                    output_slot,
+                    is_first_frame,
+                )?;
             }
             _ => {}
         }
@@ -825,7 +907,10 @@ impl VideoDecoder {
                 .reset_fences(&[self.fence])
                 .map_err(|e| VideoError::FenceWait(e.to_string()))?;
 
-            let queue = self.vulkan.device.get_device_queue(self.decode_queue_family, 0);
+            let queue = self
+                .vulkan
+                .device
+                .get_device_queue(self.decode_queue_family, 0);
             self.vulkan
                 .device
                 .queue_submit(
@@ -863,10 +948,8 @@ impl VideoDecoder {
             _ => return Err(VideoError::DecoderInit("H264 PPS not found".to_string())),
         };
 
-        let mut h264_decoder = H264Decoder::new(
-            self.vulkan.device.clone(),
-            self.vulkan.instance.clone(),
-        );
+        let mut h264_decoder =
+            H264Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
         h264_decoder.set_sps(sps.clone());
         h264_decoder.set_pps(pps.clone());
 
@@ -910,7 +993,10 @@ impl VideoDecoder {
         h264_decoder.record_decode_command(
             cmd_buffer,
             self.session.handle(),
-            self.session_params.as_ref().map(|p| p.handle()).unwrap_or(vk::VideoSessionParametersKHR::null()),
+            self.session_params
+                .as_ref()
+                .map(|p| p.handle())
+                .unwrap_or(vk::VideoSessionParametersKHR::null()),
             self.bs_buffer.buffer(),
             0,
             bs_size,
@@ -922,7 +1008,7 @@ impl VideoDecoder {
             &au.slice_offsets,
             Some(au.frame_num),
             Some(au.pic_order_cnt),
-             Some(matches!(au.slice_type, 0 | 4 | 8)), // I or SI slices are intra
+            Some(matches!(au.slice_type, 0 | 4 | 8)), // I or SI slices are intra
             Some(au.is_reference),
             Some(au.is_idr),
             is_first_frame,
@@ -954,10 +1040,8 @@ impl VideoDecoder {
             _ => return Err(VideoError::DecoderInit("H265 PPS not found".to_string())),
         };
 
-        let mut h265_decoder = H265Decoder::new(
-            self.vulkan.device.clone(),
-            self.vulkan.instance.clone(),
-        );
+        let mut h265_decoder =
+            H265Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
         if let Some(vps) = vps {
             h265_decoder.set_vps(vps.clone());
         }
@@ -1005,7 +1089,10 @@ impl VideoDecoder {
         h265_decoder.record_decode_command(
             cmd_buffer,
             self.session.handle(),
-            self.session_params.as_ref().map(|p| p.handle()).unwrap_or(vk::VideoSessionParametersKHR::null()),
+            self.session_params
+                .as_ref()
+                .map(|p| p.handle())
+                .unwrap_or(vk::VideoSessionParametersKHR::null()),
             self.bs_buffer.buffer(),
             0,
             bs_size,
@@ -1029,66 +1116,72 @@ impl VideoDecoder {
     }
 }
 
- impl Drop for VideoDecoder {
-     fn drop(&mut self) {
-         unsafe {
-             self.vulkan
-                 .device
-                 .device_wait_idle()
-                 .ok();
+impl Drop for VideoDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            self.vulkan.device.device_wait_idle().ok();
 
-             // Destroy command resources first
-             self.vulkan.device.destroy_command_pool(self.command_pool, None);
-             self.vulkan.device.destroy_fence(self.fence, None);
+            // Destroy command resources first
+            self.vulkan
+                .device
+                .destroy_command_pool(self.command_pool, None);
+            self.vulkan.device.destroy_fence(self.fence, None);
 
-             // Destroy DPB resources
-             for ((img, view), mem) in self.dpb_images
-                 .drain(..)
-                 .zip(self.dpb_views.drain(..))
-                 .zip(self.dpb_memories.drain(..))
-             {
-                 self.vulkan.device.destroy_image_view(view, None);
-                 self.vulkan.device.destroy_image(img, None);
-                 self.vulkan.device.free_memory(mem, None);
-             }
+            // Destroy DPB resources
+            for ((img, view), mem) in self
+                .dpb_images
+                .drain(..)
+                .zip(self.dpb_views.drain(..))
+                .zip(self.dpb_memories.drain(..))
+            {
+                self.vulkan.device.destroy_image_view(view, None);
+                self.vulkan.device.destroy_image(img, None);
+                self.vulkan.device.free_memory(mem, None);
+            }
 
-             // Destroy bitstream buffer BEFORE device
-             self.bs_buffer = BitstreamBuffer::null(&self.vulkan.device);
+            // Destroy bitstream buffer BEFORE device
+            self.bs_buffer = BitstreamBuffer::null(&self.vulkan.device);
 
-               // Destroy session resources
-               destroy_session_parameters(
-                   &self.vulkan.instance,
-                   self.vulkan.device.handle(),
-                   self.session_params.as_ref().map(|p| p.handle()).unwrap_or(vk::VideoSessionParametersKHR::null()),
-               );
-               if let Some(ref mut params) = self.session_params {
-                   params.reset();
-               }
-               destroy_session(
-                   &self.vulkan.instance,
-                   self.vulkan.device.handle(),
-                   self.session.handle(),
-               );
-               self.session.reset();
+            // Destroy session resources
+            destroy_session_parameters(
+                &self.vulkan.instance,
+                self.vulkan.device.handle(),
+                self.session_params
+                    .as_ref()
+                    .map(|p| p.handle())
+                    .unwrap_or(vk::VideoSessionParametersKHR::null()),
+            );
+            if let Some(ref mut params) = self.session_params {
+                params.reset();
+            }
+            destroy_session(
+                &self.vulkan.instance,
+                self.vulkan.device.handle(),
+                self.session.handle(),
+            );
+            self.session.reset();
 
-              for mem in self.session_memories.drain(..) {
-                  self.vulkan.device.free_memory(mem, None);
-              }
+            for mem in self.session_memories.drain(..) {
+                self.vulkan.device.free_memory(mem, None);
+            }
 
-               // Destroy debug messenger BEFORE destroying device/instance
-               if self.vulkan.has_validation && self.vulkan.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
-                   let debug_utils = ash::ext::debug_utils::Instance::new(&self.vulkan.entry, &self.vulkan.instance);
-                   let _ = unsafe {
-                       debug_utils.destroy_debug_utils_messenger(self.vulkan.debug_messenger, None);
-                   };
-                   self.vulkan.debug_messenger = vk::DebugUtilsMessengerEXT::null();
-               }
+            // Destroy debug messenger BEFORE destroying device/instance
+            if self.vulkan.has_validation
+                && self.vulkan.debug_messenger != vk::DebugUtilsMessengerEXT::null()
+            {
+                let debug_utils =
+                    ash::ext::debug_utils::Instance::new(&self.vulkan.entry, &self.vulkan.instance);
+                let _ = unsafe {
+                    debug_utils.destroy_debug_utils_messenger(self.vulkan.debug_messenger, None);
+                };
+                self.vulkan.debug_messenger = vk::DebugUtilsMessengerEXT::null();
+            }
 
-              self.vulkan.device.destroy_device(None);
-              self.vulkan.instance.destroy_instance(None);
-         }
-     }
- }
+            self.vulkan.device.destroy_device(None);
+            self.vulkan.instance.destroy_instance(None);
+        }
+    }
+}
 
 // ============================================================================
 // Helper functions
@@ -1115,9 +1208,9 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
     // First pass: prioritize SPS/VPS detection for unambiguous identification
     // H.264: SPS=7, PPS=8; H.265: VPS=32, SPS=33, PPS=34
     for i in 0..data.len().min(4096) {
-        let start = if i + 4 <= data.len() && data[i..i+4] == [0x00, 0x00, 0x00, 0x01] {
+        let start = if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
             i + 4
-        } else if i + 3 <= data.len() && data[i..i+3] == [0x00, 0x00, 0x01] {
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
             i + 3
         } else {
             continue;
@@ -1138,9 +1231,9 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
 
     // Second pass: detect from other NAL types
     for i in 0..data.len().min(1024) {
-        let start = if i + 4 <= data.len() && data[i..i+4] == [0x00, 0x00, 0x00, 0x01] {
+        let start = if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
             i + 4
-        } else if i + 3 <= data.len() && data[i..i+3] == [0x00, 0x00, 0x01] {
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
             i + 3
         } else {
             continue;
@@ -1166,8 +1259,7 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
 
 fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
     use vk_video_parser::{
-        bitstream::BitstreamPacket, h264::H264Parser,
-        DetectedVideoFormat, ParseResult, VideoParser,
+        bitstream::BitstreamPacket, h264::H264Parser, DetectedVideoFormat, ParseResult, VideoParser,
     };
 
     let mut parser = H264Parser::new();
@@ -1254,8 +1346,7 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
 
 fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
     use vk_video_parser::{
-        bitstream::BitstreamPacket, h265::H265Parser,
-        DetectedVideoFormat, ParseResult, VideoParser,
+        bitstream::BitstreamPacket, h265::H265Parser, DetectedVideoFormat, ParseResult, VideoParser,
     };
 
     let mut parser = H265Parser::new();
@@ -1394,7 +1485,11 @@ fn create_video_session(
     parsed: &ParsedInfo,
     coded_extent: vk::Extent2D,
     max_dpb_slots: u32,
-) -> VideoResult<(VideoSession, Option<VideoSessionParameters>, Vec<vk::DeviceMemory>)> {
+) -> VideoResult<(
+    VideoSession,
+    Option<VideoSessionParameters>,
+    Vec<vk::DeviceMemory>,
+)> {
     let output_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
     let (codec_profile_info, std_header_name) = match codec {
@@ -1436,8 +1531,12 @@ fn create_video_session(
 
     let std_header_version = build_std_header_version(std_header_name);
 
-    let (session, session_memories) =
-        VideoSession::create(&vulkan.instance, &vulkan.device, &session_params, &std_header_version)?;
+    let (session, session_memories) = VideoSession::create(
+        &vulkan.instance,
+        &vulkan.device,
+        &session_params,
+        &std_header_version,
+    )?;
 
     // Extract SPS/PPS/VPS for session parameters creation
     let h264_sps = match codec {
@@ -1508,10 +1607,7 @@ fn build_std_header_version(extension_name: &str) -> vk::ExtensionProperties {
     props
 }
 
-fn create_command_pool(
-    device: &ash::Device,
-    queue_family: u32,
-) -> VideoResult<vk::CommandPool> {
+fn create_command_pool(device: &ash::Device, queue_family: u32) -> VideoResult<vk::CommandPool> {
     let pool_create_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -1577,11 +1673,7 @@ fn destroy_session_parameters(
     }
 }
 
-fn destroy_session(
-    instance: &ash::Instance,
-    device: vk::Device,
-    session: vk::VideoSessionKHR,
-) {
+fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::VideoSessionKHR) {
     if session.is_null() {
         return;
     }
@@ -1646,9 +1738,9 @@ fn extract_max_frame_size(data: &[u8], codec: AccessUnitCodec, max_frames: usize
 // ============================================================================
 
 fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u32, vk::Extent2D)> {
+    use vk_video_core::codec::VideoCodec as CoreCodec;
     use vk_video_parser::vp9::Vp9Parser;
     use vk_video_parser::{DetectedVideoFormat, VideoParser};
-    use vk_video_core::codec::VideoCodec as CoreCodec;
 
     // Extract first frame for parsing
     let raw_frames = if data.len() >= 32 && data[0..4] == *b"DKIF" {
@@ -1667,11 +1759,13 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
 
     // Parse first frame
     let mut parser = Vp9Parser::new();
-    parser.init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9))
+    parser
+        .init(&DetectedVideoFormat::new(CoreCodec::DecodeVp9))
         .map_err(|e| VideoError::DecoderInit(e.to_string()))?;
 
-    let parsed = parser.parse_frame(&raw_frames[0])
-        .map_err(|e| VideoError::DecoderInit(format!("Failed to parse first VP9 frame: {:?}", e)))?;
+    let parsed = parser.parse_frame(&raw_frames[0]).map_err(|e| {
+        VideoError::DecoderInit(format!("Failed to parse first VP9 frame: {:?}", e))
+    })?;
 
     let coded_width = parsed.frame_width;
     let coded_height = parsed.frame_height;
@@ -1681,13 +1775,15 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
     let bit_depth = parsed.color_config.bit_depth;
 
     if coded_width == 0 || coded_height == 0 {
-        return Err(VideoError::DecoderInit("Failed to parse VP9 dimensions".to_string()));
+        return Err(VideoError::DecoderInit(
+            "Failed to parse VP9 dimensions".to_string(),
+        ));
     }
 
     // Initialize Vulkan with VP9 decode support
-        let vulkan = super::VideoDeviceBuilder::new()
-            .with_validation(false)
-            .build()?;
+    let vulkan = super::VideoDeviceBuilder::new()
+        .with_validation(false)
+        .build()?;
 
     let luma_bit_depth = match bit_depth {
         8 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,

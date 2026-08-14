@@ -49,52 +49,52 @@ pub trait PictureParametersSet: std::fmt::Debug {
 ///
 /// Wraps `StdVideoH264SequenceParameterSet` from the Vulkan headers.
 #[derive(Debug, Clone)]
- pub struct H264Sps {
-     pub profile_idc: u8,
-     pub constraint_set0_flag: bool,
-     pub constraint_set1_flag: bool,
-     pub constraint_set2_flag: bool,
-     pub constraint_set3_flag: bool,
-     pub constraint_set4_flag: bool,
-     pub constraint_set5_flag: bool,
-     pub level_idc: u8,
-     pub seq_parameter_set_id: u32,
-     pub chroma_format_idc: u8,
-     pub separate_colour_plane_flag: bool,
-     pub bit_depth_luma_minus8: u8,
-     pub bit_depth_chroma_minus8: u8,
-     pub qpprime_y_zero_transform_bypass_flag: bool,
-     pub seq_scaling_matrix_present_flag: bool,
-     /// Scaling lists (6x4x4 + 2x8x8 matrices, each row is zigzag order)
-     pub scaling_list_4x4: [[u8; 16]; 6],
-     pub scaling_list_8x8: [[u8; 64]; 2],
-     pub log2_max_frame_num_minus4: u8,
-     pub max_frame_num: u32,
-     pub pic_order_cnt_type: u8,
-     /// pic_order_cnt_type==1 fields
-     pub delta_pic_order_always_zero_flag: bool,
-     pub offset_for_non_ref_pic: i32,
-     pub offset_for_top_to_bottom_field: i32,
-     pub num_ref_frames_in_pic_order_cnt_cycle: u32,
-     pub offset_for_ref_frame: Vec<i32>,
-     pub log2_max_pic_order_cnt_lsb_minus4: u8,
-     pub max_pic_order_cnt_lsb: u32,
-     pub max_num_ref_frames: u32,
-     pub gaps_in_frame_num_value_allowed_flag: bool,
-     pub pic_width_in_mbs_minus1: u16,
-     pub pic_height_in_map_units_minus1: u16,
-     pub frame_mbs_only_flag: bool,
-     pub mb_adaptive_frame_field_flag: bool,
-     pub direct_8x8_inference_flag: bool,
-     pub frame_cropping_flag: bool,
-     pub frame_crop_left_offset: u32,
-     pub frame_crop_right_offset: u32,
-     pub frame_crop_top_offset: u32,
-     pub frame_crop_bottom_offset: u32,
-     pub vui_parameters_present_flag: bool,
-     /// VUI parameters (present when vui_parameters_present_flag is true)
-     pub vui: Option<H264SpsVui>,
- }
+pub struct H264Sps {
+    pub profile_idc: u8,
+    pub constraint_set0_flag: bool,
+    pub constraint_set1_flag: bool,
+    pub constraint_set2_flag: bool,
+    pub constraint_set3_flag: bool,
+    pub constraint_set4_flag: bool,
+    pub constraint_set5_flag: bool,
+    pub level_idc: u8,
+    pub seq_parameter_set_id: u32,
+    pub chroma_format_idc: u8,
+    pub separate_colour_plane_flag: bool,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub qpprime_y_zero_transform_bypass_flag: bool,
+    pub seq_scaling_matrix_present_flag: bool,
+    /// Scaling lists (6x4x4 + 2x8x8 matrices, each row is zigzag order)
+    pub scaling_list_4x4: [[u8; 16]; 6],
+    pub scaling_list_8x8: [[u8; 64]; 2],
+    pub log2_max_frame_num_minus4: u8,
+    pub max_frame_num: u32,
+    pub pic_order_cnt_type: u8,
+    /// pic_order_cnt_type==1 fields
+    pub delta_pic_order_always_zero_flag: bool,
+    pub offset_for_non_ref_pic: i32,
+    pub offset_for_top_to_bottom_field: i32,
+    pub num_ref_frames_in_pic_order_cnt_cycle: u32,
+    pub offset_for_ref_frame: Vec<i32>,
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    pub max_pic_order_cnt_lsb: u32,
+    pub max_num_ref_frames: u32,
+    pub gaps_in_frame_num_value_allowed_flag: bool,
+    pub pic_width_in_mbs_minus1: u16,
+    pub pic_height_in_map_units_minus1: u16,
+    pub frame_mbs_only_flag: bool,
+    pub mb_adaptive_frame_field_flag: bool,
+    pub direct_8x8_inference_flag: bool,
+    pub frame_cropping_flag: bool,
+    pub frame_crop_left_offset: u32,
+    pub frame_crop_right_offset: u32,
+    pub frame_crop_top_offset: u32,
+    pub frame_crop_bottom_offset: u32,
+    pub vui_parameters_present_flag: bool,
+    /// VUI parameters (present when vui_parameters_present_flag is true)
+    pub vui: Option<H264SpsVui>,
+}
 
 /// H.264 Sequence Parameter Set VUI parameters.
 #[derive(Debug, Clone, Default)]
@@ -138,53 +138,53 @@ pub struct H264SpsVui {
     pub pic_struct_present_flag: bool,
 }
 
- impl H264Sps {
-     pub fn new() -> Self {
-         Self {
-             profile_idc: 0,
-             constraint_set0_flag: false,
-             constraint_set1_flag: false,
-             constraint_set2_flag: false,
-             constraint_set3_flag: false,
-             constraint_set4_flag: false,
-             constraint_set5_flag: false,
-             level_idc: 0,
-             seq_parameter_set_id: 0,
-             chroma_format_idc: 1,
-             separate_colour_plane_flag: false,
-             bit_depth_luma_minus8: 0,
-             bit_depth_chroma_minus8: 0,
-             qpprime_y_zero_transform_bypass_flag: false,
-             seq_scaling_matrix_present_flag: false,
-             scaling_list_4x4: [[0u8; 16]; 6],
-             scaling_list_8x8: [[0u8; 64]; 2],
-             log2_max_frame_num_minus4: 0,
-             max_frame_num: 1,
-             pic_order_cnt_type: 0,
-             delta_pic_order_always_zero_flag: false,
-             offset_for_non_ref_pic: 0,
-             offset_for_top_to_bottom_field: 0,
-             num_ref_frames_in_pic_order_cnt_cycle: 0,
-             offset_for_ref_frame: Vec::new(),
-             log2_max_pic_order_cnt_lsb_minus4: 0,
-             max_pic_order_cnt_lsb: 16,
-             max_num_ref_frames: 1,
-             gaps_in_frame_num_value_allowed_flag: false,
-             pic_width_in_mbs_minus1: 0,
-             pic_height_in_map_units_minus1: 0,
-             frame_mbs_only_flag: true,
-             mb_adaptive_frame_field_flag: false,
-             direct_8x8_inference_flag: false,
-             frame_cropping_flag: false,
-             frame_crop_left_offset: 0,
-             frame_crop_right_offset: 0,
-             frame_crop_top_offset: 0,
-             frame_crop_bottom_offset: 0,
-             vui_parameters_present_flag: false,
-             vui: None,
-         }
-     }
- }
+impl H264Sps {
+    pub fn new() -> Self {
+        Self {
+            profile_idc: 0,
+            constraint_set0_flag: false,
+            constraint_set1_flag: false,
+            constraint_set2_flag: false,
+            constraint_set3_flag: false,
+            constraint_set4_flag: false,
+            constraint_set5_flag: false,
+            level_idc: 0,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            scaling_list_4x4: [[0u8; 16]; 6],
+            scaling_list_8x8: [[0u8; 64]; 2],
+            log2_max_frame_num_minus4: 0,
+            max_frame_num: 1,
+            pic_order_cnt_type: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            max_pic_order_cnt_lsb: 16,
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 0,
+            pic_height_in_map_units_minus1: 0,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: false,
+            frame_cropping_flag: false,
+            frame_crop_left_offset: 0,
+            frame_crop_right_offset: 0,
+            frame_crop_top_offset: 0,
+            frame_crop_bottom_offset: 0,
+            vui_parameters_present_flag: false,
+            vui: None,
+        }
+    }
+}
 
 impl Default for H264Sps {
     fn default() -> Self {
@@ -325,9 +325,9 @@ impl H265Vps {
             vps_max_sub_layers_minus1: 0,
             vps_temporal_id_nesting_flag: true,
             vps_sub_layer_ordering_info_present_flag: false,
-            profile_idc: 1, // Main profile default
+            profile_idc: 1,   // Main profile default
             tier_flag: false, // Main tier default
-            level_idc: 123, // Level 4.1 default (123 = 4.1 * 30)
+            level_idc: 123,   // Level 4.1 default (123 = 4.1 * 30)
             vps_max_layer_id: 0,
             vps_num_layer_sets: 1,
             layer_id_included_flag: Vec::new(),
@@ -476,87 +476,87 @@ impl Default for H265ScalingLists {
 /// H.265 Sequence Parameter Set.
 /// Matches StdVideoH265SequenceParameterSet layout.
 #[derive(Debug, Clone)]
- pub struct H265Sps {
-      pub sps_video_parameter_set_id: u8,
-      pub sps_max_sub_layers_minus1: u8,
-      pub sps_temporal_id_nesting_flag: bool,
-       pub sps_seq_parameter_set_id: u32,
-        pub profile_idc: u8,
-        pub tier_flag: bool,
-        pub level_idc: u8,
-       pub chroma_format_idc: u8,
-     pub separate_colour_plane_flag: bool,
-     pub pic_width_in_luma_samples: u16,
-     pub pic_height_in_luma_samples: u16,
-     pub bit_depth_luma_minus8: u8,
-     pub bit_depth_chroma_minus8: u8,
-     pub log2_max_pic_order_cnt_lsb_minus4: u8,
-     pub max_num_ref_frames: u16,
-     pub scaling_list_enabled_flag: bool,
-     pub sps_sub_layer_ordering_info_present_flag: bool,
-     pub conformance_window_flag: bool,
-     pub sps_scaling_list_data_present_flag: bool,
-     pub amp_enabled_flag: bool,
-     pub sample_adaptive_offset_enabled_flag: bool,
-     pub sps_temporal_mvp_enabled_flag: bool,
-     pub strong_intra_smoothing_enabled_flag: bool,
-     pub vui_parameters_present_flag: bool,
-     pub long_term_ref_pics_present_flag: bool,
+pub struct H265Sps {
+    pub sps_video_parameter_set_id: u8,
+    pub sps_max_sub_layers_minus1: u8,
+    pub sps_temporal_id_nesting_flag: bool,
+    pub sps_seq_parameter_set_id: u32,
+    pub profile_idc: u8,
+    pub tier_flag: bool,
+    pub level_idc: u8,
+    pub chroma_format_idc: u8,
+    pub separate_colour_plane_flag: bool,
+    pub pic_width_in_luma_samples: u16,
+    pub pic_height_in_luma_samples: u16,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    pub max_num_ref_frames: u16,
+    pub scaling_list_enabled_flag: bool,
+    pub sps_sub_layer_ordering_info_present_flag: bool,
+    pub conformance_window_flag: bool,
+    pub sps_scaling_list_data_present_flag: bool,
+    pub amp_enabled_flag: bool,
+    pub sample_adaptive_offset_enabled_flag: bool,
+    pub sps_temporal_mvp_enabled_flag: bool,
+    pub strong_intra_smoothing_enabled_flag: bool,
+    pub vui_parameters_present_flag: bool,
+    pub long_term_ref_pics_present_flag: bool,
 
-     // Block/transform sizes
-     pub log2_min_luma_coding_block_size_minus3: u8,
-     pub log2_diff_max_min_luma_coding_block_size: u8,
-     pub log2_min_luma_transform_block_size_minus2: u8,
-     pub log2_diff_max_min_luma_transform_block_size: u8,
-     pub max_transform_hierarchy_depth_inter: u8,
-     pub max_transform_hierarchy_depth_intra: u8,
+    // Block/transform sizes
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    pub log2_min_luma_transform_block_size_minus2: u8,
+    pub log2_diff_max_min_luma_transform_block_size: u8,
+    pub max_transform_hierarchy_depth_inter: u8,
+    pub max_transform_hierarchy_depth_intra: u8,
 
-     // DPB management (from StdVideoH265DecPicBufMgr) - matches Vulkan API [7]
-     pub max_dec_pic_buffering_minus1: [u8; 7],
-     pub max_num_reorder_pics: [u8; 7],
-     pub max_latency_increase_plus1: [u8; 7],
+    // DPB management (from StdVideoH265DecPicBufMgr) - matches Vulkan API [7]
+    pub max_dec_pic_buffering_minus1: [u8; 7],
+    pub max_num_reorder_pics: [u8; 7],
+    pub max_latency_increase_plus1: [u8; 7],
 
-     // Short-term reference picture sets
-     pub num_short_term_ref_pic_sets: u8,
-     pub short_term_ref_pic_sets: Vec<H265ShortTermRefPicSet>,
+    // Short-term reference picture sets
+    pub num_short_term_ref_pic_sets: u8,
+    pub short_term_ref_pic_sets: Vec<H265ShortTermRefPicSet>,
 
-     // Long-term reference pictures
-     pub num_long_term_ref_pics_sps: u8,
-     pub lt_ref_pic_poc_lsb_sps: [u32; 32], // matches StdVideoH265LongTermRefPicsSps
-     pub used_by_curr_pic_lt_sps_flag: u32,
+    // Long-term reference pictures
+    pub num_long_term_ref_pics_sps: u8,
+    pub lt_ref_pic_poc_lsb_sps: [u32; 32], // matches StdVideoH265LongTermRefPicsSps
+    pub used_by_curr_pic_lt_sps_flag: u32,
 
-     // PCM fields
-     pub pcm_enabled_flag: bool,
-     pub pcm_sample_bit_depth_luma_minus1: u8,
-     pub pcm_sample_bit_depth_chroma_minus1: u8,
-     pub log2_min_pcm_luma_coding_block_size_minus3: u8,
-     pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
+    // PCM fields
+    pub pcm_enabled_flag: bool,
+    pub pcm_sample_bit_depth_luma_minus1: u8,
+    pub pcm_sample_bit_depth_chroma_minus1: u8,
+    pub log2_min_pcm_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
 
-     // Palette fields
-     pub palette_predictor_initialization_present_flag: bool,
-     pub sps_num_palette_predictor_initializers_minus1: u8,
-     pub palette_max_size: u8,
-     pub delta_palette_max_predictor_size: u8,
-     pub motion_vector_resolution_control_idc: u8,
+    // Palette fields
+    pub palette_predictor_initialization_present_flag: bool,
+    pub sps_num_palette_predictor_initializers_minus1: u8,
+    pub palette_max_size: u8,
+    pub delta_palette_max_predictor_size: u8,
+    pub motion_vector_resolution_control_idc: u8,
 
-     // Conformance window
-     pub conf_win_left_offset: u32,
-     pub conf_win_right_offset: u32,
-     pub conf_win_top_offset: u32,
-     pub conf_win_bottom_offset: u32,
+    // Conformance window
+    pub conf_win_left_offset: u32,
+    pub conf_win_right_offset: u32,
+    pub conf_win_top_offset: u32,
+    pub conf_win_bottom_offset: u32,
 
-     // VUI parameters
+    // VUI parameters
     pub vui: H265SpsVui,
 
     // Scaling lists
     pub scaling_lists: H265ScalingLists,
 
     // Extension flags (from sps_extension)
-     pub pcm_loop_filter_disabled_flag: bool,
-     pub sps_extension_present_flag: bool,
-     pub sps_range_extension_flag: bool,
-     pub intra_smoothing_disabled_flag: bool,
-     pub palette_mode_enabled_flag: bool,
+    pub pcm_loop_filter_disabled_flag: bool,
+    pub sps_extension_present_flag: bool,
+    pub sps_range_extension_flag: bool,
+    pub intra_smoothing_disabled_flag: bool,
+    pub palette_mode_enabled_flag: bool,
 }
 
 /// H.265 Short-Term Reference Picture Set.
@@ -596,15 +596,15 @@ impl Default for H265ShortTermRefPicSet {
 
 impl H265Sps {
     pub fn new() -> Self {
-         Self {
-             sps_video_parameter_set_id: 0,
-             sps_max_sub_layers_minus1: 0,
-             sps_temporal_id_nesting_flag: true,
-             sps_seq_parameter_set_id: 0,
-               profile_idc: 1,
-               tier_flag: false, // Main tier default
-               level_idc: 123, // Level 4.1 default (123 = 4.1 * 30)
-              chroma_format_idc: 1,
+        Self {
+            sps_video_parameter_set_id: 0,
+            sps_max_sub_layers_minus1: 0,
+            sps_temporal_id_nesting_flag: true,
+            sps_seq_parameter_set_id: 0,
+            profile_idc: 1,
+            tier_flag: false, // Main tier default
+            level_idc: 123,   // Level 4.1 default (123 = 4.1 * 30)
+            chroma_format_idc: 1,
             separate_colour_plane_flag: false,
             pic_width_in_luma_samples: 0,
             pic_height_in_luma_samples: 0,
@@ -714,20 +714,20 @@ pub struct H265Pps {
     pub weighted_pred_flag: bool,
     pub weighted_bipred_flag: bool,
     pub transquant_bypass_enabled_flag: bool,
-     pub tiles_enabled_flag: bool,
-     pub entropy_coding_sync_enabled_flag: bool,
-     pub uniform_spacing_flag: bool,
-     pub loop_filter_across_tiles_enabled_flag: bool,
-     pub pps_loop_filter_across_slices_enabled_flag: bool,
-     pub deblocking_filter_control_present_flag: bool,
-     pub deblocking_filter_override_enabled_flag: bool,
-     pub pps_deblocking_filter_disabled_flag: bool,
-     pub pps_scaling_list_data_present_flag: bool,
-     pub lists_modification_present_flag: bool,
-     pub slice_segment_header_extension_present_flag: bool,
-     pub pps_extension_present_flag: bool,
+    pub tiles_enabled_flag: bool,
+    pub entropy_coding_sync_enabled_flag: bool,
+    pub uniform_spacing_flag: bool,
+    pub loop_filter_across_tiles_enabled_flag: bool,
+    pub pps_loop_filter_across_slices_enabled_flag: bool,
+    pub deblocking_filter_control_present_flag: bool,
+    pub deblocking_filter_override_enabled_flag: bool,
+    pub pps_deblocking_filter_disabled_flag: bool,
+    pub pps_scaling_list_data_present_flag: bool,
+    pub lists_modification_present_flag: bool,
+    pub slice_segment_header_extension_present_flag: bool,
+    pub pps_extension_present_flag: bool,
 
-     // QP and deblocking fields
+    // QP and deblocking fields
     pub diff_cu_qp_delta_depth: u8,
     pub pps_cb_qp_offset: i8,
     pub pps_cr_qp_offset: i8,
@@ -797,20 +797,20 @@ impl H265Pps {
             weighted_pred_flag: false,
             weighted_bipred_flag: false,
             transquant_bypass_enabled_flag: false,
-             tiles_enabled_flag: false,
-             entropy_coding_sync_enabled_flag: false,
-             uniform_spacing_flag: true,
-             loop_filter_across_tiles_enabled_flag: false,
-             pps_loop_filter_across_slices_enabled_flag: false,
-             deblocking_filter_control_present_flag: false,
-             deblocking_filter_override_enabled_flag: false,
-             pps_deblocking_filter_disabled_flag: false,
-             pps_scaling_list_data_present_flag: false,
-             lists_modification_present_flag: false,
-             slice_segment_header_extension_present_flag: false,
-             pps_extension_present_flag: false,
+            tiles_enabled_flag: false,
+            entropy_coding_sync_enabled_flag: false,
+            uniform_spacing_flag: true,
+            loop_filter_across_tiles_enabled_flag: false,
+            pps_loop_filter_across_slices_enabled_flag: false,
+            deblocking_filter_control_present_flag: false,
+            deblocking_filter_override_enabled_flag: false,
+            pps_deblocking_filter_disabled_flag: false,
+            pps_scaling_list_data_present_flag: false,
+            lists_modification_present_flag: false,
+            slice_segment_header_extension_present_flag: false,
+            pps_extension_present_flag: false,
 
-             diff_cu_qp_delta_depth: 0,
+            diff_cu_qp_delta_depth: 0,
             pps_cb_qp_offset: 0,
             pps_cr_qp_offset: 0,
             pps_beta_offset_div2: 0,
@@ -971,9 +971,9 @@ impl Av1Sps {
             twelve_bit: false,
             mono_chrome: false,
             color_description_present: false,
-            color_primaries: 2, // BT.709 default
+            color_primaries: 2,          // BT.709 default
             transfer_characteristics: 2, // BT.709 default
-            matrix_coefficients: 2, // BT.709 default
+            matrix_coefficients: 2,      // BT.709 default
             color_range: false,
             subsampling_x: 1,
             subsampling_y: 1,
@@ -1372,7 +1372,8 @@ impl Default for Vp9Segmentation {
     fn default() -> Self {
         Self {
             flags: Vp9SegmentationFlags::default(),
-            segmentation_tree_probs: [VP9_MAX_PROBABILITY; VP9_MAX_SEGMENTATION_TREE_PROBS as usize],
+            segmentation_tree_probs: [VP9_MAX_PROBABILITY;
+                VP9_MAX_SEGMENTATION_TREE_PROBS as usize],
             segmentation_pred_prob: [VP9_MAX_PROBABILITY; VP9_MAX_SEGMENTATION_PRED_PROB as usize],
             feature_enabled: [0; VP9_MAX_SEGMENTS as usize],
             feature_data: [[0; VP9_SEG_LVL_MAX as usize]; VP9_MAX_SEGMENTS as usize],
@@ -1382,85 +1383,85 @@ impl Default for Vp9Segmentation {
 
 /// VP9 parsed frame data (complete parser output).
 #[derive(Debug, Clone)]
- pub struct Vp9FrameData {
-     /// Whether this is a "show existing frame" command.
-     pub show_existing_frame: bool,
-     /// Frame to show map index (when show_existing_frame is true).
-     pub frame_to_show_map_idx: u8,
-     /// Whether this is an intra (key) frame.
-     pub frame_is_intra: bool,
-     /// Frame width in pixels.
-     pub frame_width: u32,
-     /// Frame height in pixels.
-     pub frame_height: u32,
-     /// Render width in pixels.
-     pub render_width: u32,
-     /// Render height in pixels.
-     pub render_height: u32,
-     /// Macroblock columns.
-     pub mi_cols: u32,
-     /// Macroblock rows.
-     pub mi_rows: u32,
-     /// 64x64 superblock columns.
-     pub sb64_cols: u32,
-     /// 64x64 superblock rows.
-     pub sb64_rows: u32,
-     /// Number of tiles.
-     pub num_tiles: u32,
-     /// Picture info.
-     pub picture_info: Vp9PictureInfo,
-     /// Color configuration.
-     pub color_config: Vp9ColorConfig,
-     /// Loop filter parameters.
-     pub loop_filter: Vp9LoopFilter,
-     /// Segmentation parameters.
-     pub segmentation: Vp9Segmentation,
-     /// Compressed header size (from bitstream).
-     pub compressed_header_size: u32,
-     /// Uncompressed header size in bytes (from frame marker to compressed_header_size).
-     pub uncompressed_header_size: u32,
-     /// Offset to uncompressed header in bitstream buffer.
-     pub uncompressed_header_offset: u32,
-     /// Offset to compressed header in bitstream buffer.
-     pub compressed_header_offset: u32,
-     /// Offset to tiles data in bitstream buffer.
-     pub tiles_offset: u32,
-       /// Reference frame indices [VP9_REFS_PER_FRAME].
-       pub ref_frame_idx: [u8; VP9_REFS_PER_FRAME as usize],
-       /// Picture indices for each reference frame [VP9_NUM_REF_FRAMES].
-       pub pic_idx: [i32; VP9_NUM_REF_FRAMES as usize],
-     /// Offset of this frame within a superframe (0 if not in superframe).
-     /// Used to adjust Vulkan decode offsets for superframe frames.
-     pub superframe_frame_offset: u32,
- }
+pub struct Vp9FrameData {
+    /// Whether this is a "show existing frame" command.
+    pub show_existing_frame: bool,
+    /// Frame to show map index (when show_existing_frame is true).
+    pub frame_to_show_map_idx: u8,
+    /// Whether this is an intra (key) frame.
+    pub frame_is_intra: bool,
+    /// Frame width in pixels.
+    pub frame_width: u32,
+    /// Frame height in pixels.
+    pub frame_height: u32,
+    /// Render width in pixels.
+    pub render_width: u32,
+    /// Render height in pixels.
+    pub render_height: u32,
+    /// Macroblock columns.
+    pub mi_cols: u32,
+    /// Macroblock rows.
+    pub mi_rows: u32,
+    /// 64x64 superblock columns.
+    pub sb64_cols: u32,
+    /// 64x64 superblock rows.
+    pub sb64_rows: u32,
+    /// Number of tiles.
+    pub num_tiles: u32,
+    /// Picture info.
+    pub picture_info: Vp9PictureInfo,
+    /// Color configuration.
+    pub color_config: Vp9ColorConfig,
+    /// Loop filter parameters.
+    pub loop_filter: Vp9LoopFilter,
+    /// Segmentation parameters.
+    pub segmentation: Vp9Segmentation,
+    /// Compressed header size (from bitstream).
+    pub compressed_header_size: u32,
+    /// Uncompressed header size in bytes (from frame marker to compressed_header_size).
+    pub uncompressed_header_size: u32,
+    /// Offset to uncompressed header in bitstream buffer.
+    pub uncompressed_header_offset: u32,
+    /// Offset to compressed header in bitstream buffer.
+    pub compressed_header_offset: u32,
+    /// Offset to tiles data in bitstream buffer.
+    pub tiles_offset: u32,
+    /// Reference frame indices [VP9_REFS_PER_FRAME].
+    pub ref_frame_idx: [u8; VP9_REFS_PER_FRAME as usize],
+    /// Picture indices for each reference frame [VP9_NUM_REF_FRAMES].
+    pub pic_idx: [i32; VP9_NUM_REF_FRAMES as usize],
+    /// Offset of this frame within a superframe (0 if not in superframe).
+    /// Used to adjust Vulkan decode offsets for superframe frames.
+    pub superframe_frame_offset: u32,
+}
 
- impl Default for Vp9FrameData {
-     fn default() -> Self {
-         Self {
-             show_existing_frame: false,
-             frame_to_show_map_idx: 0,
-             frame_is_intra: false,
-             frame_width: 0,
-             frame_height: 0,
-             render_width: 0,
-             render_height: 0,
-             mi_cols: 0,
-             mi_rows: 0,
-             sb64_cols: 0,
-             sb64_rows: 0,
-             num_tiles: 0,
-             picture_info: Vp9PictureInfo::default(),
-             color_config: Vp9ColorConfig::default(),
-             loop_filter: Vp9LoopFilter::default(),
-             segmentation: Vp9Segmentation::default(),
-             compressed_header_size: 0,
-             uncompressed_header_size: 0,
-             uncompressed_header_offset: 0,
-             compressed_header_offset: 0,
-             tiles_offset: 0,
-               ref_frame_idx: [0; VP9_REFS_PER_FRAME as usize],
-               pic_idx: [-1; VP9_NUM_REF_FRAMES as usize],
-             superframe_frame_offset: 0,
-         }
+impl Default for Vp9FrameData {
+    fn default() -> Self {
+        Self {
+            show_existing_frame: false,
+            frame_to_show_map_idx: 0,
+            frame_is_intra: false,
+            frame_width: 0,
+            frame_height: 0,
+            render_width: 0,
+            render_height: 0,
+            mi_cols: 0,
+            mi_rows: 0,
+            sb64_cols: 0,
+            sb64_rows: 0,
+            num_tiles: 0,
+            picture_info: Vp9PictureInfo::default(),
+            color_config: Vp9ColorConfig::default(),
+            loop_filter: Vp9LoopFilter::default(),
+            segmentation: Vp9Segmentation::default(),
+            compressed_header_size: 0,
+            uncompressed_header_size: 0,
+            uncompressed_header_offset: 0,
+            compressed_header_offset: 0,
+            tiles_offset: 0,
+            ref_frame_idx: [0; VP9_REFS_PER_FRAME as usize],
+            pic_idx: [-1; VP9_NUM_REF_FRAMES as usize],
+            superframe_frame_offset: 0,
+        }
     }
 }

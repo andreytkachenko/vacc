@@ -1,7 +1,7 @@
 //! Decoded Picture Buffer (DPB) management for reference frame tracking.
 
-use ash::vk;
 use crate::access_unit::H264MmcoCommand;
+use ash::vk;
 
 /// Type of the last access to a DPB slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +124,12 @@ impl DpbManager {
         current_slot_index: u32,
         mmco_commands: &[H264MmcoCommand],
     ) {
-        eprintln!("[DEBUG] DPB::apply_mmco: current_frame_num={}, current_slot={}, commands={}",
-                  current_frame_num, current_slot_index, mmco_commands.len());
+        eprintln!(
+            "[DEBUG] DPB::apply_mmco: current_frame_num={}, current_slot={}, commands={}",
+            current_frame_num,
+            current_slot_index,
+            mmco_commands.len()
+        );
 
         for cmd in mmco_commands {
             eprintln!("[DEBUG]   MMCO command: {:?}", cmd);
@@ -135,36 +139,52 @@ impl DpbManager {
             match cmd {
                 // MMCO 1: Mark short-term reference as unused
                 // picNumX = CurrPicNum - (difference_of_pic_nums_minus1 + 1)
-                H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1 } => {
-                    let pic_num_x = self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
+                H264MmcoCommand::UnmarkShortTerm {
+                    difference_of_pic_nums_minus1,
+                } => {
+                    let pic_num_x =
+                        self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
                     eprintln!("[DEBUG]   MMCO 1: unmark short-term picNumX={}", pic_num_x);
                     for entry in &mut self.entries {
                         if entry.is_valid && entry.frame_num == pic_num_x {
                             entry.is_valid = false;
-                            eprintln!("[DEBUG]     invalidated slot {} (frame_num={})", entry.slot_index, entry.frame_num);
+                            eprintln!(
+                                "[DEBUG]     invalidated slot {} (frame_num={})",
+                                entry.slot_index, entry.frame_num
+                            );
                         }
                     }
                 }
 
                 // MMCO 2: Mark long-term reference as unused
                 // (We don't fully track long-term refs, but mark by frame_num if known)
-                H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx } => {
+                H264MmcoCommand::UnmarkLongTerm {
+                    long_term_frame_idx,
+                } => {
                     eprintln!("[DEBUG]   MMCO 2: unmark long-term long_term_frame_idx={} (not fully tracked)", long_term_frame_idx);
                     // For now, skip - long-term reference tracking would require additional state
                 }
 
                 // MMCO 3: Assign LongTermFrameIdx to short-term reference
-                H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1, long_term_frame_idx } => {
-                    let pic_num_x = self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
+                H264MmcoCommand::AssignLongTerm {
+                    difference_of_pic_nums_minus1,
+                    long_term_frame_idx,
+                } => {
+                    let pic_num_x =
+                        self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
                     eprintln!("[DEBUG]   MMCO 3: assign LongTermFrameIdx={} to picNumX={} (not fully tracked)",
                               long_term_frame_idx, pic_num_x);
                     // For now, skip - long-term reference tracking would require additional state
                 }
 
                 // MMCO 4: Set MaxLongTermFrameIdx
-                H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1 } => {
-                    eprintln!("[DEBUG]   MMCO 4: set MaxLongTermFrameIdx={} (not fully tracked)",
-                              max_long_term_frame_idx_plus1);
+                H264MmcoCommand::SetMaxLongTermFrameIdx {
+                    max_long_term_frame_idx_plus1,
+                } => {
+                    eprintln!(
+                        "[DEBUG]   MMCO 4: set MaxLongTermFrameIdx={} (not fully tracked)",
+                        max_long_term_frame_idx_plus1
+                    );
                     // For now, skip - long-term reference tracking would require additional state
                 }
 
@@ -179,7 +199,9 @@ impl DpbManager {
                 }
 
                 // MMCO 6: Assign LongTermFrameIdx to current picture
-                H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx } => {
+                H264MmcoCommand::AssignLongTermToCurrent {
+                    long_term_frame_idx,
+                } => {
                     eprintln!("[DEBUG]   MMCO 6: assign LongTermFrameIdx={} to current (slot {}) (not fully tracked)",
                               long_term_frame_idx, current_slot_index);
                     // For now, skip - long-term reference tracking would require additional state

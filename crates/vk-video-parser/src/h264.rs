@@ -5,11 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::nal::{self, H264NalUnitType, NalUnit};
-use crate::{
-    DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser,
-};
 use crate::bitreader::BitReader;
+use crate::nal::{self, H264NalUnitType, NalUnit};
+use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 
 /// H.264 parser state.
 pub struct H264Parser {
@@ -33,9 +31,7 @@ impl H264Parser {
             pps_cache: HashMap::new(),
             active_sps: None,
             active_pps: None,
-            detected_format: DetectedVideoFormat::new(
-                vk_video_core::codec::VideoCodec::DecodeH264,
-            ),
+            detected_format: DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH264),
             first_slice_header: None,
             prev_frame_num: 0,
             prev_pic_order_cnt_lsb: 0,
@@ -179,9 +175,14 @@ impl H264Parser {
             100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
         );
 
-        let (mut chroma_format_idc, mut separate_colour_plane_flag, mut bit_depth_luma_minus8,
-             mut bit_depth_chroma_minus8, mut qpprime_y_zero_transform_bypass_flag,
-             mut seq_scaling_matrix_present_flag) = (1u8, false, 0u8, 0u8, false, false);
+        let (
+            mut chroma_format_idc,
+            mut separate_colour_plane_flag,
+            mut bit_depth_luma_minus8,
+            mut bit_depth_chroma_minus8,
+            mut qpprime_y_zero_transform_bypass_flag,
+            mut seq_scaling_matrix_present_flag,
+        ) = (1u8, false, 0u8, 0u8, false, false);
 
         if is_high_profile {
             chroma_format_idc = r.read_ue()? as u8;
@@ -236,9 +237,12 @@ impl H264Parser {
         let pic_order_cnt_type = r.read_ue()? as u8;
 
         let (mut log2_max_pic_order_cnt_lsb_minus4, mut max_pic_order_cnt_lsb) = (0u8, 0u32);
-        let (mut delta_pic_order_always_zero_flag, mut offset_for_non_ref_pic,
-             mut offset_for_top_to_bottom_field, mut num_ref_frames_in_pic_order_cnt_cycle) =
-            (false, 0i32, 0i32, 0u32);
+        let (
+            mut delta_pic_order_always_zero_flag,
+            mut offset_for_non_ref_pic,
+            mut offset_for_top_to_bottom_field,
+            mut num_ref_frames_in_pic_order_cnt_cycle,
+        ) = (false, 0i32, 0i32, 0u32);
         let mut offset_for_ref_frame: Vec<i32> = Vec::new();
 
         match pic_order_cnt_type {
@@ -272,8 +276,12 @@ impl H264Parser {
         let direct_8x8_inference_flag = r.read_bit()?;
         let frame_cropping_flag = r.read_bit()?;
 
-        let (mut frame_crop_left_offset, mut frame_crop_right_offset,
-             mut frame_crop_top_offset, mut frame_crop_bottom_offset) = (0, 0, 0, 0);
+        let (
+            mut frame_crop_left_offset,
+            mut frame_crop_right_offset,
+            mut frame_crop_top_offset,
+            mut frame_crop_bottom_offset,
+        ) = (0, 0, 0, 0);
 
         if frame_cropping_flag {
             frame_crop_left_offset = r.read_ue()?;
@@ -376,14 +384,19 @@ impl H264Parser {
                 6 => {
                     // Explicit slice group ID per macroblock
                     let pic_size_in_map_units_minus1 = r.read_ue()?;
-                    let v = (num_slice_groups_minus1 + 1).next_power_of_two().trailing_zeros();
+                    let v = (num_slice_groups_minus1 + 1)
+                        .next_power_of_two()
+                        .trailing_zeros();
                     for _ in 0..=pic_size_in_map_units_minus1 {
                         let _slice_group_id = r.read_bits(v as u8)?;
                     }
                 }
                 _ => {
                     // Invalid slice_group_map_type, but continue parsing
-                    eprintln!("[PPS] Invalid slice_group_map_type: {}", slice_group_map_type);
+                    eprintln!(
+                        "[PPS] Invalid slice_group_map_type: {}",
+                        slice_group_map_type
+                    );
                 }
             }
         }
@@ -464,7 +477,8 @@ impl H264Parser {
         pps.pic_parameter_set_id = pic_parameter_set_id;
         pps.seq_parameter_set_id = seq_parameter_set_id;
         pps.entropy_coding_mode_flag = entropy_coding_mode_flag;
-        pps.bottom_field_pic_order_in_frame_present_flag = bottom_field_pic_order_in_frame_present_flag;
+        pps.bottom_field_pic_order_in_frame_present_flag =
+            bottom_field_pic_order_in_frame_present_flag;
         pps.num_slice_groups_minus1 = num_slice_groups_minus1;
         pps.num_ref_idx_l0_default_active_minus1 = num_ref_idx_l0_default_active_minus1;
         pps.num_ref_idx_l1_default_active_minus1 = num_ref_idx_l1_default_active_minus1;
@@ -646,16 +660,21 @@ impl H264Parser {
 
         // Pred weight table
         let has_pred_weight_table =
-            (pps.weighted_pred_flag && (is_p || is_sp))
-                || (pps.weighted_bipred_idc == 1 && is_b);
+            (pps.weighted_pred_flag && (is_p || is_sp)) || (pps.weighted_bipred_idc == 1 && is_b);
         if has_pred_weight_table {
-            Self::parse_pred_weight_table(&mut r, sps, slice_type,
-                slh.num_ref_idx_l0_active_minus1, slh.num_ref_idx_l1_active_minus1)?;
+            Self::parse_pred_weight_table(
+                &mut r,
+                sps,
+                slice_type,
+                slh.num_ref_idx_l0_active_minus1,
+                slh.num_ref_idx_l1_active_minus1,
+            )?;
         }
 
         // Decoded reference picture marking (for reference pictures)
         if nal_ref_idc > 0 {
-            let (marking, no_output, lt_ref) = Self::parse_dec_ref_pic_marking(&mut r, nal_unit_type == 5)?;
+            let (marking, no_output, lt_ref) =
+                Self::parse_dec_ref_pic_marking(&mut r, nal_unit_type == 5)?;
             slh.dec_ref_pic_marking = marking;
             slh.no_output_of_prior_pics_flag = no_output;
             slh.long_term_reference_flag = lt_ref;
@@ -685,14 +704,18 @@ impl H264Parser {
     fn parse_ref_pic_list_modification(
         r: &mut BitReader,
         slice_type: u32,
-    ) -> ParserResult<(Vec<RefPicListModificationEntry>, Vec<RefPicListModificationEntry>)> {
+    ) -> ParserResult<(
+        Vec<RefPicListModificationEntry>,
+        Vec<RefPicListModificationEntry>,
+    )> {
         let is_b = slice_type == 1; // B-slice after modulo 5
 
         let mut mod_l0 = Vec::new();
         let mut mod_l1 = Vec::new();
 
         // Ref pic list 0 modification (for P/SP/B slices)
-        if r.read_bit()? { // ref_pic_list_modification_flag_l0
+        if r.read_bit()? {
+            // ref_pic_list_modification_flag_l0
             loop {
                 let modification_of_pic_nums_idc = r.read_ue()?;
                 let value = r.read_ue()?;
@@ -707,7 +730,8 @@ impl H264Parser {
         }
 
         // Ref pic list 1 modification (for B slices only)
-        if is_b && r.read_bit()? { // ref_pic_list_modification_flag_l1
+        if is_b && r.read_bit()? {
+            // ref_pic_list_modification_flag_l1
             loop {
                 let modification_of_pic_nums_idc = r.read_ue()?;
                 let value = r.read_ue()?;
@@ -803,8 +827,8 @@ impl H264Parser {
                 }
                 let value = match memory_management_control_operation {
                     1 | 3 => r.read_ue()?, // difference_of_pic_nums_minus1
-                    2 => r.read_ue()?, // long_term_pic_num
-                    4 => r.read_ue()?, // max_long_term_frame_idx_plus1
+                    2 => r.read_ue()?,     // long_term_pic_num
+                    4 => r.read_ue()?,     // max_long_term_frame_idx_plus1
                     5 => {
                         let lt_idx = r.read_ue()?; // long_term_frame_idx
                         let _used_for_reference_field_flag = r.read_bit()?;
@@ -819,7 +843,11 @@ impl H264Parser {
             }
         }
 
-        Ok((marking, no_output_of_prior_pics_flag, long_term_reference_flag))
+        Ok((
+            marking,
+            no_output_of_prior_pics_flag,
+            long_term_reference_flag,
+        ))
     }
 
     fn extract_nal_units(&self, data: &[u8]) -> Vec<NalUnit> {
@@ -839,8 +867,13 @@ impl H264Parser {
                 if !nal_data.is_empty() {
                     if let Some((_, _, nal_unit_type)) = nal::parse_h264_nal_header(nal_data) {
                         if nal_units.len() < 5 {
-                            eprintln!("[extract_nal] NAL#{}: offset={}, type={}, size={}",
-                                nal_units.len(), start, nal_unit_type, nal_data.len());
+                            eprintln!(
+                                "[extract_nal] NAL#{}: offset={}, type={}, size={}",
+                                nal_units.len(),
+                                start,
+                                nal_unit_type,
+                                nal_data.len()
+                            );
                         }
                         nal_units.push(NalUnit::new(
                             nal_unit_type,
@@ -888,7 +921,14 @@ impl VideoParser for H264Parser {
             match H264NalUnitType::from_u8(nal.nal_unit_type) {
                 Some(H264NalUnitType::Sps) => {
                     eprintln!("[parse] Found SPS NAL, size={}", nal.data.len());
-                    eprintln!("[parse] SPS hex: {}", nal.data.iter().take(24).map(|b| format!("{:02x}", b)).collect::<String>());
+                    eprintln!(
+                        "[parse] SPS hex: {}",
+                        nal.data
+                            .iter()
+                            .take(24)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>()
+                    );
                     match self.parse_sps(&nal.data) {
                         Ok(sps) => {
                             eprintln!("[parse] SPS parsed OK: width_mbs={}, height_mbs={}, poc_type={}, max_ref={}, cropping={}", 
@@ -897,9 +937,10 @@ impl VideoParser for H264Parser {
                             let sps_id = sps.seq_parameter_set_id;
                             self.sps_cache.insert(sps_id, sps.clone());
                             self.active_sps = Some(sps);
-                            result_sps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                self.active_sps.clone().unwrap(),
-                            ));
+                            result_sps =
+                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                    self.active_sps.clone().unwrap(),
+                                ));
                         }
                         Err(e) => {
                             eprintln!("[parse] SPS parse ERROR: {:?}", e);
@@ -907,19 +948,28 @@ impl VideoParser for H264Parser {
                     }
                 }
                 Some(H264NalUnitType::Pps) => {
-                    eprintln!("[parse] Found PPS NAL, size={}, hex={}", 
-                        nal.data.len(), 
-                        nal.data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<String>());
+                    eprintln!(
+                        "[parse] Found PPS NAL, size={}, hex={}",
+                        nal.data.len(),
+                        nal.data
+                            .iter()
+                            .take(16)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>()
+                    );
                     match self.parse_pps(&nal.data) {
                         Ok(pps) => {
-                            eprintln!("[parse] PPS parsed OK: pps_id={}, sps_id={}",
-                                pps.pic_parameter_set_id, pps.seq_parameter_set_id);
+                            eprintln!(
+                                "[parse] PPS parsed OK: pps_id={}, sps_id={}",
+                                pps.pic_parameter_set_id, pps.seq_parameter_set_id
+                            );
                             let pps_id = pps.pic_parameter_set_id;
                             self.pps_cache.insert(pps_id, pps.clone());
                             self.active_pps = Some(pps);
-                            result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                self.active_pps.clone().unwrap(),
-                            ));
+                            result_pps =
+                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                    self.active_pps.clone().unwrap(),
+                                ));
                         }
                         Err(e) => {
                             eprintln!("[parse] PPS parse ERROR: {:?}", e);
@@ -938,7 +988,9 @@ impl VideoParser for H264Parser {
                         nal::parse_h264_nal_header(&nal.data).unwrap_or((false, 0, 0));
 
                     if self.first_slice_header.is_none() {
-                        if let Ok(slh) = self.parse_slice_header(&nal.data, nal_ref_idc, nal_unit_type) {
+                        if let Ok(slh) =
+                            self.parse_slice_header(&nal.data, nal_ref_idc, nal_unit_type)
+                        {
                             self.first_slice_header = Some(slh);
                             self.frame_count += 1;
                         }
@@ -948,7 +1000,9 @@ impl VideoParser for H264Parser {
                     last_slice_len = Some(nal.size);
                     slice_count += 1;
                 }
-                Some(H264NalUnitType::FillerData) | Some(H264NalUnitType::SeqEnd) | Some(H264NalUnitType::StreamEnd) => {
+                Some(H264NalUnitType::FillerData)
+                | Some(H264NalUnitType::SeqEnd)
+                | Some(H264NalUnitType::StreamEnd) => {
                     // Skip filler and end codes
                 }
                 _ => {}

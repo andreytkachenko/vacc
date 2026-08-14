@@ -3,8 +3,10 @@
 use ash::vk;
 use ash::vk::Handle;
 
+use super::vp9::{
+    vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9SessionParametersCreateInfoKHR,
+};
 use super::{device::VideoCodec, VideoError, VideoResult};
-use super::vp9::{VideoDecodeVP9ProfileInfoKHR, VideoDecodeVP9SessionParametersCreateInfoKHR, vp9_vk_constants};
 
 /// Codec-specific profile information for session creation.
 #[derive(Debug, Clone)]
@@ -79,7 +81,12 @@ impl VideoSession {
                 *mut vk::VideoSessionMemoryRequirementsKHR,
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(get_req_fn);
-            let result = fn_ptr(device.handle(), session, &mut req_count, std::ptr::null_mut());
+            let result = fn_ptr(
+                device.handle(),
+                session,
+                &mut req_count,
+                std::ptr::null_mut(),
+            );
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkGetVideoSessionMemoryRequirementsKHR (count) failed: {:?}",
@@ -92,7 +99,8 @@ impl VideoSession {
             return Ok(Vec::new());
         }
 
-        let mut requirements = vec![vk::VideoSessionMemoryRequirementsKHR::default(); req_count as usize];
+        let mut requirements =
+            vec![vk::VideoSessionMemoryRequirementsKHR::default(); req_count as usize];
         for (i, req) in requirements.iter_mut().enumerate() {
             req.s_type = vk::StructureType::VIDEO_SESSION_MEMORY_REQUIREMENTS_KHR;
             req.p_next = std::ptr::null_mut::<std::ffi::c_void>();
@@ -107,7 +115,12 @@ impl VideoSession {
                 *mut vk::VideoSessionMemoryRequirementsKHR,
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(get_req_fn);
-            let result = fn_ptr(device.handle(), session, &mut req_count, requirements.as_mut_ptr());
+            let result = fn_ptr(
+                device.handle(),
+                session,
+                &mut req_count,
+                requirements.as_mut_ptr(),
+            );
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkGetVideoSessionMemoryRequirementsKHR failed: {:?}",
@@ -143,7 +156,8 @@ impl VideoSession {
             };
 
             let memory = unsafe {
-                device.allocate_memory(&alloc_info, None)
+                device
+                    .allocate_memory(&alloc_info, None)
                     .map_err(|e| VideoError::SessionCreation(e.to_string()))?
             };
 
@@ -178,7 +192,12 @@ impl VideoSession {
                 *const vk::BindVideoSessionMemoryInfoKHR<'_>,
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(bind_fn);
-            let result = fn_ptr(device.handle(), session, bind_infos.len() as u32, bind_infos.as_ptr());
+            let result = fn_ptr(
+                device.handle(),
+                session,
+                bind_infos.len() as u32,
+                bind_infos.as_ptr(),
+            );
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkBindVideoSessionMemoryKHR failed: {:?}",
@@ -213,7 +232,8 @@ impl VideoSession {
                 h264_profile.s_type = vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR;
                 h264_profile.p_next = std::ptr::null();
                 h264_profile.std_profile_idc = *std_profile_idc;
-                h264_profile.picture_layout = vk::VideoDecodeH264PictureLayoutFlagsKHR::from_raw(*picture_layout);
+                h264_profile.picture_layout =
+                    vk::VideoDecodeH264PictureLayoutFlagsKHR::from_raw(*picture_layout);
                 &h264_profile as *const _ as *const std::ffi::c_void
             }
             CodecProfileInfo::H265 { std_profile_idc } => {
@@ -233,7 +253,9 @@ impl VideoSession {
                 &av1_profile as *const _ as *const std::ffi::c_void
             }
             CodecProfileInfo::Vp9 { std_profile } => {
-                vp9_profile.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+                vp9_profile.s_type = vk::StructureType::from_raw(
+                    vp9_vk_constants::VIDEO_DECODE_VP9_PROFILE_INFO_KHR,
+                );
                 vp9_profile.p_next = std::ptr::null();
                 vp9_profile.std_profile = *std_profile;
                 &vp9_profile as *const _ as *const std::ffi::c_void
@@ -306,11 +328,14 @@ impl VideoSession {
         // Bind session memory (required after session creation)
         let session_memories = Self::bind_session_memory(instance, device, session)?;
 
-        Ok((Self {
-            session,
-            device: device.clone(),
-            instance: instance.clone(),
-        }, session_memories))
+        Ok((
+            Self {
+                session,
+                device: device.clone(),
+                instance: instance.clone(),
+            },
+            session_memories,
+        ))
     }
 
     pub fn handle(&self) -> vk::VideoSessionKHR {
@@ -336,23 +361,21 @@ impl Drop for VideoSession {
         }
 
         let destroy_fn = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkDestroyVideoSessionKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkDestroyVideoSessionKHR\0".as_ptr().cast(),
+            )
         };
 
         if let Some(ptr) = destroy_fn {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::Device, vk::VideoSessionKHR, *const vk::AllocationCallbacks);
-                let fn_ptr: FnType = std::mem::transmute(ptr);
-                fn_ptr(
-                    self.device.handle(),
-                    self.session,
-                    std::ptr::null(),
+                type FnType = unsafe extern "system" fn(
+                    vk::Device,
+                    vk::VideoSessionKHR,
+                    *const vk::AllocationCallbacks,
                 );
+                let fn_ptr: FnType = std::mem::transmute(ptr);
+                fn_ptr(self.device.handle(), self.session, std::ptr::null());
             }
         }
     }
@@ -410,30 +433,44 @@ impl VideoSessionParameters {
         // Initialize codec-specific structs
         match codec {
             VideoCodec::DecodeH264 => {
-                h264_add_info.s_type = vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR;
+                h264_add_info.s_type =
+                    vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR;
                 h264_add_info.p_next = std::ptr::null();
                 h264_add_info.std_sps_count = std_sps_h264.is_some() as u32;
-                h264_add_info.p_std_sp_ss = std_sps_h264.as_ref().map_or(std::ptr::null(), |s| s as *const _);
+                h264_add_info.p_std_sp_ss = std_sps_h264
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _);
                 h264_add_info.std_pps_count = std_pps_h264.is_some() as u32;
-                h264_add_info.p_std_pp_ss = std_pps_h264.as_ref().map_or(std::ptr::null(), |p| p as *const _);
+                h264_add_info.p_std_pp_ss = std_pps_h264
+                    .as_ref()
+                    .map_or(std::ptr::null(), |p| p as *const _);
 
-                h264_params.s_type = vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                h264_params.s_type =
+                    vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR;
                 h264_params.p_next = std::ptr::null();
                 h264_params.max_std_sps_count = 32;
                 h264_params.max_std_pps_count = 256;
                 h264_params.p_parameters_add_info = &h264_add_info as *const _ as *const _;
             }
             VideoCodec::DecodeH265 => {
-                h265_add_info.s_type = vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR;
+                h265_add_info.s_type =
+                    vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR;
                 h265_add_info.p_next = std::ptr::null();
                 h265_add_info.std_vps_count = std_vps_h265.is_some() as u32;
-                h265_add_info.p_std_vp_ss = std_vps_h265.as_ref().map_or(std::ptr::null(), |v| v as *const _);
+                h265_add_info.p_std_vp_ss = std_vps_h265
+                    .as_ref()
+                    .map_or(std::ptr::null(), |v| v as *const _);
                 h265_add_info.std_sps_count = std_sps_h265.is_some() as u32;
-                h265_add_info.p_std_sp_ss = std_sps_h265.as_ref().map_or(std::ptr::null(), |s| s as *const _);
+                h265_add_info.p_std_sp_ss = std_sps_h265
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _);
                 h265_add_info.std_pps_count = std_pps_h265.is_some() as u32;
-                h265_add_info.p_std_pp_ss = std_pps_h265.as_ref().map_or(std::ptr::null(), |p| p as *const _);
+                h265_add_info.p_std_pp_ss = std_pps_h265
+                    .as_ref()
+                    .map_or(std::ptr::null(), |p| p as *const _);
 
-                h265_params.s_type = vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                h265_params.s_type =
+                    vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR;
                 h265_params.p_next = std::ptr::null();
                 h265_params.max_std_vps_count = 16;
                 h265_params.max_std_sps_count = 32;
@@ -441,7 +478,8 @@ impl VideoSessionParameters {
                 h265_params.p_parameters_add_info = &h265_add_info as *const _ as *const _;
             }
             VideoCodec::DecodeAv1 => {
-                av1_params.s_type = vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR;
+                av1_params.s_type =
+                    vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR;
                 av1_params.p_next = std::ptr::null();
                 av1_params.p_std_sequence_header = std::ptr::null();
             }
@@ -471,9 +509,7 @@ impl VideoSessionParameters {
             )
         }
         .ok_or_else(|| {
-            VideoError::SessionCreation(
-                "vkCreateVideoSessionParametersKHR not found".to_string(),
-            )
+            VideoError::SessionCreation("vkCreateVideoSessionParametersKHR not found".to_string())
         })?;
 
         let parameters = unsafe {
@@ -528,10 +564,7 @@ impl VideoSessionParameters {
     /// With VK_KHR_video_maintenance1 (not maintenance2), vkCmdBeginVideoCodingKHR
     /// will automatically initialize the session when first called with session parameters.
     /// This matches the NVIDIA Vulkan-Video-Samples behavior.
-    pub fn update_session(
-        &self,
-        _session: vk::VideoSessionKHR,
-    ) -> VideoResult<()> {
+    pub fn update_session(&self, _session: vk::VideoSessionKHR) -> VideoResult<()> {
         // With VK_KHR_video_maintenance1, the session is auto-initialized by
         // vkCmdBeginVideoCodingKHR when called with session parameters.
         // No explicit vkUpdateVideoSessionKHR call needed.
@@ -546,11 +579,10 @@ impl Drop for VideoSessionParameters {
         }
 
         let destroy_fn = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkDestroyVideoSessionParametersKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkDestroyVideoSessionParametersKHR\0".as_ptr().cast(),
+            )
         };
 
         if let Some(ptr) = destroy_fn {
@@ -561,11 +593,7 @@ impl Drop for VideoSessionParameters {
                     *const vk::AllocationCallbacks,
                 );
                 let fn_ptr: FnType = std::mem::transmute(ptr);
-                fn_ptr(
-                    self.device.handle(),
-                    self.parameters,
-                    std::ptr::null(),
-                );
+                fn_ptr(self.device.handle(), self.parameters, std::ptr::null());
             }
         }
     }

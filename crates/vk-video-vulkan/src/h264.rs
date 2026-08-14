@@ -73,10 +73,8 @@ impl H264Decoder {
         sps: Option<&vk_video_core::picture::H264Sps>,
         pps: Option<&vk_video_core::picture::H264Pps>,
     ) -> VideoResult<()> {
-        let std_sps: Option<StdVideoH264SequenceParameterSet> =
-            sps.map(convert_h264_sps);
-        let std_pps: Option<StdVideoH264PictureParameterSet> =
-            pps.map(convert_h264_pps);
+        let std_sps: Option<StdVideoH264SequenceParameterSet> = sps.map(convert_h264_sps);
+        let std_pps: Option<StdVideoH264PictureParameterSet> = pps.map(convert_h264_pps);
 
         let add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR {
             s_type: vk::StructureType::VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR,
@@ -114,9 +112,7 @@ impl H264Decoder {
             )
         }
         .ok_or_else(|| {
-            VideoError::SessionCreation(
-                "vkUpdateVideoSessionParametersKHR not found".to_string(),
-            )
+            VideoError::SessionCreation("vkUpdateVideoSessionParametersKHR not found".to_string())
         })?;
 
         unsafe {
@@ -127,11 +123,7 @@ impl H264Decoder {
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(update_fn);
 
-            let result = fn_ptr(
-                self.device.handle(),
-                session_params,
-                update_info,
-            );
+            let result = fn_ptr(self.device.handle(), session_params, update_info);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkUpdateVideoSessionParametersKHR failed: {:?}",
@@ -176,25 +168,33 @@ impl H264Decoder {
         dpb_views: &[vk::ImageView],
     ) -> VideoResult<()> {
         // Use provided values or compute from internal state
-        let (effective_frame_num, effective_poc, effective_is_intra, effective_is_ref, effective_is_idr) = 
-            if let (Some(fn_), Some(poc), Some(intra), Some(ref_), Some(idr)) = 
-                (frame_num, pic_order_cnt, is_intra, is_reference, is_idr) {
-                (fn_, poc, intra, ref_, idr)
-            } else {
-                let sps = self.sps.as_ref().ok_or(VideoError::InvalidState("H264 SPS not set before decode".into()))?;
-                let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 as u32 + 4);
-                let computed_frame_num = self.frame_count % max_frame_num;
-                let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
-                let max_poc_lsb = 1u32 << log2_max_poc_lsb;
-                let poc_lsb = self.frame_count % max_poc_lsb;
-                (
-                    computed_frame_num,
-                    [poc_lsb as i32, poc_lsb as i32],
-                    false,
-                    true,
-                    false,
-                )
-            };
+        let (
+            effective_frame_num,
+            effective_poc,
+            effective_is_intra,
+            effective_is_ref,
+            effective_is_idr,
+        ) = if let (Some(fn_), Some(poc), Some(intra), Some(ref_), Some(idr)) =
+            (frame_num, pic_order_cnt, is_intra, is_reference, is_idr)
+        {
+            (fn_, poc, intra, ref_, idr)
+        } else {
+            let sps = self.sps.as_ref().ok_or(VideoError::InvalidState(
+                "H264 SPS not set before decode".into(),
+            ))?;
+            let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 as u32 + 4);
+            let computed_frame_num = self.frame_count % max_frame_num;
+            let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
+            let max_poc_lsb = 1u32 << log2_max_poc_lsb;
+            let poc_lsb = self.frame_count % max_poc_lsb;
+            (
+                computed_frame_num,
+                [poc_lsb as i32, poc_lsb as i32],
+                false,
+                true,
+                false,
+            )
+        };
 
         // Build picture info outside unsafe block so frame_num/poc are in scope
         let pic_info = self.build_picture_info(
@@ -215,7 +215,13 @@ impl H264Decoder {
             //
             // Matches working example: vulkan_decode.rs lines 4061-4140
 
-            let max_frame_num = 1u32 << (self.sps.as_ref().ok_or(VideoError::InvalidState("H264 SPS not set".into()))?.log2_max_frame_num_minus4 as u32 + 4);
+            let max_frame_num = 1u32
+                << (self
+                    .sps
+                    .as_ref()
+                    .ok_or(VideoError::InvalidState("H264 SPS not set".into()))?
+                    .log2_max_frame_num_minus4 as u32
+                    + 4);
 
             // Build reference slots for begin coding
             //
@@ -236,9 +242,9 @@ impl H264Decoder {
                 // RESET frame: activate ALL DPB slots
 
                 // Build picture resources for all slots
-                let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> = (0..dpb_views.len() as u32)
-                    .map(|slot_idx| {
-                        vk::VideoPictureResourceInfoKHR {
+                let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> =
+                    (0..dpb_views.len() as u32)
+                        .map(|slot_idx| vk::VideoPictureResourceInfoKHR {
                             s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                             p_next: std::ptr::null(),
                             coded_offset: vk::Offset2D::default(),
@@ -246,20 +252,23 @@ impl H264Decoder {
                             base_array_layer: 0,
                             image_view_binding: dpb_views[slot_idx as usize],
                             _marker: Default::default(),
-                        }
-                    })
-                    .collect();
+                        })
+                        .collect();
 
                 // Build setup slot with DPB info
-                let setup_slot_idx = dpb_setup_picture.as_ref().map_or(0, |s| s.slot_index as usize);
+                let setup_slot_idx = dpb_setup_picture
+                    .as_ref()
+                    .map_or(0, |s| s.slot_index as usize);
 
-                let mut setup_ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                let mut setup_ref_info =
+                    unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                 setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
                 setup_ref_info.PicOrderCnt = effective_poc;
                 // For progressive frames: both fields are available for prediction
                 setup_ref_info.flags.set_top_field_flag(1);
                 setup_ref_info.flags.set_bottom_field_flag(1);
-                let setup_dpb_slot_info = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info);
+                let setup_dpb_slot_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
+                    .std_reference_info(&setup_ref_info);
 
                 // Build all slots
                 all_begin_slots = (0..dpb_views.len() as u32)
@@ -301,7 +310,8 @@ impl H264Decoder {
                 // NOT the setup picture. Setup picture is only in DecodeVideo's p_setup_reference_slot.
                 let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
                 for ref_pic in dpb_ref_pictures.iter() {
-                    let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                    let mut ref_info =
+                        unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                     ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
                     ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
                     // For progressive frames: both fields are available for prediction
@@ -321,14 +331,12 @@ impl H264Decoder {
                 all_begin_slots = dpb_ref_pictures
                     .iter()
                     .zip(ref_dpb_slot_infos.iter())
-                    .map(|(ref_pic, dpb_slot_info)| {
-                        vk::VideoReferenceSlotInfoKHR {
-                            s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                            p_next: dpb_slot_info as *const _ as *const _,
-                            slot_index: ref_pic.slot_index as i32,
-                            p_picture_resource: &ref_pic.picture_resource as *const _,
-                            _marker: Default::default(),
-                        }
+                    .map(|(ref_pic, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
+                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                        p_next: dpb_slot_info as *const _ as *const _,
+                        slot_index: ref_pic.slot_index as i32,
+                        p_picture_resource: &ref_pic.picture_resource as *const _,
+                        _marker: Default::default(),
                     })
                     .collect();
 
@@ -339,7 +347,9 @@ impl H264Decoder {
                 // We use Box::leak to ensure pointers remain valid.
 
                 // Build setup DPB info (leaked to ensure pointer validity)
-                let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo = if dpb_setup_picture.is_some() {
+                let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo = if dpb_setup_picture
+                    .is_some()
+                {
                     let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                     info.FrameNum = (effective_frame_num % max_frame_num) as u16;
                     info.PicOrderCnt = effective_poc;
@@ -350,20 +360,26 @@ impl H264Decoder {
                     std::ptr::null()
                 };
 
-                let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR = if !setup_ref_info.is_null() {
-                    let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(unsafe { &*setup_ref_info });
-                    Box::leak(Box::new(dpb_info))
-                } else {
-                    std::ptr::null()
-                };
+                let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR =
+                    if !setup_ref_info.is_null() {
+                        let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
+                            .std_reference_info(unsafe { &*setup_ref_info });
+                        Box::leak(Box::new(dpb_info))
+                    } else {
+                        std::ptr::null()
+                    };
 
                 // Build setup slot info (if setup picture exists)
                 let setup_slot_info = if !setup_dpb_slot_info.is_null() {
                     Some(vk::VideoReferenceSlotInfoKHR {
                         s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                         p_next: setup_dpb_slot_info as *const _ as *const _,
-                        slot_index: dpb_setup_picture.as_ref().map_or(0, |s| s.slot_index as i32),
-                        p_picture_resource: dpb_setup_picture.as_ref().map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
+                        slot_index: dpb_setup_picture
+                            .as_ref()
+                            .map_or(0, |s| s.slot_index as i32),
+                        p_picture_resource: dpb_setup_picture
+                            .as_ref()
+                            .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
                         _marker: Default::default(),
                     })
                 } else {
@@ -372,17 +388,18 @@ impl H264Decoder {
 
                 // Build combined slots array for BeginVideoCoding
                 // MUST keep this alive until after cmd_begin_video_coding is called!
-                let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> = if all_begin_slots.is_empty() {
-                    // No refs: use only setup slot
-                    setup_slot_info.into_iter().collect()
-                } else {
-                    // Has refs: combine refs + setup
-                    let mut combined = all_begin_slots.clone();
-                    if let Some(slot) = setup_slot_info {
-                        combined.push(slot);
-                    }
-                    combined
-                };
+                let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
+                    if all_begin_slots.is_empty() {
+                        // No refs: use only setup slot
+                        setup_slot_info.into_iter().collect()
+                    } else {
+                        // Has refs: combine refs + setup
+                        let mut combined = all_begin_slots.clone();
+                        if let Some(slot) = setup_slot_info {
+                            combined.push(slot);
+                        }
+                        combined
+                    };
 
                 let slot_count = begin_video_coding_slots.len() as u32;
                 let slot_ptr = if begin_video_coding_slots.is_empty() {
@@ -468,7 +485,9 @@ impl H264Decoder {
             let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
             for ref_pic in dpb_ref_pictures.iter() {
                 // Only add barrier if image is valid and not already in DPB layout
-                if ref_pic.image != vk::Image::null() && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                if ref_pic.image != vk::Image::null()
+                    && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+                {
                     all_image_barriers.push(vk::ImageMemoryBarrier2 {
                         s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
                         p_next: std::ptr::null(),
@@ -530,10 +549,12 @@ impl H264Decoder {
 
             // Build reference slots - use same indices as in begin coding
             // Each slot needs a VkVideoDecodeH264DpbSlotInfoKHR in its pNext chain
-            let max_frame_num = 1u32 << (self.sps.as_ref().expect("SPS").log2_max_frame_num_minus4 as u32 + 4);
+            let max_frame_num =
+                1u32 << (self.sps.as_ref().expect("SPS").log2_max_frame_num_minus4 as u32 + 4);
 
             // Setup slot DPB info
-            let mut setup_ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+            let mut setup_ref_info =
+                unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
             setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
             setup_ref_info.PicOrderCnt = effective_poc;
             // For progressive frames: both fields are available for prediction
@@ -543,47 +564,50 @@ impl H264Decoder {
                 vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info)
             });
 
-            let setup_slot = dpb_setup_picture.as_ref().map(|info| vk::VideoReferenceSlotInfoKHR {
-                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                p_next: setup_dpb_slot_info.as_ref().map(|s| s as *const _ as *const _).unwrap_or(std::ptr::null()),
-                slot_index: info.slot_index as i32,
-                p_picture_resource: &info.picture_resource as *const _,
-                _marker: Default::default(),
-            });
+            let setup_slot = dpb_setup_picture
+                .as_ref()
+                .map(|info| vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: setup_dpb_slot_info
+                        .as_ref()
+                        .map(|s| s as *const _ as *const _)
+                        .unwrap_or(std::ptr::null()),
+                    slot_index: info.slot_index as i32,
+                    p_picture_resource: &info.picture_resource as *const _,
+                    _marker: Default::default(),
+                });
 
-              // Reference slots with their DPB info - store everything in Vecs so pointers remain valid
-              let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
-              for ref_pic in dpb_ref_pictures.iter() {
-                  let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                  ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
-                  ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
-                   // For progressive frames: both fields are available for prediction
-                   ref_info.flags.set_top_field_flag(1);
-                   ref_info.flags.set_bottom_field_flag(1);
-                  ref_infos.push(ref_info);
-              }
+            // Reference slots with their DPB info - store everything in Vecs so pointers remain valid
+            let mut ref_infos: Vec<StdVideoDecodeH264ReferenceInfo> = Vec::new();
+            for ref_pic in dpb_ref_pictures.iter() {
+                let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
+                ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
+                // For progressive frames: both fields are available for prediction
+                ref_info.flags.set_top_field_flag(1);
+                ref_info.flags.set_bottom_field_flag(1);
+                ref_infos.push(ref_info);
+            }
 
-             // Build DPB slot infos first (so pointers remain valid)
-             let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
-                 .iter()
-                 .map(|ref_info| {
-                     vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(ref_info)
-                 })
-                 .collect();
+            // Build DPB slot infos first (so pointers remain valid)
+            let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
+                .iter()
+                .map(|ref_info| {
+                    vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(ref_info)
+                })
+                .collect();
 
-             let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
-                 .iter()
-                 .zip(ref_dpb_slot_infos.iter())
-                 .map(|(ref_pic, dpb_slot_info)| {
-                     vk::VideoReferenceSlotInfoKHR {
-                         s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                         p_next: dpb_slot_info as *const _ as *const _,
-                         slot_index: ref_pic.slot_index as i32,
-                         p_picture_resource: &ref_pic.picture_resource as *const _,
-                         _marker: Default::default(),
-                     }
-                 })
-                 .collect();
+            let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
+                .iter()
+                .zip(ref_dpb_slot_infos.iter())
+                .map(|(ref_pic, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: dpb_slot_info as *const _ as *const _,
+                    slot_index: ref_pic.slot_index as i32,
+                    p_picture_resource: &ref_pic.picture_resource as *const _,
+                    _marker: Default::default(),
+                })
+                .collect();
 
             let decode_info = vk::VideoDecodeInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
@@ -593,17 +617,18 @@ impl H264Decoder {
                 src_buffer_offset: bitstream_offset,
                 src_buffer_range: bitstream_range,
                 dst_picture_resource: dst_picture_resource,
-                p_setup_reference_slot: setup_slot.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+                p_setup_reference_slot: setup_slot
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _),
                 reference_slot_count: ref_slots.len() as u32,
                 p_reference_slots: ref_slots.as_ptr(),
-                 _marker: Default::default(),
-              };
+                _marker: Default::default(),
+            };
 
-              self.cmd_decode_video(cmd_buffer, &decode_info);
+            self.cmd_decode_video(cmd_buffer, &decode_info);
 
-             // End video coding
+            // End video coding
             self.cmd_end_video_coding(cmd_buffer);
-
         }
 
         // Update POC tracking
@@ -624,14 +649,8 @@ impl H264Decoder {
         is_reference: bool,
         is_idr: bool,
     ) -> StdVideoDecodeH264PictureInfo {
-        let sps = self
-            .sps
-            .as_ref()
-            .expect("H264 SPS not set before decode");
-        let pps = self
-            .pps
-            .as_ref()
-            .expect("H264 PPS not set before decode");
+        let sps = self.sps.as_ref().expect("H264 SPS not set before decode");
+        let pps = self.pps.as_ref().expect("H264 PPS not set before decode");
 
         let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 as u32 + 4);
         let effective_frame_num = frame_num % max_frame_num;
@@ -644,7 +663,9 @@ impl H264Decoder {
 
         // Set flags based on frame properties
         pic_info.flags.set_is_intra(if is_intra { 1 } else { 0 });
-        pic_info.flags.set_is_reference(if is_reference { 1 } else { 0 });
+        pic_info
+            .flags
+            .set_is_reference(if is_reference { 1 } else { 0 });
         pic_info.flags.set_field_pic_flag(0);
         pic_info.flags.set_IdrPicFlag(if is_idr { 1 } else { 0 });
         pic_info.flags.set_bottom_field_flag(0);
@@ -660,11 +681,10 @@ impl H264Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -683,16 +703,17 @@ impl H264Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoBeginCodingInfoKHR<'_>);
+                type FnType = unsafe extern "system" fn(
+                    vk::CommandBuffer,
+                    *const vk::VideoBeginCodingInfoKHR<'_>,
+                );
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, info);
             }
@@ -700,17 +721,12 @@ impl H264Decoder {
     }
 
     // Helper: dispatch cmdDecodeVideoKHR
-    fn cmd_decode_video(
-        &self,
-        cmd_buffer: vk::CommandBuffer,
-        info: &vk::VideoDecodeInfoKHR<'_>,
-    ) {
+    fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -732,11 +748,10 @@ impl H264Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -759,11 +774,10 @@ impl H264Decoder {
             _marker: Default::default(),
         };
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -782,27 +796,67 @@ impl H264Decoder {
 pub fn convert_h264_sps(sps: &vk_video_core::picture::H264Sps) -> StdVideoH264SequenceParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH264SpsFlags>() };
     flags.set_separate_colour_plane_flag(if sps.separate_colour_plane_flag { 1 } else { 0 });
-    flags.set_qpprime_y_zero_transform_bypass_flag(if sps.qpprime_y_zero_transform_bypass_flag { 1 } else { 0 });
+    flags.set_qpprime_y_zero_transform_bypass_flag(if sps.qpprime_y_zero_transform_bypass_flag {
+        1
+    } else {
+        0
+    });
     flags.set_frame_mbs_only_flag(if sps.frame_mbs_only_flag { 1 } else { 0 });
     flags.set_direct_8x8_inference_flag(if sps.direct_8x8_inference_flag { 1 } else { 0 });
     flags.set_frame_cropping_flag(if sps.frame_cropping_flag { 1 } else { 0 });
-    flags.set_vui_parameters_present_flag(if sps.vui_parameters_present_flag { 1 } else { 0 });
+    flags.set_vui_parameters_present_flag(if sps.vui_parameters_present_flag {
+        1
+    } else {
+        0
+    });
 
     // Convert VUI parameters if present
     let vui_data = if let Some(vui) = &sps.vui {
         let mut vui_flags = unsafe { std::mem::zeroed::<StdVideoH264SpsVuiFlags>() };
-        vui_flags.set_aspect_ratio_info_present_flag(if vui.aspect_ratio_info_present_flag { 1 } else { 0 });
-        vui_flags.set_overscan_info_present_flag(if vui.overscan_info_present_flag { 1 } else { 0 });
+        vui_flags.set_aspect_ratio_info_present_flag(if vui.aspect_ratio_info_present_flag {
+            1
+        } else {
+            0
+        });
+        vui_flags.set_overscan_info_present_flag(if vui.overscan_info_present_flag {
+            1
+        } else {
+            0
+        });
         vui_flags.set_overscan_appropriate_flag(if vui.overscan_appropriate_flag { 1 } else { 0 });
-        vui_flags.set_video_signal_type_present_flag(if vui.video_signal_type_present_flag { 1 } else { 0 });
+        vui_flags.set_video_signal_type_present_flag(if vui.video_signal_type_present_flag {
+            1
+        } else {
+            0
+        });
         vui_flags.set_video_full_range_flag(if vui.video_full_range_flag { 1 } else { 0 });
-        vui_flags.set_color_description_present_flag(if vui.color_description_present_flag { 1 } else { 0 });
-        vui_flags.set_chroma_loc_info_present_flag(if vui.chroma_loc_info_present_flag { 1 } else { 0 });
+        vui_flags.set_color_description_present_flag(if vui.color_description_present_flag {
+            1
+        } else {
+            0
+        });
+        vui_flags.set_chroma_loc_info_present_flag(if vui.chroma_loc_info_present_flag {
+            1
+        } else {
+            0
+        });
         vui_flags.set_timing_info_present_flag(if vui.timing_info_present_flag { 1 } else { 0 });
         vui_flags.set_fixed_frame_rate_flag(if vui.fixed_frame_rate_flag { 1 } else { 0 });
-        vui_flags.set_bitstream_restriction_flag(if vui.bitstream_restriction_flag { 1 } else { 0 });
-        vui_flags.set_nal_hrd_parameters_present_flag(if vui.nal_hrd_parameters_present_flag { 1 } else { 0 });
-        vui_flags.set_vcl_hrd_parameters_present_flag(if vui.vcl_hrd_parameters_present_flag { 1 } else { 0 });
+        vui_flags.set_bitstream_restriction_flag(if vui.bitstream_restriction_flag {
+            1
+        } else {
+            0
+        });
+        vui_flags.set_nal_hrd_parameters_present_flag(if vui.nal_hrd_parameters_present_flag {
+            1
+        } else {
+            0
+        });
+        vui_flags.set_vcl_hrd_parameters_present_flag(if vui.vcl_hrd_parameters_present_flag {
+            1
+        } else {
+            0
+        });
 
         StdVideoH264SequenceParameterSetVui {
             flags: vui_flags,
@@ -862,10 +916,24 @@ pub fn convert_h264_sps(sps: &vk_video_core::picture::H264Sps) -> StdVideoH264Se
 pub fn convert_h264_pps(pps: &vk_video_core::picture::H264Pps) -> StdVideoH264PictureParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH264PpsFlags>() };
     flags.set_weighted_pred_flag(if pps.weighted_pred_flag { 1 } else { 0 });
-    flags.set_deblocking_filter_control_present_flag(if pps.deblocking_filter_control_present_flag { 1 } else { 0 });
-    flags.set_redundant_pic_cnt_present_flag(if pps.redundant_pic_cnt_present_flag { 1 } else { 0 });
+    flags.set_deblocking_filter_control_present_flag(
+        if pps.deblocking_filter_control_present_flag {
+            1
+        } else {
+            0
+        },
+    );
+    flags.set_redundant_pic_cnt_present_flag(if pps.redundant_pic_cnt_present_flag {
+        1
+    } else {
+        0
+    });
     flags.set_transform_8x8_mode_flag(if pps.transform_8x8_mode_flag { 1 } else { 0 });
-    flags.set_constrained_intra_pred_flag(if pps.constrained_intra_pred_flag { 1 } else { 0 });
+    flags.set_constrained_intra_pred_flag(if pps.constrained_intra_pred_flag {
+        1
+    } else {
+        0
+    });
 
     StdVideoH264PictureParameterSet {
         flags,

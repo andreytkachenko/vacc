@@ -50,10 +50,8 @@ impl DecodedImage {
             _marker: std::marker::PhantomData,
         };
 
-        let image = unsafe {
-            device.create_image(&image_create_info, None)
-        }
-        .map_err(|e| VideoError::ImageCreation(format!("Failed to create image: {}", e)))?;
+        let image = unsafe { device.create_image(&image_create_info, None) }
+            .map_err(|e| VideoError::ImageCreation(format!("Failed to create image: {}", e)))?;
 
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
 
@@ -74,15 +72,11 @@ impl DecodedImage {
             _marker: std::marker::PhantomData,
         };
 
-        let memory = unsafe {
-            device.allocate_memory(&alloc_info, None)
-        }
-        .map_err(|e| VideoError::MemoryAllocation(e.to_string()))?;
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+            .map_err(|e| VideoError::MemoryAllocation(e.to_string()))?;
 
-        unsafe {
-            device.bind_image_memory(image, memory, 0)
-        }
-        .map_err(|e| VideoError::ImageCreation(format!("Failed to bind memory: {}", e)))?;
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .map_err(|e| VideoError::ImageCreation(format!("Failed to bind memory: {}", e)))?;
 
         // Create image view with COLOR aspect for video decode
         let y_view = create_image_view(
@@ -90,7 +84,10 @@ impl DecodedImage {
             image,
             format,
             ash::vk::ImageAspectFlags::COLOR,
-            0, 1, 0, 1,
+            0,
+            1,
+            0,
+            1,
         )?;
 
         Ok(Self {
@@ -107,11 +104,7 @@ impl DecodedImage {
 
     /// Read back YUV data from the decoded image to host memory.
     /// Requires proper staging image and transfer command buffer.
-    pub fn read_back_yuv(
-        &self,
-        _width: u32,
-        _height: u32,
-    ) -> VideoResult<(Vec<u8>, Vec<u8>)> {
+    pub fn read_back_yuv(&self, _width: u32, _height: u32) -> VideoResult<(Vec<u8>, Vec<u8>)> {
         // For optimal images, we need to copy to a linear staging image first
         // This requires a command buffer with proper pipeline barriers.
         Ok((Vec::new(), Vec::new()))
@@ -173,15 +166,21 @@ pub fn create_output_image_with_pnext(
     let image_create_info = ash::vk::ImageCreateInfo::default()
         .image_type(ash::vk::ImageType::TYPE_2D)
         .format(format)
-        .extent(ash::vk::Extent3D { width, height, depth: 1 })
+        .extent(ash::vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(ash::vk::SampleCountFlags::TYPE_1)
         .tiling(ash::vk::ImageTiling::OPTIMAL)
-        .usage(ash::vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-            | ash::vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-            | ash::vk::ImageUsageFlags::TRANSFER_SRC
-            | ash::vk::ImageUsageFlags::SAMPLED)
+        .usage(
+            ash::vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                | ash::vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                | ash::vk::ImageUsageFlags::TRANSFER_SRC
+                | ash::vk::ImageUsageFlags::SAMPLED,
+        )
         .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
         .initial_layout(ash::vk::ImageLayout::UNDEFINED);
 
@@ -194,9 +193,8 @@ pub fn create_output_image_with_pnext(
         info
     };
 
-    let image = unsafe {
-        device.create_image(&image_create_info, None)
-    }.map_err(|e| VideoError::ImageCreation(format!("Image creation failed: {:?}", e)))?;
+    let image = unsafe { device.create_image(&image_create_info, None) }
+        .map_err(|e| VideoError::ImageCreation(format!("Image creation failed: {:?}", e)))?;
 
     let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
 
@@ -204,19 +202,18 @@ pub fn create_output_image_with_pnext(
         memory_properties,
         mem_requirements.memory_type_bits,
         ash::vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ).ok_or_else(|| VideoError::MemoryAllocation("No device-local memory type found".to_string()))?;
+    )
+    .ok_or_else(|| VideoError::MemoryAllocation("No device-local memory type found".to_string()))?;
 
     let alloc_info = ash::vk::MemoryAllocateInfo::default()
         .allocation_size(mem_requirements.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None)
-    }.map_err(|e| VideoError::MemoryAllocation(format!("Memory allocation failed: {:?}", e)))?;
+    let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+        .map_err(|e| VideoError::MemoryAllocation(format!("Memory allocation failed: {:?}", e)))?;
 
-    unsafe {
-        device.bind_image_memory(image, memory, 0)
-    }.map_err(|e| VideoError::ImageCreation(format!("Memory binding failed: {:?}", e)))?;
+    unsafe { device.bind_image_memory(image, memory, 0) }
+        .map_err(|e| VideoError::ImageCreation(format!("Memory binding failed: {:?}", e)))?;
 
     // Create image view with COLOR aspect for video decode.
     // Vulkan spec requires COLOR aspect for VIDEO_DECODE_DST/DPB usage.
@@ -231,9 +228,8 @@ pub fn create_output_image_with_pnext(
                 .layer_count(1),
         );
 
-    let view = unsafe {
-        device.create_image_view(&view_create_info, None)
-    }.map_err(|e| VideoError::ImageCreation(format!("ImageView creation failed: {:?}", e)))?;
+    let view = unsafe { device.create_image_view(&view_create_info, None) }
+        .map_err(|e| VideoError::ImageCreation(format!("ImageView creation failed: {:?}", e)))?;
 
     Ok((image, view, memory))
 }
@@ -251,7 +247,11 @@ pub fn create_staging_image(
     let image_create_info = ash::vk::ImageCreateInfo::default()
         .image_type(ash::vk::ImageType::TYPE_2D)
         .format(format)
-        .extent(ash::vk::Extent3D { width, height, depth: 1 })
+        .extent(ash::vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(ash::vk::SampleCountFlags::TYPE_1)
@@ -260,33 +260,38 @@ pub fn create_staging_image(
         .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
         .initial_layout(ash::vk::ImageLayout::UNDEFINED);
 
-    let image = unsafe {
-        device.create_image(&image_create_info, None)
-    }.map_err(|e| VideoError::ImageCreation(format!("Staging image creation failed: {:?}", e)))?;
+    let image = unsafe { device.create_image(&image_create_info, None) }.map_err(|e| {
+        VideoError::ImageCreation(format!("Staging image creation failed: {:?}", e))
+    })?;
 
     let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
 
     let mem_type_index = find_memory_type(
         memory_properties,
         mem_requirements.memory_type_bits,
-        ash::vk::MemoryPropertyFlags::HOST_VISIBLE
-            | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
-    ).ok_or_else(|| VideoError::MemoryAllocation("No host-visible memory type found".to_string()))?;
+        ash::vk::MemoryPropertyFlags::HOST_VISIBLE | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .ok_or_else(|| VideoError::MemoryAllocation("No host-visible memory type found".to_string()))?;
 
     let alloc_info = ash::vk::MemoryAllocateInfo::default()
         .allocation_size(mem_requirements.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None)
-    }.map_err(|e| VideoError::MemoryAllocation(format!("Staging memory allocation failed: {:?}", e)))?;
+    let memory = unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| {
+        VideoError::MemoryAllocation(format!("Staging memory allocation failed: {:?}", e))
+    })?;
 
-    unsafe {
-        device.bind_image_memory(image, memory, 0)
-    }.map_err(|e| VideoError::ImageCreation(format!("Staging memory binding failed: {:?}", e)))?;
+    unsafe { device.bind_image_memory(image, memory, 0) }.map_err(|e| {
+        VideoError::ImageCreation(format!("Staging memory binding failed: {:?}", e))
+    })?;
 
     let mapped_ptr = unsafe {
-        device.map_memory(memory, ash::vk::WHOLE_SIZE, 0, ash::vk::MemoryMapFlags::empty())
+        device.map_memory(
+            memory,
+            ash::vk::WHOLE_SIZE,
+            0,
+            ash::vk::MemoryMapFlags::empty(),
+        )
     }
     .map(|p| p as *mut u8)
     .ok();
@@ -378,9 +383,8 @@ fn create_image_view(
                 .layer_count(layer_count),
         );
 
-    unsafe {
-        device.create_image_view(&view_create_info, None)
-    }.map_err(|e| VideoError::ImageCreation(format!("ImageView creation failed: {:?}", e)))
+    unsafe { device.create_image_view(&view_create_info, None) }
+        .map_err(|e| VideoError::ImageCreation(format!("ImageView creation failed: {:?}", e)))
 }
 
 /// Find a suitable memory type index.

@@ -20,18 +20,18 @@
 //! ```
 
 pub mod codec;
-pub mod format;
-pub mod picture;
-pub mod frame;
 pub mod error;
+pub mod format;
+pub mod frame;
+pub mod picture;
 pub mod session;
 
 pub use codec::{VideoCodec, VideoCodecFlagBits, VideoCodecOperation};
-pub use format::{VideoFormat, ChromaSubsampling, ComponentBitDepth, VideoProfile};
-pub use picture::{PictureParametersSet, StdType, ParameterType};
+pub use error::{VideoError, VideoResult};
+pub use format::{ChromaSubsampling, ComponentBitDepth, VideoFormat, VideoProfile};
 pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo};
-pub use error::{VideoResult, VideoError};
-pub use session::{VideoSessionParams, VideoDecodeInfo, PictureResourceInfo};
+pub use picture::{ParameterType, PictureParametersSet, StdType};
+pub use session::{PictureResourceInfo, VideoDecodeInfo, VideoSessionParams};
 
 /// Maximum number of DPB (Decoded Picture Buffer) reference slots.
 pub const MAX_DPB_REF_SLOTS: usize = 16;

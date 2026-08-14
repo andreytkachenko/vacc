@@ -149,9 +149,7 @@ impl Av1Parser {
     pub fn new() -> Self {
         Self {
             active_sps: None,
-            detected_format: DetectedVideoFormat::new(
-                vk_video_core::codec::VideoCodec::DecodeAv1,
-            ),
+            detected_format: DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeAv1),
             frame_count: 0,
             stream_format: StreamFormat::LowOverhead,
             should_probe_for_annexb: true,
@@ -221,20 +219,14 @@ impl Av1Parser {
             num_bytes_read += obu_length;
 
             if !seen_sequence {
-                let mut obu_reader = BitReader::new(
-                    &data[r.position() as usize..],
-                    false,
-                );
+                let mut obu_reader = BitReader::new(&data[r.position() as usize..], false);
                 if let Ok(header) = Self::parse_obu_header(&mut obu_reader) {
                     seen_sequence = header.obu_type == ObuType::SequenceHeader;
                 }
             }
 
             if !seen_frame {
-                let mut obu_reader = BitReader::new(
-                    &data[r.position() as usize..],
-                    false,
-                );
+                let mut obu_reader = BitReader::new(&data[r.position() as usize..], false);
                 if let Ok(header) = Self::parse_obu_header(&mut obu_reader) {
                     seen_frame = matches!(header.obu_type, ObuType::Frame | ObuType::FrameHeader);
                 }
@@ -382,7 +374,10 @@ impl Av1Parser {
     }
 
     /// Parse the Sequence Header OBU and populate Av1Sps.
-    fn parse_sequence_header_obu(&mut self, obu_data: &[u8]) -> ParserResult<vk_video_core::picture::Av1Sps> {
+    fn parse_sequence_header_obu(
+        &mut self,
+        obu_data: &[u8],
+    ) -> ParserResult<vk_video_core::picture::Av1Sps> {
         let mut sps = vk_video_core::picture::Av1Sps::new();
 
         if obu_data.is_empty() {
@@ -500,7 +495,8 @@ impl Av1Parser {
             sps.additional_frame_id_length_minus1 = r.read_bits(3)? as u8;
 
             let frame_id_length = sps.additional_frame_id_length_minus1 as u32
-                + sps.delta_frame_id_length_minus2 as u32 + 3;
+                + sps.delta_frame_id_length_minus2 as u32
+                + 3;
             if frame_id_length > 16 {
                 return Err(ParserError::InvalidBitstream);
             }
@@ -601,7 +597,10 @@ impl Av1Parser {
     }
 
     /// Parse timing_info syntax element.
-    fn parse_timing_info(sps: &mut vk_video_core::picture::Av1Sps, r: &mut BitReader) -> ParserResult<()> {
+    fn parse_timing_info(
+        sps: &mut vk_video_core::picture::Av1Sps,
+        r: &mut BitReader,
+    ) -> ParserResult<()> {
         // num_units_in_display_tick (32 bits)
         sps.num_units_in_display_tick = r.read_bits(32)?;
 
@@ -619,7 +618,10 @@ impl Av1Parser {
     }
 
     /// Parse decoder_model_info syntax element.
-    fn parse_decoder_model_info(sps: &mut vk_video_core::picture::Av1Sps, r: &mut BitReader) -> ParserResult<()> {
+    fn parse_decoder_model_info(
+        sps: &mut vk_video_core::picture::Av1Sps,
+        r: &mut BitReader,
+    ) -> ParserResult<()> {
         // buffer_delay_length_minus_1 (5 bits)
         sps.buffer_delay_length_minus_1 = r.read_bits(5)? as u8;
 
@@ -636,7 +638,10 @@ impl Av1Parser {
     }
 
     /// Parse color_config syntax element.
-    fn parse_color_config(sps: &mut vk_video_core::picture::Av1Sps, r: &mut BitReader) -> ParserResult<()> {
+    fn parse_color_config(
+        sps: &mut vk_video_core::picture::Av1Sps,
+        r: &mut BitReader,
+    ) -> ParserResult<()> {
         let seq_profile = sps.profile as u32;
 
         // high_bitdepth (1 bit)
@@ -658,20 +663,25 @@ impl Av1Parser {
 
         // color_description_present_flag (1 bit)
         sps.color_description_present = r.read_bit()?;
-        let (color_primaries, transfer_characteristics, matrix_coefficients) = if sps.color_description_present {
-            // color_primaries (8 bits)
-            let color_primaries = r.read_bits(8)? as u8;
+        let (color_primaries, transfer_characteristics, matrix_coefficients) =
+            if sps.color_description_present {
+                // color_primaries (8 bits)
+                let color_primaries = r.read_bits(8)? as u8;
 
-            // transfer_characteristics (8 bits)
-            let transfer_characteristics = r.read_bits(8)? as u8;
+                // transfer_characteristics (8 bits)
+                let transfer_characteristics = r.read_bits(8)? as u8;
 
-            // matrix_coefficients (8 bits)
-            let matrix_coefficients = r.read_bits(8)? as u8;
+                // matrix_coefficients (8 bits)
+                let matrix_coefficients = r.read_bits(8)? as u8;
 
-            (color_primaries, transfer_characteristics, matrix_coefficients)
-        } else {
-            (2, 2, 2) // Default: BT.709
-        };
+                (
+                    color_primaries,
+                    transfer_characteristics,
+                    matrix_coefficients,
+                )
+            } else {
+                (2, 2, 2) // Default: BT.709
+            };
         sps.color_primaries = color_primaries;
         sps.transfer_characteristics = transfer_characteristics;
         sps.matrix_coefficients = matrix_coefficients;
@@ -817,7 +827,9 @@ impl Av1Parser {
             // In error_resilient_mode, use the first available reference frame.
             let ref_idx = if fh.error_resilient_mode {
                 // In error resilient mode, inherit from first valid ref
-                self.ref_frame_sizes.iter().position(|&(w, h)| w > 0 && h > 0)
+                self.ref_frame_sizes
+                    .iter()
+                    .position(|&(w, h)| w > 0 && h > 0)
                     .unwrap_or(0) as u8
             } else {
                 fh.primary_ref_frame
@@ -882,7 +894,8 @@ impl Av1Parser {
                 .collect();
 
             // LAST/LAST2/LAST3: 3 most recent with order_hint < current
-            let mut past = candidates.iter()
+            let mut past = candidates
+                .iter()
                 .filter(|(oh, _)| *oh < cur_order_hint)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -890,7 +903,8 @@ impl Av1Parser {
             past.reverse();
 
             // ALTREF/ALTREF2/BWDREF: most recent with order_hint > current
-            let mut future = candidates.iter()
+            let mut future = candidates
+                .iter()
                 .filter(|(oh, _)| *oh > cur_order_hint)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -903,7 +917,8 @@ impl Av1Parser {
             fh.ref_frame_idx[3] = gold_frame_idx; // GOLDEN
             fh.ref_frame_idx[4] = future.first().map(|(_, i)| *i).unwrap_or(gold_frame_idx); // BWDREF
             fh.ref_frame_idx[5] = future.get(1).map(|(_, i)| *i).unwrap_or(gold_frame_idx); // ALTREF2
-            fh.ref_frame_idx[6] = future.first().map(|(_, i)| *i).unwrap_or(gold_frame_idx); // ALTREF
+            fh.ref_frame_idx[6] = future.first().map(|(_, i)| *i).unwrap_or(gold_frame_idx);
+        // ALTREF
         } else {
             // Normal signaling: reference_frame (3 bits each for 7 refs)
             for i in 0..7usize {
@@ -988,8 +1003,7 @@ impl Av1Parser {
             return false;
         }
         // AV1 start code is 0x9E or 0x80 for the first frame
-        data[data.len() - 1] == 0x9E
-            || (data.len() >= 2 && data[data.len() - 2] == 0x80)
+        data[data.len() - 1] == 0x9E || (data.len() >= 2 && data[data.len() - 2] == 0x80)
     }
 }
 
@@ -1027,7 +1041,11 @@ impl VideoParser for Av1Parser {
                                 let seq_header = self.parse_sequence_header_obu(obu_data)?;
                                 offset += obu_data_offset + obu_size;
                                 return Ok(ParseResult::ParameterSet {
-                                    sps: Some(vk_video_core::picture::BoxedPictureParametersSet::new(seq_header)),
+                                    sps: Some(
+                                        vk_video_core::picture::BoxedPictureParametersSet::new(
+                                            seq_header,
+                                        ),
+                                    ),
                                     pps: None,
                                     vps: None,
                                 });

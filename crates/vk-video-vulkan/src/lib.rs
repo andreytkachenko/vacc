@@ -2,33 +2,35 @@
 //!
 //! Vulkan Video Decoder implementation using `ash` for Vulkan bindings.
 
-pub mod device;
-pub mod session;
+pub mod access_unit;
+pub mod av1;
 pub mod buffer;
+pub mod codec_types;
+pub mod decoder;
+pub mod device;
+pub mod dpb;
 pub mod frame;
 pub mod h264;
 pub mod h265;
-pub mod vp9;
-pub mod av1;
 pub mod image;
-pub mod codec_types;
-pub mod dpb;
-pub mod access_unit;
-pub mod readback;
 pub mod profile_chain;
-pub mod decoder;
+pub mod readback;
+pub mod session;
+pub mod vp9;
 
-pub use device::{VideoCodec, VulkanDevice, VideoDeviceBuilder, QueueFamilies};
-pub use session::{VideoSession, VideoSessionParams, VideoSessionParameters, CodecProfileInfo};
+pub use access_unit::{
+    AccessUnit, H264OrH265Pps, H264OrH265Sps, VideoCodec as AccessUnitCodec, Vp9Frame,
+};
 pub use buffer::{BitstreamBuffer, BitstreamBufferPool};
+pub use codec_types::*;
+pub use decoder::{DecodedFrame, VideoDecoder};
+pub use device::{QueueFamilies, VideoCodec, VideoDeviceBuilder, VulkanDevice};
+pub use dpb::{DpbEntry, DpbManager, LastAccessType};
 pub use frame::{DecodedFrame as FrameDecodedFrame, YCbCrPlane};
 pub use image::{create_output_image, create_output_image_with_pnext, StagingImage};
-pub use codec_types::*;
-pub use dpb::{DpbManager, DpbEntry, LastAccessType};
-pub use access_unit::{AccessUnit, H264OrH265Sps, H264OrH265Pps, VideoCodec as AccessUnitCodec, Vp9Frame};
-pub use readback::{DecodedPixels, readback_decoded_image};
-pub use profile_chain::{create_output_image_with_profile, create_bitstream_buffer_with_profile};
-pub use decoder::{VideoDecoder, DecodedFrame};
+pub use profile_chain::{create_bitstream_buffer_with_profile, create_output_image_with_profile};
+pub use readback::{readback_decoded_image, DecodedPixels};
+pub use session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams};
 
 /// Result type for Vulkan video operations.
 pub type VideoResult<T> = std::result::Result<T, VideoError>;

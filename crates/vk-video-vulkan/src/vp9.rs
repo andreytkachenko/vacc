@@ -164,10 +164,10 @@ impl Vp9Decoder {
     /// 7. End command buffer
     ///
     /// # Slot index semantics
-        ///
-        /// `output_slot_index` and `dpb_ref_slot_indices` must be actual DPB slot indices
-        /// (typically 0..max_dpb_slots-1). These are computed via
-        /// `compute_reference_name_slot_indices` using frame_buffer_to_dpb_slot.
+    ///
+    /// `output_slot_index` and `dpb_ref_slot_indices` must be actual DPB slot indices
+    /// (typically 0..max_dpb_slots-1). These are computed via
+    /// `compute_reference_name_slot_indices` using frame_buffer_to_dpb_slot.
     /// The slot index uniquely identifies a DPB entry in the Vulkan video session.
     ///
     /// # Arguments
@@ -223,15 +223,15 @@ impl Vp9Decoder {
 
         // Setup slot (current frame output) - use actual DPB slot index
         // Heap-allocate to ensure pointer stays valid for p_setup_reference_slot
-        let setup_slot_info = dpb_setup_picture.as_ref().map(|res| {
-            vk::VideoReferenceSlotInfoKHR {
+        let setup_slot_info = dpb_setup_picture
+            .as_ref()
+            .map(|res| vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                 p_next: std::ptr::null(),
                 slot_index: output_slot_index,
                 p_picture_resource: res as *const _,
                 _marker: Default::default(),
-            }
-        });
+            });
         let has_setup_slot = setup_slot_info.is_some();
         let setup_slot_ptr = if has_setup_slot {
             Box::leak(Box::new(setup_slot_info.unwrap())) as *const _
@@ -248,9 +248,8 @@ impl Vp9Decoder {
             all_slots.push(unsafe { *setup_slot_ptr });
         }
         if !ref_slots_ptr.is_null() {
-            let ref_slice = unsafe {
-                std::slice::from_raw_parts(ref_slots_ptr, dpb_ref_pictures.len())
-            };
+            let ref_slice =
+                unsafe { std::slice::from_raw_parts(ref_slots_ptr, dpb_ref_pictures.len()) };
             all_slots.extend_from_slice(ref_slice);
         }
         let all_slots_ptr = if all_slots.is_empty() {
@@ -258,7 +257,11 @@ impl Vp9Decoder {
         } else {
             Box::leak(all_slots.into_boxed_slice()).as_ptr()
         };
-        let all_slots_count = if all_slots_ptr.is_null() { 0 } else { has_setup_slot as u32 + dpb_ref_pictures.len() as u32 };
+        let all_slots_count = if all_slots_ptr.is_null() {
+            0
+        } else {
+            has_setup_slot as u32 + dpb_ref_pictures.len() as u32
+        };
 
         unsafe {
             // Begin command buffer
@@ -353,15 +356,17 @@ impl Vp9Decoder {
             // Per Vulkan spec, reference images must be in VIDEO_DECODE_DPB_KHR layout.
             // This matches NVIDIA VkVideoDecoder.cpp:1044-1056 which adds barriers for reference
             // images when their layout is not VIDEO_DECODE_DPB_KHR.
-            let mut image_barriers: Vec<vk::ImageMemoryBarrier2> = Vec::with_capacity(
-                1 + dpb_ref_images.len(),
-            );
+            let mut image_barriers: Vec<vk::ImageMemoryBarrier2> =
+                Vec::with_capacity(1 + dpb_ref_images.len());
             image_barriers.push(image_barrier);
 
-            for (&ref_image, &ref_layout) in dpb_ref_images.iter().zip(dpb_ref_slot_layouts.iter()) {
+            for (&ref_image, &ref_layout) in dpb_ref_images.iter().zip(dpb_ref_slot_layouts.iter())
+            {
                 // Only add barrier if reference image is valid and not already in correct layout.
                 // This matches C++ reference which checks currentImageLayout before adding barriers.
-                if ref_image == vk::Image::null() || ref_layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                if ref_image == vk::Image::null()
+                    || ref_layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+                {
                     continue;
                 }
 
@@ -415,19 +420,19 @@ impl Vp9Decoder {
                 _marker: Default::default(),
             };
 
-              let decode_info = vk::VideoDecodeInfoKHR {
-                  s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                  p_next: vp9_decode_info as *const _ as *const _,
-                  flags: vk::VideoDecodeFlagsKHR::empty(),
-                  src_buffer: bitstream_buffer,
-                  src_buffer_offset: bitstream_offset,
-                  src_buffer_range: bitstream_range,
-                  dst_picture_resource: dst_picture_resource,
-                  p_setup_reference_slot: setup_slot_ptr,
-                  reference_slot_count: dpb_ref_pictures.len() as u32,
-                  p_reference_slots: ref_slots_ptr,
-                  _marker: Default::default(),
-              };
+            let decode_info = vk::VideoDecodeInfoKHR {
+                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+                p_next: vp9_decode_info as *const _ as *const _,
+                flags: vk::VideoDecodeFlagsKHR::empty(),
+                src_buffer: bitstream_buffer,
+                src_buffer_offset: bitstream_offset,
+                src_buffer_range: bitstream_range,
+                dst_picture_resource: dst_picture_resource,
+                p_setup_reference_slot: setup_slot_ptr,
+                reference_slot_count: dpb_ref_pictures.len() as u32,
+                p_reference_slots: ref_slots_ptr,
+                _marker: Default::default(),
+            };
 
             self.cmd_decode_video(cmd_buffer, &decode_info);
 
@@ -439,9 +444,7 @@ impl Vp9Decoder {
             // End command buffer
             self.device
                 .end_command_buffer(cmd_buffer)
-                .map_err(|e| {
-                    VideoError::CommandBufferRecording(format!("End failed: {:?}", e))
-                })?;
+                .map_err(|e| VideoError::CommandBufferRecording(format!("End failed: {:?}", e)))?;
         }
 
         self.frame_count += 1;
@@ -456,11 +459,10 @@ impl Vp9Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -479,16 +481,17 @@ impl Vp9Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoBeginCodingInfoKHR<'_>);
+                type FnType = unsafe extern "system" fn(
+                    vk::CommandBuffer,
+                    *const vk::VideoBeginCodingInfoKHR<'_>,
+                );
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, info);
             }
@@ -496,17 +499,12 @@ impl Vp9Decoder {
     }
 
     // Helper: dispatch cmdDecodeVideoKHR
-    fn cmd_decode_video(
-        &self,
-        cmd_buffer: vk::CommandBuffer,
-        info: &vk::VideoDecodeInfoKHR<'_>,
-    ) {
+    fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -527,11 +525,10 @@ impl Vp9Decoder {
             _marker: Default::default(),
         };
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdControlVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -555,11 +552,10 @@ impl Vp9Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -634,7 +630,9 @@ impl VideoDecodeVP9PictureInfoKHR {
         tiles_offset: u32,
     ) -> Self {
         Self {
-            s_type: vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_PICTURE_INFO_KHR),
+            s_type: vk::StructureType::from_raw(
+                vp9_vk_constants::VIDEO_DECODE_VP9_PICTURE_INFO_KHR,
+            ),
             p_next: std::ptr::null(),
             p_std_picture_info,
             reference_name_slot_indices,
@@ -792,10 +790,10 @@ pub struct StdVideoVP9SegmentationFlags {
 #[derive(Debug, Clone, Copy)]
 pub struct StdVideoVP9Segmentation {
     pub flags: StdVideoVP9SegmentationFlags,
-    pub segmentation_tree_probs: [u8; 7],  // STD_VIDEO_VP9_MAX_SEGMENTATION_TREE_PROBS
-    pub segmentation_pred_prob: [u8; 3],   // STD_VIDEO_VP9_MAX_SEGMENTATION_PRED_PROB
-    pub feature_enabled: [u8; 8],          // STD_VIDEO_VP9_MAX_SEGMENTS
-    pub feature_data: [[i16; 4]; 8],       // [STD_VIDEO_VP9_MAX_SEGMENTS][STD_VIDEO_VP9_SEG_LVL_MAX]
+    pub segmentation_tree_probs: [u8; 7], // STD_VIDEO_VP9_MAX_SEGMENTATION_TREE_PROBS
+    pub segmentation_pred_prob: [u8; 3],  // STD_VIDEO_VP9_MAX_SEGMENTATION_PRED_PROB
+    pub feature_enabled: [u8; 8],         // STD_VIDEO_VP9_MAX_SEGMENTS
+    pub feature_data: [[i16; 4]; 8],      // [STD_VIDEO_VP9_MAX_SEGMENTS][STD_VIDEO_VP9_SEG_LVL_MAX]
 }
 
 impl Default for StdVideoVP9Segmentation {
@@ -1023,9 +1021,7 @@ pub fn convert_vp9_picture_info(
         segmentation_tree_probs: segmentation.segmentation_tree_probs,
         segmentation_pred_prob: segmentation.segmentation_pred_prob,
         feature_enabled: segmentation.feature_enabled,
-        feature_data: segmentation
-            .feature_data
-            .map(|row| row.map(|v| v as i16)),
+        feature_data: segmentation.feature_data.map(|row| row.map(|v| v as i16)),
     };
 
     Vp9PictureInfoContainer {
@@ -1046,16 +1042,21 @@ pub fn convert_vp9_picture_info(
             refresh_frame_flags: info.refresh_frame_flags,
             ref_frame_sign_bias_mask: info.ref_frame_sign_bias_mask,
             interpolation_filter: match info.interpolation_filter {
-                vk_video_core::picture::Vp9InterpolationFilter::EightTapSmooth =>
-                    StdVideoVP9InterpolationFilter::EightTapSmooth,
-                vk_video_core::picture::Vp9InterpolationFilter::EightTap =>
-                    StdVideoVP9InterpolationFilter::EightTap,
-                vk_video_core::picture::Vp9InterpolationFilter::EightTapSharp =>
-                    StdVideoVP9InterpolationFilter::EightTapSharp,
-                vk_video_core::picture::Vp9InterpolationFilter::Bilinear =>
-                    StdVideoVP9InterpolationFilter::Bilinear,
-                vk_video_core::picture::Vp9InterpolationFilter::Switchable =>
-                    StdVideoVP9InterpolationFilter::Switchable,
+                vk_video_core::picture::Vp9InterpolationFilter::EightTapSmooth => {
+                    StdVideoVP9InterpolationFilter::EightTapSmooth
+                }
+                vk_video_core::picture::Vp9InterpolationFilter::EightTap => {
+                    StdVideoVP9InterpolationFilter::EightTap
+                }
+                vk_video_core::picture::Vp9InterpolationFilter::EightTapSharp => {
+                    StdVideoVP9InterpolationFilter::EightTapSharp
+                }
+                vk_video_core::picture::Vp9InterpolationFilter::Bilinear => {
+                    StdVideoVP9InterpolationFilter::Bilinear
+                }
+                vk_video_core::picture::Vp9InterpolationFilter::Switchable => {
+                    StdVideoVP9InterpolationFilter::Switchable
+                }
             },
             base_q_idx: info.base_q_idx as u8,
             delta_q_y_dc: info.delta_q_y_dc,

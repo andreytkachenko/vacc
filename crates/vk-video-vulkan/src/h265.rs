@@ -4,10 +4,10 @@ use ash::vk;
 use ash::vk::native::*;
 
 use super::codec_types::*;
-use super::{VideoError, VideoResult};
 use super::dpb::LastAccessType;
+use super::{VideoError, VideoResult};
 
-use vk_video_core::picture::{H265Vps, H265Sps, H265Pps, H265ShortTermRefPicSet, H265SpsVui};
+use vk_video_core::picture::{H265Pps, H265ShortTermRefPicSet, H265Sps, H265SpsVui, H265Vps};
 
 /// Reference picture info for H.265 DPB slot setup.
 pub struct H265RefPictureInfo<'a> {
@@ -197,7 +197,8 @@ impl H265Decoder {
 
             // First: create StdVideoDecodeH265ReferenceInfo for setup slot
             let setup_ref_std_info = dpb_setup_picture.as_ref().map(|info| {
-                let mut ref_std_info = unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
+                let mut ref_std_info =
+                    unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
                 ref_std_info.PicOrderCntVal = info.pic_order_cnt;
                 ref_std_info.flags.set_used_for_long_term_reference(0);
                 ref_std_info.flags.set_unused_for_reference(0);
@@ -205,19 +206,22 @@ impl H265Decoder {
             });
 
             // Second: create VkVideoDecodeH265DpbSlotInfoKHR for setup slot
-            let setup_dpb_slot_info = setup_ref_std_info.as_ref().map(|ref_std_info| {
-                vk::VideoDecodeH265DpbSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    p_std_reference_info: ref_std_info as *const _,
-                    _marker: Default::default(),
-                }
-            });
+            let setup_dpb_slot_info =
+                setup_ref_std_info
+                    .as_ref()
+                    .map(|ref_std_info| vk::VideoDecodeH265DpbSlotInfoKHR {
+                        s_type: vk::StructureType::VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
+                        p_next: std::ptr::null(),
+                        p_std_reference_info: ref_std_info as *const _,
+                        _marker: Default::default(),
+                    });
 
             // Third: create VkVideoReferenceSlotInfoKHR for setup slot
             // Use actual slot index (matches C++ reference implementation)
             let setup_slot = dpb_setup_picture.as_ref().map(|info| {
-                let pnext = setup_dpb_slot_info.as_ref().map_or(std::ptr::null(), |s| s as *const _ as *const _);
+                let pnext = setup_dpb_slot_info
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _ as *const _);
                 vk::VideoReferenceSlotInfoKHR {
                     s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                     p_next: pnext,
@@ -231,7 +235,8 @@ impl H265Decoder {
             let ref_std_infos: Vec<StdVideoDecodeH265ReferenceInfo> = dpb_ref_pictures
                 .iter()
                 .map(|info| {
-                    let mut ref_std_info = unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
+                    let mut ref_std_info =
+                        unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
                     ref_std_info.PicOrderCntVal = info.pic_order_cnt;
                     ref_std_info.flags.set_used_for_long_term_reference(0);
                     ref_std_info.flags.set_unused_for_reference(0);
@@ -242,13 +247,11 @@ impl H265Decoder {
             // Fifth: create VkVideoDecodeH265DpbSlotInfoKHR for each ref picture
             let ref_dpb_slot_infos: Vec<vk::VideoDecodeH265DpbSlotInfoKHR> = ref_std_infos
                 .iter()
-                .map(|ref_std_info| {
-                    vk::VideoDecodeH265DpbSlotInfoKHR {
-                        s_type: vk::StructureType::VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
-                        p_next: std::ptr::null(),
-                        p_std_reference_info: ref_std_info as *const _,
-                        _marker: Default::default(),
-                    }
+                .map(|ref_std_info| vk::VideoDecodeH265DpbSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    p_std_reference_info: ref_std_info as *const _,
+                    _marker: Default::default(),
                 })
                 .collect();
 
@@ -256,14 +259,12 @@ impl H265Decoder {
             let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
                 .iter()
                 .zip(ref_dpb_slot_infos.iter())
-                .map(|(info, dpb_slot_info)| {
-                    vk::VideoReferenceSlotInfoKHR {
-                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                        p_next: dpb_slot_info as *const _ as *const _,
-                        slot_index: info.slot_index as i32,
-                        p_picture_resource: &info.picture_resource as *const _,
-                        _marker: Default::default(),
-                    }
+                .map(|(info, dpb_slot_info)| vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: dpb_slot_info as *const _ as *const _,
+                    slot_index: info.slot_index as i32,
+                    p_picture_resource: &info.picture_resource as *const _,
+                    _marker: Default::default(),
                 })
                 .collect();
 
@@ -286,15 +287,16 @@ impl H265Decoder {
 
             // Build combined slots array for BeginVideoCoding.
             // MUST keep this alive until after cmd_begin_video_coding is called!
-            let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> = if !ref_slots.is_empty() {
-                let mut combined = ref_slots.clone();
-                if let Some(ref setup) = setup_slot {
-                    combined.push(setup.clone());
-                }
-                combined
-            } else {
-                setup_slot.clone().into_iter().collect()
-            };
+            let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
+                if !ref_slots.is_empty() {
+                    let mut combined = ref_slots.clone();
+                    if let Some(ref setup) = setup_slot {
+                        combined.push(setup.clone());
+                    }
+                    combined
+                } else {
+                    setup_slot.clone().into_iter().collect()
+                };
 
             let begin_slot_count = begin_video_coding_slots.len() as u32;
             let begin_slot_ptr = if begin_video_coding_slots.is_empty() {
@@ -374,7 +376,9 @@ impl H265Decoder {
             let mut all_image_barriers: Vec<vk::ImageMemoryBarrier2> = vec![image_barrier];
             for ref_pic in dpb_ref_pictures.iter() {
                 // Only add barrier if image is valid and not already in DPB layout
-                if ref_pic.image != vk::Image::null() && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+                if ref_pic.image != vk::Image::null()
+                    && ref_pic.current_layout != vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+                {
                     all_image_barriers.push(vk::ImageMemoryBarrier2 {
                         s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
                         p_next: std::ptr::null(),
@@ -434,31 +438,31 @@ impl H265Decoder {
                 _marker: Default::default(),
             };
 
-             let decode_info = vk::VideoDecodeInfoKHR {
-                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                 p_next: &h265_decode_info as *const _ as *const _,
-                 flags: vk::VideoDecodeFlagsKHR::empty(),
-                 src_buffer: bitstream_buffer,
-                 src_buffer_offset: bitstream_offset,
-                 src_buffer_range: bitstream_range,
-                 dst_picture_resource: dst_picture_resource,
-                 // Always include setup slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-08376
-                 // requires pSetupReferenceSlot must not be NULL).
-                 p_setup_reference_slot: setup_slot_for_decode
-                     .as_ref()
-                     .map_or(std::ptr::null(), |s| s as *const _),
-                 reference_slot_count: ref_slots.len() as u32,
-                 p_reference_slots: if ref_slots.is_empty() {
-                     std::ptr::null()
-                 } else {
-                     ref_slots.as_ptr()
-                 },
-                  _marker: Default::default(),
-              };
+            let decode_info = vk::VideoDecodeInfoKHR {
+                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+                p_next: &h265_decode_info as *const _ as *const _,
+                flags: vk::VideoDecodeFlagsKHR::empty(),
+                src_buffer: bitstream_buffer,
+                src_buffer_offset: bitstream_offset,
+                src_buffer_range: bitstream_range,
+                dst_picture_resource: dst_picture_resource,
+                // Always include setup slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-08376
+                // requires pSetupReferenceSlot must not be NULL).
+                p_setup_reference_slot: setup_slot_for_decode
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _),
+                reference_slot_count: ref_slots.len() as u32,
+                p_reference_slots: if ref_slots.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ref_slots.as_ptr()
+                },
+                _marker: Default::default(),
+            };
 
-              self.cmd_decode_video(cmd_buffer, &decode_info);
+            self.cmd_decode_video(cmd_buffer, &decode_info);
 
-             // End video coding
+            // End video coding
             self.cmd_end_video_coding(cmd_buffer);
         }
 
@@ -525,7 +529,10 @@ impl H265Decoder {
 
         for &ref_poc in ref_pocs {
             // Find the DPB entry with this POC
-            if let Some(entry) = dpb_entries.iter().find(|e| (*e).pic_order_cnt[0] == ref_poc) {
+            if let Some(entry) = dpb_entries
+                .iter()
+                .find(|e| (*e).pic_order_cnt[0] == ref_poc)
+            {
                 let slot_idx = ((*entry).slot_index & 0xf) as u8;
 
                 if ref_poc < pic_order_cnt_val {
@@ -683,7 +690,10 @@ fn h265_level_idc_to_vulkan(raw_level_idc: u8) -> StdVideoH265LevelIdc {
         183 => StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_1,
         186 => StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_2,
         _ => {
-            eprintln!("[H265] WARNING: Unknown level_idc={}, defaulting to 5.1", raw_level_idc);
+            eprintln!(
+                "[H265] WARNING: Unknown level_idc={}, defaulting to 5.1",
+                raw_level_idc
+            );
             StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_5_1
         }
     }
@@ -694,24 +704,74 @@ fn h265_level_idc_to_vulkan(raw_level_idc: u8) -> StdVideoH265LevelIdc {
 /// tells the decoder whether to use full range (0-255) or limited range (16-235).
 pub fn convert_h265_vui(vui: &H265SpsVui) -> StdVideoH265SequenceParameterSetVui {
     let mut vui_flags = unsafe { std::mem::zeroed::<StdVideoH265SpsVuiFlags>() };
-    vui_flags.set_aspect_ratio_info_present_flag(if vui.aspect_ratio_info_present_flag { 1 } else { 0 });
+    vui_flags.set_aspect_ratio_info_present_flag(if vui.aspect_ratio_info_present_flag {
+        1
+    } else {
+        0
+    });
     vui_flags.set_overscan_info_present_flag(if vui.overscan_info_present_flag { 1 } else { 0 });
     vui_flags.set_overscan_appropriate_flag(if vui.overscan_appropriate_flag { 1 } else { 0 });
-    vui_flags.set_video_signal_type_present_flag(if vui.video_signal_type_present_flag { 1 } else { 0 });
+    vui_flags.set_video_signal_type_present_flag(if vui.video_signal_type_present_flag {
+        1
+    } else {
+        0
+    });
     vui_flags.set_video_full_range_flag(if vui.video_full_range_flag { 1 } else { 0 });
-    vui_flags.set_colour_description_present_flag(if vui.colour_description_present_flag { 1 } else { 0 });
-    vui_flags.set_chroma_loc_info_present_flag(if vui.chroma_loc_info_present_flag { 1 } else { 0 });
-    vui_flags.set_neutral_chroma_indication_flag(if vui.neutral_chroma_indication_flag { 1 } else { 0 });
+    vui_flags.set_colour_description_present_flag(if vui.colour_description_present_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_chroma_loc_info_present_flag(if vui.chroma_loc_info_present_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_neutral_chroma_indication_flag(if vui.neutral_chroma_indication_flag {
+        1
+    } else {
+        0
+    });
     vui_flags.set_field_seq_flag(if vui.field_seq_flag { 1 } else { 0 });
-    vui_flags.set_frame_field_info_present_flag(if vui.frame_field_info_present_flag { 1 } else { 0 });
-    vui_flags.set_default_display_window_flag(if vui.default_display_window_flag { 1 } else { 0 });
-    vui_flags.set_vui_timing_info_present_flag(if vui.vui_timing_info_present_flag { 1 } else { 0 });
-    vui_flags.set_vui_poc_proportional_to_timing_flag(if vui.vui_poc_proportional_to_timing_flag { 1 } else { 0 });
-    vui_flags.set_vui_hrd_parameters_present_flag(if vui.vui_hrd_parameters_present_flag { 1 } else { 0 });
+    vui_flags.set_frame_field_info_present_flag(if vui.frame_field_info_present_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_default_display_window_flag(if vui.default_display_window_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_vui_timing_info_present_flag(if vui.vui_timing_info_present_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_vui_poc_proportional_to_timing_flag(if vui.vui_poc_proportional_to_timing_flag {
+        1
+    } else {
+        0
+    });
+    vui_flags.set_vui_hrd_parameters_present_flag(if vui.vui_hrd_parameters_present_flag {
+        1
+    } else {
+        0
+    });
     vui_flags.set_bitstream_restriction_flag(if vui.bitstream_restriction_flag { 1 } else { 0 });
     vui_flags.set_tiles_fixed_structure_flag(if vui.tiles_fixed_structure_flag { 1 } else { 0 });
-    vui_flags.set_motion_vectors_over_pic_boundaries_flag(if vui.motion_vectors_over_pic_boundaries_flag { 1 } else { 0 });
-    vui_flags.set_restricted_ref_pic_lists_flag(if vui.restricted_ref_pic_lists_flag { 1 } else { 0 });
+    vui_flags.set_motion_vectors_over_pic_boundaries_flag(
+        if vui.motion_vectors_over_pic_boundaries_flag {
+            1
+        } else {
+            0
+        },
+    );
+    vui_flags.set_restricted_ref_pic_lists_flag(if vui.restricted_ref_pic_lists_flag {
+        1
+    } else {
+        0
+    });
 
     StdVideoH265SequenceParameterSetVui {
         flags: vui_flags,
@@ -745,53 +805,69 @@ pub fn convert_h265_vui(vui: &H265SpsVui) -> StdVideoH265SequenceParameterSetVui
 
 pub fn convert_h265_sps(sps: &H265Sps) -> StdVideoH265SequenceParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265SpsFlags>() };
-    flags.set_sps_temporal_id_nesting_flag(if sps.sps_temporal_id_nesting_flag { 1 } else { 0 });
+    flags.set_sps_temporal_id_nesting_flag(if sps.sps_temporal_id_nesting_flag {
+        1
+    } else {
+        0
+    });
     flags.set_separate_colour_plane_flag(if sps.separate_colour_plane_flag { 1 } else { 0 });
     flags.set_conformance_window_flag(if sps.conformance_window_flag { 1 } else { 0 });
     flags.set_sps_sub_layer_ordering_info_present_flag(
-        if sps.sps_sub_layer_ordering_info_present_flag { 1 } else { 0 },
+        if sps.sps_sub_layer_ordering_info_present_flag {
+            1
+        } else {
+            0
+        },
     );
     flags.set_scaling_list_enabled_flag(if sps.scaling_list_enabled_flag { 1 } else { 0 });
-    flags.set_sps_scaling_list_data_present_flag(
-        if sps.sps_scaling_list_data_present_flag { 1 } else { 0 },
-    );
+    flags.set_sps_scaling_list_data_present_flag(if sps.sps_scaling_list_data_present_flag {
+        1
+    } else {
+        0
+    });
     flags.set_amp_enabled_flag(if sps.amp_enabled_flag { 1 } else { 0 });
-    flags.set_sample_adaptive_offset_enabled_flag(
-        if sps.sample_adaptive_offset_enabled_flag { 1 } else { 0 },
-    );
-    flags.set_sps_temporal_mvp_enabled_flag(
-        if sps.sps_temporal_mvp_enabled_flag { 1 } else { 0 },
-    );
-    flags.set_strong_intra_smoothing_enabled_flag(
-        if sps.strong_intra_smoothing_enabled_flag { 1 } else { 0 },
-    );
-    flags.set_long_term_ref_pics_present_flag(
-        if sps.long_term_ref_pics_present_flag { 1 } else { 0 },
-    );
+    flags.set_sample_adaptive_offset_enabled_flag(if sps.sample_adaptive_offset_enabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_sps_temporal_mvp_enabled_flag(if sps.sps_temporal_mvp_enabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_strong_intra_smoothing_enabled_flag(if sps.strong_intra_smoothing_enabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_long_term_ref_pics_present_flag(if sps.long_term_ref_pics_present_flag {
+        1
+    } else {
+        0
+    });
     flags.set_pcm_enabled_flag(if sps.pcm_enabled_flag { 1 } else { 0 });
-    flags.set_pcm_loop_filter_disabled_flag(
-        if sps.pcm_loop_filter_disabled_flag { 1 } else { 0 },
-    );
-    flags.set_vui_parameters_present_flag(
-        if sps.vui_parameters_present_flag { 1 } else { 0 },
-    );
-    flags.set_sps_extension_present_flag(
-        if sps.sps_extension_present_flag { 1 } else { 0 },
-    );
-    flags.set_sps_range_extension_flag(
-        if sps.sps_range_extension_flag { 1 } else { 0 },
-    );
-    flags.set_intra_smoothing_disabled_flag(
-        if sps.intra_smoothing_disabled_flag { 1 } else { 0 },
-    );
-    flags.set_palette_mode_enabled_flag(
-        if sps.palette_mode_enabled_flag { 1 } else { 0 },
-    );
+    flags.set_pcm_loop_filter_disabled_flag(if sps.pcm_loop_filter_disabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_vui_parameters_present_flag(if sps.vui_parameters_present_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_sps_extension_present_flag(if sps.sps_extension_present_flag { 1 } else { 0 });
+    flags.set_sps_range_extension_flag(if sps.sps_range_extension_flag { 1 } else { 0 });
+    flags.set_intra_smoothing_disabled_flag(if sps.intra_smoothing_disabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_palette_mode_enabled_flag(if sps.palette_mode_enabled_flag { 1 } else { 0 });
 
-     // DecPicBufMgr - always set per C++ reference (VulkanH265Parser.cpp:499)
-    let max_latency_increase_plus1: [u32; 7] = sps
-        .max_latency_increase_plus1
-        .map(|v| v as u32);
+    // DecPicBufMgr - always set per C++ reference (VulkanH265Parser.cpp:499)
+    let max_latency_increase_plus1: [u32; 7] = sps.max_latency_increase_plus1.map(|v| v as u32);
     let dec_pic_buf_mgr_data = StdVideoH265DecPicBufMgr {
         max_latency_increase_plus1,
         max_dec_pic_buffering_minus1: sps.max_dec_pic_buffering_minus1,
@@ -813,22 +889,22 @@ pub fn convert_h265_sps(sps: &H265Sps) -> StdVideoH265SequenceParameterSet {
         };
 
     // LongTermRefPicsSps - per C++ reference (VulkanH265Parser.cpp:600+)
-    let long_term_ref_pics_sps = if sps.long_term_ref_pics_present_flag
-        && sps.num_long_term_ref_pics_sps > 0
-    {
-        let ltrp = Box::leak(Box::new(StdVideoH265LongTermRefPicsSps {
-            used_by_curr_pic_lt_sps_flag: sps.used_by_curr_pic_lt_sps_flag,
-            lt_ref_pic_poc_lsb_sps: sps.lt_ref_pic_poc_lsb_sps,
-        }));
-        ltrp
-    } else {
-        std::ptr::null()
-    };
+    let long_term_ref_pics_sps =
+        if sps.long_term_ref_pics_present_flag && sps.num_long_term_ref_pics_sps > 0 {
+            let ltrp = Box::leak(Box::new(StdVideoH265LongTermRefPicsSps {
+                used_by_curr_pic_lt_sps_flag: sps.used_by_curr_pic_lt_sps_flag,
+                lt_ref_pic_poc_lsb_sps: sps.lt_ref_pic_poc_lsb_sps,
+            }));
+            ltrp
+        } else {
+            std::ptr::null()
+        };
 
     // ProfileTierLevel - REQUIRED by Vulkan spec
     // Use actual profile/level from parsed SPS, matching C++ reference
     let mut ptl = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevel>() };
-    ptl.flags.set_general_tier_flag(if sps.tier_flag { 1 } else { 0 });
+    ptl.flags
+        .set_general_tier_flag(if sps.tier_flag { 1 } else { 0 });
     ptl.general_profile_idc = sps.profile_idc as StdVideoH265ProfileIdc;
     ptl.general_level_idc = h265_level_idc_to_vulkan(sps.level_idc);
     let profile_tier_level = Box::leak(Box::new(ptl));
@@ -854,7 +930,8 @@ pub fn convert_h265_sps(sps: &H265Sps) -> StdVideoH265SequenceParameterSet {
         log2_min_luma_coding_block_size_minus3: sps.log2_min_luma_coding_block_size_minus3,
         log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_luma_coding_block_size,
         log2_min_luma_transform_block_size_minus2: sps.log2_min_luma_transform_block_size_minus2,
-        log2_diff_max_min_luma_transform_block_size: sps.log2_diff_max_min_luma_transform_block_size,
+        log2_diff_max_min_luma_transform_block_size: sps
+            .log2_diff_max_min_luma_transform_block_size,
         max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
         max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
         num_short_term_ref_pic_sets: sps.num_short_term_ref_pic_sets,
@@ -862,13 +939,15 @@ pub fn convert_h265_sps(sps: &H265Sps) -> StdVideoH265SequenceParameterSet {
         pcm_sample_bit_depth_luma_minus1: sps.pcm_sample_bit_depth_luma_minus1,
         pcm_sample_bit_depth_chroma_minus1: sps.pcm_sample_bit_depth_chroma_minus1,
         log2_min_pcm_luma_coding_block_size_minus3: sps.log2_min_pcm_luma_coding_block_size_minus3,
-        log2_diff_max_min_pcm_luma_coding_block_size: sps.log2_diff_max_min_pcm_luma_coding_block_size,
+        log2_diff_max_min_pcm_luma_coding_block_size: sps
+            .log2_diff_max_min_pcm_luma_coding_block_size,
         reserved1: 0,
         reserved2: 0,
         palette_max_size: sps.palette_max_size,
         delta_palette_max_predictor_size: sps.delta_palette_max_predictor_size,
         motion_vector_resolution_control_idc: sps.motion_vector_resolution_control_idc,
-        sps_num_palette_predictor_initializers_minus1: sps.sps_num_palette_predictor_initializers_minus1,
+        sps_num_palette_predictor_initializers_minus1: sps
+            .sps_num_palette_predictor_initializers_minus1,
         conf_win_left_offset: sps.conf_win_left_offset,
         conf_win_right_offset: sps.conf_win_right_offset,
         conf_win_top_offset: sps.conf_win_top_offset,
@@ -887,9 +966,11 @@ pub fn convert_h265_short_term_ref_pic_set(
     strps: &H265ShortTermRefPicSet,
 ) -> StdVideoH265ShortTermRefPicSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265ShortTermRefPicSetFlags>() };
-    flags.set_inter_ref_pic_set_prediction_flag(
-        if strps.inter_ref_pic_set_prediction_flag { 1 } else { 0 },
-    );
+    flags.set_inter_ref_pic_set_prediction_flag(if strps.inter_ref_pic_set_prediction_flag {
+        1
+    } else {
+        0
+    });
 
     StdVideoH265ShortTermRefPicSet {
         flags,
@@ -911,51 +992,93 @@ pub fn convert_h265_short_term_ref_pic_set(
 
 pub fn convert_h265_pps(pps: &H265Pps) -> StdVideoH265PictureParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265PpsFlags>() };
-    flags.set_dependent_slice_segments_enabled_flag(
-        if pps.dependent_slice_segments_enabled_flag { 1 } else { 0 },
-    );
+    flags.set_dependent_slice_segments_enabled_flag(if pps.dependent_slice_segments_enabled_flag {
+        1
+    } else {
+        0
+    });
     flags.set_output_flag_present_flag(if pps.output_flag_present_flag { 1 } else { 0 });
-    flags.set_sign_data_hiding_enabled_flag(if pps.sign_data_hiding_enabled_flag { 1 } else { 0 });
+    flags.set_sign_data_hiding_enabled_flag(if pps.sign_data_hiding_enabled_flag {
+        1
+    } else {
+        0
+    });
     flags.set_cabac_init_present_flag(if pps.cabac_init_present_flag { 1 } else { 0 });
-    flags.set_constrained_intra_pred_flag(if pps.constrained_intra_pred_flag { 1 } else { 0 });
-    flags.set_transform_skip_enabled_flag(if pps.transform_skip_enabled_flag { 1 } else { 0 });
+    flags.set_constrained_intra_pred_flag(if pps.constrained_intra_pred_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_transform_skip_enabled_flag(if pps.transform_skip_enabled_flag {
+        1
+    } else {
+        0
+    });
     flags.set_cu_qp_delta_enabled_flag(if pps.cu_qp_delta_enabled_flag { 1 } else { 0 });
     flags.set_pps_slice_chroma_qp_offsets_present_flag(
-        if pps.pps_slice_chroma_qp_offsets_present_flag { 1 } else { 0 },
+        if pps.pps_slice_chroma_qp_offsets_present_flag {
+            1
+        } else {
+            0
+        },
     );
     flags.set_weighted_pred_flag(if pps.weighted_pred_flag { 1 } else { 0 });
     flags.set_weighted_bipred_flag(if pps.weighted_bipred_flag { 1 } else { 0 });
-    flags.set_transquant_bypass_enabled_flag(
-        if pps.transquant_bypass_enabled_flag { 1 } else { 0 },
-    );
+    flags.set_transquant_bypass_enabled_flag(if pps.transquant_bypass_enabled_flag {
+        1
+    } else {
+        0
+    });
     flags.set_tiles_enabled_flag(if pps.tiles_enabled_flag { 1 } else { 0 });
-     flags.set_entropy_coding_sync_enabled_flag(
-         if pps.entropy_coding_sync_enabled_flag { 1 } else { 0 },
-     );
-     flags.set_uniform_spacing_flag(if pps.uniform_spacing_flag { 1 } else { 0 });
-     flags.set_loop_filter_across_tiles_enabled_flag(
-         if pps.loop_filter_across_tiles_enabled_flag { 1 } else { 0 },
-     );
-     flags.set_pps_loop_filter_across_slices_enabled_flag(
-         if pps.pps_loop_filter_across_slices_enabled_flag { 1 } else { 0 },
-     );
-     flags.set_deblocking_filter_control_present_flag(
-         if pps.deblocking_filter_control_present_flag { 1 } else { 0 },
-     );
-     flags.set_deblocking_filter_override_enabled_flag(
-         if pps.deblocking_filter_override_enabled_flag { 1 } else { 0 },
-     );
-     flags.set_pps_deblocking_filter_disabled_flag(
-         if pps.pps_deblocking_filter_disabled_flag { 1 } else { 0 },
-     );
-     flags.set_pps_scaling_list_data_present_flag(
-         if pps.pps_scaling_list_data_present_flag { 1 } else { 0 },
-     );
-     flags.set_lists_modification_present_flag(
-         if pps.lists_modification_present_flag { 1 } else { 0 },
-     );
+    flags.set_entropy_coding_sync_enabled_flag(if pps.entropy_coding_sync_enabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_uniform_spacing_flag(if pps.uniform_spacing_flag { 1 } else { 0 });
+    flags.set_loop_filter_across_tiles_enabled_flag(if pps.loop_filter_across_tiles_enabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_pps_loop_filter_across_slices_enabled_flag(
+        if pps.pps_loop_filter_across_slices_enabled_flag {
+            1
+        } else {
+            0
+        },
+    );
+    flags.set_deblocking_filter_control_present_flag(
+        if pps.deblocking_filter_control_present_flag {
+            1
+        } else {
+            0
+        },
+    );
+    flags.set_deblocking_filter_override_enabled_flag(
+        if pps.deblocking_filter_override_enabled_flag {
+            1
+        } else {
+            0
+        },
+    );
+    flags.set_pps_deblocking_filter_disabled_flag(if pps.pps_deblocking_filter_disabled_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_pps_scaling_list_data_present_flag(if pps.pps_scaling_list_data_present_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_lists_modification_present_flag(if pps.lists_modification_present_flag {
+        1
+    } else {
+        0
+    });
 
-     StdVideoH265PictureParameterSet {
+    StdVideoH265PictureParameterSet {
         flags,
         pps_pic_parameter_set_id: pps.pps_pic_parameter_set_id as u8,
         pps_seq_parameter_set_id: pps.pps_seq_parameter_set_id as u8,
@@ -997,14 +1120,26 @@ pub fn convert_h265_pps(pps: &H265Pps) -> StdVideoH265PictureParameterSet {
 
 pub fn convert_h265_vps(vps: &H265Vps) -> StdVideoH265VideoParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265VpsFlags>() };
-    flags.set_vps_temporal_id_nesting_flag(if vps.vps_temporal_id_nesting_flag { 1 } else { 0 });
-    flags.set_vps_sub_layer_ordering_info_present_flag(if vps.vps_sub_layer_ordering_info_present_flag { 1 } else { 0 });
-    flags.set_vps_timing_info_present_flag(if vps.vps_timing_info_present_flag { 1 } else { 0 });
+    flags.set_vps_temporal_id_nesting_flag(if vps.vps_temporal_id_nesting_flag {
+        1
+    } else {
+        0
+    });
+    flags.set_vps_sub_layer_ordering_info_present_flag(
+        if vps.vps_sub_layer_ordering_info_present_flag {
+            1
+        } else {
+            0
+        },
+    );
+    flags.set_vps_timing_info_present_flag(if vps.vps_timing_info_present_flag {
+        1
+    } else {
+        0
+    });
 
     // DecPicBufMgr - always set per C++ reference
-    let max_latency_increase_plus1: [u32; 7] = vps
-        .max_latency_increase_plus1
-        .map(|v| v as u32);
+    let max_latency_increase_plus1: [u32; 7] = vps.max_latency_increase_plus1.map(|v| v as u32);
     let mgr = StdVideoH265DecPicBufMgr {
         max_latency_increase_plus1,
         max_dec_pic_buffering_minus1: vps.max_dec_pic_buffering_minus1,
@@ -1015,7 +1150,8 @@ pub fn convert_h265_vps(vps: &H265Vps) -> StdVideoH265VideoParameterSet {
     // ProfileTierLevel - REQUIRED by Vulkan spec
     // Use actual profile/level from parsed VPS, matching C++ reference
     let mut ptl = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevel>() };
-    ptl.flags.set_general_tier_flag(if vps.tier_flag { 1 } else { 0 });
+    ptl.flags
+        .set_general_tier_flag(if vps.tier_flag { 1 } else { 0 });
     ptl.general_profile_idc = vps.profile_idc as StdVideoH265ProfileIdc;
     ptl.general_level_idc = h265_level_idc_to_vulkan(vps.level_idc);
     let profile_tier_level = Box::leak(Box::new(ptl));

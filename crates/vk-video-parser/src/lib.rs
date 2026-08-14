@@ -13,13 +13,13 @@
 //! The parser is designed to feed decoded picture parameter sets
 //! to the Vulkan video decoder layer.
 
+pub mod av1;
+pub mod bitreader;
+pub mod bitstream;
 pub mod h264;
 pub mod h265;
-pub mod vp9;
-pub mod av1;
-pub mod bitstream;
 pub mod nal;
-pub mod bitreader;
+pub mod vp9;
 
 pub use bitreader::BitReader;
 

@@ -8,18 +8,14 @@
 //! begin with a 2-bit frame marker (0b10), followed by the uncompressed header.
 //! Superframes may contain a superframe index at the end of the data.
 
-use crate::{
-    DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser,
-};
 use crate::bitreader::BitReader;
+use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 use vk_video_core::picture::{
-    Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType,
-    Vp9InterpolationFilter, Vp9Profile,
-    VP9_FRAME_MARKER, VP9_FRAME_SYNC_CODE, VP9_LOOP_FILTER_ADJUSTMENTS,
-    VP9_MAX_PROBABILITY, VP9_MAX_REF_FRAMES, VP9_MAX_SEGMENTATION_PRED_PROB,
-    VP9_MAX_SEGMENTATION_TREE_PROBS, VP9_MAX_SEGMENTS, VP9_SEG_LVL_MAX,
-    VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES, VP9_REFS_PER_FRAME,
-    VP9_REFERENCE_NAME_LAST_FRAME, VP9_MAX_TILE_WIDTH_B64,
+    Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType, Vp9InterpolationFilter, Vp9Profile,
+    VP9_FRAME_MARKER, VP9_FRAME_SYNC_CODE, VP9_LOOP_FILTER_ADJUSTMENTS, VP9_MAX_PROBABILITY,
+    VP9_MAX_REF_FRAMES, VP9_MAX_SEGMENTATION_PRED_PROB, VP9_MAX_SEGMENTATION_TREE_PROBS,
+    VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES,
+    VP9_REFERENCE_NAME_LAST_FRAME, VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
 };
 
 /// VP9 parser state.
@@ -45,9 +41,7 @@ pub struct Vp9Parser {
 impl Vp9Parser {
     pub fn new() -> Self {
         Self {
-            detected_format: DetectedVideoFormat::new(
-                vk_video_core::codec::VideoCodec::DecodeVp9,
-            ),
+            detected_format: DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeVp9),
             frame_count: 0,
             last_frame_width: 0,
             last_frame_height: 0,
@@ -68,7 +62,11 @@ impl Vp9Parser {
     /// # Arguments
     /// * `data` - The frame data
     /// * `superframe_offset` - Offset of this frame within a superframe (0 if not from superframe)
-    pub fn parse_frame_with_offset(&mut self, data: &[u8], superframe_offset: u32) -> ParserResult<Vp9FrameData> {
+    pub fn parse_frame_with_offset(
+        &mut self,
+        data: &[u8],
+        superframe_offset: u32,
+    ) -> ParserResult<Vp9FrameData> {
         if data.is_empty() {
             return Err(ParserError::InvalidBitstream);
         }
@@ -128,12 +126,17 @@ impl Vp9Parser {
             // Key frame: read frame sync code (24 bits)
             let sync_code = r.read_bits(24)?;
             if sync_code != VP9_FRAME_SYNC_CODE {
-                eprintln!("[VP9] Invalid frame sync code: 0x{:06x} (expected 0x{:06x})",
-                    sync_code, VP9_FRAME_SYNC_CODE);
+                eprintln!(
+                    "[VP9] Invalid frame sync code: 0x{:06x} (expected 0x{:06x})",
+                    sync_code, VP9_FRAME_SYNC_CODE
+                );
             }
 
-            self.parse_color_config(&mut r, &mut frame_data.color_config,
-                frame_data.picture_info.profile)?;
+            self.parse_color_config(
+                &mut r,
+                &mut frame_data.color_config,
+                frame_data.picture_info.profile,
+            )?;
 
             self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
 
@@ -162,13 +165,18 @@ impl Vp9Parser {
                 // Intra-only non-key frame: read sync code
                 let sync_code = r.read_bits(24)?;
                 if sync_code != VP9_FRAME_SYNC_CODE {
-                    eprintln!("[VP9] Invalid intra frame sync code: 0x{:06x} (expected 0x{:06x})",
-                        sync_code, VP9_FRAME_SYNC_CODE);
+                    eprintln!(
+                        "[VP9] Invalid intra frame sync code: 0x{:06x} (expected 0x{:06x})",
+                        sync_code, VP9_FRAME_SYNC_CODE
+                    );
                 }
 
                 if (frame_data.picture_info.profile as u32) > (Vp9Profile::Profile0 as u32) {
-                    self.parse_color_config(&mut r, &mut frame_data.color_config,
-                        frame_data.picture_info.profile)?;
+                    self.parse_color_config(
+                        &mut r,
+                        &mut frame_data.color_config,
+                        frame_data.picture_info.profile,
+                    )?;
                 } else {
                     frame_data.color_config.color_space = Vp9ColorSpace::Bt601;
                     frame_data.color_config.subsampling_x = 1;
@@ -229,11 +237,13 @@ impl Vp9Parser {
         frame_data.picture_info.frame_context_idx = r.read_bits(2)? as u8;
 
         // Reset frame context for intra or error resilient mode
-        if frame_data.frame_is_intra
-            || frame_data.picture_info.flags.error_resilient_mode != 0
-        {
+        if frame_data.frame_is_intra || frame_data.picture_info.flags.error_resilient_mode != 0 {
             frame_data.segmentation.feature_enabled.fill(0);
-            frame_data.segmentation.feature_data.iter_mut().for_each(|f| f.fill(0));
+            frame_data
+                .segmentation
+                .feature_data
+                .iter_mut()
+                .for_each(|f| f.fill(0));
             frame_data.picture_info.frame_context_idx = 0;
         }
 
@@ -262,8 +272,7 @@ impl Vp9Parser {
         for i in 0..VP9_NUM_REF_FRAMES as usize {
             let flag = 1u8 << i;
             if frame_data.picture_info.refresh_frame_flags & flag != 0 {
-                self.reference_frame_sz[i] =
-                    (frame_data.frame_width, frame_data.frame_height);
+                self.reference_frame_sz[i] = (frame_data.frame_width, frame_data.frame_height);
             }
         }
 
@@ -409,15 +418,14 @@ impl Vp9Parser {
         } else {
             let intra_only = frame_data.picture_info.frame_type == Vp9FrameType::Key
                 || frame_data.picture_info.flags.intra_only != 0;
-            frame_data.picture_info.flags.use_prev_frame_mvs =
-                if self.last_show_frame
-                    && frame_data.picture_info.flags.error_resilient_mode == 0
-                    && !intra_only
-                {
-                    1
-                } else {
-                    0
-                };
+            frame_data.picture_info.flags.use_prev_frame_mvs = if self.last_show_frame
+                && frame_data.picture_info.flags.error_resilient_mode == 0
+                && !intra_only
+            {
+                1
+            } else {
+                0
+            };
         }
 
         self.last_frame_height = frame_data.frame_height;
@@ -433,9 +441,7 @@ impl Vp9Parser {
     ) -> ParserResult<()> {
         let loop_filter = &mut frame_data.loop_filter;
 
-        if frame_data.frame_is_intra
-            || frame_data.picture_info.flags.error_resilient_mode != 0
-        {
+        if frame_data.frame_is_intra || frame_data.picture_info.flags.error_resilient_mode != 0 {
             self.loop_filter_ref_deltas.fill(0);
             self.loop_filter_mode_deltas.fill(0);
             self.loop_filter_ref_deltas[0] = 1;
@@ -448,7 +454,7 @@ impl Vp9Parser {
         loop_filter.loop_filter_sharpness = r.read_bits(3)? as u8;
 
         loop_filter.flags.loop_filter_delta_enabled = r.read_bits(1)? as u8;
-        
+
         if loop_filter.flags.loop_filter_delta_enabled != 0 {
             loop_filter.flags.loop_filter_delta_update = r.read_bits(1)? as u8;
 
@@ -479,8 +485,12 @@ impl Vp9Parser {
             }
         }
 
-        loop_filter.loop_filter_ref_deltas.copy_from_slice(&self.loop_filter_ref_deltas);
-        loop_filter.loop_filter_mode_deltas.copy_from_slice(&self.loop_filter_mode_deltas);
+        loop_filter
+            .loop_filter_ref_deltas
+            .copy_from_slice(&self.loop_filter_ref_deltas);
+        loop_filter
+            .loop_filter_mode_deltas
+            .copy_from_slice(&self.loop_filter_mode_deltas);
 
         Ok(())
     }
@@ -529,16 +539,22 @@ impl Vp9Parser {
         if segmentation.flags.segmentation_update_map != 0 {
             for i in 0..VP9_MAX_SEGMENTATION_TREE_PROBS as usize {
                 let prob_coded = r.read_bits(1)?;
-                segmentation.segmentation_tree_probs[i] =
-                    if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
+                segmentation.segmentation_tree_probs[i] = if prob_coded != 0 {
+                    r.read_bits(8)? as u8
+                } else {
+                    VP9_MAX_PROBABILITY
+                };
             }
 
             segmentation.flags.segmentation_temporal_update = r.read_bits(1)? as u8;
             for i in 0..VP9_MAX_SEGMENTATION_PRED_PROB as usize {
                 if segmentation.flags.segmentation_temporal_update != 0 {
                     let prob_coded = r.read_bits(1)?;
-                    segmentation.segmentation_pred_prob[i] =
-                        if prob_coded != 0 { r.read_bits(8)? as u8 } else { VP9_MAX_PROBABILITY };
+                    segmentation.segmentation_pred_prob[i] = if prob_coded != 0 {
+                        r.read_bits(8)? as u8
+                    } else {
+                        VP9_MAX_PROBABILITY
+                    };
                 } else {
                     segmentation.segmentation_pred_prob[i] = VP9_MAX_PROBABILITY;
                 }
@@ -616,8 +632,7 @@ impl Vp9Parser {
             frame_data.picture_info.tile_rows_log2 += r.read_bits(1)? as u8;
         }
 
-        frame_data.num_tiles =
-            (1u32 << frame_data.picture_info.tile_rows_log2)
+        frame_data.num_tiles = (1u32 << frame_data.picture_info.tile_rows_log2)
             * (1u32 << frame_data.picture_info.tile_cols_log2);
 
         Ok(())
@@ -693,27 +708,24 @@ impl Vp9Parser {
         self.detected_format.coded_width = frame_data.frame_width;
         self.detected_format.coded_height = frame_data.frame_height;
 
-        self.detected_format.luma_bit_depth =
-            match frame_data.color_config.bit_depth {
-                8 => vk_video_core::format::ComponentBitDepth::Bit8,
-                10 => vk_video_core::format::ComponentBitDepth::Bit10,
-                12 => vk_video_core::format::ComponentBitDepth::Bit12,
-                _ => vk_video_core::format::ComponentBitDepth::Bit8,
-            };
+        self.detected_format.luma_bit_depth = match frame_data.color_config.bit_depth {
+            8 => vk_video_core::format::ComponentBitDepth::Bit8,
+            10 => vk_video_core::format::ComponentBitDepth::Bit10,
+            12 => vk_video_core::format::ComponentBitDepth::Bit12,
+            _ => vk_video_core::format::ComponentBitDepth::Bit8,
+        };
 
         self.detected_format.chroma_bit_depth = self.detected_format.luma_bit_depth;
 
-        self.detected_format.chroma_subsampling =
-            if frame_data.color_config.subsampling_x == 1
-                && frame_data.color_config.subsampling_y == 1
-            {
-                vk_video_core::format::ChromaSubsampling::_420
-            } else {
-                vk_video_core::format::ChromaSubsampling::_444
-            };
+        self.detected_format.chroma_subsampling = if frame_data.color_config.subsampling_x == 1
+            && frame_data.color_config.subsampling_y == 1
+        {
+            vk_video_core::format::ChromaSubsampling::_420
+        } else {
+            vk_video_core::format::ChromaSubsampling::_444
+        };
 
-        self.detected_format.codec_profile =
-            frame_data.picture_info.profile as u32;
+        self.detected_format.codec_profile = frame_data.picture_info.profile as u32;
         self.detected_format.progressive_sequence = true;
     }
 }
@@ -740,16 +752,14 @@ impl VideoParser for Vp9Parser {
         let data = Self::skip_superframe_index(data);
 
         match self.parse_frame(data) {
-            Ok(frame_data) => {
-                Ok(ParseResult::Slice {
-                    slice_data_offset: frame_data.compressed_header_offset as usize,
-                    slice_data_len: data.len().saturating_sub(
-                        frame_data.compressed_header_offset as usize,
-                    ),
-                    num_slices: frame_data.num_tiles,
-                    slice_header: None,
-                })
-            }
+            Ok(frame_data) => Ok(ParseResult::Slice {
+                slice_data_offset: frame_data.compressed_header_offset as usize,
+                slice_data_len: data
+                    .len()
+                    .saturating_sub(frame_data.compressed_header_offset as usize),
+                num_slices: frame_data.num_tiles,
+                slice_header: None,
+            }),
             Err(e) => Err(e),
         }
     }
@@ -844,12 +854,7 @@ mod tests {
         // Marker: frames=2 (0b001+1=2), mag=2 (0b01+1=2)
         // Marker byte: 0b11001001 = 0xC9
         let data = [
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0xC9,
-            0x00, 0x03,
-            0x00, 0x0A,
-            0xC9,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC9, 0x00, 0x03, 0x00, 0x0A, 0xC9,
         ];
 
         let (count, sizes) = Vp9Parser::parse_superframe_index(&data);
@@ -870,9 +875,7 @@ mod tests {
     fn test_skip_superframe_index() {
         let data = [
             0xC1, // Marker: frames=2, mag=1
-            0x10, 0x20,
-            0xC1,
-            0x10, 0x10,
+            0x10, 0x20, 0xC1, 0x10, 0x10,
         ];
 
         let remaining = Vp9Parser::skip_superframe_index(&data);
@@ -932,9 +935,7 @@ mod tests {
     #[test]
     fn test_parser_init() {
         let mut parser = Vp9Parser::new();
-        let format = DetectedVideoFormat::new(
-            vk_video_core::codec::VideoCodec::DecodeVp9,
-        );
+        let format = DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeVp9);
         parser.init(&format).unwrap();
         assert_eq!(
             parser.detected_format().codec,
@@ -945,9 +946,7 @@ mod tests {
     #[test]
     fn test_parser_init_wrong_codec() {
         let mut parser = Vp9Parser::new();
-        let format = DetectedVideoFormat::new(
-            vk_video_core::codec::VideoCodec::DecodeH264,
-        );
+        let format = DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH264);
         assert!(parser.init(&format).is_err());
     }
 

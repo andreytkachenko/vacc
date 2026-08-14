@@ -177,12 +177,22 @@ impl H265NalUnitType {
     pub const fn is_slice(&self) -> bool {
         matches!(
             self,
-            Self::TraiNalN | Self::TraiNalR
-                | Self::TsaN | Self::TsaR | Self::StsaN | Self::StsaR
-                | Self::RadlN | Self::RadlR | Self::RaslN | Self::RaslR
-                | Self::CodNalSliceIdrW | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN | Self::CodNalSliceCra
+            Self::TraiNalN
+                | Self::TraiNalR
+                | Self::TsaN
+                | Self::TsaR
+                | Self::StsaN
+                | Self::StsaR
+                | Self::RadlN
+                | Self::RadlR
+                | Self::RaslN
+                | Self::RaslR
+                | Self::CodNalSliceIdrW
+                | Self::CodNalSliceIdrN
+                | Self::CodNalSliceBlaW
+                | Self::CodNalSliceBlaRadl
+                | Self::CodNalSliceBlaN
+                | Self::CodNalSliceCra
         )
     }
 
@@ -191,9 +201,12 @@ impl H265NalUnitType {
     pub const fn is_irap(&self) -> bool {
         matches!(
             self,
-            Self::CodNalSliceIdrW | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN | Self::CodNalSliceCra
+            Self::CodNalSliceIdrW
+                | Self::CodNalSliceIdrN
+                | Self::CodNalSliceBlaW
+                | Self::CodNalSliceBlaRadl
+                | Self::CodNalSliceBlaN
+                | Self::CodNalSliceCra
         )
     }
 
@@ -212,10 +225,17 @@ impl H265NalUnitType {
     pub const fn is_reference(&self) -> bool {
         matches!(
             self,
-            Self::TraiNalR | Self::TsaR | Self::StsaR | Self::RadlR | Self::RaslR
-                | Self::CodNalSliceIdrW | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN | Self::CodNalSliceCra
+            Self::TraiNalR
+                | Self::TsaR
+                | Self::StsaR
+                | Self::RadlR
+                | Self::RaslR
+                | Self::CodNalSliceIdrW
+                | Self::CodNalSliceIdrN
+                | Self::CodNalSliceBlaW
+                | Self::CodNalSliceBlaRadl
+                | Self::CodNalSliceBlaN
+                | Self::CodNalSliceCra
         )
     }
 }
@@ -260,16 +280,12 @@ impl NalUnit {
     /// Check if this NAL unit contains slice data.
     pub fn is_slice(&self, codec: CodecType) -> bool {
         match codec {
-            CodecType::H264 => {
-                H264NalUnitType::from_u8(self.nal_unit_type)
-                    .map(|t| t.is_slice())
-                    .unwrap_or(false)
-            }
-            CodecType::H265 => {
-                H265NalUnitType::from_u8(self.nal_unit_type)
-                    .map(|t| t.is_slice())
-                    .unwrap_or(false)
-            }
+            CodecType::H264 => H264NalUnitType::from_u8(self.nal_unit_type)
+                .map(|t| t.is_slice())
+                .unwrap_or(false),
+            CodecType::H265 => H265NalUnitType::from_u8(self.nal_unit_type)
+                .map(|t| t.is_slice())
+                .unwrap_or(false),
             CodecType::Av1 => false,
         }
     }
@@ -277,16 +293,12 @@ impl NalUnit {
     /// Check if this NAL unit is a parameter set.
     pub fn is_parameter_set(&self, codec: CodecType) -> bool {
         match codec {
-            CodecType::H264 => {
-                H264NalUnitType::from_u8(self.nal_unit_type)
-                    .map(|t| t.is_parameter_set())
-                    .unwrap_or(false)
-            }
-            CodecType::H265 => {
-                H265NalUnitType::from_u8(self.nal_unit_type)
-                    .map(|t| t.is_parameter_set())
-                    .unwrap_or(false)
-            }
+            CodecType::H264 => H264NalUnitType::from_u8(self.nal_unit_type)
+                .map(|t| t.is_parameter_set())
+                .unwrap_or(false),
+            CodecType::H265 => H265NalUnitType::from_u8(self.nal_unit_type)
+                .map(|t| t.is_parameter_set())
+                .unwrap_or(false),
             CodecType::Av1 => false,
         }
     }
@@ -360,21 +372,27 @@ pub fn parse_h264_nal_header(data: &[u8]) -> Option<(bool, u8, u8)> {
     Some((forbidden_zero_bit, nal_ref_idc, nal_unit_type))
 }
 
- /// Parse NAL unit header for H.265.
- ///
- /// Returns (forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1).
- pub fn parse_h265_nal_header(data: &[u8]) -> Option<(bool, u8, u16, u8)> {
-      if data.is_empty() {
-          return None;
-      }
-      let first_byte = data[0];
-      let second_byte = if data.len() > 1 { data[1] } else { 0 };
-      let forbidden_zero_bit = (first_byte & 0x80) != 0;
-      let nal_unit_type = (first_byte & 0x7E) >> 1;
-      let nuh_layer_id: u16 = (((first_byte & 0x01) as u16) << 6) | (((second_byte & 0xFC) as u16) >> 2);
-      let nuh_temporal_id_plus1 = second_byte & 0x07;
-      Some((forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1))
-  }
+/// Parse NAL unit header for H.265.
+///
+/// Returns (forbidden_zero_bit, nal_unit_type, nuh_layer_id, nuh_temporal_id_plus1).
+pub fn parse_h265_nal_header(data: &[u8]) -> Option<(bool, u8, u16, u8)> {
+    if data.is_empty() {
+        return None;
+    }
+    let first_byte = data[0];
+    let second_byte = if data.len() > 1 { data[1] } else { 0 };
+    let forbidden_zero_bit = (first_byte & 0x80) != 0;
+    let nal_unit_type = (first_byte & 0x7E) >> 1;
+    let nuh_layer_id: u16 =
+        (((first_byte & 0x01) as u16) << 6) | (((second_byte & 0xFC) as u16) >> 2);
+    let nuh_temporal_id_plus1 = second_byte & 0x07;
+    Some((
+        forbidden_zero_bit,
+        nal_unit_type,
+        nuh_layer_id,
+        nuh_temporal_id_plus1,
+    ))
+}
 
 /// Remove emulation prevention bytes from RBSP data.
 ///

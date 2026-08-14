@@ -4,8 +4,6 @@
 //! `VkVideoBeginCodingInfoKHR`, `VkVideoDecodeInfoKHR`,
 //! and `VkVideoPictureResourceInfoKHR`.
 
-
-
 /// Video session creation parameters.
 ///
 /// Corresponds to `VkVideoSessionCreateInfoKHR` with codec-specific
@@ -227,11 +225,7 @@ pub struct BitstreamBufferDescriptor {
 }
 
 impl BitstreamBufferDescriptor {
-    pub fn new(
-        min_offset_alignment: u32,
-        min_size_alignment: u32,
-        size: u64,
-    ) -> Self {
+    pub fn new(min_offset_alignment: u32, min_size_alignment: u32, size: u64) -> Self {
         Self {
             min_bitstream_buffer_offset_alignment: min_offset_alignment,
             min_bitstream_buffer_size_alignment: min_size_alignment,

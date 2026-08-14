@@ -19,7 +19,10 @@ fn main() {
     let bitstream_path = if args.len() >= 2 {
         &args[1]
     } else {
-        eprintln!("Usage: {} <bitstream.h264|h265|vp9|ivf> [max_frames]", args[0]);
+        eprintln!(
+            "Usage: {} <bitstream.h264|h265|vp9|ivf> [max_frames]",
+            args[0]
+        );
         eprintln!("Available: born_trailer.h264, big_buck_bunney.h265");
         std::process::exit(1);
     };
@@ -72,8 +75,10 @@ fn main() {
 
     // Print frame info for debugging
     for (i, frame) in frames.iter().enumerate().take(10) {
-        println!("  Frame {}: POC={}, frame_num={}, is_idr={}, is_ref={}",
-            i, frame.poc, frame.frame_num, frame.is_idr, frame.is_reference);
+        println!(
+            "  Frame {}: POC={}, frame_num={}, is_idr={}, is_ref={}",
+            i, frame.poc, frame.frame_num, frame.is_idr, frame.is_reference
+        );
     }
     if frames.len() > 10 {
         println!("  ... and {} more frames", frames.len() - 10);

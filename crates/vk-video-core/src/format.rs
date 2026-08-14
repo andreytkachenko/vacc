@@ -310,10 +310,7 @@ pub struct VideoProfile {
 
 impl VideoProfile {
     /// Create a new video profile.
-    pub fn new(
-        operation: super::codec::VideoCodecOperation,
-        format: VideoFormat,
-    ) -> Self {
+    pub fn new(operation: super::codec::VideoCodecOperation, format: VideoFormat) -> Self {
         Self { operation, format }
     }
 

@@ -126,7 +126,6 @@ impl BitstreamBuffer {
         self.data.data.is_empty()
     }
 
-
     /// Clone the buffer with new size.
     pub fn clone_with_size(&self, new_size: usize) -> Self {
         let mut new_data = self.data.data.clone();
@@ -248,4 +247,3 @@ impl std::ops::Index<usize> for BitstreamStream<'_> {
         &self.buffer.data()[index]
     }
 }
-

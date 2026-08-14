@@ -221,11 +221,10 @@ impl Av1Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdPipelineBarrier2KHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -243,33 +242,29 @@ impl Av1Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdBeginVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoBeginCodingInfoKHR<'_>);
+                type FnType = unsafe extern "system" fn(
+                    vk::CommandBuffer,
+                    *const vk::VideoBeginCodingInfoKHR<'_>,
+                );
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, info);
             }
         }
     }
 
-    fn cmd_decode_video(
-        &self,
-        cmd_buffer: vk::CommandBuffer,
-        info: &vk::VideoDecodeInfoKHR<'_>,
-    ) {
+    fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) {
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdDecodeVideoKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -290,11 +285,10 @@ impl Av1Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance
-                .get_device_proc_addr(
-                    self.device.handle(),
-                    b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
-                )
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                b"vkCmdEndVideoCodingKHR\0".as_ptr().cast(),
+            )
         };
         if let Some(ptr) = fn_ptr {
             unsafe {

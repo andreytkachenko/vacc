@@ -52,10 +52,7 @@ impl VideoCodec {
 
     /// Returns true if this is an encode operation.
     pub const fn is_encode(self) -> bool {
-        matches!(
-            self,
-            Self::EncodeH264 | Self::EncodeH265 | Self::EncodeAv1
-        )
+        matches!(self, Self::EncodeH264 | Self::EncodeH265 | Self::EncodeAv1)
     }
 
     /// Returns the Vulkan structure type for codec-specific capabilities.
@@ -67,7 +64,9 @@ impl VideoCodec {
             Self::DecodeAv1 => ash::vk::StructureType::VIDEO_DECODE_AV1_CAPABILITIES_KHR,
             // ash 0.38 doesn't expose VIDEO_DECODE_VP9_CAPABILITIES_KHR
             Self::DecodeVp9 => ash::vk::StructureType::from_raw(1_000_028_003),
-            Self::EncodeH264 | Self::EncodeH265 | Self::EncodeAv1 => ash::vk::StructureType::from_raw(0),
+            Self::EncodeH264 | Self::EncodeH265 | Self::EncodeAv1 => {
+                ash::vk::StructureType::from_raw(0)
+            }
         }
     }
 }
