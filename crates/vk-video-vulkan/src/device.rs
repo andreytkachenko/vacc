@@ -659,40 +659,29 @@ impl VulkanDevice {
 
             // Decode capabilities (intermediate)
             let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+            decode_caps.s_type = vk::StructureType::VIDEO_DECODE_CAPABILITIES_KHR;
 
-            // Chain: codec-specific -> decode_caps
+            // Chain: decode_caps -> codec-specific
+            // Vulkan spec: VkVideoCapabilitiesKHR -> VkVideoDecodeCapabilitiesKHR -> VkVideoDecode<Codec>CapabilitiesKHR
             match codec {
                 VideoCodec::DecodeH264 => {
-                    h264_caps.p_next = &mut decode_caps as *mut _ as *mut _;
+                    decode_caps.p_next = &mut h264_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeH265 => {
-                    h265_caps.p_next = &mut decode_caps as *mut _ as *mut _;
+                    decode_caps.p_next = &mut h265_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeAv1 => {
-                    av1_caps.p_next = &mut decode_caps as *mut _ as *mut _;
+                    decode_caps.p_next = &mut av1_caps as *mut _ as *mut _;
                 }
                 VideoCodec::DecodeVp9 => {
                     vp9_caps.s_type = vk::StructureType::from_raw(vp9_vk_constants::VIDEO_DECODE_VP9_CAPABILITIES_KHR);
-                    vp9_caps.p_next = &mut decode_caps as *mut _ as *mut _;
+                    decode_caps.p_next = &mut vp9_caps as *mut _ as *mut _;
                 }
             }
 
-            // Top-level capabilities: caps -> codec-specific
+            // Top-level capabilities: caps -> decode_caps
             let mut caps = vk::VideoCapabilitiesKHR::default();
-            match codec {
-                VideoCodec::DecodeH264 => {
-                    caps.p_next = &mut h264_caps as *mut _ as *mut _;
-                }
-                VideoCodec::DecodeH265 => {
-                    caps.p_next = &mut h265_caps as *mut _ as *mut _;
-                }
-                VideoCodec::DecodeAv1 => {
-                    caps.p_next = &mut av1_caps as *mut _ as *mut _;
-                }
-                VideoCodec::DecodeVp9 => {
-                    caps.p_next = &mut vp9_caps as *mut _ as *mut _;
-                }
-            }
+            caps.p_next = &mut decode_caps as *mut _ as *mut _;
 
             let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
             if result != vk::Result::SUCCESS {
