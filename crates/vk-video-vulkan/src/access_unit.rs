@@ -640,6 +640,7 @@ pub enum VideoCodec {
     H264,
     H265,
     Vp9,
+    Av1,
 }
 
 /// Extract all access units and in-band parameter sets from the bitstream.
@@ -756,8 +757,8 @@ pub fn extract_all_access_units(
                     (0, false, false, false, false)
                 }
             }
-            VideoCodec::Vp9 => {
-                // VP9 uses extract_vp9_frames, not this function
+            VideoCodec::Vp9 | VideoCodec::Av1 => {
+                // VP9/AV1 uses extract_vp9_frames / extract_av1_frames, not this function
                 (0, false, false, false, false)
             }
         };
@@ -805,7 +806,7 @@ pub fn extract_all_access_units(
                     &seen_h265_sps_ids,
                     &seen_h265_pps_ids,
                 ),
-                VideoCodec::Vp9 => None,
+                VideoCodec::Vp9 | VideoCodec::Av1 => None,
             };
 
             if let Some(ps) = param_set {
@@ -1495,4 +1496,135 @@ pub fn extract_vp9_frames(data: &[u8], max_frames: usize) -> Vec<Vp9Frame> {
             frame_count: i as u32,
         })
         .collect()
+}
+
+// ============================================================================
+// AV1 bitstream parsing
+// ============================================================================
+
+/// An AV1 frame extracted from the bitstream.
+#[derive(Debug, Clone)]
+pub struct Av1Frame {
+    /// The full IVF packet (bitstream) — the GPU decodes from this buffer.
+    pub data: Vec<u8>,
+    /// Frame count (sequential, per Frame OBU).
+    pub frame_count: u32,
+    /// The Frame OBU payload (frame header + tile data), used to parse the
+    /// frame header.
+    pub frame_obu_payload: Vec<u8>,
+    /// Offset of the Frame OBU payload within `data` (the packet).
+    pub payload_start: u32,
+    /// Size of the Frame OBU payload within `data`.
+    pub payload_size: u32,
+}
+
+/// Extract AV1 frames from IVF container or raw bitstream.
+///
+/// Returns one `Av1Frame` per Frame OBU (type 6) in the bitstream, in order.
+/// The C++ reference decodes every Frame OBU as a separate decode command,
+/// giving the GPU the full IVF packet and using per-Frame-OBU tile offsets to
+/// point into it. `max_frames` limits the number of Frame OBUs extracted (a
+/// generous multiple of the requested display frames, since some Frame OBUs
+/// may be non-display).
+pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
+    let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
+
+    let raw_packets = if is_ivf {
+        match parse_ivf_container(data) {
+            Ok(packets) => packets,
+            Err(_) => vec![data.to_vec()],
+        }
+    } else {
+        vec![data.to_vec()]
+    };
+
+    // Extract a generous number of Frame OBUs (some are non-display frames).
+    let max_obus = max_frames.saturating_mul(10).max(64);
+
+    let mut frames = Vec::new();
+    let mut frame_count: u32 = 0;
+    let mut pkt_idx = 0usize;
+    for packet in &raw_packets {
+        let n_obus = extract_frame_obus_from_packet(packet);
+        if frame_count < 16 {
+            eprintln!(
+                "[AV1-EXTRACT] pkt{}: size={} frame_obus={} (extracted frame{}..{})",
+                pkt_idx,
+                packet.len(),
+                n_obus.len(),
+                frame_count,
+                frame_count + n_obus.len() as u32 - 1
+            );
+        }
+        for obu in n_obus {
+            frames.push(Av1Frame {
+                data: packet.clone(),
+                frame_count,
+                frame_obu_payload: obu.payload,
+                payload_start: obu.payload_start,
+                payload_size: obu.payload_size,
+            });
+            frame_count += 1;
+            if frames.len() >= max_obus {
+                return frames;
+            }
+        }
+        pkt_idx += 1;
+    }
+    frames
+}
+
+/// Information about a single Frame OBU (type 6) within a packet.
+struct FrameObuInfo {
+    /// The Frame OBU payload (frame header + tile data).
+    payload: Vec<u8>,
+    /// Offset of the payload within the packet.
+    payload_start: u32,
+    /// Size of the payload.
+    payload_size: u32,
+}
+
+/// Extract all Frame OBUs (type 6) from a packet, in order.
+fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
+    let mut obus = Vec::new();
+    let mut pos = 0;
+    while pos < packet.len().saturating_sub(1) {
+        let first = packet[pos];
+        let obu_type = (first >> 3) & 0x0F;
+        let ext = (first >> 2) & 1;
+        let has_size = (first >> 1) & 1 != 0;
+        let header_size = 1 + ext as usize;
+        if has_size && pos + header_size < packet.len() {
+            // Read EB128 size
+            let mut size: usize = 0;
+            let mut shift = 0;
+            let mut size_pos = pos + header_size;
+            loop {
+                if size_pos >= packet.len() {
+                    break;
+                }
+                let b = packet[size_pos];
+                size |= ((b & 0x7F) as usize) << shift;
+                shift += 7;
+                size_pos += 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            if obu_type == 6 {
+                let payload_start = size_pos;
+                let payload_end = (payload_start + size).min(packet.len());
+                obus.push(FrameObuInfo {
+                    payload: packet[payload_start..payload_end].to_vec(),
+                    payload_start: payload_start as u32,
+                    payload_size: (payload_end - payload_start) as u32,
+                });
+            }
+            let next = size_pos + size;
+            pos = if next > pos { next } else { size_pos + 1 };
+        } else {
+            pos += header_size.max(1);
+        }
+    }
+    obus
 }

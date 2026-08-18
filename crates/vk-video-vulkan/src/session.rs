@@ -273,12 +273,24 @@ impl VideoSession {
             _marker: Default::default(),
         };
 
-        // Session create info
+        // Session create info.
+        //
+        // VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR (VK_KHR_video_maintenance1)
+        // is REQUIRED here: without it the session must be initialized with the
+        // session parameters via vkUpdateVideoSessionKHR before the first
+        // vkCmdBeginVideoCodingKHR (VUID-vkCmdBeginVideoCodingKHR-...-09237).
+        // On this NVIDIA driver vkUpdateVideoSessionKHR is not resolvable via
+        // vkGetDeviceProcAddr, so the session would otherwise never receive the
+        // AV1 SPS and the driver silently skips every decode (all-zero DPB).
+        // The C++ reference (Vulkan-Video-Samples) sets this same flag whenever
+        // VK_KHR_video_maintenance1 is supported.
+        let session_flags = vk::VideoSessionCreateFlagsKHR::INLINE_QUERIES;
+
         let session_create_info = vk::VideoSessionCreateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_CREATE_INFO_KHR,
             p_next: std::ptr::null(),
             queue_family_index: params.queue_family_index,
-            flags: vk::VideoSessionCreateFlagsKHR::empty(),
+            flags: session_flags,
             p_video_profile: &profile_info as *const _,
             picture_format: params.picture_format,
             max_coded_extent: params.max_coded_extent,
@@ -309,6 +321,7 @@ impl VideoSession {
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(create_fn);
 
+            eprintln!("[Session] Calling vkCreateVideoSessionKHR...");
             let mut session_handle = vk::VideoSessionKHR::null();
             let result = fn_ptr(
                 device.handle(),
@@ -316,6 +329,7 @@ impl VideoSession {
                 std::ptr::null(),
                 &mut session_handle,
             );
+            eprintln!("[Session] vkCreateVideoSessionKHR returned: {:?}", result);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkCreateVideoSessionKHR failed: {:?}",
@@ -326,7 +340,9 @@ impl VideoSession {
         };
 
         // Bind session memory (required after session creation)
+        eprintln!("[Session] Binding session memory...");
         let session_memories = Self::bind_session_memory(instance, device, session)?;
+        eprintln!("[Session] Session memory bound");
 
         Ok((
             Self {
@@ -408,6 +424,7 @@ impl VideoSessionParameters {
         vps: Option<&vk_video_core::picture::H265Vps>,
         sps_h265: Option<&vk_video_core::picture::H265Sps>,
         pps_h265: Option<&vk_video_core::picture::H265Pps>,
+        sps_av1: Option<&vk_video_core::picture::Av1Sps>,
     ) -> VideoResult<Self> {
         use super::codec_types::*;
 
@@ -423,6 +440,37 @@ impl VideoSessionParameters {
             sps_h265.map(super::h265::convert_h265_sps);
         let std_pps_h265: Option<StdVideoH265PictureParameterSet> =
             pps_h265.map(super::h265::convert_h265_pps);
+        // AV1: the sequence header (and the color config / timing info it
+        // points to) must remain valid for the lifetime of the session
+        // parameters object. The driver retains these pointers (it does not
+        // copy the data), so we leak them to keep them alive past create().
+        let std_color_config_av1: Option<*const StdVideoAV1ColorConfig> =
+            sps_av1.map(|sps| {
+                Box::into_raw(Box::new(super::av1::convert_av1_color_config(sps))) as *const _
+            });
+        let std_timing_info_av1: Option<*const StdVideoAV1TimingInfo> =
+            sps_av1.map(|sps| {
+                Box::into_raw(Box::new(super::av1::convert_av1_timing_info(sps))) as *const _
+            });
+        let std_sps_av1: Option<*const StdVideoAV1SequenceHeader> = sps_av1.map(|sps| {
+            let mut header = super::av1::convert_av1_sps(sps);
+            header.pColorConfig = std_color_config_av1.unwrap_or(std::ptr::null());
+            header.pTimingInfo = std_timing_info_av1.unwrap_or(std::ptr::null());
+            eprintln!(
+                "[SessionParams] AV1 SPS: profile={}, fw_bits-1={}, fh_bits-1={}, max_w-1={}, max_h-1={}, order_hint-1={}, force_int_mv={}, force_sct={}, color_cfg={:?}, timing={:?}",
+                header.seq_profile,
+                header.frame_width_bits_minus_1,
+                header.frame_height_bits_minus_1,
+                header.max_frame_width_minus_1,
+                header.max_frame_height_minus_1,
+                header.order_hint_bits_minus_1,
+                header.seq_force_integer_mv,
+                header.seq_force_screen_content_tools,
+                header.pColorConfig.is_null(),
+                header.pTimingInfo.is_null(),
+            );
+            Box::into_raw(Box::new(header)) as *const _
+        });
 
         let mut h264_add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR::default();
         let mut h264_params = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default();
@@ -481,7 +529,7 @@ impl VideoSessionParameters {
                 av1_params.s_type =
                     vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR;
                 av1_params.p_next = std::ptr::null();
-                av1_params.p_std_sequence_header = std::ptr::null();
+                av1_params.p_std_sequence_header = std_sps_av1.unwrap_or(std::ptr::null());
             }
             VideoCodec::DecodeVp9 => {
                 // VP9 doesn't need codec-specific session parameters create info
@@ -521,6 +569,7 @@ impl VideoSessionParameters {
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(create_fn);
 
+            eprintln!("[SessionParams] Calling vkCreateVideoSessionParametersKHR...");
             let mut params = vk::VideoSessionParametersKHR::null();
             let result = fn_ptr(
                 device.handle(),
@@ -528,6 +577,7 @@ impl VideoSessionParameters {
                 std::ptr::null(),
                 &mut params,
             );
+            eprintln!("[SessionParams] vkCreateVideoSessionParametersKHR returned: {:?}", result);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkCreateVideoSessionParametersKHR failed: {:?}",
@@ -561,13 +611,54 @@ impl VideoSessionParameters {
 
     /// Initialize the video session with the given session parameters.
     ///
-    /// With VK_KHR_video_maintenance1 (not maintenance2), vkCmdBeginVideoCodingKHR
-    /// will automatically initialize the session when first called with session parameters.
-    /// This matches the NVIDIA Vulkan-Video-Samples behavior.
-    pub fn update_session(&self, _session: vk::VideoSessionKHR) -> VideoResult<()> {
-        // With VK_KHR_video_maintenance1, the session is auto-initialized by
-        // vkCmdBeginVideoCodingKHR when called with session parameters.
-        // No explicit vkUpdateVideoSessionKHR call needed.
+    /// Explicitly calls vkUpdateVideoSessionKHR so the session is initialized
+    /// with the codec-specific parameters (e.g. the AV1 SPS) before the first
+    /// decode. The function pointer is loaded via the device proc addr, with a
+    /// fallback to the instance proc addr (some drivers do not expose
+    /// core-promoted video commands via vkGetDeviceProcAddr on a 1.2 device).
+    pub fn update_session(&self, session: vk::VideoSessionKHR) -> VideoResult<()> {
+        // Try both the KHR-suffixed extension name and the core (non-KHR) name.
+        // Some drivers only expose core-promoted video commands under one or the other.
+        let update_fn = unsafe {
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkUpdateVideoSessionKHR".as_ptr())
+                .or_else(|| {
+                    self.instance.get_device_proc_addr(
+                        self.device.handle(),
+                        c"vkUpdateVideoSession".as_ptr(),
+                    )
+                })
+        };
+        let update_fn = match update_fn {
+            Some(f) => f,
+            None => {
+                // vkUpdateVideoSessionKHR not loadable via vkGetDeviceProcAddr on this
+                // driver (API 1.2 device). VK_KHR_video_maintenance1 is enabled, so the
+                // session is auto-initialized by vkCmdBeginVideoCodingKHR with the session
+                // parameters. Rely on that (matches the C++ reference, which never calls
+                // vkUpdateVideoSessionKHR).
+                eprintln!("[SessionParams] vkUpdateVideoSessionKHR not found (tried KHR + core names); relying on maintenance1 auto-init");
+                return Ok(());
+            }
+        };
+
+        let result = unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::Device,
+                vk::VideoSessionKHR,
+                vk::VideoSessionParametersKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = std::mem::transmute(update_fn);
+            fn_ptr(self.device.handle(), session, self.parameters)
+        };
+
+        eprintln!("[SessionParams] vkUpdateVideoSessionKHR returned: {:?}", result);
+        if result != vk::Result::SUCCESS {
+            return Err(VideoError::SessionCreation(format!(
+                "vkUpdateVideoSessionKHR failed: {:?}",
+                result
+            )));
+        }
         Ok(())
     }
 }

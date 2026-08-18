@@ -21,6 +21,38 @@ struct PhysicalDeviceVideoDecodeFeaturesKHR {
 const PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR: vk::StructureType =
     vk::StructureType::from_raw(1000346000);
 
+/// PhysicalDeviceVideoMaintenance2FeaturesKHR - not available in ash 0.38, define manually.
+/// The videoMaintenance2 feature makes videoSessionParameters = VK_NULL_HANDLE legal in
+/// vkCmdBeginVideoCodingKHR for AV1/VP9/H.264/H.265 decode
+/// (VUID-VkVideoBeginCodingInfoKHR-videoSession-09261).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct PhysicalDeviceVideoMaintenance2FeaturesKHR {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    video_maintenance2: u32,
+}
+
+const PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR: vk::StructureType =
+    vk::StructureType::from_raw(1000586000);
+
+/// PhysicalDeviceVideoMaintenance1FeaturesKHR - not re-exported by ash 0.38, define manually.
+/// The videoMaintenance1 feature is REQUIRED for VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR
+/// (VUID-VkVideoSessionCreateInfoKHR-flags-09236). The C++ reference (VulkanDeviceContext.cpp:816-841)
+/// enables it: GetPhysicalDeviceFeatures2 fills the chain with supported values, so
+/// videoMaintenance1 ends up VK_TRUE when the device is created. Without it, the NVIDIA driver
+/// silently skips every decode (all-zero DPB) even though vkCreateVideoSessionKHR succeeds.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct PhysicalDeviceVideoMaintenance1FeaturesKHR {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    video_maintenance1: u32,
+}
+
+const PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR: vk::StructureType =
+    vk::StructureType::from_raw(1000515000);
+
 /// Queue family indices found during device selection.
 #[derive(Debug, Clone, Default)]
 pub struct QueueFamilies {
@@ -138,13 +170,18 @@ impl VideoDeviceBuilder {
         self
     }
 
-    pub fn build(self) -> VideoResult<VulkanDevice> {
+    pub     fn build(self) -> VideoResult<VulkanDevice> {
+        eprintln!("[VideoDeviceBuilder] Creating entry...");
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
+        eprintln!("[VideoDeviceBuilder] Creating instance...");
         let (instance, has_validation) = Self::create_instance(&entry, &self)?;
+        eprintln!("[VideoDeviceBuilder] Selecting physical device...");
         let (physical_device, queue_families) = Self::select_physical_device(&instance, &self)?;
+        eprintln!("[VideoDeviceBuilder] Creating device...");
         let (device, enabled_extensions) =
             Self::create_device(&entry, &instance, &physical_device, &queue_families, &self)?;
+        eprintln!("[VideoDeviceBuilder] Getting memory properties...");
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
@@ -366,6 +403,35 @@ impl VideoDeviceBuilder {
             let queue_families_list =
                 unsafe { instance.get_physical_device_queue_family_properties(pd) };
 
+            // TEMP DIAGNOSTIC (iteration 5): which device, and does it have AV1?
+            {
+                let props = unsafe { instance.get_physical_device_properties(pd) };
+                let name: String = props
+                    .device_name
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|b| *b as u8 as char)
+                    .collect();
+                let exts =
+                    unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+                let ext_names: Vec<String> = exts
+                    .iter()
+                    .map(|e| {
+                        e.extension_name
+                            .iter()
+                            .take_while(|&&b| b != 0)
+                            .map(|b| *b as u8 as char)
+                            .collect()
+                    })
+                    .collect();
+                let has_av1 = ext_names.iter().any(|n| n == "VK_KHR_video_decode_av1");
+                let has_decode = ext_names.iter().any(|n| n == "VK_KHR_video_decode_queue");
+                eprintln!(
+                    "[DEV-DIAG] candidate: {} | decode_queue_ext={} av1={}",
+                    name, has_decode, has_av1
+                );
+            }
+
             let mut decode_queue_family: Option<u32> = None;
             let mut graphics_queue_family: Option<u32> = None;
             let mut transfer_queue_family: Option<u32> = None;
@@ -390,6 +456,14 @@ impl VideoDeviceBuilder {
             }
 
             if let Some(decode_qf) = decode_queue_family {
+                let props = unsafe { instance.get_physical_device_properties(pd) };
+                let name: String = props
+                    .device_name
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|b| *b as u8 as char)
+                    .collect();
+                eprintln!("[DEV-DIAG] SELECTED: {}", name);
                 let queue_families = QueueFamilies {
                     graphics: graphics_queue_family,
                     compute: None,
@@ -441,11 +515,10 @@ impl VideoDeviceBuilder {
         }
 
         // Collect device extensions (only those that are actually available)
-        // NOTE: We use VK_KHR_video_maintenance1 instead of maintenance2.
-        // maintenance2 adds vkUpdateVideoSessionKHR which is required to initialize
-        // the session, but some drivers advertise the extension without exporting
-        // the function. Using maintenance1 allows vkCmdBeginVideoCodingKHR to
-        // auto-initialize the session (matching NVIDIA Vulkan-Video-Samples behavior).
+        // NOTE: VK_KHR_video_maintenance1 is used for session auto-initialization.
+        // VK_KHR_video_maintenance2 (optional) enables the videoMaintenance2 feature,
+        // which makes NULL videoSessionParameters legal in vkCmdBeginVideoCodingKHR
+        // for AV1 decode (VUID-VkVideoBeginCodingInfoKHR-videoSession-09261).
         let mut extensions: Vec<&str> = Vec::new();
         let required = [
             "VK_KHR_video_queue",
@@ -463,6 +536,13 @@ impl VideoDeviceBuilder {
                     ext
                 );
             }
+        }
+
+        // VK_KHR_video_maintenance2 (optional but required for NULL session params on AV1)
+        if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_maintenance2") {
+            extensions.push("VK_KHR_video_maintenance2");
+        } else {
+            eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_maintenance2 not available (NULL session params invalid for AV1 decode)");
         }
 
         // Add codec-specific extensions only if available
@@ -539,9 +619,19 @@ impl VideoDeviceBuilder {
         sampler_ycbcr_features.p_next = &mut video_decode_features as *mut _ as *mut _;
         sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
 
+        let mut video_maintenance1_features = PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
+        video_maintenance1_features.s_type = PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR;
+        video_maintenance1_features.p_next = &mut sampler_ycbcr_features as *mut _ as *mut _;
+        video_maintenance1_features.video_maintenance1 = 1;
+
+        let mut video_maintenance2_features = PhysicalDeviceVideoMaintenance2FeaturesKHR::default();
+        video_maintenance2_features.s_type = PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR;
+        video_maintenance2_features.p_next = &mut video_maintenance1_features as *mut _ as *mut _;
+        video_maintenance2_features.video_maintenance2 = 1;
+
         let mut features2 = vk::PhysicalDeviceFeatures2::default();
         features2.s_type = vk::StructureType::PHYSICAL_DEVICE_FEATURES_2;
-        features2.p_next = &mut sampler_ycbcr_features as *mut _ as *mut std::ffi::c_void;
+        features2.p_next = &mut video_maintenance2_features as *mut _ as *mut std::ffi::c_void;
 
         let queue_priorities = vec![1.0f32; builder.num_decode_queues];
         let mut queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = Vec::new();
@@ -592,8 +682,10 @@ impl VideoDeviceBuilder {
             _marker: Default::default(),
         };
 
+        eprintln!("[VideoDeviceBuilder] Creating device...");
         let device = unsafe { instance.create_device(*physical_device, &device_create_info, None) }
             .map_err(|e| VideoError::DeviceCreation(e.to_string()))?;
+        eprintln!("[VideoDeviceBuilder] Device created successfully");
 
         let ext_names: Vec<String> = c_extensions
             .iter()

@@ -210,6 +210,7 @@ impl VideoPipeline {
             self.config.bitstream_buffer_size,
             256,
             256,
+            self.decode_queue_family,
         )?;
         self.bitstream_buffers = Some(bitstream_buffers);
 
