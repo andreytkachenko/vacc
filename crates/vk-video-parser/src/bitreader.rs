@@ -59,12 +59,21 @@ impl<'a> BitReader<'a> {
 
         // Accumulate whole bytes while we need more bits than are available
         while self.bits_left < bits_left {
-            out |= (self.curr_byte as u32) << (bits_left - self.bits_left);
+            // Mask curr_byte to extract only the top (unread) bits before shifting.
+            // Top N bits mask: 0xFF << (8 - N). Use u16 to avoid overflow when N==8.
+            if self.bits_left > 0 {
+                // Unread bits are the bottom self.bits_left bits of curr_byte.
+                // Use u16 to avoid overflow when self.bits_left == 8.
+                let mask = ((1u16 << self.bits_left) - 1) as u8;
+                out |= ((self.curr_byte & mask) as u32) << (bits_left - self.bits_left);
+            }
             bits_left -= self.bits_left;
             self.load_byte()?;
         }
 
-        // Take the remaining bits from the top of curr_byte
+        // Take the remaining bits from the top of curr_byte.
+        // self.bits_left >= bits_left here; shift by (self.bits_left - bits_left)
+        // to get the top bits_left of the remaining unread bits.
         out |= (self.curr_byte >> (self.bits_left as u32 - bits_left as u32)) as u32;
         // Handle n=32 specially to avoid UB with 1u32 << 32
         out &= if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
@@ -110,13 +119,14 @@ impl<'a> BitReader<'a> {
 
     /// Read a signed exponential-Golomb coded integer (se(v)).
     ///
-    /// H.264 spec maps: even ue → positive, odd ue → negative.
+    /// H.264 spec 9.1 maps: even codeNum → negative, odd codeNum → positive.
+    /// codeNum 0→0, 1→1, 2→-1, 3→2, 4→-2, 5→3, 6→-3.
     pub fn read_se(&mut self) -> Result<i32, ParserError> {
         let code = self.read_ue()? as i32;
         if code % 2 == 0 {
-            Ok(code / 2)
+            Ok(-(code / 2))
         } else {
-            Ok(-(code / 2 + 1))
+            Ok((code + 1) / 2)
         }
     }
 
@@ -364,8 +374,9 @@ impl<'a> BitReader<'a> {
             }
             let actual_byte = self.data[self.pos];
             self.pos += 1;
-            // Update prev_two_bytes with the actual byte (matching cros-codecs)
-            self.prev_two_bytes = (0xFFFFu16 << 8) | (actual_byte as u16);
+            // Update prev_two_bytes: track raw stream bytes (EPB byte + actual byte)
+            // to avoid false EPB detection after removal
+            self.prev_two_bytes = (0x03u16 << 8) | (actual_byte as u16);
             self.curr_byte = actual_byte;
         } else {
             self.prev_two_bytes = (self.prev_two_bytes << 8) | (byte as u16);
@@ -482,6 +493,33 @@ mod tests {
         let data = [0b00011010];
         let mut r = BitReader::new(&data, false);
         assert_eq!(r.read_ue().unwrap(), 12);
+    }
+
+    #[test]
+    fn test_read_se() {
+        // se(v) per H.264 spec 9.1: even codeNum → -(codeNum/2), odd → (codeNum+1)/2
+        // Each case: (raw bits MSB-first, zero-padded to a byte, expected value)
+        let cases: &[(&str, u8, i32)] = &[
+            ("1", 0b10000000, 0),    // codeNum 0
+            ("010", 0b01000000, 1),  // codeNum 1
+            ("011", 0b01100000, -1), // codeNum 2
+            ("00100", 0b00100000, 2), // codeNum 3
+            ("00101", 0b00101000, -2), // codeNum 4
+            ("00110", 0b00110000, 3), // codeNum 5
+            ("00111", 0b00111000, -3), // codeNum 6
+        ];
+
+        for (bits, byte, expected) in cases {
+            let data = [*byte];
+            let mut r = BitReader::new(&data, false);
+            assert_eq!(
+                r.read_se().unwrap(),
+                *expected,
+                "se(v) bits \"{}\" should decode to {}",
+                bits,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -656,5 +694,37 @@ mod tests {
         println!("Width: {}, Height: {}", width, height);
         assert_eq!(width, 1920, "expected width=1920");
         assert_eq!(height, 816, "expected height=816");
+    }
+
+    #[test]
+    fn test_pps_rbsp_dump() {
+        // Actual PPS RBSP from bframe_test.h264: eb e3 cb 22 c0
+        let data = [0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+        let mut r = BitReader::new(&data, false);
+        let pps_id = r.read_ue().unwrap();
+        let sps_id = r.read_ue().unwrap();
+        let entropy = r.read_bits(1).unwrap();
+        let bottom = r.read_bits(1).unwrap();
+        let nsg = r.read_ue().unwrap();
+        let nr0 = r.read_ue().unwrap();
+        let nr1 = r.read_ue().unwrap();
+        let wp = r.read_bits(1).unwrap();
+        let wbi = r.read_bits(2).unwrap();
+        // Dump the next 24 bits (starting at pq) for inspection
+        let window = r.read_bits(24).unwrap();
+        eprintln!("wp={} wbi={} bits_from_pq(24)={:024b}", wp, wbi, window);
+        // Fresh reader: read up to wbi, then the raw ue codes for the se(v) fields
+        let mut r2 = BitReader::new(&data, false);
+        for _ in 0..2 { r2.read_ue().unwrap(); } // pps_id, sps_id
+        for _ in 0..2 { r2.read_bits(1).unwrap(); } // entropy, bottom
+        r2.read_ue().unwrap(); // nsg
+        r2.read_ue().unwrap(); // nr0
+        r2.read_ue().unwrap(); // nr1
+        r2.read_bits(1).unwrap(); // wp
+        r2.read_bits(2).unwrap(); // wbi
+        let pq_code = r2.read_ue().unwrap();
+        let ps_code = r2.read_ue().unwrap();
+        let cq_code = r2.read_ue().unwrap();
+        eprintln!("pq_code={} ps_code={} cq_code={}", pq_code, ps_code, cq_code);
     }
 }

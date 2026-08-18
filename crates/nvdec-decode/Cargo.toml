@@ -8,6 +8,10 @@ edition.workspace = true
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
+vk-video-vulkan = { workspace = true }
 libloading = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+ash = { workspace = true }

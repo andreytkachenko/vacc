@@ -1,31 +1,92 @@
-//! FFI bindings for NVDEC (cuviddec.h) - decoder only.
+//! FFI bindings for NVDEC (`cuviddec.h`) — decoder only.
 //!
 //! Generated from Video_Codec_SDK_12.0.16/Interface/cuviddec.h.
 //! Only includes decoder-related types and functions.
+//!
+//! ## Contents
+//!
+//! ### Type Aliases
+//! - [`CUresult`] — CUDA result/error code
+//! - [`CUdeviceptr`] — 64-bit CUDA device pointer
+//! - [`CUvideodecoder`] — Opaque decoder handle
+//! - [`CUvideoparser`] — Opaque parser handle
+//!
+//! ### Enums
+//! - [`cudaVideoCodec`] — Video codec identifiers (H.264, HEVC, VP9, AV1, etc.)
+//! - [`cudaVideoSurfaceFormat`] — Output pixel format (NV12, P016, YUV444)
+//! - [`cudaVideoChromaFormat`] — Chroma subsampling (4:2:0, 4:2:2, 4:4:4)
+//! - [`cudaVideoDeinterlaceMode`] — Deinterlacing mode
+//! - [`cudaVideoCreateFlags`] — Decoder creation flags
+//! - [`cuvidDecodeStatus`] — Decode operation status
+//! - [`CUvideopacketflags`] — Parser packet flags
+//!
+//! ### Structures
+//! - [`CUVIDDECODECAPS`] — Decoder capability query results
+//! - [`CUVIDDECODECREATEINFO`] — Decoder creation parameters
+//! - [`CUVIDPICPARAMS`] — Per-picture decode parameters
+//! - [`CUVIDEOFORMAT`] — Video format info (from parser sequence callback)
+//! - [`CUVIDSOURCEDATAPACKET`] — Bitstream data packet
+//! - [`CUVIDPARSERPARAMS`] — Parser creation parameters
+//! - [`CUVIDPARSERDISPINFO`] — Display timing info (from parser display callback)
+//! - [`CUDA_MEMCPY2D`](crate::device::CUDA_MEMCPY2D) — 2D memory copy descriptor (from `device` module)
+//!
+//! ### Constants
+//! - [`CUDA_SUCCESS`] and error codes (e.g., [`CUDA_ERROR_OUT_OF_MEMORY`])
+//!
+//! ### Functions
+//! Declared as `extern "C"` for direct FFI use. The `device` module provides
+//! safe wrappers via dynamically loaded function pointers.
+//!
+//! ## Safety
+//!
+//! All types in this module are `#[repr(C)]` FFI bindings. Direct use requires
+//! `unsafe` blocks. Prefer the safe wrappers in the [`device`](crate::device)
+//! and [`decoder`](crate::decoder) modules when possible.
+//!
+//! Struct sizes and field offsets are verified by unit tests to match the
+//! NVIDIA Video Codec SDK layout on 64-bit Linux.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use std::os::raw::{c_char, c_int, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_void};
+use std::os::raw::{c_char, c_int, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort, c_void};
 
-/// CUDA result type (from cuda.h)
+/// CUDA result type (from cuda.h).
+///
+/// `0` indicates success; non-zero values indicate errors.
+/// See [`CUDA_SUCCESS`], [`CUDA_ERROR_OUT_OF_MEMORY`], etc.
 pub type CUresult = c_uint;
 
-/// CUDA stream (from cuda.h)
+/// CUDA stream (from cuda.h).
 pub type CUstream = *mut c_void;
 
-/// CUDA device pointer (from cuda.h)
+/// CUDA device pointer (from cuda.h).
+///
+/// 64-bit GPU virtual address.
 pub type CUdeviceptr = c_ulonglong;
 
-/// Video decoder handle
+/// Opaque video decoder handle.
+///
+/// Returned by `cuvidCreateDecoder`. Passed to decode, map, and unmap
+/// operations. Destroy with `cuvidDestroyDecoder`.
 pub type CUvideodecoder = *mut c_void;
 
-/// Video context lock
+/// Opaque video context lock.
 pub type CUvideoctxlock = *mut c_void;
 
-/// Video codec enums
-#[repr(C)]
+/// Video codec identifiers.
+///
+/// Used to specify the codec type when creating a decoder or querying
+/// capabilities.
+///
+/// # Example
+///
+/// ```
+/// use nvdec_decode::ffi::cudaVideoCodec;
+/// let codec = cudaVideoCodec::cudaVideoCodec_H264;
+/// ```
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum cudaVideoCodec {
     cudaVideoCodec_MPEG1 = 0,
@@ -41,12 +102,17 @@ pub enum cudaVideoCodec {
     cudaVideoCodec_VP9,
     cudaVideoCodec_AV1,
     cudaVideoCodec_NumCodecs,
-    // Uncompressed YUV formats (using isize repr)
-    cudaVideoCodec_YUV420 = (('I' as isize) << 24 | ('Y' as isize) << 16 | ('U' as isize) << 8 | ('V' as isize)) as isize,
-    cudaVideoCodec_YV12 = (('Y' as isize) << 24 | ('V' as isize) << 16 | ('1' as isize) << 8 | ('2' as isize)) as isize,
-    cudaVideoCodec_NV12 = (('N' as isize) << 24 | ('V' as isize) << 16 | ('1' as isize) << 8 | ('2' as isize)) as isize,
-    cudaVideoCodec_YUYV = (('Y' as isize) << 24 | ('U' as isize) << 16 | ('Y' as isize) << 8 | ('V' as isize)) as isize,
-    cudaVideoCodec_UYVY = (('U' as isize) << 24 | ('Y' as isize) << 16 | ('V' as isize) << 8 | ('Y' as isize)) as isize,
+    // Uncompressed YUV formats (using i32 repr for 32-bit compatibility)
+    cudaVideoCodec_YUV420 =
+        (('I' as i32) << 24 | ('Y' as i32) << 16 | ('U' as i32) << 8 | ('V' as i32)),
+    cudaVideoCodec_YV12 =
+        (('Y' as i32) << 24 | ('V' as i32) << 16 | ('1' as i32) << 8 | ('2' as i32)),
+    cudaVideoCodec_NV12 =
+        (('N' as i32) << 24 | ('V' as i32) << 16 | ('1' as i32) << 8 | ('2' as i32)),
+    cudaVideoCodec_YUYV =
+        (('Y' as i32) << 24 | ('U' as i32) << 16 | ('Y' as i32) << 8 | ('V' as i32)),
+    cudaVideoCodec_UYVY =
+        (('U' as i32) << 24 | ('Y' as i32) << 16 | ('V' as i32) << 8 | ('Y' as i32)),
 }
 
 impl std::fmt::Debug for cudaVideoCodec {
@@ -74,18 +140,25 @@ impl std::fmt::Debug for cudaVideoCodec {
     }
 }
 
-/// Video surface format enums for output format of decoded output
-#[repr(C)]
+/// Video surface format for decoded output.
+///
+/// Specifies the pixel format of decoded frames in GPU memory.
+/// Values match the NVIDIA Video Codec SDK 12.0.16 header.
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum cudaVideoSurfaceFormat {
+    /// Semi-Planar YUV [Y plane followed by interleaved UV plane]
     cudaVideoSurfaceFormat_NV12 = 0,
+    /// 16 bit Semi-Planar YUV [Y plane followed by interleaved UV plane]
     cudaVideoSurfaceFormat_P016 = 1,
+    /// Planar YUV [Y plane followed by U and V planes]
     cudaVideoSurfaceFormat_YUV444 = 2,
+    /// 16 bit Planar YUV [Y plane followed by U and V planes]
     cudaVideoSurfaceFormat_YUV444_16Bit = 3,
 }
 
 /// Deinterlacing mode enums
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum cudaVideoDeinterlaceMode {
     cudaVideoDeinterlaceMode_Weave = 0,
@@ -94,7 +167,7 @@ pub enum cudaVideoDeinterlaceMode {
 }
 
 /// Chroma format enums
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum cudaVideoChromaFormat {
     cudaVideoChromaFormat_Monochrome = 0,
@@ -104,7 +177,7 @@ pub enum cudaVideoChromaFormat {
 }
 
 /// Decoder creation flags
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum cudaVideoCreateFlags {
     cudaVideoCreate_Default = 0x00,
@@ -114,7 +187,9 @@ pub enum cudaVideoCreateFlags {
 }
 
 /// Decode status enums
-#[repr(C)]
+///
+/// Values match the NVIDIA Video Codec SDK header on this platform.
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum cuvidDecodeStatus {
     cuvidDecodeStatus_Invalid = 0,
@@ -124,7 +199,14 @@ pub enum cuvidDecodeStatus {
     cuvidDecodeStatus_Error_Concealed = 9,
 }
 
-/// Decoder capabilities structure
+/// Decoder capabilities structure.
+///
+/// Returned by `cuvidGetDecoderCaps` with information about hardware
+/// decoder support for a specific codec and format combination.
+///
+/// Matches the NVIDIA Video Codec SDK header on this platform.
+/// Note: nOutputFormatMask, nMinWidth, nMinHeight, nMaxHistogramBins are
+/// unsigned short (2 bytes), not unsigned int (4 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDDECODECAPS {
@@ -134,15 +216,15 @@ pub struct CUVIDDECODECAPS {
     pub reserved1: [c_uint; 3],
     pub bIsSupported: c_uchar,
     pub nNumNVDECs: c_uchar,
-    pub nOutputFormatMask: c_uint,
+    pub nOutputFormatMask: c_ushort,
     pub nMaxWidth: c_uint,
     pub nMaxHeight: c_uint,
     pub nMaxMBCount: c_uint,
-    pub nMinWidth: c_uint,
-    pub nMinHeight: c_uint,
+    pub nMinWidth: c_ushort,
+    pub nMinHeight: c_ushort,
     pub bIsHistogramSupported: c_uchar,
     pub nCounterBitDepth: c_uchar,
-    pub nMaxHistogramBins: c_uint,
+    pub nMaxHistogramBins: c_ushort,
     pub reserved3: [c_uint; 10],
 }
 
@@ -156,7 +238,14 @@ pub struct CUVIDRECT {
     pub bottom: c_short,
 }
 
-/// Decoder creation info structure
+/// Decoder creation info structure.
+///
+/// Passed to `cuvidCreateDecoder` to configure the decoder. Specifies
+/// resolution, codec type, output format, number of surfaces, and
+/// other decode parameters.
+///
+/// Uses `c_ulong` (tcu_ulong in NVIDIA SDK) which is 8 bytes on 64-bit Linux
+/// and 4 bytes on 32-bit/Windows. Total size: 176 bytes on 64-bit Linux.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDDECODECREATEINFO {
@@ -314,7 +403,9 @@ pub union CUVIDH264SVCMVC {
 
 impl Default for CUVIDH264SVCMVC {
     fn default() -> Self {
-        Self { mvcext: CUVIDH264MVCEXT::default() }
+        Self {
+            mvcext: CUVIDH264MVCEXT::default(),
+        }
     }
 }
 
@@ -654,7 +745,11 @@ pub struct CUVIDAV1GLOBALMOTION {
     pub wmmat: [c_int; 6],
 }
 
-/// Picture parameters for decoding
+/// Picture parameters for decoding.
+///
+/// Passed to `cuvidDecodePicture` with per-frame decode parameters
+/// including picture dimensions, reference picture flags, bitstream
+/// data pointer, and codec-specific parameters (via [`CUVIDCODECSPECIFIC`]).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUVIDPICPARAMS {
@@ -736,21 +831,26 @@ pub struct CUVIDRECONFIGUREDECODERINFO {
 // Parser types and structures (from nvcuvid.h)
 // ============================================================================
 
-/// Video parser handle
+/// Opaque video parser handle.
+///
+/// Returned by `cuvidCreateVideoParser`. Passed to parse and destroy
+/// operations. Destroy with `cuvidDestroyVideoParser`.
 pub type CUvideoparser = *mut c_void;
 
-/// Video timestamp type
+/// Video timestamp type (microseconds).
 pub type CUvideotimestamp = i64;
 
-/// Video packet flags
+/// Video packet flags.
+///
+/// Bitmask of flags for [`CUVIDSOURCEDATAPACKET`] passed to the parser.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CUvideopacketflags {
-    CUVID_PKT_ENDOFSTREAM   = 0x01,
-    CUVID_PKT_TIMESTAMP     = 0x02,
+    CUVID_PKT_ENDOFSTREAM = 0x01,
+    CUVID_PKT_TIMESTAMP = 0x02,
     CUVID_PKT_DISCONTINUITY = 0x04,
-    CUVID_PKT_ENDOFPICTURE  = 0x08,
-    CUVID_PKT_NOTIFY_EOS    = 0x10,
+    CUVID_PKT_ENDOFPICTURE = 0x08,
+    CUVID_PKT_NOTIFY_EOS = 0x10,
 }
 
 /// Frame rate structure
@@ -791,7 +891,11 @@ pub struct CUVIDVIDEOSIGNALDESCRIPTION {
     pub matrix_coefficients: c_uchar,
 }
 
-/// Video format structure (from parser sequence callback)
+/// Video format structure (from parser sequence callback).
+///
+/// Provided by the NVIDIA parser in the sequence callback with decoded
+/// video format information extracted from the bitstream (codec,
+/// resolution, chroma format, bit depth, display area, etc.).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDEOFORMAT {
@@ -811,7 +915,11 @@ pub struct CUVIDEOFORMAT {
     pub seqhdr_data_length: c_uint,
 }
 
-/// Source data packet
+/// Source data packet.
+///
+/// Describes a chunk of bitstream data to pass to `cuvidParseVideoData`.
+/// Contains a pointer to the raw NAL unit data and optional metadata
+/// (timestamp, flags).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDSOURCEDATAPACKET {
@@ -821,7 +929,11 @@ pub struct CUVIDSOURCEDATAPACKET {
     pub timestamp: CUvideotimestamp,
 }
 
-/// Parser display info
+/// Parser display info.
+///
+/// Passed to the display callback when a decoded frame is ready for
+/// presentation. Contains the picture index, progressive/field flags,
+/// and repeat field information.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDPARSERDISPINFO {
@@ -833,11 +945,19 @@ pub struct CUVIDPARSERDISPINFO {
 }
 
 /// Parser callback types
-pub type PFNVIDSEQUENCECALLBACK = Option<unsafe extern "C" fn(pUserData: *mut c_void, pVideoFormat: *mut CUVIDEOFORMAT) -> c_int>;
-pub type PFNVIDDECODECALLBACK = Option<unsafe extern "C" fn(pUserData: *mut c_void, pPicParams: *mut CUVIDPICPARAMS) -> c_int>;
-pub type PFNVIDDISPLAYCALLBACK = Option<unsafe extern "C" fn(pUserData: *mut c_void, pDispInfo: *mut CUVIDPARSERDISPINFO) -> c_int>;
+pub type PFNVIDSEQUENCECALLBACK =
+    Option<unsafe extern "C" fn(pUserData: *mut c_void, pVideoFormat: *mut CUVIDEOFORMAT) -> c_int>;
+pub type PFNVIDDECODECALLBACK =
+    Option<unsafe extern "C" fn(pUserData: *mut c_void, pPicParams: *mut CUVIDPICPARAMS) -> c_int>;
+pub type PFNVIDDISPLAYCALLBACK = Option<
+    unsafe extern "C" fn(pUserData: *mut c_void, pDispInfo: *mut CUVIDPARSERDISPINFO) -> c_int,
+>;
 
-/// Parser parameters
+/// Parser parameters.
+///
+/// Passed to `cuvidCreateVideoParser` to configure the parser. Specifies
+/// the codec type, callback functions, user data pointer, and parser
+/// options (Annex-B mode, clock rate, error threshold, etc.).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDPARSERPARAMS {
@@ -863,18 +983,28 @@ pub struct CUVIDPARSERPARAMS {
 // FFI Function declarations
 // ============================================================================
 
+// NVDEC FFI function declarations.
+//
+// These are declared as `extern "C"` for direct linking. In practice,
+// the `device` module loads these dynamically via `libloading`.
 extern "C" {
     /// Query decoder capabilities
     pub fn cuvidGetDecoderCaps(pdc: *mut CUVIDDECODECAPS) -> CUresult;
 
     /// Create decoder
-    pub fn cuvidCreateDecoder(phDecoder: *mut CUvideodecoder, pdci: *const CUVIDDECODECREATEINFO) -> CUresult;
+    pub fn cuvidCreateDecoder(
+        phDecoder: *mut CUvideodecoder,
+        pdci: *const CUVIDDECODECREATEINFO,
+    ) -> CUresult;
 
     /// Destroy decoder
     pub fn cuvidDestroyDecoder(hDecoder: CUvideodecoder) -> CUresult;
 
     /// Decode a picture
-    pub fn cuvidDecodePicture(hDecoder: CUvideodecoder, pPicParams: *const CUVIDPICPARAMS) -> CUresult;
+    pub fn cuvidDecodePicture(
+        hDecoder: CUvideodecoder,
+        pPicParams: *const CUVIDPICPARAMS,
+    ) -> CUresult;
 
     /// Get decode status
     pub fn cuvidGetDecodeStatus(
@@ -915,10 +1045,16 @@ extern "C" {
 
     // Parser functions
     /// Create video parser
-    pub fn cuvidCreateVideoParser(pObj: *mut CUvideoparser, pParams: *const CUVIDPARSERPARAMS) -> CUresult;
+    pub fn cuvidCreateVideoParser(
+        pObj: *mut CUvideoparser,
+        pParams: *const CUVIDPARSERPARAMS,
+    ) -> CUresult;
 
     /// Parse video data
-    pub fn cuvidParseVideoData(obj: CUvideoparser, pPacket: *const CUVIDSOURCEDATAPACKET) -> CUresult;
+    pub fn cuvidParseVideoData(
+        obj: CUvideoparser,
+        pPacket: *const CUVIDSOURCEDATAPACKET,
+    ) -> CUresult;
 
     /// Destroy video parser
     pub fn cuvidDestroyVideoParser(obj: CUvideoparser) -> CUresult;
@@ -928,16 +1064,34 @@ extern "C" {
 // CUDA result constants (subset needed for error handling)
 // ============================================================================
 
+/// CUDA operation succeeded.
 pub const CUDA_SUCCESS: CUresult = 0;
+/// Invalid argument value.
 pub const CUDA_ERROR_INVALID_VALUE: CUresult = 1;
+/// Out of memory.
 pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
+/// CUDA not initialized.
 pub const CUDA_ERROR_NOT_INITIALIZED: CUresult = 3;
+/// CUDA deinitialized.
 pub const CUDA_ERROR_DEINITIALIZED: CUresult = 4;
+/// No CUDA-capable device found.
 pub const CUDA_ERROR_NO_DEVICE: CUresult = 76;
+/// Operation not supported.
 pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 80;
+/// Peer access not supported.
 pub const CUDA_ERROR_PEER_ACCESS_UNSUPPORTED: CUresult = 218;
 
-/// Get error string for CUresult
+/// Convert a CUDA result code to a human-readable string.
+///
+/// # Example
+///
+/// ```
+/// use nvdec_decode::ffi::{cu_result_to_string, CUDA_SUCCESS, CUDA_ERROR_OUT_OF_MEMORY};
+///
+/// assert_eq!(cu_result_to_string(CUDA_SUCCESS), "CUDA_SUCCESS");
+/// assert_eq!(cu_result_to_string(CUDA_ERROR_OUT_OF_MEMORY), "CUDA_ERROR_OUT_OF_MEMORY");
+/// assert_eq!(cu_result_to_string(999), "UNKNOWN_CUDA_ERROR");
+/// ```
 pub fn cu_result_to_string(result: CUresult) -> &'static str {
     match result {
         CUDA_SUCCESS => "CUDA_SUCCESS",
@@ -952,12 +1106,26 @@ pub fn cu_result_to_string(result: CUresult) -> &'static str {
     }
 }
 
-/// Check CUDA result and panic on error (for development)
+/// Check CUDA result and panic on error (for development).
+///
+/// Macro that checks if a CUDA operation returned [`CUDA_SUCCESS`].
+/// Panics with a descriptive message (error name, code, file, line)
+/// on failure.
+///
+/// # Panics
+///
+/// Panics if the expression evaluates to a non-zero CUDA error code.
+///
+/// # Example
+///
+/// ```ignore
+/// nvdec_check!(cuvidCreateDecoder(&mut decoder, &create_info));
+/// ```
 #[macro_export]
 macro_rules! nvdec_check {
     ($expr:expr) => {
         match $expr {
-            $crate::ffi::CUDA_SUCCESS => {},
+            $crate::ffi::CUDA_SUCCESS => {}
             err => panic!(
                 "NVDEC error: {} ({}) at {}:{}",
                 $crate::ffi::cu_result_to_string(err),
@@ -1005,5 +1173,379 @@ impl std::fmt::Debug for CUVIDPICPARAMS {
             .field("CurrPicIdx", &self.CurrPicIdx)
             .field("nBitstreamDataLen", &self.nBitstreamDataLen)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod struct_size_tests {
+    use super::*;
+
+    // ── Struct size tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_cuvid_h264_picparams_size() {
+        let size = std::mem::size_of::<CUVIDH264PICPARAMS>();
+        println!("CUVIDH264PICPARAMS size: {}", size);
+        // NVIDIA SDK: 984 bytes on 64-bit
+        assert_eq!(size, 984, "CUVIDH264PICPARAMS size mismatch: expected 984, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_hevc_picparams_size() {
+        let size = std::mem::size_of::<CUVIDHEVCPICPARAMS>();
+        println!("CUVIDHEVCPICPARAMS size: {}", size);
+        // NVIDIA SDK: 1568 bytes on 64-bit (with RExt fields)
+        assert_eq!(size, 1568, "CUVIDHEVCPICPARAMS size mismatch: expected 1568, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_vp9_picparams_size() {
+        let size = std::mem::size_of::<CUVIDVP9PICPARAMS>();
+        println!("CUVIDVP9PICPARAMS size: {}", size);
+        // NVIDIA SDK: 352 bytes on 64-bit
+        assert_eq!(size, 352, "CUVIDVP9PICPARAMS size mismatch: expected 352, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_av1_picparams_size() {
+        let size = std::mem::size_of::<CUVIDAV1PICPARAMS>();
+        println!("CUVIDAV1PICPARAMS size: {}", size);
+        // NVIDIA SDK: 1916 bytes on 64-bit (with film grain params)
+        assert_eq!(size, 1916, "CUVIDAV1PICPARAMS size mismatch: expected 1916, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_picparams_size() {
+        let size = std::mem::size_of::<CUVIDPICPARAMS>();
+        println!("CUVIDPICPARAMS size: {}", size);
+        // NVIDIA SDK: 4280 bytes on 64-bit (includes 4096-byte union)
+        assert_eq!(size, 4280, "CUVIDPICPARAMS size mismatch: expected 4280, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_codec_specific_size() {
+        let size = std::mem::size_of::<CUVIDCODECSPECIFIC>();
+        println!("CUVIDCODECSPECIFIC size: {}", size);
+        // NVIDIA SDK: 4096 bytes (union of codec-specific params + reserved)
+        assert_eq!(size, 4096, "CUVIDCODECSPECIFIC size mismatch: expected 4096, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_decode_createinfo_size() {
+        let size = std::mem::size_of::<CUVIDDECODECREATEINFO>();
+        println!("CUVIDDECODECREATEINFO size: {}", size);
+        assert!(size > 0, "CUVIDDECODECREATEINFO size must be > 0");
+    }
+
+    #[test]
+    fn test_cuvid_decodecaps_size() {
+        let size = std::mem::size_of::<CUVIDDECODECAPS>();
+        println!("CUVIDDECODECAPS size: {}", size);
+        assert!(size > 0, "CUVIDDECODECAPS size must be > 0");
+    }
+
+    #[test]
+    fn test_cuvid_procparams_size() {
+        let size = std::mem::size_of::<CUVIDPROCPARAMS>();
+        println!("CUVIDPROCPARAMS size: {}", size);
+        assert!(size > 0, "CUVIDPROCPARAMS size must be > 0");
+    }
+
+    #[test]
+    fn test_cuvid_parserparams_size() {
+        let size = std::mem::size_of::<CUVIDPARSERPARAMS>();
+        println!("CUVIDPARSERPARAMS size: {}", size);
+        assert!(size > 0, "CUVIDPARSERPARAMS size must be > 0");
+    }
+
+    #[test]
+    fn test_cuvid_h264_dpbentry_size() {
+        let size = std::mem::size_of::<CUVIDH264DPBENTRY>();
+        println!("CUVIDH264DPBENTRY size: {}", size);
+        // 5 * c_int + FieldOrderCnt[2] = 7 * 4 = 28 bytes
+        assert_eq!(size, 28, "CUVIDH264DPBENTRY size mismatch: expected 28, got {}", size);
+    }
+
+    #[test]
+    fn test_cuvid_rect_size() {
+        let size = std::mem::size_of::<CUVIDRECT>();
+        println!("CUVIDRECT size: {}", size);
+        // 4 * c_short = 4 * 2 = 8 bytes
+        assert_eq!(size, 8, "CUVIDRECT size mismatch: expected 8, got {}", size);
+    }
+
+    // ── Struct field offset tests ─────────────────────────────────────
+
+    #[test]
+    fn test_cuvid_h264_picparams_offsets() {
+        // Verify critical field offsets match NVIDIA SDK layout
+        use std::mem::offset_of;
+
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, log2_max_frame_num_minus4), 0);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, pic_order_cnt_type), 4);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, log2_max_pic_order_cnt_lsb_minus4),
+            8
+        );
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, delta_pic_order_always_zero_flag),
+            12
+        );
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, frame_mbs_only_flag), 16);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, direct_8x8_inference_flag), 20);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, num_ref_frames), 24);
+        // 4 c_uchar fields at offset 28-31
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, residual_colour_transform_flag),
+            28
+        );
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, bit_depth_luma_minus8), 29);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, bit_depth_chroma_minus8), 30);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, qpprime_y_zero_transform_bypass_flag),
+            31
+        );
+        // PPS starts at offset 32
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, entropy_coding_mode_flag), 32);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, pic_order_present_flag), 36);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, num_ref_idx_l0_active_minus1),
+            40
+        );
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, num_ref_idx_l1_active_minus1),
+            44
+        );
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, weighted_pred_flag), 48);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, weighted_bipred_idc), 52);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, pic_init_qp_minus26), 56);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, deblocking_filter_control_present_flag),
+            60
+        );
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, redundant_pic_cnt_present_flag),
+            64
+        );
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, transform_8x8_mode_flag), 68);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, MbaffFrameFlag), 72);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, constrained_intra_pred_flag), 76);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, chroma_qp_index_offset), 80);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, second_chroma_qp_index_offset),
+            84
+        );
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, ref_pic_flag), 88);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, frame_num), 92);
+        // CurrFieldOrderCnt at offset 96
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, CurrFieldOrderCnt), 96);
+        // DPB at offset 104
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, dpb), 104);
+        // DPB: 16 * 28 = 448 bytes, ends at offset 552
+        // WeightScale4x4 at offset 552 (104 + 16*28)
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, WeightScale4x4), 552);
+        // WeightScale8x8 at offset 648 (552 + 6*16)
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, WeightScale8x8), 648);
+        // fmo_aso_enable at offset 776 (648 + 2*64)
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, fmo_aso_enable), 776);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, num_slice_groups_minus1), 777);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, slice_group_map_type), 778);
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, pic_init_qs_minus26), 779);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, slice_group_change_rate_minus1),
+            780
+        );
+        // fmo union at offset 784 (aligned to 8)
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, fmo), 784);
+        // Reserved at offset 792
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, Reserved), 792);
+        // svc_mvc at offset 840 (792 + 12*4)
+        assert_eq!(offset_of!(CUVIDH264PICPARAMS, svc_mvc), 840);
+    }
+
+    #[test]
+    fn test_cuvid_picparams_offsets() {
+        use std::mem::offset_of;
+
+        assert_eq!(offset_of!(CUVIDPICPARAMS, PicWidthInMbs), 0);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, FrameHeightInMbs), 4);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, CurrPicIdx), 8);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, field_pic_flag), 12);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, bottom_field_flag), 16);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, second_field), 20);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, nBitstreamDataLen), 24);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, pBitstreamData), 32);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, nNumSlices), 40);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, pSliceDataOffsets), 48);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, ref_pic_flag), 56);
+        assert_eq!(offset_of!(CUVIDPICPARAMS, intra_pic_flag), 60);
+        // Reserved[30] starts at offset 64
+        assert_eq!(offset_of!(CUVIDPICPARAMS, Reserved), 64);
+        // CodecSpecific union at offset 184 (64 + 30*4)
+        assert_eq!(offset_of!(CUVIDPICPARAMS, CodecSpecific), 184);
+    }
+
+    #[test]
+    fn test_cuvid_codec_specific_offsets() {
+        use std::mem::offset_of;
+
+        // All union members start at offset 0
+        assert_eq!(offset_of!(CUVIDCODECSPECIFIC, h264), 0);
+        assert_eq!(offset_of!(CUVIDCODECSPECIFIC, hevc), 0);
+        assert_eq!(offset_of!(CUVIDCODECSPECIFIC, vp9), 0);
+        assert_eq!(offset_of!(CUVIDCODECSPECIFIC, av1), 0);
+        assert_eq!(offset_of!(CUVIDCODECSPECIFIC, CodecReserved), 0);
+    }
+
+    #[test]
+    fn test_cuvid_decode_createinfo_offsets() {
+        use std::mem::offset_of;
+
+        // Offsets match NVIDIA SDK CUVIDDECODECREATEINFO layout on 64-bit Linux
+        // tcu_ulong = unsigned long = 8 bytes on 64-bit Linux
+        // Total struct size: 176 bytes on 64-bit Linux
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulWidth), 0);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulHeight), 8);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulNumDecodeSurfaces), 16);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, CodecType), 24);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ChromaFormat), 28);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulCreationFlags), 32);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, bitDepthMinus8), 40);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulIntraDecodeOnly), 48);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulMaxWidth), 56);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulMaxHeight), 64);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, Reserved1), 72);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, display_area), 80);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, OutputFormat), 88);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, DeinterlaceMode), 92);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulTargetWidth), 96);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulTargetHeight), 104);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, ulNumOutputSurfaces), 112);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, vidLock), 120);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, target_rect), 128);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, enableHistogram), 136);
+        assert_eq!(offset_of!(CUVIDDECODECREATEINFO, Reserved2), 144);
+    }
+
+    // ── Enum size tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_enum_sizes() {
+        // All NVIDIA SDK enums are c_int (4 bytes) on 64-bit
+        assert_eq!(
+            std::mem::size_of::<cudaVideoCodec>(),
+            4,
+            "cudaVideoCodec size mismatch: expected 4, got {}",
+            std::mem::size_of::<cudaVideoCodec>()
+        );
+        assert_eq!(
+            std::mem::size_of::<cudaVideoChromaFormat>(),
+            4,
+            "cudaVideoChromaFormat size mismatch: expected 4, got {}",
+            std::mem::size_of::<cudaVideoChromaFormat>()
+        );
+        assert_eq!(
+            std::mem::size_of::<cudaVideoSurfaceFormat>(),
+            4,
+            "cudaVideoSurfaceFormat size mismatch: expected 4, got {}",
+            std::mem::size_of::<cudaVideoSurfaceFormat>()
+        );
+        assert_eq!(
+            std::mem::size_of::<cudaVideoDeinterlaceMode>(),
+            4,
+            "cudaVideoDeinterlaceMode size mismatch: expected 4, got {}",
+            std::mem::size_of::<cudaVideoDeinterlaceMode>()
+        );
+        assert_eq!(
+            std::mem::size_of::<cudaVideoCreateFlags>(),
+            4,
+            "cudaVideoCreateFlags size mismatch: expected 4, got {}",
+            std::mem::size_of::<cudaVideoCreateFlags>()
+        );
+        assert_eq!(
+            std::mem::size_of::<cuvidDecodeStatus>(),
+            4,
+            "cuvidDecodeStatus size mismatch: expected 4, got {}",
+            std::mem::size_of::<cuvidDecodeStatus>()
+        );
+    }
+
+    // ── Cross-platform pointer size checks ────────────────────────────
+
+    #[test]
+    fn test_pointer_sizes() {
+        // Verify pointer sizes match platform expectations
+        let ptr_size = std::mem::size_of::<*const c_void>();
+        assert!(
+            ptr_size == 4 || ptr_size == 8,
+            "Unexpected pointer size: {} (expected 4 or 8)",
+            ptr_size
+        );
+        println!("Pointer size: {} bytes", ptr_size);
+    }
+
+    #[test]
+    fn test_cuulonglong_size() {
+        // c_ulonglong must be 8 bytes on all platforms
+        assert_eq!(
+            std::mem::size_of::<c_ulonglong>(),
+            8,
+            "c_ulonglong size mismatch: expected 8, got {}",
+            std::mem::size_of::<c_ulonglong>()
+        );
+    }
+
+    // ── Union size tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_union_sizes() {
+        // CUVIDH264FMOASO: max(c_ulonglong, *const c_uchar) = 8 bytes
+        assert_eq!(
+            std::mem::size_of::<CUVIDH264FMOASO>(),
+            8,
+            "CUVIDH264FMOASO size mismatch: expected 8, got {}",
+            std::mem::size_of::<CUVIDH264FMOASO>()
+        );
+
+        // CUVIDH264SVCMVC: max(MVC, SVC) - SVC is larger due to *const CUVIDPICPARAMS
+        let svc_mvc_size = std::mem::size_of::<CUVIDH264SVCMVC>();
+        assert!(
+            svc_mvc_size > 0,
+            "CUVIDH264SVCMVC size must be > 0"
+        );
+        println!("CUVIDH264SVCMVC size: {} bytes", svc_mvc_size);
+    }
+
+    // ── Alignment tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_struct_alignment() {
+        // All FFI structs must have alignment compatible with C
+        // CUVIDH264PICPARAMS has 8-byte alignment due to c_ulonglong in FMOASO union
+        assert_eq!(
+            std::mem::align_of::<CUVIDH264PICPARAMS>(),
+            8,
+            "CUVIDH264PICPARAMS alignment mismatch"
+        );
+        assert_eq!(
+            std::mem::align_of::<CUVIDPICPARAMS>(),
+            8,
+            "CUVIDPICPARAMS alignment mismatch (has pointer fields)"
+        );
+        assert_eq!(
+            std::mem::align_of::<CUVIDCODECSPECIFIC>(),
+            8,
+            "CUVIDCODECSPECIFIC alignment mismatch (has pointer via union)"
+        );
+        assert_eq!(
+            std::mem::align_of::<CUVIDDECODECREATEINFO>(),
+            8,
+            "CUVIDDECODECREATEINFO alignment mismatch"
+        );
+        assert_eq!(
+            std::mem::align_of::<CUVIDPROCPARAMS>(),
+            8,
+            "CUVIDPROCPARAMS alignment mismatch"
+        );
     }
 }

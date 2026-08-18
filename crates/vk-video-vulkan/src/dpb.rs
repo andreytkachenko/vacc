@@ -67,6 +67,14 @@ impl DpbManager {
         self.max_frame_num = max_frame_num;
     }
 
+    pub fn max_num_ref_frames(&self) -> u32 {
+        self.max_num_ref_frames
+    }
+
+    pub fn max_frame_num(&self) -> u32 {
+        self.max_frame_num
+    }
+
     /// Compute a wraparound-aware "wrapped" frame number relative to current.
     /// Returns negative values for frames from the previous wrap cycle.
     /// Based on VulkanH264Parser.cpp FrameNumWrap computation.

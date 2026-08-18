@@ -578,11 +578,13 @@ dependencies = [
 name = "nvdec-decode"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "libloading",
  "log",
  "thiserror 2.0.18",
  "vk-video-core",
  "vk-video-parser",
+ "vk-video-vulkan",
 ]
 
 [[package]]

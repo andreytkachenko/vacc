@@ -24,7 +24,8 @@ pub mod session;
 pub mod vp9;
 
 pub use access_unit::{
-    AccessUnit, H264OrH265Pps, H264OrH265Sps, VideoCodec as AccessUnitCodec, Vp9Frame,
+    AccessUnit, H264MmcoCommand, H264OrH265Pps, H264OrH265Sps, VideoCodec as AccessUnitCodec,
+    Vp9Frame,
 };
 pub use buffer::{BitstreamBuffer, BitstreamBufferPool};
 pub use codec_types::*;

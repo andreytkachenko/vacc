@@ -134,14 +134,37 @@ Bitstream ──► BitstreamBuffer ──────────┤
 
 ## Supported Codecs
 
-| Codec | Parser | Vulkan Decoder | Profile Support |
-|-------|--------|---------------|-----------------|
-| H.264/AVC | ✅ | ✅ | Baseline, Main, High |
-| H.265/HEVC | ✅ | ✅ | Main, Main10 |
-| AV1 | ✅ | ✅ | Main, High, Professional |
-| VP9 | 🔄 | 🔄 | Profile 0-3 |
+| Codec | Parser | Vulkan Decoder | NVDEC Decoder | Profile Support |
+|-------|--------|---------------|---------------|-----------------|
+| H.264/AVC | ✅ | ✅ | ✅ | Baseline, Main, High |
+| H.265/HEVC | ✅ | ✅ | ❌ | Main, Main10 |
+| AV1 | ✅ | ✅ | ❌ | Main, High, Professional |
+| VP9 | 🔄 | 🔄 | ❌ | Profile 0-3 |
 
-✅ = Implemented | 🔄 = Planned
+✅ = Implemented | 🔄 = Planned | ❌ = Not yet implemented
+
+### NVDEC Decoder (`nvdec-decode`)
+
+Hardware-accelerated H.264 decoding via NVIDIA CUVID/NVDEC API.
+
+**What works:**
+- H.264 Main, High, and Baseline profiles (8-bit, progressive)
+- Various resolutions and frame rates (tested: 1920x1080, 640x480, 320x240)
+- Multi-segment streams with resolution changes mid-stream
+- B-frame reordering (NVDEC parser handles DPB and display order)
+- Proper drain/flush at end-of-stream (2136 frames, byte-perfect vs ffmpeg)
+- Decoder reset/reconfiguration mid-stream
+- Multi-GPU support (select specific CUDA device)
+- Concurrent thread safety (decoder instances per thread)
+
+**What doesn't work on V100:**
+- 10-bit H.264 (V100 NVDEC hardware limitation)
+- High 4:4:4 Intra profile (V100 NVDEC hardware limitation)
+
+**Known limitations:**
+- Interlaced content: field ordering differs from ffmpeg (NVDEC uses top-field-first convention)
+- H.264 only — HEVC and AV1 NVDEC support not yet implemented
+- Requires NVIDIA GPU with NVDEC hardware (tested on Tesla V100, Driver 580.159.04)
 
 ## Vulkan Extensions Required
 

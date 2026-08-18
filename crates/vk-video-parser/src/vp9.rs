@@ -757,12 +757,11 @@ impl VideoParser for Vp9Parser {
 
         match self.parse_frame(data) {
             Ok(frame_data) => Ok(ParseResult::Slice {
-                slice_data_offset: frame_data.compressed_header_offset as usize,
-                slice_data_len: data
-                    .len()
-                    .saturating_sub(frame_data.compressed_header_offset as usize),
-                num_slices: frame_data.num_tiles,
-                slice_header: None,
+                slices: vec![crate::SliceEntry {
+                    slice_header: None,
+                    nal_data: Vec::new(),
+                }],
+                bytes_consumed: data.len().saturating_sub(frame_data.compressed_header_offset as usize),
             }),
             Err(e) => Err(e),
         }

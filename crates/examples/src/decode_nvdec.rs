@@ -18,7 +18,7 @@ fn main() {
     let bitstream_path = if args.len() >= 2 {
         &args[1]
     } else {
-        eprintln!("Usage: {} <bitstream.h264> [max_frames]", args[0]);
+        eprintln!("Usage: {} <bitstream.h264> [max_frames] [out_prefix]", args[0]);
         eprintln!("Available: born_trailer.h264");
         std::process::exit(1);
     };
@@ -27,6 +27,12 @@ fn main() {
         args[2].parse().unwrap_or(3)
     } else {
         3
+    };
+
+    let out_prefix: String = if args.len() >= 4 {
+        args[3].clone()
+    } else {
+        "nvdec".to_string()
     };
 
     if !std::path::Path::new(bitstream_path).exists() {
@@ -69,49 +75,54 @@ fn main() {
     println!("  Profile: {:?}", info.profile_idc);
     println!("  DPB slots: {}", info.dpb_slots);
 
-    // Decode frames
+    // Decode frames (in display order; B-frame reordering is handled inside
+    // the decoder, with the tail drained via flush() at end of stream)
     println!("\n--- Decoding up to {} frames ---", max_frames);
-    let mut frames_decoded = 0;
-    let mut frame_idx = 0;
+    let mut frames: Vec<vk_video_core::frame::DecodedFrame> = Vec::new();
 
-    loop {
+    while frames.len() < max_frames {
         match decoder.decode() {
-            Ok(Some(frame)) => {
-                frames_decoded += 1;
-                let has_pixel_data = frame.pixel_data.is_some();
-                println!(
-                    "  Frame {}: index={}, POC={}, width={}x{}, ref={}, pixel_data={}",
-                    frame_idx,
-                    frame.frame_index,
-                    frame.poc,
-                    frame.width,
-                    frame.height,
-                    frame.is_reference(),
-                    has_pixel_data
-                );
-
-                // Save frame as YUV420P
-                if let Some(ref pixel_data) = frame.pixel_data {
-                    let output_path = format!("nvdec_frame_{}.yuv", frame_idx);
-                    let yuv_data = frame_to_yuv420p(pixel_data);
-                    match std::fs::write(&output_path, &yuv_data) {
-                        Ok(()) => println!("    Saved to {} ({} bytes)", output_path, yuv_data.len()),
-                        Err(e) => eprintln!("    Failed to save: {}", e),
-                    }
-                }
-
-                frame_idx += 1;
-
-                if frames_decoded >= max_frames {
-                    break;
-                }
-            }
-            Ok(None) => {
-                break;
-            }
+            Ok(Some(frame)) => frames.push(frame),
+            Ok(None) => break,
             Err(e) => {
                 eprintln!("Decode error: {}", e);
                 break;
+            }
+        }
+    }
+
+    // Drain any frames still held back in the decoder pipeline (B-frame
+    // reorder depth) so ALL frames are emitted.
+    if frames.len() < max_frames {
+        match decoder.flush() {
+            Ok(mut flushed) => frames.append(&mut flushed),
+            Err(e) => eprintln!("Flush error: {}", e),
+        }
+    }
+    frames.truncate(max_frames);
+
+    let frames_decoded = frames.len();
+
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        let has_pixel_data = frame.pixel_data.is_some();
+        println!(
+            "  Frame {}: index={}, POC={}, width={}x{}, ref={}, pixel_data={}",
+            frame_idx,
+            frame.frame_index,
+            frame.poc,
+            frame.width,
+            frame.height,
+            frame.is_reference(),
+            has_pixel_data
+        );
+
+        // Save frame as YUV420P
+        if let Some(ref pixel_data) = frame.pixel_data {
+            let output_path = format!("{}_frame_{}.yuv", out_prefix, frame_idx);
+            let yuv_data = frame_to_yuv420p(pixel_data);
+            match std::fs::write(&output_path, &yuv_data) {
+                Ok(()) => println!("    Saved to {} ({} bytes)", output_path, yuv_data.len()),
+                Err(e) => eprintln!("    Failed to save: {}", e),
             }
         }
     }
@@ -123,7 +134,7 @@ fn main() {
         println!("Success: NVDEC H.264 decoding with pixel output is working!");
         println!("\nTo verify pixel-perfect output against ffmpeg:");
         println!("  ffmpeg -y -i {} -vframes {} -f rawvideo -pix_fmt yuv420p ffmpeg_ref.yuv", bitstream_path, frames_decoded);
-        println!("  diff nvdec_frame_0.yuv <(dd if=ffmpeg_ref.yuv bs={} count=1 status=none)", frame_size(&info));
+        println!("  diff {}_frame_0.yuv <(dd if=ffmpeg_ref.yuv bs={} count=1 status=none)", out_prefix, frame_size(&info));
     } else {
         eprintln!("Warning: No frames were decoded. Check input file.");
     }

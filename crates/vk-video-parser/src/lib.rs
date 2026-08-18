@@ -174,18 +174,36 @@ pub enum ParseResult {
         sps: Option<vk_video_core::picture::BoxedPictureParametersSet>,
         pps: Option<vk_video_core::picture::BoxedPictureParametersSet>,
         vps: Option<vk_video_core::picture::BoxedPictureParametersSet>,
+        /// Raw SPS NAL bytes (including NAL header), for feeding to the decoder.
+        sps_nal: Option<Vec<u8>>,
+        /// Raw PPS NAL bytes (including NAL header), for feeding to the decoder.
+        pps_nal: Option<Vec<u8>>,
     },
     /// Slice data received (ready for decode).
     Slice {
-        /// Slice data in the bitstream buffer.
-        slice_data_offset: usize,
-        /// Slice data length.
-        slice_data_len: usize,
-        /// Number of slices.
-        num_slices: u32,
-        /// Parsed slice header information (from the first slice of the frame).
-        slice_header: Option<crate::h265::SliceHeaderInfo>,
+        /// All slices belonging to this frame.
+        slices: Vec<SliceEntry>,
+        /// Total bytes consumed from the input for this frame.
+        bytes_consumed: usize,
     },
     /// End of stream.
     EndOfStream,
+}
+
+/// Codec-specific slice header.
+#[derive(Debug, Clone)]
+pub enum SliceHeader {
+    /// H.264 slice header.
+    H264(crate::h264::SliceHeader),
+    /// H.265 slice header info.
+    H265(crate::h265::SliceHeaderInfo),
+}
+
+/// A single slice entry within a parsed frame.
+#[derive(Debug, Clone)]
+pub struct SliceEntry {
+    /// Parsed slice header.
+    pub slice_header: Option<SliceHeader>,
+    /// Full NAL data including header.
+    pub nal_data: Vec<u8>,
 }

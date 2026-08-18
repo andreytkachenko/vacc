@@ -431,6 +431,7 @@ pub fn add_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
             result.push(data[i]);
             result.push(data[i + 1]);
             result.push(EMULATION_PREVENTION_BYTE);
+            result.push(data[i + 2]);
             i += 3;
         } else {
             result.push(data[i]);
