@@ -366,6 +366,7 @@ fn main() {
         chroma_subsampling,
         luma_bit_depth,
         chroma_bit_depth,
+        decode_qf,
     )
     .map_err(|e| format!("Failed to create bitstream buffer: {}", e))
     .expect("Failed to create bitstream buffer");
@@ -1395,6 +1396,7 @@ fn create_vp9_bitstream_buffer(
     chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
     luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
     chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    queue_family_index: u32,
 ) -> Result<VkBitstreamBuffer, String> {
     let (profile_list, _video_profile, _vp9_profile) = build_vp9_profile_list(
         profile,
@@ -1411,6 +1413,8 @@ fn create_vp9_bitstream_buffer(
         0,
         1,
         &profile_list as *const _ as *const std::ffi::c_void,
+        vk::BufferCreateFlags::empty(),
+        queue_family_index,
     )
     .map_err(|e| e.to_string())
 }

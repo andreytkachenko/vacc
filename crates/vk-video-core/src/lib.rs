@@ -20,6 +20,7 @@
 //! ```
 
 pub mod codec;
+pub mod decoder;
 pub mod error;
 pub mod format;
 pub mod frame;
@@ -27,6 +28,7 @@ pub mod picture;
 pub mod session;
 
 pub use codec::{VideoCodec, VideoCodecFlagBits, VideoCodecOperation};
+pub use decoder::{Decoder, DecoderInfo};
 pub use error::{VideoError, VideoResult};
 pub use format::{ChromaSubsampling, ComponentBitDepth, VideoFormat, VideoProfile};
 pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo};
