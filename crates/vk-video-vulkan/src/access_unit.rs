@@ -1520,12 +1520,14 @@ pub struct Av1Frame {
 
 /// Extract AV1 frames from IVF container or raw bitstream.
 ///
-/// Returns one `Av1Frame` per Frame OBU (type 6) in the bitstream, in order.
-/// The C++ reference decodes every Frame OBU as a separate decode command,
-/// giving the GPU the full IVF packet and using per-Frame-OBU tile offsets to
-/// point into it. `max_frames` limits the number of Frame OBUs extracted (a
-/// generous multiple of the requested display frames, since some Frame OBUs
-/// may be non-display).
+/// Returns one `Av1Frame` per Frame OBU (type 6) and per show_existing_frame
+/// FrameHeader OBU (type 3) in the bitstream, in order. The C++ reference
+/// decodes every Frame OBU as a separate decode command, giving the GPU the
+/// full IVF packet and using per-Frame-OBU tile offsets to point into it.
+/// show_existing_frame packets carry a type-3 FrameHeader OBU (no tile data);
+/// the decode loop reads back the referenced frame buffer for those.
+/// `max_frames` limits the number of OBUs extracted (a generous multiple of
+/// the requested display frames, since some Frame OBUs may be non-display).
 pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
     let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
 
@@ -1546,7 +1548,7 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
     let mut pkt_idx = 0usize;
     for packet in &raw_packets {
         let n_obus = extract_frame_obus_from_packet(packet);
-        if frame_count < 16 {
+        if frame_count < 16 && crate::vacc_debug() {
             eprintln!(
                 "[AV1-EXTRACT] pkt{}: size={} frame_obus={} (extracted frame{}..{})",
                 pkt_idx,
@@ -1574,9 +1576,11 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
     frames
 }
 
-/// Information about a single Frame OBU (type 6) within a packet.
+/// Information about a single Frame OBU (type 6) or show_existing_frame
+/// FrameHeader OBU (type 3) within a packet.
 struct FrameObuInfo {
-    /// The Frame OBU payload (frame header + tile data).
+    /// The OBU payload (frame header + tile data for Frame OBUs; frame header
+    /// only for FrameHeader OBUs).
     payload: Vec<u8>,
     /// Offset of the payload within the packet.
     payload_start: u32,
@@ -1584,7 +1588,15 @@ struct FrameObuInfo {
     payload_size: u32,
 }
 
-/// Extract all Frame OBUs (type 6) from a packet, in order.
+/// Extract all Frame OBUs (type 6) and show_existing_frame FrameHeader OBUs
+/// (type 3) from a packet, in order.
+///
+/// A type-3 FrameHeader OBU is extracted only when its payload signals
+/// `show_existing_frame = 1` (MSB of the first payload byte). Those carry no
+/// tile data — the decode loop reads back the referenced frame buffer instead
+/// of issuing a GPU decode. Redundant frame headers (type 3 with
+/// show_existing_frame = 0) are skipped: the corresponding Frame OBU is
+/// decoded instead (C++ behavior).
 fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
     let mut obus = Vec::new();
     let mut pos = 0;
@@ -1611,7 +1623,10 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                     break;
                 }
             }
-            if obu_type == 6 {
+            let is_frame = obu_type == 6;
+            let is_show_existing =
+                obu_type == 3 && size > 0 && size_pos < packet.len() && (packet[size_pos] & 0x80) != 0;
+            if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
                 obus.push(FrameObuInfo {

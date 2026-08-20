@@ -81,6 +81,7 @@ def run_vulkan_decode(bitstream: str, max_frames: int):
         cwd=str(TMP_DIR),
         capture_output=True,
         text=True,
+        env=os.environ,
     )
     if result.returncode != 0:
         print("Vulkan decode failed!")

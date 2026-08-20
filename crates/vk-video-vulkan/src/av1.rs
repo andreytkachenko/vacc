@@ -6,6 +6,8 @@
 //! All StdVideo* structs match vulkan_video_codec_av1std.h and
 //! vulkan_video_codec_av1std_decode.h exactly.
 
+use std::collections::VecDeque;
+
 use ash::vk;
 use ash::vk::Handle;
 
@@ -58,11 +60,10 @@ pub enum StdVideoAV1FrameType {
 pub enum StdVideoAV1InterpolationFilter {
     #[default]
     Eighttap = 0,
-    Switchable = 1,
-    Proximity = 2,
+    EighttapSmooth = 1,
+    EighttapSharp = 2,
     Bilinear = 3,
-    EighttapSmooth = 4,
-    EighttapSharp = 5,
+    Switchable = 4,
 }
 
 /// AV1 Tx mode (from vulkan_video_codec_av1std.h).
@@ -71,10 +72,8 @@ pub enum StdVideoAV1InterpolationFilter {
 pub enum StdVideoAV1TxMode {
     #[default]
     Only4x4 = 0,
-    Only8x8 = 1,
-    Only16x16 = 2,
-    Only32x32 = 3,
-    Selected = 4,
+    Largest = 1,
+    Select = 2,
 }
 
 /// AV1 Reference frame names (from vulkan_video_codec_av1std.h).
@@ -402,10 +401,10 @@ impl VideoDecodeAV1PictureInfoKHR {
 
 /// Container for AV1 picture info and its referenced sub-structures.
 ///
-/// Holds the picture info and all sub-structures (tile info, quantization,
-/// segmentation, loop filter, CDEF, loop restoration, global motion, film grain)
-/// as a single stack-allocated value. This avoids memory leaks and ensures
-/// all pointers remain valid during command buffer execution.
+/// Holds ALL picture info data in a single contiguous allocation (Test B).
+/// No heap-allocated Vecs — everything is inline fixed-size arrays.
+/// This eliminates pointer indirection: all internal pointers point to offsets
+/// within the same contiguous memory block.
 #[repr(C)]
 pub struct Av1PictureInfoContainer {
     /// Must come first so &container as pointer to StdVideoDecodeAV1PictureInfo works
@@ -427,16 +426,20 @@ pub struct Av1PictureInfoContainer {
     pub tile_offsets: [u32; 1],
     /// Tile data sizes in bytes.
     pub tile_sizes: [u32; 1],
-    /// Tile sub-pointer arrays (StdVideoAV1TileInfo). The C++ reference always
-    /// sets these non-null; null pointers made the NVIDIA driver skip the decode.
-    pub tile_width_in_sbs_minus_1: Vec<u16>,
-    pub tile_height_in_sbs_minus_1: Vec<u16>,
-    pub tile_mi_col_starts: Vec<u16>,
-    pub tile_mi_row_starts: Vec<u16>,
+    /// Tile sub-pointer arrays — inline fixed-size (matching C++ VkParserAv1PictureData).
+    /// All pointers point to offsets within this single contiguous allocation.
+    pub tile_width_in_sbs_minus_1: [u16; 64],
+    pub tile_height_in_sbs_minus_1: [u16; 64],
+    pub tile_mi_col_starts: [u16; 64],
+    pub tile_mi_row_starts: [u16; 64],
+    /// Number of valid entries in each tile array (tile_cols / tile_rows)
+    pub tile_cols_count: usize,
+    pub tile_rows_count: usize,
 }
 
 impl Av1PictureInfoContainer {
     /// Initialize the pointer fields to point to the container's own sub-structures.
+    /// All pointers reference offsets within this single contiguous allocation.
     pub fn init_pointers(&mut self) {
         // Use mutable reference to set pointers
         self.std_picture_info.pTileInfo = &self.tile_info as *const _;
@@ -447,29 +450,12 @@ impl Av1PictureInfoContainer {
         self.std_picture_info.pLoopRestoration = &self.loop_restoration as *const _;
         self.std_picture_info.pGlobalMotion = &self.global_motion as *const _;
         self.std_picture_info.pFilmGrain = &self.film_grain as *const _;
-        // Tile sub-pointers: the C++ reference always sets these non-null
-        // (VulkanVideoParser.cpp:2549-2552). Null pointers made the NVIDIA
-        // driver skip the decode.
-        self.tile_info.pWidthInSbsMinus1 = if self.tile_width_in_sbs_minus_1.is_empty() {
-            std::ptr::null()
-        } else {
-            self.tile_width_in_sbs_minus_1.as_ptr()
-        };
-        self.tile_info.pHeightInSbsMinus1 = if self.tile_height_in_sbs_minus_1.is_empty() {
-            std::ptr::null()
-        } else {
-            self.tile_height_in_sbs_minus_1.as_ptr()
-        };
-        self.tile_info.pMiColStarts = if self.tile_mi_col_starts.is_empty() {
-            std::ptr::null()
-        } else {
-            self.tile_mi_col_starts.as_ptr()
-        };
-        self.tile_info.pMiRowStarts = if self.tile_mi_row_starts.is_empty() {
-            std::ptr::null()
-        } else {
-            self.tile_mi_row_starts.as_ptr()
-        };
+        // Tile sub-pointers: always point to inline arrays (never null)
+        // All pointers are within the same contiguous allocation.
+        self.tile_info.pWidthInSbsMinus1 = self.tile_width_in_sbs_minus_1.as_ptr();
+        self.tile_info.pHeightInSbsMinus1 = self.tile_height_in_sbs_minus_1.as_ptr();
+        self.tile_info.pMiColStarts = self.tile_mi_col_starts.as_ptr();
+        self.tile_info.pMiRowStarts = self.tile_mi_row_starts.as_ptr();
     }
 
     /// Get a pointer to the StdVideoDecodeAV1PictureInfo within this container.
@@ -492,10 +478,12 @@ impl Default for Av1PictureInfoContainer {
             film_grain: unsafe { std::mem::zeroed() },
             tile_offsets: [0; 1],
             tile_sizes: [0; 1],
-            tile_width_in_sbs_minus_1: Vec::new(),
-            tile_height_in_sbs_minus_1: Vec::new(),
-            tile_mi_col_starts: Vec::new(),
-            tile_mi_row_starts: Vec::new(),
+            tile_width_in_sbs_minus_1: [0; 64],
+            tile_height_in_sbs_minus_1: [0; 64],
+            tile_mi_col_starts: [0; 64],
+            tile_mi_row_starts: [0; 64],
+            tile_cols_count: 0,
+            tile_rows_count: 0,
         }
     }
 }
@@ -647,6 +635,16 @@ pub struct Av1Decoder {
     frame_buffer_seg_enabled: [u8; 8],
     /// Frame counter.
     frame_count: u32,
+    /// FIFO of available DPB slots for AV1 output allocation (iteration 7 fix).
+    ///
+    /// Mirrors the C++ `m_dpbSlotsAvailable` queue (VulkanVideoParser.cpp
+    /// `DpbSlots::AllocateSlot`/`FreeSlot`). A slot is available iff it is not
+    /// currently held by any frame buffer; this is the C++ invariant that a DPB
+    /// slot is freed only when its picture is no longer in any frame buffer
+    /// (`ResetPicDpbSlots`). Consequently a slot popped from this queue can
+    /// never be a reference for the current or any future frame, so the output
+    /// slot never clobbers a still-live reference.
+    av1_available_slots: VecDeque<u32>,
 }
 
 impl Av1Decoder {
@@ -664,6 +662,7 @@ impl Av1Decoder {
             frame_buffer_frame_type: [0; 8],
             frame_buffer_disable_cdf: [0; 8],
             frame_buffer_seg_enabled: [0; 8],
+            av1_available_slots: VecDeque::new(),
         }
     }
 
@@ -791,11 +790,90 @@ impl Av1Decoder {
 
     /// AV1 GetRelativeDist (C++ VulkanAV1Decoder.cpp:352-369): signed distance
     /// from `b` to `a` in order-hint space, wrapped to [-2^(ohb), 2^(ohb)).
-    fn get_relative_dist(a: i32, b: i32, ohb: u32) -> i32 {
+    pub(crate) fn get_relative_dist(a: i32, b: i32, ohb: u32) -> i32 {
         let bits = ohb + 1;
         let diff = a - b;
         let m = 1 << (bits - 1);
         (diff & (m - 1)) - (diff & m)
+    }
+
+    /// AV1 SetFrameRefs (C++ VulkanAV1Decoder.cpp:1579-1711): when
+    /// enable_order_hint is true, the bitstream only carries lst_ref and
+    /// gld_ref; the decoder must derive the full ref_frame_idx array by
+    /// selecting frames based on order-hint distances.  Returns
+    /// [LAST, LAST2, LAST3, GOLDEN, BWDREF, ALTREF2, ALTREF] buffer indices.
+    pub fn set_frame_refs(
+        lst_ref: i32,
+        gld_ref: i32,
+        ref_order_hint: &[u32; 8],
+        cur_order_hint: u32,
+        ohb: u32,
+    ) -> [i32; 7] {
+        let cur_frame_hint = 1_i32 << ohb;
+        let cur_oh = cur_order_hint as i32;
+
+        // shiftedOrderHints[i] = curFrameHint + GetRelativeDist1(RefOrderHint[i], cur_OH)
+        let shifted: [i32; 8] = std::array::from_fn(|i| {
+            cur_frame_hint + Self::get_relative_dist(ref_order_hint[i] as i32, cur_oh, ohb)
+        });
+
+        let mut rfi = [-1_i32; 7];
+        let mut used = [false; 8];
+
+        // LAST and GOLDEN come directly from the bitstream
+        rfi[0] = lst_ref; // LAST
+        rfi[3] = gld_ref; // GOLDEN
+        used[lst_ref as usize] = true;
+        used[gld_ref as usize] = true;
+
+        // Inline pick logic (no closures to avoid borrow conflicts)
+        // ALTREF: hint >= curFrameHint, largest
+        {
+            let mut best: Option<usize> = None;
+            for i in 0..8usize {
+                if used[i] || shifted[i] < cur_frame_hint { continue; }
+                if best.map_or(true, |b| shifted[i] >= shifted[b]) { best = Some(i); }
+            }
+            if let Some(r) = best { rfi[6] = r as i32; used[r] = true; }
+        }
+        // BWDREF: hint >= curFrameHint, smallest
+        {
+            let mut best: Option<usize> = None;
+            for i in 0..8usize {
+                if used[i] || shifted[i] < cur_frame_hint { continue; }
+                if best.map_or(true, |b| shifted[i] < shifted[b]) { best = Some(i); }
+            }
+            if let Some(r) = best { rfi[4] = r as i32; used[r] = true; }
+        }
+        // ALTREF2: hint >= curFrameHint, smallest
+        {
+            let mut best: Option<usize> = None;
+            for i in 0..8usize {
+                if used[i] || shifted[i] < cur_frame_hint { continue; }
+                if best.map_or(true, |b| shifted[i] < shifted[b]) { best = Some(i); }
+            }
+            if let Some(r) = best { rfi[5] = r as i32; used[r] = true; }
+        }
+        // LAST2, LAST3, BWDREF: hint < curFrameHint, largest
+        for &ref_name in &[2, 3, 5, 6, 7] { // LAST2=2, LAST3=3, BWDREF=5, ALTREF2=6, ALTREF=7
+            let idx = ref_name - 1;
+            if rfi[idx] < 0 {
+                let mut best: Option<usize> = None;
+                for i in 0..8usize {
+                    if used[i] || shifted[i] >= cur_frame_hint { continue; }
+                    if best.map_or(true, |b| shifted[i] >= shifted[b]) { best = Some(i); }
+                }
+                if let Some(r) = best { rfi[idx] = r as i32; used[r] = true; }
+            }
+        }
+        // Fallback: assign buffer with smallest shiftedOrderHint to remaining -1 slots
+        let fallback = (0..8usize)
+            .min_by_key(|&i| shifted[i])
+            .unwrap_or(0);
+        for i in 0..7 {
+            if rfi[i] < 0 { rfi[i] = fallback as i32; }
+        }
+        rfi
     }
 
     /// Reset DPB state (e.g., on key frame or discontinuity).
@@ -808,6 +886,50 @@ impl Av1Decoder {
         self.frame_buffer_frame_type.fill(0);
         self.frame_buffer_disable_cdf.fill(0);
         self.frame_buffer_seg_enabled.fill(0);
+    }
+
+    /// Reset the AV1 available-slot FIFO to all slots in index order.
+    ///
+    /// Called on key frames / first frame (C++ `DpbSlots::Init` pushes slots
+    /// 0..maxSize-1 in order; `Deinit`+re-Init happens on a session reset).
+    pub fn reset_av1_fifo(&mut self, num_slots: u32) {
+        self.av1_available_slots.clear();
+        for s in 0..num_slots {
+            self.av1_available_slots.push_back(s);
+        }
+    }
+
+    /// Allocate the output DPB slot for the current frame using C++ FIFO
+    /// semantics (VulkanVideoParser.cpp `DpbSlots::AllocateSlot`).
+    ///
+    /// A slot is available iff it is not currently held by any frame buffer.
+    /// This matches the C++ invariant exactly: a DPB slot is freed only when its
+    /// picture is no longer in any frame buffer (`ResetPicDpbSlots`), so a slot
+    /// popped here can never be a reference for the current or any future frame.
+    /// The oldest available slot (FIFO front) is returned, matching the C++
+    /// rotation. There is always at least one available slot: 8 frame buffers +
+    /// 1 output <= num_slots (10 for AV1).
+    pub fn allocate_output_slot(&mut self, num_slots: u32) -> u32 {
+        let n = num_slots as usize;
+        // Slots currently held by a frame buffer (live references).
+        let mut in_use = vec![false; n];
+        for &slot in &self.frame_buffer_to_dpb_slot {
+            if slot >= 0 && (slot as usize) < n {
+                in_use[slot as usize] = true;
+            }
+        }
+        // Drop any FIFO entries that are now in use (defensive).
+        self.av1_available_slots
+            .retain(|&s| (s as usize) < n && !in_use[s as usize]);
+        // Append newly-available slots (not in use, not already queued) at the
+        // back, in slot-index order.
+        for s in 0..n {
+            if !in_use[s] && !self.av1_available_slots.contains(&(s as u32)) {
+                self.av1_available_slots.push_back(s as u32);
+            }
+        }
+        // Pop the oldest available slot (FIFO front).
+        self.av1_available_slots.pop_front().unwrap_or(0)
     }
 
     /// Compute reference DPB slot indices for building the Vulkan decode command.
@@ -871,12 +993,13 @@ impl Av1Decoder {
         output_slot_index: i32,
         output_slot_old_layout: vk::ImageLayout,
         dpb_use_image_array: bool,
+        decode_queue_family: u32,
     ) -> VideoResult<()> {
         let _picture_info_ptr = picture_info_container.std_picture_info();
 
         // TEMP DIAGNOSTIC (iteration 18): confirm session params + key decode fields
         // for EVERY frame (was frame-0-only). Prints the ACTUAL src_buffer_range.
-        if self.frame_count < 16 {
+        if self.frame_count < 16 && super::vacc_debug() {
             eprintln!(
                 "[AV1-DIAG] frame{}: bitstream=[{}..{}) range={} frame_header_offset={}, ref_name_slots={:?}, ref_slot_indices={:?}, coded_extent={}x{}, output_slot={}",
                 self.frame_count,
@@ -895,7 +1018,7 @@ impl Av1Decoder {
         // Build reference slots for BeginVideoCoding. For AV1, the pNext chain of
         // each reference slot must include a VkVideoDecodeAV1DpbSlotInfoKHR with
         // the reference picture's StdVideoDecodeAV1ReferenceInfo (Vulkan spec
-        // VUID for AV1 decode; the C++ reference does the same).
+         // VUID for AV1 decode; the C++ reference does the same).
         let ref_std_infos: Vec<ash::vk::native::StdVideoDecodeAV1ReferenceInfo> = (0..dpb_ref_pictures.len())
             .map(|i| {
                 let mut info =
@@ -905,25 +1028,48 @@ impl Av1Decoder {
                 // from the stored per-frame-buffer reference info (C++
                 // VulkanAV1Decoder.cpp:323-334). Leaving these zero made INTER
                 // frames decode with motion-compensation errors.
-                if let Some(&ref_slot) = dpb_ref_slot_indices.get(i) {
-                    if let Some(fb) = self.get_frame_buffer_for_dpb_slot(ref_slot) {
-                        if let Some((saved_oh, bias, ftype, dcdf, seg)) =
-                            self.get_frame_buffer_ref_info(fb)
-                        {
-                            info.SavedOrderHints = *saved_oh;
-                            info.RefFrameSignBias = bias;
-                            info.frame_type = ftype;
-                            info.flags.set_disable_frame_end_update_cdf(dcdf as u32);
-                            info.flags.set_segmentation_enabled(seg as u32);
-                        }
-                    }
-                }
+                  if let Some(&ref_slot) = dpb_ref_slot_indices.get(i) {
+                      let fb_opt = self.get_frame_buffer_for_dpb_slot(ref_slot);
+                      if self.frame_count < 8 && super::vacc_debug() {
+                          eprintln!("[FB-LOOKUP] fc={} ref[i={}] slot={} -> fb={:?}",
+                              self.frame_count, i, ref_slot, fb_opt);
+                      }
+                      if let Some(fb) = fb_opt {
+                          if let Some((saved_oh, bias, ftype, dcdf, seg)) =
+                              self.get_frame_buffer_ref_info(fb)
+                          {
+                               info.SavedOrderHints = *saved_oh;
+                               info.RefFrameSignBias = bias;
+                              info.frame_type = ftype;
+                              info.flags.set_disable_frame_end_update_cdf(dcdf as u32);
+                              info.flags.set_segmentation_enabled(seg as u32);
+                               // DEBUG: print EXACT values READ from frame buffer for this reference
+                               if self.frame_count < 8 && super::vacc_debug() {
+                                   eprintln!(
+                                       "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={}: OrderHint={}, frame_type={}, dcdf={}, seg={}, SavedOH=[{},{},{},{},{},{},{},{}], Bias={:02x}",
+                                       self.frame_count, i, fb, ref_slot,
+                                       info.OrderHint, ftype, dcdf, seg,
+                                       saved_oh[0], saved_oh[1], saved_oh[2], saved_oh[3],
+                                       saved_oh[4], saved_oh[5], saved_oh[6], saved_oh[7],
+                                       bias
+                                   );
+                               }
+                           } else {
+                               if self.frame_count < 8 && super::vacc_debug() {
+                                   eprintln!(
+                                       "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={} -> NO REF INFO (stale!)",
+                                       self.frame_count, i, fb, ref_slot
+                                   );
+                               }
+                           }
+                      }
+                 }
                 info
             })
             .collect();
         // DEBUG (iteration 28): dump the FULL StdVideoDecodeAV1ReferenceInfo for
         // every reference (mirrors C++ [CPP-REFINFO], VulkanAV1Decoder.cpp:337-366).
-        if self.frame_count < 16 {
+        if self.frame_count < 16 && super::vacc_debug() {
             eprintln!(
                 "[RUST-REFINFO] frame{}: refNameIdx={:?} ref_slots={:?}",
                 self.frame_count,
@@ -967,30 +1113,37 @@ impl Av1Decoder {
             Box::leak(ref_slot_infos.into_boxed_slice()).as_ptr()
         };
 
-        let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> = dpb_ref_pictures
+        // Build a SINGLE contiguous slots array, exactly like the C++ reference
+        // (VkVideoDecoder.cpp:783-1254). Layout:
+        //   slots[0..numRefs] = reference slots
+        //   slots[numRefs]    = setup slot (if present)
+        // Both BeginVideoCoding and DecodeVideo point into this SAME allocation.
+        let num_refs = dpb_ref_pictures.len();
+        let has_setup_slot = dpb_setup_picture.is_some();
+        let total_slots = num_refs + has_setup_slot as usize;
+        let mut slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> =
+            Vec::with_capacity(total_slots);
+
+        // Fill reference slots first
+        for (i, (res, &slot_idx)) in dpb_ref_pictures
             .iter()
             .zip(dpb_ref_slot_indices.iter())
             .enumerate()
-            .map(|(i, (res, &slot_idx))| {
-                let p_next = if ref_slot_infos_ptr.is_null() {
-                    std::ptr::null()
-                } else {
-                    (unsafe { ref_slot_infos_ptr.add(i) }) as *const _
-                };
-                vk::VideoReferenceSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                    p_next,
-                    slot_index: slot_idx,
-                    p_picture_resource: res as *const _,
-                    _marker: Default::default(),
-                }
-            })
-            .collect();
-        let ref_slots_ptr = if ref_slots.is_empty() {
-            std::ptr::null()
-        } else {
-            Box::leak(ref_slots.into_boxed_slice()).as_ptr()
-        };
+        {
+            let p_next = if ref_slot_infos_ptr.is_null() {
+                std::ptr::null()
+            } else {
+                (unsafe { ref_slot_infos_ptr.add(i) }) as *const _
+            };
+            slots.push(vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next,
+                slot_index: slot_idx,
+                p_picture_resource: res as *const _,
+                _marker: Default::default(),
+            });
+        }
+
 
         // Setup slot (current frame output). Per VUID-vkCmdDecodeVideoKHR-pDecodeInfo-09254,
         // for AV1 the pNext chain of pSetupReferenceSlot MUST include a
@@ -1034,7 +1187,7 @@ impl Av1Decoder {
             };
         // DEBUG (iteration 28): dump the setup slot's StdVideoDecodeAV1ReferenceInfo
         // (mirrors C++ [CPP-REFINFO] SETUP line, VulkanAV1Decoder.cpp:358-363).
-        if self.frame_count < 16 && !setup_std_info_ptr.is_null() {
+        if self.frame_count < 16 && !setup_std_info_ptr.is_null() && super::vacc_debug() {
             let info = unsafe { &*setup_std_info_ptr };
             eprintln!(
                 "[RUST-REFINFO]   SETUP: OrderHint={} RefFrameSignBias={:02x} SavedOH=[{},{},{},{},{},{},{},{}]",
@@ -1060,54 +1213,32 @@ impl Av1Decoder {
                 std::ptr::null_mut()
             };
 
-        let setup_slot_info = dpb_setup_picture
-            .as_ref()
-            .map(|res| vk::VideoReferenceSlotInfoKHR {
+        // Append setup slot to the end of the single array (C++ reference pattern)
+        if has_setup_slot {
+            let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
+                std::ptr::null()
+            } else {
+                setup_slot_info_khr_ptr as *const _
+            };
+            slots.push(vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                p_next: if setup_slot_info_khr_ptr.is_null() {
-                    std::ptr::null()
-                } else {
-                    setup_slot_info_khr_ptr as *const _
-                },
+                p_next: setup_p_next,
                 slot_index: output_slot_index,
-                p_picture_resource: res as *const _,
+                p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
                 _marker: Default::default(),
             });
-        let has_setup_slot = setup_slot_info.is_some();
-        let setup_slot_ptr = if has_setup_slot {
-            Box::leak(Box::new(setup_slot_info.unwrap())) as *const _
-        } else {
-            std::ptr::null()
-        };
+        }
 
-        // Build all_slots for BeginVideoCoding. The C++ reference (VulkanVideoParser.cpp
-        // lines 2496-2511) fills referenceSlots[0..numRefs-1] with the reference slots
-        // and then appends the setup slot to the END: referenceSlots[numRefs] =
-        // setupReferenceSlot. BeginVideoCoding then passes all (numRefs+1) elements.
-        // So the array order is [ref0, ..., refN, setup] — setup LAST. (We previously
-        // put setup FIRST, which differs from the pixel-perfect C++ reference.)
-        let mut all_slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> = Vec::new();
-        if !ref_slots_ptr.is_null() {
-            let ref_slice =
-                unsafe { std::slice::from_raw_parts(ref_slots_ptr, dpb_ref_pictures.len()) };
-            all_slots.extend_from_slice(ref_slice);
-        }
-        if has_setup_slot {
-            all_slots.push(unsafe { *setup_slot_ptr });
-        }
-        let all_slots_ptr = if all_slots.is_empty() {
+        // Finalize: leak the single array for Vulkan's raw pointer usage
+        let slots_ptr = if slots.is_empty() {
             std::ptr::null()
         } else {
-            Box::leak(all_slots.into_boxed_slice()).as_ptr()
+            Box::leak(slots.into_boxed_slice()).as_ptr()
         };
-        let all_slots_count = if all_slots_ptr.is_null() {
-            0
-        } else {
-            has_setup_slot as u32 + dpb_ref_pictures.len() as u32
-        };
+        let all_slots_count = total_slots as u32;
 
         // DEBUG (iteration 10): dump decode command params for frame 1
-        if self.frame_count == 1 {
+        if self.frame_count == 1 && super::vacc_debug() {
             eprintln!(
                 "[RUST-DEC] frame1: output_slot={} output_old_layout={:?} ref_slots={:?} ref_layouts={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
                 output_slot_index, output_slot_old_layout, dpb_ref_slot_indices, dpb_ref_slot_layouts,
@@ -1129,12 +1260,14 @@ impl Av1Decoder {
         } else {
             (0, 0)
         };
-        eprintln!(
-            "[RUST-REF] fc={} out_slot={} ref_slots={:?} refNameIdx={:?} tile=[{}..{}) fh_off={}",
-            self.frame_count, output_slot_index, dpb_ref_slot_indices,
-            av1_decode_info.reference_name_slot_indices,
-            dbg_t_off, dbg_t_off + dbg_t_size, av1_decode_info.frame_header_offset
-        );
+        if super::vacc_debug() {
+            eprintln!(
+                "[RUST-REF] fc={} out_slot={} ref_slots={:?} refNameIdx={:?} tile=[{}..{}) fh_off={}",
+                self.frame_count, output_slot_index, dpb_ref_slot_indices,
+                av1_decode_info.reference_name_slot_indices,
+                dbg_t_off, dbg_t_off + dbg_t_size, av1_decode_info.frame_header_offset
+            );
+        }
 
         // DEBUG (iteration 16): full decode-command input dump for the first
         // multi-reference frame (Rust frame 3 = decode command 2). Prints the
@@ -1142,7 +1275,7 @@ impl Av1Decoder {
         // (imageView + base_array_layer + slot_index), referenceNameSlotIndices,
         // ref_slot_indices, and the tile/frame-header offsets, so we can diff
         // against the C++ reference's [CPP-DEC]/[CPP-PI] output.
-        if self.frame_count < 16 {
+        if self.frame_count < 16 && super::vacc_debug() {
             let setup = dpb_setup_picture.as_ref();
             eprintln!(
                 "[RUST-DEC-F3] frame3: output_slot={} output_old_layout={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
@@ -1184,7 +1317,7 @@ impl Av1Decoder {
             eprintln!(
                 "[RUST-DEC-F3]   all_slots: {:?}",
                 (0..all_slots_count)
-                    .map(|i| unsafe { (*all_slots_ptr.add(i as usize)).slot_index })
+                    .map(|i| unsafe { (*slots_ptr.add(i as usize)).slot_index })
                     .collect::<Vec<_>>()
             );
             eprintln!(
@@ -1214,7 +1347,7 @@ impl Av1Decoder {
 
         // DEBUG (iteration 22): full StdVideoDecodeAV1PictureInfo dump for ext3
         // (the broken multi-ref frame) to diff field-by-field vs C++ [CPP-PI] frame3.
-        if self.frame_count < 8 {
+        if self.frame_count < 8 && super::vacc_debug() {
             let pi = &picture_info_container.std_picture_info;
             let fl = &pi.flags;
             eprintln!(
@@ -1287,6 +1420,69 @@ impl Av1Decoder {
             eprintln!("[RUST-PI-F3] seg: enabled=[{}]", seg_en);
         }
 
+        // ===== BYTE-LEVEL DUMP for fc2 (iteration 12) =====
+        // Dump raw bytes of every structure passed to the Vulkan driver
+        if self.frame_count == 2 && super::vacc_debug() {
+            let dump_bytes = |label: &str, ptr: *const u8, len: usize| {
+                if !ptr.is_null() && len > 0 {
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
+                    eprintln!("[RUST-BYTES] {}: {} bytes: {}", label, len, hex.join(" "));
+                }
+            };
+
+            // 1. StdVideoDecodeAV1PictureInfo (the main picture info)
+            let pi = &picture_info_container.std_picture_info;
+            let pi_ptr = pi as *const _ as *const u8;
+            let pi_size = std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1PictureInfo>();
+            dump_bytes("StdVideoDecodeAV1PictureInfo", pi_ptr, pi_size);
+
+            // 2. Each StdVideoDecodeAV1ReferenceInfo
+            for i in 0..dpb_ref_pictures.len() {
+                if !ref_std_infos_ptr.is_null() {
+                    let ri = unsafe { &*ref_std_infos_ptr.add(i) };
+                    let ri_ptr = ri as *const _ as *const u8;
+                    let ri_size = std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
+                    dump_bytes(&format!("StdVideoDecodeAV1ReferenceInfo[{}]", i), ri_ptr, ri_size);
+                }
+            }
+
+            // 3. Setup StdVideoDecodeAV1ReferenceInfo
+            if !setup_std_info_ptr.is_null() {
+                let si = unsafe { &*setup_std_info_ptr };
+                let si_ptr = si as *const _ as *const u8;
+                let si_size = std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
+                dump_bytes("StdVideoDecodeAV1ReferenceInfo[SETUP]", si_ptr, si_size);
+            }
+
+            // 4. VideoDecodeAV1PictureInfoKHR (via av1_decode_info)
+            let av1pi = av1_decode_info as *const _ as *const u8;
+            let av1pi_size = std::mem::size_of::<VideoDecodeAV1PictureInfoKHR>();
+            dump_bytes("VideoDecodeAV1PictureInfoKHR", av1pi, av1pi_size);
+
+            // 5. Each VkVideoPictureResourceInfoKHR in reference pictures
+            for (i, res) in dpb_ref_pictures.iter().enumerate() {
+                let pr_ptr = res as *const _ as *const u8;
+                let pr_size = std::mem::size_of::<vk::VideoPictureResourceInfoKHR>();
+                dump_bytes(&format!("VkVideoPictureResourceInfoKHR[REF{}]", i), pr_ptr, pr_size);
+            }
+
+            // 6. Setup VkVideoPictureResourceInfoKHR
+            if let Some(sp) = &dpb_setup_picture {
+                let sp_ptr = sp as *const _ as *const u8;
+                let sp_size = std::mem::size_of::<vk::VideoPictureResourceInfoKHR>();
+                dump_bytes("VkVideoPictureResourceInfoKHR[SETUP]", sp_ptr, sp_size);
+            }
+
+            // 7. VkVideoDecodeInfoKHR (built below, dump after construction)
+            // We'll dump this after the decode_info is constructed (see below)
+
+            // 8. VkVideoBeginCodingInfoKHR (built below, dump after construction)
+            // We'll dump this after begin_coding_info is constructed (see below)
+
+            eprintln!("[RUST-BYTES] === fc2 byte dump complete ===");
+        }
+
         unsafe {
             // Begin command buffer
             let begin_info = vk::CommandBufferBeginInfo::default()
@@ -1303,9 +1499,18 @@ impl Av1Decoder {
                 video_session: session,
                 video_session_parameters: session_params,
                 reference_slot_count: all_slots_count,
-                p_reference_slots: all_slots_ptr,
+                p_reference_slots: slots_ptr,
                 _marker: Default::default(),
             };
+
+            // BYTE DUMP: VkVideoBeginCodingInfoKHR for fc2
+            if self.frame_count == 2 && super::vacc_debug() {
+                let bci_ptr = &begin_coding_info as *const _ as *const u8;
+                let bci_size = std::mem::size_of::<vk::VideoBeginCodingInfoKHR>();
+                let slice = std::slice::from_raw_parts(bci_ptr, bci_size);
+                let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
+                eprintln!("[RUST-BYTES] VkVideoBeginCodingInfoKHR: {} bytes: {}", bci_size, hex.join(" "));
+            }
 
             self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info)?;
 
@@ -1315,15 +1520,18 @@ impl Av1Decoder {
             }
 
             // Bitstream buffer barrier
+            // Match C++ VkVideoDecoder.cpp:827-839 exactly:
+            // srcStageMask=NONE, srcAccessMask=HOST_WRITE (C++ uses NONE/HOST_WRITE)
             let buffer_barrier = vk::BufferMemoryBarrier2 {
                 s_type: vk::StructureType::BUFFER_MEMORY_BARRIER_2,
                 p_next: std::ptr::null(),
-                src_stage_mask: vk::PipelineStageFlags2::HOST,
+                src_stage_mask: vk::PipelineStageFlags2::NONE,
                 src_access_mask: vk::AccessFlags2::HOST_WRITE,
                 dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
                 dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                // Match C++: dst=decode queue family index (VkVideoDecoder.cpp:835)
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: decode_queue_family,
                 buffer: bitstream_buffer,
                 offset: bitstream_offset,
                 size: bitstream_range,
@@ -1366,8 +1574,9 @@ impl Av1Decoder {
                 src_access_mask: vk::AccessFlags2::NONE,
                 dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
                 dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+                // Match C++: dst=decode queue family index (VkVideoDecoder.cpp:854)
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: decode_queue_family,
                 image: output_image,
                 old_layout,
                 new_layout,
@@ -1376,9 +1585,13 @@ impl Av1Decoder {
             };
 
             // Build barriers for reference images
+            // Match C++: only add output barrier when layout is UNDEFINED
+            // (VkVideoDecoder.cpp:889-896, 939-946)
             let mut image_barriers: Vec<vk::ImageMemoryBarrier2> =
                 Vec::with_capacity(1 + dpb_ref_images.len());
-            image_barriers.push(image_barrier);
+            if old_layout == vk::ImageLayout::UNDEFINED {
+                image_barriers.push(image_barrier);
+            }
 
             for ((&ref_image, &ref_layout), &ref_slot_idx) in dpb_ref_images
                 .iter()
@@ -1399,16 +1612,18 @@ impl Av1Decoder {
                     0
                 };
 
+                // Match C++ VkVideoDecoder.cpp:842-864 (dpbBarrierTemplates[0]):
+                // srcStageMask=NONE, srcAccessMask=0 (NOT VIDEO_DECODE/WRITE|READ)
                 let ref_barrier = vk::ImageMemoryBarrier2 {
                     s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
                     p_next: std::ptr::null(),
-                    src_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
-                    src_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
-                        | vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                    src_stage_mask: vk::PipelineStageFlags2::NONE,
+                    src_access_mask: vk::AccessFlags2::NONE,
                     dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
                     dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                    // Match C++: dst=decode queue family index (VkVideoDecoder.cpp:854)
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: decode_queue_family,
                     image: ref_image,
                     old_layout: ref_layout,
                     new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
@@ -1422,6 +1637,29 @@ impl Av1Decoder {
                     _marker: Default::default(),
                 };
                 image_barriers.push(ref_barrier);
+                if super::vacc_debug() {
+                    eprintln!(
+                        "[DPB-ITER8]   REF barrier: img={:#x} base_array_layer={} old_layout={:?} new_layout={:?}",
+                        ref_barrier.image.as_raw(),
+                        ref_barrier.subresource_range.base_array_layer,
+                        ref_barrier.old_layout,
+                        ref_barrier.new_layout,
+                    );
+                }
+            }
+
+            if super::vacc_debug() {
+                if !image_barriers.is_empty() {
+                    eprintln!(
+                        "[DPB-ITER8]   OUTPUT barrier: img={:#x} base_array_layer={} old_layout={:?} new_layout={:?}",
+                        image_barriers[0].image.as_raw(),
+                        image_barriers[0].subresource_range.base_array_layer,
+                        image_barriers[0].old_layout,
+                        image_barriers[0].new_layout,
+                    );
+                } else {
+                    eprintln!("[DPB-ITER8]   No image barriers needed (all layouts correct)");
+                }
             }
 
             let dep_info = vk::DependencyInfo {
@@ -1436,6 +1674,7 @@ impl Av1Decoder {
                 p_image_memory_barriers: image_barriers.as_ptr(),
                 _marker: Default::default(),
             };
+
             self.cmd_pipeline_barrier_2(cmd_buffer, &dep_info)?;
 
             // Build AV1 decode info
@@ -1449,21 +1688,63 @@ impl Av1Decoder {
                 _marker: Default::default(),
             };
 
-            let decode_info = vk::VideoDecodeInfoKHR {
-                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: av1_decode_info as *const _ as *const _,
-                flags: vk::VideoDecodeFlagsKHR::empty(),
-                src_buffer: bitstream_buffer,
-                src_buffer_offset: bitstream_offset,
-                src_buffer_range: bitstream_range,
-                dst_picture_resource,
-                p_setup_reference_slot: setup_slot_ptr,
-                reference_slot_count: dpb_ref_pictures.len() as u32,
-                p_reference_slots: ref_slots_ptr,
-                _marker: Default::default(),
-            };
+             let decode_info = vk::VideoDecodeInfoKHR {
+                  s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+                  p_next: av1_decode_info as *const _ as *const _,
+                  flags: vk::VideoDecodeFlagsKHR::empty(),
+                  src_buffer: bitstream_buffer,
+                  src_buffer_offset: bitstream_offset,
+                  src_buffer_range: bitstream_range,
+                  dst_picture_resource,
+                   p_setup_reference_slot: if has_setup_slot && !slots_ptr.is_null() {
+                       unsafe { slots_ptr.add(num_refs) }
+                   } else {
+                       std::ptr::null()
+                   },
+                   reference_slot_count: num_refs as u32,
+                   p_reference_slots: if num_refs == 0 { std::ptr::null() } else { slots_ptr },
+                  _marker: Default::default(),
+              };
 
-            self.cmd_decode_video(cmd_buffer, &decode_info)?;
+              // DEBUG: verify s_type value
+              if self.frame_count == 2 && super::vacc_debug() {
+                  eprintln!("[S-TYPE-CHECK] VIDEO_DECODE_INFO_KHR raw value = {}",
+                      vk::StructureType::VIDEO_DECODE_INFO_KHR.as_raw());
+                  eprintln!("[S-TYPE-CHECK] decode_info.s_type raw value = {}",
+                      decode_info.s_type.as_raw());
+                  eprintln!("[S-TYPE-CHECK] VIDEO_PICTURE_RESOURCE_INFO_KHR raw value = {}",
+                      vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR.as_raw());
+                  eprintln!("[S-TYPE-CHECK] VIDEO_DECODE_AV1_PICTURE_INFO_KHR raw value = {}",
+                      vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR.as_raw());
+              }
+
+              // BYTE DUMP: VkVideoDecodeInfoKHR + pNext chain for fc2 (Test C)
+               if self.frame_count == 2 && super::vacc_debug() {
+                  // Dump VkVideoDecodeInfoKHR
+                  let di_ptr = &decode_info as *const _ as *const u8;
+                  let di_size = std::mem::size_of::<vk::VideoDecodeInfoKHR>();
+                  let di_slice = std::slice::from_raw_parts(di_ptr, di_size);
+                  let di_hex: Vec<String> = di_slice.iter().map(|b| format!("{:02x}", b)).collect();
+                  eprintln!("[RAW-DEC-INFO] fc2: VkVideoDecodeInfoKHR size={} bytes:", di_size);
+                  for chunk in di_hex.chunks(32) {
+                      eprintln!("  {}", chunk.join(" "));
+                  }
+                  // Dump pNext chain (VideoDecodeAV1PictureInfoKHR + StdVideoDecodeAV1PictureInfo)
+                  unsafe {
+                      if !decode_info.p_next.is_null() {
+                          let pnext = decode_info.p_next as *const u8;
+                          let pnext_size = std::cmp::min(200u64, 200);
+                          let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
+                          let pnext_hex: Vec<String> = pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
+                          eprintln!("[RAW-PNEXT] fc2: first {} bytes of pNext chain:", pnext_size);
+                          for chunk in pnext_hex.chunks(32) {
+                              eprintln!("  {}", chunk.join(" "));
+                          }
+                      }
+                  }
+              }
+
+             self.cmd_decode_video(cmd_buffer, &decode_info)?;
 
             // End video coding
             self.cmd_end_video_coding(cmd_buffer)?;

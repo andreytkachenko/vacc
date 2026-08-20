@@ -773,6 +773,41 @@ impl VulkanDevice {
         };
         let profile_ptr: *const vk::VideoProfileInfoKHR = &profile_info;
 
+        // DEBUG (iteration 17): print profile info used for capabilities query
+        eprintln!(
+            "[CAPABILITIES-QUERY] VkVideoProfileInfoKHR: codecOp={:?} chromaSub={:?} lumaBit={:?} chromaBit={:?}",
+            profile_info.video_codec_operation,
+            profile_info.chroma_subsampling,
+            profile_info.luma_bit_depth,
+            profile_info.chroma_bit_depth,
+        );
+        match codec {
+            VideoCodec::DecodeAv1 => {
+                eprintln!(
+                    "[CAPABILITIES-QUERY]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}",
+                    av1_profile.std_profile, av1_profile.film_grain_support
+                );
+            }
+            VideoCodec::DecodeH264 => {
+                eprintln!(
+                    "[CAPABILITIES-QUERY]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={:?}",
+                    h264_profile.std_profile_idc, h264_profile.picture_layout
+                );
+            }
+            VideoCodec::DecodeH265 => {
+                eprintln!(
+                    "[CAPABILITIES-QUERY]   VkVideoDecodeH265ProfileInfoKHR: stdProfileIdc={}",
+                    h265_profile.std_profile_idc
+                );
+            }
+            VideoCodec::DecodeVp9 => {
+                eprintln!(
+                    "[CAPABILITIES-QUERY]   VkVideoDecodeVP9ProfileInfoKHR: stdProfile={}",
+                    vp9_profile.std_profile
+                );
+            }
+        }
+
         // Get function pointer
         let get_caps_fn = unsafe {
             self.entry.get_instance_proc_addr(
@@ -837,6 +872,54 @@ impl VulkanDevice {
                     result
                 )));
             }
+
+            // DEBUG (iteration 17): print capabilities
+            eprintln!(
+                "[CAPABILITIES] ===== VkVideoCapabilitiesKHR ====="
+            );
+            eprintln!(
+                "[CAPABILITIES]   flags                          = {:?}",
+                caps.flags
+            );
+            eprintln!(
+                "[CAPABILITIES]   minCodedExtent                 = {}x{}",
+                caps.min_coded_extent.width, caps.min_coded_extent.height
+            );
+            eprintln!(
+                "[CAPABILITIES]   maxCodedExtent                 = {}x{}",
+                caps.max_coded_extent.width, caps.max_coded_extent.height
+            );
+            eprintln!(
+                "[CAPABILITIES]   pictureAccessGranularity       = {}x{}",
+                caps.picture_access_granularity.width, caps.picture_access_granularity.height
+            );
+            eprintln!(
+                "[CAPABILITIES]   maxDpbSlots                    = {}",
+                caps.max_dpb_slots
+            );
+            eprintln!(
+                "[CAPABILITIES]   maxActiveReferencePictures     = {}",
+                caps.max_active_reference_pictures
+            );
+            eprintln!(
+                "[CAPABILITIES]   minBitstreamBufferOffsetAlignment = {}",
+                caps.min_bitstream_buffer_offset_alignment
+            );
+            eprintln!(
+                "[CAPABILITIES]   minBitstreamBufferSizeAlignment   = {}",
+                caps.min_bitstream_buffer_size_alignment
+            );
+            // Print decode capabilities (p_next chain)
+            if !decode_caps.p_next.is_null() {
+                eprintln!(
+                    "[CAPABILITIES]   VkVideoDecodeCapabilitiesKHR: flags = {:?}",
+                    decode_caps.flags
+                );
+            }
+            eprintln!(
+                "[CAPABILITIES] ==========================================="
+            );
+
             caps
         };
 

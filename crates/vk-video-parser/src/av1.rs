@@ -9,6 +9,12 @@
 use crate::bitreader::BitReader;
 use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 
+/// Returns true when `VACC_DEBUG=1` is set. Gates the verbose per-frame
+/// frame-header debug dumps. Off by default.
+fn vacc_debug() -> bool {
+    std::env::var("VACC_DEBUG").ok().unwrap_or_default() == "1"
+}
+
 /// AV1 OBU types as defined in the AV1 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObuType {
@@ -163,7 +169,8 @@ pub struct Av1FrameHeader {
     pub allow_high_precision_mv: bool,
     /// is_filter_switchable.
     pub is_filter_switchable: bool,
-    /// interpolation_filter: 0=ZERO, 1=SHARP, 2=SMOOTH, 3=SWITCHABLE.
+    /// interpolation_filter: raw bitstream value (0=EIGHTTAP, 1=EIGHTTAP_SMOOTH, 2=EIGHTTAP_SHARP)
+    /// or 4=SWITCHABLE when is_filter_switchable. Stored as-is for Vulkan struct.
     pub interpolation_filter: u8,
     /// is_motion_mode_switchable.
     pub is_motion_mode_switchable: bool,
@@ -326,6 +333,11 @@ pub struct Av1Parser {
     ref_segmentation: [([u8; 8], [[i16; 8]; 8]); 8],
     /// Per-frame-buffer loop filter deltas [8 slots] of (ref_deltas[8], mode_deltas[2]).
     ref_loop_filter: [([i8; 8], [i8; 2]); 8],
+    /// Persistent CDEF strengths carried across frames (AV1: levels not re-coded
+    /// in the current frame inherit the previous frame's values). Mirrors the
+    /// C++ reference's persistent `m_PicData.CDEF`. Format:
+    /// (cdef_damping, cdef_bits, y_pri[8], y_sec[8], uv_pri[8], uv_sec[8]).
+    last_cdef: (u8, u8, [u8; 8], [u8; 8], [u8; 8], [u8; 8]),
 }
 
 impl Default for Av1Parser {
@@ -347,6 +359,7 @@ impl Av1Parser {
             ref_global_models: [Self::default_global_models(); 8],
             ref_segmentation: [(([0; 8]), [[0; 8]; 8]); 8],
             ref_loop_filter: [(([0; 8]), [0; 2]); 8],
+            last_cdef: (0, 0, [0; 8], [0; 8], [0; 8], [0; 8]),
         }
     }
 
@@ -769,7 +782,7 @@ impl Av1Parser {
             // seq_choose_screen_content_tools (1 bit)
             let seq_choose_screen_content_tools = r.read_bit()?;
             if seq_choose_screen_content_tools {
-                sps.seq_force_screen_content_tools = 1; // SELECT
+                sps.seq_force_screen_content_tools = 2; // SELECT (STD_VIDEO_AV1_SELECT_SCREEN_CONTENT_TOOLS = 2)
             } else {
                 // seq_force_screen_content_tools (1 bit)
                 sps.seq_force_screen_content_tools = r.read_bit()? as u8;
@@ -779,13 +792,13 @@ impl Av1Parser {
                 // seq_choose_integer_mv (1 bit)
                 let seq_choose_integer_mv = r.read_bit()?;
                 if seq_choose_integer_mv {
-                    sps.seq_force_integer_mv = 1; // SELECT
+                    sps.seq_force_integer_mv = 2; // SELECT (STD_VIDEO_AV1_SELECT_INTEGER_MV = 2)
                 } else {
                     // seq_force_integer_mv (1 bit)
                     sps.seq_force_integer_mv = r.read_bit()? as u8;
                 }
             } else {
-                sps.seq_force_integer_mv = 1; // SELECT
+                sps.seq_force_integer_mv = 2; // SELECT (STD_VIDEO_AV1_SELECT_INTEGER_MV = 2)
             }
 
             if sps.enable_order_hint {
@@ -1016,7 +1029,9 @@ impl Av1Parser {
         }
 
         // 1. show_existing_frame (1 bit)
-        eprintln!("[AV1-PARSE-DBG] start: obu_data.len={} bitpos=0", obu_data.len());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] start: obu_data.len={} bitpos=0", obu_data.len());
+        }
         fh.show_existing_frame = r.read_bit()?;
         if fh.show_existing_frame {
             fh.frame_to_show_map_idx = r.read_bits(3)? as u8;
@@ -1036,7 +1051,9 @@ impl Av1Parser {
         } else {
             r.read_bit()?
         };
-        eprintln!("[AV1-PARSE-DBG] show_frame={} showable={} bitpos={}", show_frame, fh.showable_frame, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] show_frame={} showable={} bitpos={}", show_frame, fh.showable_frame, r.position());
+        }
 
         // 4. error_resilient_mode (inferred for SWITCH || (KEY && show_frame))
         fh.error_resilient_mode =
@@ -1046,25 +1063,31 @@ impl Av1Parser {
                 r.read_bit()?
             };
         let error_resilient = fh.error_resilient_mode;
-        eprintln!("[AV1-PARSE-DBG] error_resilient={} bitpos={}", error_resilient, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] error_resilient={} bitpos={}", error_resilient, r.position());
+        }
 
         // 5. disable_cdf_update (1 bit)
         fh.disable_cdf_update = r.read_bit()?;
         let disable_cdf = fh.disable_cdf_update;
-        eprintln!("[AV1-PARSE-DBG] disable_cdf={} bitpos={}", disable_cdf, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] disable_cdf={} bitpos={}", disable_cdf, r.position());
+        }
 
         // 6. allow_screen_content_tools
-        fh.allow_screen_content_tools = if sps.seq_force_screen_content_tools == 1 {
+        fh.allow_screen_content_tools = if sps.seq_force_screen_content_tools == 2 {
             r.read_bit()?
         } else {
             sps.seq_force_screen_content_tools != 0
         };
         let allow_sct = fh.allow_screen_content_tools;
-        eprintln!("[AV1-PARSE-DBG] allow_sct={} bitpos={}", allow_sct, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] allow_sct={} bitpos={}", allow_sct, r.position());
+        }
 
         // 7. force_integer_mv
         fh.force_integer_mv = if allow_sct {
-            if sps.seq_force_integer_mv == 1 {
+            if sps.seq_force_integer_mv == 2 {
                 r.read_bit()?
             } else {
                 sps.seq_force_integer_mv != 0
@@ -1076,7 +1099,9 @@ impl Av1Parser {
             fh.force_integer_mv = true;
         }
         let force_imv = fh.force_integer_mv;
-        eprintln!("[AV1-PARSE-DBG] force_imv={} bitpos={}", force_imv, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] force_imv={} bitpos={}", force_imv, r.position());
+        }
 
         // 8. frame_id (if frame_id_numbers_present)
         if sps.frame_id_numbers_present_flag {
@@ -1093,15 +1118,21 @@ impl Av1Parser {
             r.read_bit()?
         };
         let fso = fh.frame_size_override_flag;
-        eprintln!("[AV1-PARSE-DBG] fso={} bitpos={}", fso, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] fso={} bitpos={}", fso, r.position());
+        }
 
         // 10. order_hint
-        eprintln!("[AV1-PARSE-DBG] before order_hint: bitpos={}", r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] before order_hint: bitpos={}", r.position());
+        }
         if sps.enable_order_hint {
             fh.order_hint = r.read_bits(sps.order_hint_bits_minus1 + 1)?;
         }
         let order_hint = fh.order_hint;
-        eprintln!("[AV1-PARSE-DBG] order_hint={} bitpos={}", order_hint, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] order_hint={} bitpos={}", order_hint, r.position());
+        }
 
         // 11. primary_ref_frame
         fh.primary_ref_frame = if frame_is_intra || error_resilient {
@@ -1110,13 +1141,17 @@ impl Av1Parser {
             r.read_bits(3)? as u8
         };
         let primary_ref = fh.primary_ref_frame;
-        eprintln!("[AV1-PARSE-DBG] primary_ref={} bitpos={}", primary_ref, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] primary_ref={} bitpos={}", primary_ref, r.position());
+        }
 
         // 13. refresh_frame_flags
-        eprintln!(
-            "[AV1-PARSE-DBG] before refresh_frame_flags: frame_type={} bitpos={}",
-            fh.frame_type, r.position()
-        );
+        if vacc_debug() {
+            eprintln!(
+                "[AV1-PARSE-DBG] before refresh_frame_flags: frame_type={} bitpos={}",
+                fh.frame_type, r.position()
+            );
+        }
         fh.refresh_frame_flags =
             if fh.frame_type == 3 || (fh.frame_type == 0 && show_frame) {
                 0xFF
@@ -1124,7 +1159,9 @@ impl Av1Parser {
                 r.read_bits(8)? as u8
             };
         let refresh = fh.refresh_frame_flags;
-        eprintln!("[AV1-PARSE-DBG] refresh_frame_flags={:08b} bitpos={}", refresh, r.position());
+        if vacc_debug() {
+            eprintln!("[AV1-PARSE-DBG] refresh_frame_flags={:08b} bitpos={}", refresh, r.position());
+        }
 
         // 14. ref_order_hint (if !intra || refresh != 0xFF, and error_resilient, and order_hint)
         if (!frame_is_intra || refresh != 0xFF)
@@ -1141,7 +1178,7 @@ impl Av1Parser {
             if sps.enable_superres {
                 fh.use_superres = r.read_bit()?;
                 if fh.use_superres {
-                    fh.coded_denom = (r.read_bits(3)? + 4) as u8;
+                    fh.coded_denom = r.read_bits(3)? as u8; // coded_denom_minus_4 raw (match C++ VulkanAV1Decoder.cpp)
                 } else {
                     fh.coded_denom = 0;
                 }
@@ -1202,23 +1239,29 @@ impl Av1Parser {
                 false
             };
             let frss = fh.frame_refs_short_signaling;
-            eprintln!(
-                "[AV1-PARSE-DBG] frame_refs_short_signaling={} bitpos={}",
-                frss, r.position()
-            );
+            if vacc_debug() {
+                eprintln!(
+                    "[AV1-PARSE-DBG] frame_refs_short_signaling={} bitpos={}",
+                    frss, r.position()
+                );
+            }
             if frss {
                 let last_frame_idx = r.read_bits(3)? as u8;
                 let golden_frame_idx = r.read_bits(3)? as u8;
-                eprintln!(
-                    "[AV1-PARSE-DBG] last_frame_idx={} golden_frame_idx={}",
-                    last_frame_idx, golden_frame_idx
-                );
+                if vacc_debug() {
+                    eprintln!(
+                        "[AV1-PARSE-DBG] last_frame_idx={} golden_frame_idx={}",
+                        last_frame_idx, golden_frame_idx
+                    );
+                }
                 self.set_frame_refs(last_frame_idx, golden_frame_idx, order_hint, &mut fh);
             } else {
                 for i in 0..7 {
                     fh.ref_frame_idx[i] = r.read_bits(3)? as u8;
                 }
-                eprintln!("[AV1-PARSE-DBG] ref_frame_idx={:?}", fh.ref_frame_idx);
+                if vacc_debug() {
+                    eprintln!("[AV1-PARSE-DBG] ref_frame_idx={:?}", fh.ref_frame_idx);
+                }
             }
 
             // frame_size (with refs if fso && !error_resilient)
@@ -1913,15 +1956,38 @@ impl Av1Parser {
     }
 
     /// AV1 spec 7.28: cdef_params.
+    ///
+    /// Levels not re-coded in the current frame (i >= 1 << cdef_bits) inherit
+    /// the previous frame's strengths (persistent state, matching the C++
+    /// reference's persistent `m_PicData.CDEF`).
     fn parse_cdef(
-        &self,
+        &mut self,
         r: &mut BitReader,
         fh: &mut Av1FrameHeader,
         sps: &vk_video_core::picture::Av1Sps,
         coded_lossless: bool,
     ) -> ParserResult<()> {
+        // Carry over the previous frame's CDEF strengths (all 8 levels).
+        let (last_damping, last_bits, last_y_pri, last_y_sec, last_uv_pri, last_uv_sec) =
+            self.last_cdef;
+        fh.cdef_damping = last_damping;
+        fh.cdef_bits = last_bits;
+        fh.cdef_y_pri_strength = last_y_pri;
+        fh.cdef_y_sec_strength = last_y_sec;
+        fh.cdef_uv_pri_strength = last_uv_pri;
+        fh.cdef_uv_sec_strength = last_uv_sec;
+
         if coded_lossless || !sps.enable_cdef || fh.allow_intrabc {
             fh.cdef_bits = 0;
+            // Strengths remain the carried-over values (C++ does not reset them).
+            self.last_cdef = (
+                fh.cdef_damping,
+                fh.cdef_bits,
+                fh.cdef_y_pri_strength,
+                fh.cdef_y_sec_strength,
+                fh.cdef_uv_pri_strength,
+                fh.cdef_uv_sec_strength,
+            );
             return Ok(());
         }
         fh.cdef_damping = r.read_bits(2)? as u8;
@@ -1935,6 +2001,15 @@ impl Av1Parser {
                 fh.cdef_uv_sec_strength[i] = r.read_bits(2)? as u8;
             }
         }
+        // Update the persistent state for the next frame.
+        self.last_cdef = (
+            fh.cdef_damping,
+            fh.cdef_bits,
+            fh.cdef_y_pri_strength,
+            fh.cdef_y_sec_strength,
+            fh.cdef_uv_pri_strength,
+            fh.cdef_uv_sec_strength,
+        );
         Ok(())
     }
 

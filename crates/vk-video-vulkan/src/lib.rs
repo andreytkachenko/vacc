@@ -37,6 +37,13 @@ pub use profile_chain::{create_bitstream_buffer_with_profile, create_output_imag
 pub use readback::{readback_decoded_image, DecodedPixels};
 pub use session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams};
 
+/// Returns true when `VACC_DEBUG=1` is set. Gates the verbose per-frame
+/// debug dumps (picture-info dumps, DPB state, fence tracing, ...).
+/// Off by default so normal decodes stay quiet.
+pub fn vacc_debug() -> bool {
+    std::env::var("VACC_DEBUG").ok().unwrap_or_default() == "1"
+}
+
 /// Result type for Vulkan video operations.
 pub type VideoResult<T> = std::result::Result<T, VideoError>;
 

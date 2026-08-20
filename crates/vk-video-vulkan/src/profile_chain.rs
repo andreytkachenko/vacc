@@ -3,6 +3,7 @@
 use super::vp9::vp9_vk_constants;
 use super::{buffer::BitstreamBuffer, device::VideoCodec, VideoError, VideoResult};
 use ash::vk;
+use ash::vk::Handle;
 
 /// Create an output image with VkVideoProfileListInfoKHR in the pNext chain.
 pub fn create_output_image_with_profile(
@@ -153,17 +154,37 @@ pub fn create_dpb_image_array_with_profile(
 
     let mut views = Vec::with_capacity(num_slots as usize);
     for slot in 0..num_slots {
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: slot,
+            layer_count: 1,
+        };
         let view_create_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: slot,
-                layer_count: 1,
-            });
+            .subresource_range(subresource_range);
+
+        // DEBUG (iteration 10): print exact VkImageViewCreateInfo for DPB views
+        if slot == 0 {
+            eprintln!(
+                "[DPB-IV-CREATE] slot=0: image={:#x} viewType={:?} format={:?} subresourceRange={{ aspectMask={:?} baseMipLevel={} levelCount={} baseArrayLayer={} layerCount={} }}",
+                image.as_raw(),
+                view_create_info.view_type,
+                view_create_info.format,
+                view_create_info.subresource_range.aspect_mask,
+                view_create_info.subresource_range.base_mip_level,
+                view_create_info.subresource_range.level_count,
+                view_create_info.subresource_range.base_array_layer,
+                view_create_info.subresource_range.layer_count,
+            );
+            eprintln!(
+                "[DPB-IV-CREATE]   image extent: {}x{}x{} arrayLayers={} flags={:?}",
+                width, height, 1, num_slots, vk::ImageCreateFlags::MUTABLE_FORMAT
+            );
+        }
 
         let view = unsafe {
             device
@@ -273,6 +294,22 @@ fn create_image_with_profile_chain(
         initial_layout: vk::ImageLayout::UNDEFINED,
         _marker: Default::default(),
     };
+
+    // DEBUG (iteration 10): print image creation parameters
+    if array_layers > 1 {
+        eprintln!(
+            "[DPB-IMG-CREATE] format={:?} extent={{ {}x{}x1 }} arrayLayers={} flags={:?} usage={:?} queueFamilyIdx={}",
+            format, width, height, array_layers,
+            image_create_info.flags, image_create_info.usage, queue_family_index
+        );
+        eprintln!(
+            "[DPB-IMG-CREATE]   profile={{ codecOp={:?} chromaSubsampling={:?} lumaBitDepth={:?} chromaBitDepth={:?} }}",
+            profile_info.video_codec_operation,
+            profile_info.chroma_subsampling,
+            profile_info.luma_bit_depth,
+            profile_info.chroma_bit_depth,
+        );
+    }
 
     let image = unsafe {
         device

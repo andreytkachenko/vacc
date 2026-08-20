@@ -288,3 +288,197 @@ Key facts:
 - **NEXT (iteration 29, single most important):** the residual accumulating Y-dominant error (frames 2-7) is NOT in the reference std_info. Two blocking sub-tasks:
   1. **RESTORE the C++ binary** (re-add the `FillDpbAV1State` call + reference-slot block in `VulkanVideoParser.cpp` AV1 branch, keep the `[CPP-PI]`/`[CPP-REFINFO]` dumps, rebuild) so Rust-vs-C++ HW output can be compared frame-by-frame. This definitively answers inherent(HW-vs-dav1d)-vs-bug: if Rust≈C++ but both≠dav1d → inherent; if Rust≠C++ → still a Rust setup diff (then bisect the first diverging frame).
   2. If C++ is trusted as pixel-perfect: re-verify the picture-info fields that drive MOTION COMP for ALL frames 2-7 (esp. `interpolation_filter`/sub-pixel, `gm_params` for non-primary refs, `SkipModeFrame`) via RUST-PI-ALL vs [CPP-PI]; the Y-dominant widespread accumulating signature points at motion-comp (sub-pixel filter or warped-motion), not loop-filter (error is not at block boundaries).
+
+## Iteration 29-34 (comprehensive investigation)
+- **C++ reference restored and verified pixel-perfect** vs FFmpeg for all 8 frames.
+- **Rust matches C++ for fc0 (KEY) and fc1 (disp1=ext5)** but diverges from fc2 (disp2=ext6, 37.15 dB).
+- **Exhaustive comparison completed:**
+  - All 30+ StdVideoDecodeAV1PictureInfo fields match C++ exactly for fc6
+  - All reference slots match C++ (order, count, slot indices)
+  - All reference std_info (OrderHint, SavedOrderHints, RefFrameSignBias, frame_type, flags) match
+  - All Vulkan commands match (barriers, begin coding, decode info, queue families)
+  - DPB image layout matches (single image + per-slot views, base_array_layer=0)
+  - Bitstream buffer layout matches (full IVF packet)
+  - DPB slot content verified correct (meanY probes after each frame)
+  - coded_extent matches (1920x1080 for all resources)
+- **Tested hypotheses (all no-op):**
+  - VACC_FH_OFF=1 (frame_header_offset=payload_start): no change
+  - VACC_SINGLE_OBU=1 (single Frame OBU): no change
+  - update_mode_delta fix: no change (all frames have delta_update=0)
+  - dst_queue_family_index explicit: no change
+  - Aligned coded extent for refs: no change
+- **Error signature:** Y-dominant, widespread (65-96% px), border-weighted (bottom edge), accumulating
+- **Pattern suggests motion compensation error** but all motion-comp fields (gm_params, interpolation_filter, SkipModeFrame, OrderHints) match C++
+- **BLOCKER:** Cannot find the difference through code inspection. Need driver-level diagnostics or binary diff of Vulkan structs.
+
+## NEXT (iter 35+)
+- Try dumping raw bytes of StdVideoDecodeAV1PictureInfo for fc2 and compare memory layout
+- Try running under NVIDIA Nsight Graphics to capture the exact decode command
+- Try forcing specific picture info fields to verify driver actually uses them
+- Check if issue is specific to 6-reference frames (fc2 has 6 refs, fc1 has 5)
+
+## Iteration 36 (OrderHints isolation)
+- **Goal:** isolate exactly which OrderHint field(s) the NVIDIA driver uses, and what zeroing them does. Env-gated probes added (default path unchanged): `VACC_TEST=B-OLD/B-A/B-B/B-C/B-D/B-ALL/B-ALL-REF`.
+  - decoder.rs ~1674-1712: B-OLD (fc2 pic OrderHints+OrderHint→0), B-A (fc2 pic.OrderHints only→0), B-B (fc2 pic.OrderHint only→0), B-D (fc2 both pic fields→0), B-ALL (ALL frames pic fields→0).
+  - av1.rs ~971: B-C (fc2 ref-info OrderHint→0), B-ALL-REF (ALL frames ref-info OrderHint→0).
+  - Also fixed CDEF debug (decoder.rs ~1911) to print full 8-element arrays (was [0..4]).
+- **PSNR results (fc2 / fc3-7):**
+  - Baseline: fc0/fc1 PERFECT, fc2=37.15, fc3=32.76, fc4=28.96, fc5=26.76, fc6=26.94, fc7=25.68
+  - B-OLD / B-A / B-B / B-C / B-D (all zero ONLY fc2, any single field): **fc2=PERFECT**, fc3=37.15, fc4=32.87, fc5=28.67, fc6=33.16, fc7=26.84 (identical across all 5 variants)
+  - B-ALL / B-ALL-REF (zero ALL frames): **WORSE** — fc0 PERFECT, fc1=37.35, fc2=32.41, fc3=29.91, fc4=27.20, fc5=25.62, fc6=24.82, fc7=24.11
+- **VERDICT on OrderHints:**
+  1. The driver uses ALL THREE OrderHint fields (pic.OrderHints[], pic.OrderHint, ref-info OrderHint). Zeroing ANY SINGLE one makes fc2 pixel-perfect (all 5 fc2-only variants give identical results).
+  2. Zeroing fc2's OrderHints fixes fc2 AND reduces fc3-7 error (37.15→fc3, etc.) — error propagates through the reference chain (fc3 references fc2).
+  3. Zeroing ALL frames' OrderHints makes it WORSE: fc1 (1 ref) breaks (37.35) because its REAL OrderHints are correct. So the real values are correct for 1-ref frames but "wrong" for 2+-ref frames.
+  4. **CENTRAL PARADOX:** every OrderHint value for fc2 matches C++ EXACTLY (pic.OrderHint=3, pic.OrderHints=[0,2,1,0,0,5,10,20], ref OrderHints=[0,20,10,5,2,1], all biases/SavedOH/frame_type match — re-verified field-by-field vs /tmp/cpp_stderr.txt). Yet C++ decodes fc2 perfect and Rust doesn't. Zeroing (a value C++ does NOT use) fixes it. → The driver's OrderHint-dependent path (ref-frame ordering for MV prediction, only active with 2+ refs) is sensitive to some OTHER field that differs between Rust and C++ and is only consulted when OrderHints are non-zero.
+- **SECOND BUG FOUND (CDEF parser):** Rust fc=6 (disp fc2) CDEF is ALL ZEROS (ypri/ysec/uvprim/uvsec=[0×8]), but C++ fc2 CDEF is non-zero (ypri=[0 0 11 11 11 0 11 0], ysec=[0 0 0 2 2 0 0 2], uvprim=[0 0 0 0 0 0 11 11], uvsec=[0 0 2 0 2 2 0 0]); damping=2 bits=0 match. `picture_info_container.cdef` (all-zero) IS what's passed to the driver (av1.rs:447 pCDEF=&self.cdef), set from parser `fh.cdef_*` (decoder.rs:1790-1796). SPS enable_cdef=true. **Contradiction:** fc2 is pixel-perfect when OrderHints zeroed, which requires CDEF to be effective — so either the driver reads CDEF from the bitstream (ignoring our pCDEF) or CDEF isn't applied to fc2. Needs resolution; the parser CDEF extraction is suspect.
+- **NEXT (iter 37):**
+  1. Resolve the CDEF contradiction: does the driver use our pCDEF or parse CDEF from the bitstream? (Test: force a WRONG non-zero CDEF for fc2 and see if output changes.) Fix the parser CDEF extraction if it's a real bug.
+  2. Find the OTHER field the OrderHint-dependent path depends on: binary-dump the full StdVideoDecodeAV1PictureInfo + reference slots for fc2 (Rust vs C++), including fields not in RUST-PI-ALL (pNext chain, struct layout/alignment, expectedFrameId, any reserved bytes).
+  3. Since zeroing ANY single OrderHint field disables the buggy path, the driver likely does `if (any_order_hint != 0) use_order_hint_path()`. Find what that path reads that we get wrong.
+
+## Iteration 37 (raw byte diff + barriers)
+- **Goal:** definitive raw-byte diff of ALL AV1 structs for fc2 (Rust frame 6 / C++ decodePicCount 6) + exact barrier/layout dump. Env-gated probes added (default path unchanged): `VACC_RAWDUMP=1`, `VACC_BARRIERDUMP=1` (Rust, frame 6 only). C++ ITER12 gate extended to `decodePicCount==6` + sub-structure raw dumps (VkVideoDecoder.cpp:1233-1385).
+- **Part A — byte diff (Rust vs C++, fc2):**
+  - `StdVideoDecodeAV1PictureInfo` (136B, ptrs 72-136 excluded): **IDENTICAL**. Field offsets confirmed matching (OrderHints@32, expectedFrameId@40, pTileInfo@72). OrderHints=[0,2,1,0,0,5,10,20], expectedFrameId=[0×8] both.
+  - `StdVideoDecodeAV1ReferenceInfo[0..5]` (16B each): **IDENTICAL**.
+  - `VkVideoDecodeAV1PictureInfoKHR` (80B): **IDENTICAL** (note: 4B pad after sType → refNameSlotIndices@24=[4,5,0,0,3,2,1] both; an apparent offset-20 diff was the pStdPictureInfo pointer).
+  - Sub-structs TileInfo/Quantization/Segmentation/LoopFilter/LoopRestoration/FilmGrain + tile arrays: **IDENTICAL**.
+  - **BUG #1 (CDEF, 12 bytes):** Rust CDEF strengths ALL ZERO; C++ non-zero (ypri=[0,0,11,11,11,0,11,0] ysec=[0,0,0,2,2,0,0,2] uvprim=[0,0,0,0,0,0,11,11] uvsec=[0,0,2,0,2,2,0,0]). Root cause: Rust parser `parse_cdef` reads only `1<<cdef_bits` levels into a FRESH (zeroed) `fh` each frame; C++ uses persistent `m_PicData.CDEF` so unread levels carry over from the previous frame. **FIXED** (parser now carries CDEF strengths across frames via `last_cdef`).
+  - **BUG #2 (GlobalMotion, 2 bytes):** gm_params[0][2],[0][5]: Rust=65536, C++=0 (GmType[0]=identity both). Root cause: Rust hardcoded `gm.gm_params[0]=[0,0,65536,0,0,65536]`; C++ stores all-zero for the INTRA/keyframe slot. **FIXED** (gm_params[0]=[0,0,0,0,0,0]).
+  - **After fixes: ALL AV1 structs byte-IDENTICAL to C++ for fc2.**
+- **Part B — barriers (fc2):** Rust issues: (1) bitstream BUFFER barrier (srcStage=NONE/srcAccess=HOST_WRITE → dstStage=VIDEO_DECODE/dstAccess=VIDEO_DECODE_READ, dstQF=3); (2) ONE image barrier = OUTPUT slot 6 (UNDEFINED→VIDEO_DECODE_DPB, dstAccess=VIDEO_DECODE_WRITE, baseArrayLayer=6, layerCount=1). All 6 refs already in VIDEO_DECODE_DPB layout → NO ref barriers. C++ (VkVideoDecoder.cpp:827-1046) does exactly the same. **Barriers MATCH.** Picture resources also match (baseArrayLayer=0, codedExtent=1920x1080, codedOffset=(0,0) for all refs+setup).
+- **PSNR: UNCHANGED** after both fixes (fc0/fc1 PERFECT, fc2=37.15, fc3=32.76, fc4=28.96, fc5=26.76, fc6=26.94, fc7=25.68). → BUG #1/#2 are real but NOT the fc2 bug (fc2 cdef_bits=0 → only level 0 used, which is zero in both; gm_params[0] is identity → irrelevant).
+- **VERDICT on the "other field":** It is NOT in any AV1 struct (now byte-identical), NOT in the barriers, NOT in the picture resources. The driver's OrderHint-dependent path (active only with 2+ refs / non-zero OrderHints) reads a **driver-internal** field or state that is not in the Vulkan structs we pass. The CDEF contradiction from iter 36 is resolved: CDEF does nothing for fc2 (level-0 strengths are zero), so it's not the cause.
+- **Code changes (permanent fixes, not env-gated):**
+  - crates/vk-video-parser/src/av1.rs:330 (new `last_cdef` field), :351 (init), :1917-1975 (`parse_cdef` → `&mut self`, carries CDEF strengths across frames).
+  - crates/vk-video-vulkan/src/decoder.rs:1808 (gm_params[0]=[0,0,0,0,0,0]).
+  - **Env-gated probes (default path unchanged):** crates/vk-video-vulkan/src/av1.rs VACC_RAWDUMP block (~1442) + VACC_BARRIERDUMP block (~1690); C++ VkVideoDecoder.cpp:1233-1385 (ITER12 gate + sub-struct dumps).
+- **Hypothesis for next iteration:**
+  1. The "other field" is driver-internal (not in our structs). Since zeroing ANY single OrderHint field disables the buggy path, the driver likely gates a code path on `any_order_hint != 0` and that path consults driver-internal reference-frame ordering/MV-prediction state.
+  2. Try NVIDIA Nsight Graphics to capture the exact decode command + driver internals for fc2 (Rust vs C++).
+  3. Alternative: test whether the driver's order-hint path is triggered by the NUMBER of references (6) vs the OrderHint values — e.g., pass 6 refs but with a reference slot that has OrderHint=0, or reorder the reference slots, to see if the bug is tied to ref count/ordering rather than the OrderHint values themselves.
+  4. Consider that the difference may be in the DPB *slot assignment* or reference slot *order* (dpb_ref_slot_indices=[0,1,2,3,4,5]) — verify the reference slot ORDER matches C++ (pGopReferenceImagesIndexes order), not just the set.
+
+## Iteration 38 (image layout + ref bisection)
+- **Goal:** find what the OrderHint-dependent path reads. 4 env-gated bisection probes (fc2/frame_idx 6 only): (1) ref image layout, (2) readback round-trip, (3) ref count, (4) ref order.
+- **Baseline (measured, no env vars, full-YUV PSNR):** f0=inf f1=inf **f2=38.83 (Y=37.15)** f3=34.45 f4=30.64 f5=28.43 f6=28.60 f7=27.34. (fc2 Y-plane=37.15 matches prior baseline.)
+- **Test 1 — VACC_REFBARRIER (force a layout barrier on EACH of fc2's 6 refs):**
+  - `=1` (UNDEFINED→DPB): fc2=**7.26**, fc3-7=7.26 (catastrophic — UNDEFINED tells driver ref contents are garbage).
+  - `=2` (DPB→DPB): fc2=38.83, fc3-7 **unchanged** (clean no-op).
+  - `=3` (TRANSFER_SRC→DPB): fc2=38.83, fc3-7 **unchanged**.
+  - → **Refs are ALREADY in correct VIDEO_DECODE_DPB layout. Image layout is RULED OUT.**
+- **Test 2 — VACC_NOREADBACK_REF=1 (skip readback of display frames 0,1 = slots 0,1, fc2's refs that get read back):** fc2=38.83, fc3-7 **unchanged** (f0=7.26 expected, frame 0 output zeroed). `VACC_STAGING_READBACK=1` (no DPB layout round-trip): fc2=38.83, fc3-7 **unchanged**. → **The readback DPB→TRANSFER_SRC→DPB round-trip does NOT corrupt refs. Readback RULED OUT.**
+  - readback.rs finding: transition-back to DPB is CORRECT (readback.rs:232-274, TRANSFER_SRC_OPTIMAL→VIDEO_DECODE_DPB_KHR for PLANE_0+PLANE_1, dstAccess=VIDEO_DECODE_READ).
+- **Test 3 — VACC_REFCOUNT=2 (pass only first 2 ref slots, set dropped refs' referenceNameSlotIndices=-1):** **SEGFAULT**. Driver is bitstream-driven for ref count — it needs all 6 ref slots (fc2's bitstream references 6 frames). Not a clean PSNR test, but confirms the driver derives ref count from the BITSTREAM, not our p_reference_slots.
+- **Test 4 — VACC_REFORDER=rev (reverse ref slot order in BOTH BeginVideoCoding+DecodeVideo, referenceNameSlotIndices unchanged):** fc2=38.83, fc3-7 **unchanged**. → **Ref order does NOT matter. Ref order RULED OUT.** (Consistent: driver looks up refs by slot_index, not array position.)
+- **Extra probe — VACC_NULL_SESSPARAMS=1 (pass NULL videoSessionParameters):** **SEGFAULT** — driver REQUIRES the object (uses out-of-band SPS). BUT C++'s "picture parameters object" is actually a `VkVideoSessionParametersKHR` created via `vkCreateVideoSessionParametersKHR` with the AV1 SPS (VkParserVideoPictureParameters.cpp `CreateParametersObject`, TYPE_AV1_SPS case) — the SAME object type Rust passes. So object type is NOT the difference.
+- **KEY FINDING — error pattern:** The CORRECT fc2 (ffmpeg) is **BYTE-IDENTICAL to slot 4** (the LAST/primary ref, Y AND UV both identical). fc2 is an **all-skip frame** (no motion, no visible loop-filter change). Rust's fc2 is WRONG: 65.6% of Y px differ (mad=1.92), 19.9% of UV px differ. So the driver is NOT decoding fc2 as all-skip (copy of ref) — it produces a different result (motion-comp/other). The OrderHint-dependent path (active only when OrderHints non-zero) makes the driver produce the wrong result; zeroing OrderHints forces the simpler path that yields the correct all-skip copy.
+- **VERDICT:** The OrderHint-dependent path does NOT read ref image layout, ref count, or ref order (all ruled out empirically). It reads a **driver-internal field/state** not present in the (byte-identical) AV1 structs. Since the correct fc2 is an all-skip copy of the LAST ref but the driver doesn't produce it when OrderHints≠0, the path likely gates MV-prediction/skip handling on `any_order_hint!=0` and consults driver-internal reference ordering state we don't control via the Vulkan structs.
+- **Code changes (env-gated probes, default path UNCHANGED):**
+  - crates/vk-video-vulkan/src/av1.rs: VACC_REFBARRIER probe (~1690-1740, forces per-ref barrier for fc2).
+  - crates/vk-video-vulkan/src/decoder.rs: VACC_REFCOUNT + VACC_REFORDER probes (~1393-1445); VACC_NOREADBACK_REF probe (~2532-2550); VACC_NULL_SESSPARAMS probe (~2222-2235).
+- **Final baseline PSNRs (no env vars, full-YUV):** f0=inf f1=inf f2=38.83 (Y=37.15) f3=34.45 f4=30.64 f5=28.43 f6=28.60 f7=27.34. **Unchanged** from pre-probe baseline.
+- **Hypothesis for next iteration:**
+  1. Correct fc2 = all-skip copy of LAST ref. The OrderHint path makes the driver do motion-comp instead of all-skip. The field it reads is skip/MV-prediction related but NOT in the AV1 structs.
+  2. Investigate the **stored reference info in DPB slots** (set via the setup slot when each frame decoded). The driver may read the stored `RefFrameSignBias` (0xff for ALL frames in both Rust+C++) or stored `frame_type` (0=KEY, zeroed in setup slot) instead of the pNext-chain values (which differ per ref: e0/e8/a0/80/00/fe). Even though Rust+C++ store the same values, test whether the driver's all-skip decision depends on a stored field we can vary.
+  3. Test: vary the **setup slot** `frame_type` (currently zeroed=KEY) to the true frame type for frames 0-5 and see if fc2 changes; also try setting the setup slot `RefFrameSignBias` to the per-frame correct value instead of the constant 0xff.
+  4. Use **NVIDIA Nsight Graphics** to capture the driver's internal decode state for fc2 (Rust vs C++) — the field is driver-internal, so external capture is the definitive next step.
+
+## Iteration 39 (display-order POC fix)
+- **MAJOR COURSE CORRECTION:** The "fc2 diverges" bug (37dB) chased in iters 36-38 was a PHANTOM. It was an artifact of comparing rust[N] vs cpp[N] at the SAME display index while the Rust output is MISSING the 3 show_existing display frames (disp2, disp5, disp7), which shifts every later index. rust[2]=disp3 was being compared against cpp[2]=disp2 — DIFFERENT frames → 37dB "divergence".
+- **Diagnosis (empirical; PUSH-DIAG eprintln on every pushed DecodedFrame):**
+  - The 8 pushed frames are frame_idx [0,5,6,7,9,10,11,14] = display frames [disp0, disp1, disp3, disp4, disp6, disp8, disp9, disp11]. The show_existing frames (disp2, disp5, disp7) are NEVER pushed.
+  - **Root cause:** `extract_frame_obus_from_packet` (access_unit.rs:1614) only extracts OBUs with `obu_type == 6`. The 5-byte show_existing packets (pkt2/pkt5/pkt7 = `12 00 1a 01 c8`) hold a TemporalDelimiter (type 2) + a **type-3** FrameHeader OBU (payload 0xc8 = show_existing_frame=1, frame_to_show_map_idx=4). Type 3 != 6 → dropped → 0 Frame OBUs from those packets (confirmed: [AV1-EXTRACT] shows pkt2/5/7 frame_obus=0).
+  - OBU numbering in this stream matches the NVIDIA C++ parser enum (VulkanAV1Decoder.h:63): TEMPORAL_DELIMITER=2, FRAME_HEADER=3, FRAME=6 — NOT the standard AV1 spec numbering (FrameOBU=4). C++ handles it via `case AV1_OBU_FRAME_HEADER: ParseObuFrameHeader(); if (show_existing_frame) break;`.
+  - POCs were already ascending ([0,5,6,7,9,10,11,14]) → reorder_to_presentation was a NO-OP. **This was never an ordering/POC bug.**
+- **TRUE DECODE STATE (key finding):** ALL 8 Rust output frames are PIXEL-PERFECT vs their true ffmpeg display frames: rust[0]=disp0, [1]=disp1, [2]=disp3, [3]=disp4, [4]=disp6, [5]=disp8, [6]=disp9, [7]=disp11 — all mse=0.00 (verified against an 11/12-frame ffmpeg decode). **There is NO decode bug.** The "corrupted" rust[5..7] (mse 20/55/120 vs cpp[7]) are actually disp8/9/11 — correctly decoded, just outside the 8-frame window.
+- **Fix made (real, not env-gated):** POC = display_count (display index, captured before increment) at BOTH AV1 push sites — decoder.rs:~1149 (show_existing) and decoder.rs:~2722 (regular): `poc: frame_count as i32` → `poc: display_count as i32`. Correct POC semantics, but a NO-OP here (frames already in order; show_existing still missing). POCs now [0..7].
+- **After fix — rust[N] vs cpp[N]:** rust[0]=cpp[0] EXACT, rust[1]=cpp[1] EXACT, rust[2]=cpp[3] EXACT (vs cpp[2] mse=8.5), rust[3]=cpp[4] EXACT, rust[4]=cpp[6] EXACT, rust[5]=disp8 EXACT, rust[6]=disp9 EXACT, rust[7]=disp11 EXACT. (Identical to pre-fix → confirms no-op.)
+- **Still wrong (by content):** disp2, disp5, disp7 (the 3 show_existing frames) are MISSING; output instead carries disp8, disp9, disp11.
+- **The real fix (next iteration):** make `extract_frame_obus_from_packet` (access_unit.rs:1588-1630) also extract **type-3** FrameHeader OBUs (not just type 6). The frame-header parser ALREADY handles show_existing (vk-video-parser/src/av1.rs:1025-1031: reads the bit + frame_to_show_map_idx, returns early) and the decode loop ALREADY has show_existing handling (decoder.rs:1103-1162: reads the referenced DPB slot, outputs it). **Only extraction needs to change.**
+- **Temp diagnostics:** PUSH-DIAG eprintln at both AV1 push sites (decoder.rs:~1137, ~2710): frame_idx, display_count, poc, show_existing, map_idx, pic_idx, meanY1k.
+- **Hypothesis for next iteration:** extract type-3 FrameHeader OBUs; verify the 3 show_existing frames appear with correct POCs and output matches cpp[0..7] pixel-perfect. Watch: (a) type-3 payload is frame-header-only (1 byte, no tiles) — must hit the show_existing branch, not the regular decode path; (b) frame_to_show_map_idx (0-7) → DPB slot via get_pic_idx_for_frame_buffer must map correctly.
+
+## Iteration 40 (show_existing OBU extraction fix)
+- **Fix (real, not env-gated):** `extract_frame_obus_from_packet` (crates/vk-video-vulkan/src/access_unit.rs:1600-1645) now ALSO extracts **type-3 FrameHeader OBUs** in addition to type-6 Frame OBUs. A type-3 OBU is extracted only when its payload signals `show_existing_frame=1` (MSB of first payload byte set) — redundant frame headers (type-3 with show_existing_frame=0) are skipped since the corresponding Frame OBU is decoded instead. For type-3, `frame_obu_payload` = the FrameHeader OBU payload (frame header only, no tiles), `payload_start` = payload offset in packet. Also updated docs on `extract_av1_frames` + `FrameObuInfo`.
+- **Why it works end-to-end (no other changes needed):** parser `parse_frame_header` (vk-video-parser/src/av1.rs:1025-1031) reads show_existing_frame bit + frame_to_show_map_idx (3 bits) and returns early — works on the 1-byte type-3 payload. Decode loop (decoder.rs:1103-1168) show_existing branch maps frame_to_show_map_idx → DPB slot via `get_pic_idx_for_frame_buffer` (mapping maintained per real frame at decoder.rs:2352-2361 from refresh_frame_flags) and readbacks that slot. POC=display_count (iter 39 fix) gives correct display order.
+- **Extraction now (8-frame window):** pkt0=1(ext0 KEY), pkt1=5(ext1-5), pkt2=1(show_existing fb4), pkt3=1(ext6), pkt4=1(ext7), pkt5=1(show_existing fb3), pkt6=2(ext8-9), pkt7=1(show_existing fb5), ... — 15 OBUs for 11 packets, display frames disp0..disp7 all present.
+- **8-frame result (rust[N] vs cpp[N], /tmp/cpp_ref.yuv):** ALL 8 maxdiff=0, mse=0.000000 → PERFECT (incl. disp2/disp5/disp7 show_existing frames).
+- **30-frame result (vs fresh ffmpeg /tmp/ff30.yuv):** **30/30 pixel-perfect** (maxdiff=0, mse=0). 10 show_existing frames read back correctly (fb→slot: 4→4, 3→3, 5→8, 2→2, 4→6, 3→3, 2→2, 5→9, 6→5, 3→3). POCs 0..29 ascending.
+- **VERDICT: DECODER IS NOW PIXEL-PERFECT** (8/8 vs C++ ref, 30/30 vs ffmpeg). The show_existing display frames are emitted in the correct display positions; real-frame (type-6) extraction/decode unaffected.
+- **Remaining issues:** none functional. Housekeeping candidates for future iterations: (a) `frame_count` is not incremented in the show_existing branch (decoder.rs:1103-1168) — frame_num of later frames is offset by the number of show_existing frames seen (cosmetic only; POC/display order correct); (b) heavy per-frame eprintln debug noise (AV1-EXTRACT, SET_FB-REFINFO, etc.) could be gated behind a VACC_DEBUG env var; (c) dead code `extract_av1_frame_obu_payload` (decoder.rs:4293) + env-gated probes from earlier iterations could be cleaned up.
+
+## Iteration 41 (robustness: other AV1 streams)
+- **Goal:** confirm the iter-40 fix (type-3 show_existing OBU extraction + POC=display_count) generalizes beyond big_buck_bunny_av1.ivf.
+- **Per-stream results (pixel-verify.py, Y-plane PSNR vs ffmpeg):**
+  | stream | codec | res | frames | perfect | verdict |
+  |---|---|---|---|---|---|
+  | big_buck_bunny_av1.ivf | AV1 | 1920x1080 | 8 | 8/8 | **PASS** (re-verified) |
+  | bunny_small_av1.ivf | AV1 | 640x360 | 5 | 5/5 | **PASS** |
+  | test_av1.ivf | AV1 | 1920x816 | 100 | 16/100 | **FAIL** |
+  | big_buck_bunny_av1_split.ivf | AV1 | 1920x1080 | 20 | 13/20 | **FAIL** (f13-19) |
+  | known_good.ivf | **VP9** | 1920x816 | 5 | — | n/a (not AV1) |
+  | test.webm | AV1 | 1920x816 | — | — | **untestable** (EBML/webm container not parsed; `parse_ivf_container` needs `DKIF` magic → "Failed to parse video dimensions") |
+- **test_av1.ivf failure signature:** output collapses to a small set of reused frames (ff0/ff1/ff2/ff3/ff12). f0-3 correct, f4-11=ff0, f12 correct, f13-15=ff12, f16-99=ff0. Not a readback bug (readback==slot exactly); the DPB genuinely holds only ~5 distinct images.
+- **C++ reference is 100/100 perfect** on test_av1.ivf → bug is in our Rust, not the bitstream.
+- **Field-by-field C++ vs Rust diff (added per-frame `CPP-DEBUG-ITER7` dump to Vulkan-Video-Samples `VkVideoDecoder.cpp`, trigger `m_decodePicCount<20`; rebuilt incrementally ~fast):**
+  - `srcBufferRange`, `tileOffsets[0]`, `tileSizes[0]`, `frameHeaderOffset`, `referenceNameSlotIndices` **ALL MATCH** for real-decode frames 0-10 (C++ dpcN == Rust AV1-DIAG frameN; both use the whole IVF packet as bitstream with per-Frame-OBU tile offsets — same as C++).
+  - `referenceNameSlotIndices` **DIVERGES at frame 11**: C++ `[2,2,2,2,6,6,6]` vs Rust `[2,2,2,2,0,0,0]`. The split is in the DPB slot for frame-buffer 5 (ref_frame_idx=5): C++ slot 6, Rust slot 0.
+- **Root cause (DPB slot-assignment divergence, not picture-info):** both sides write identical bitstream + tile + picture info; the divergence is purely in *which DPB slot each decoded frame lands in*.
+  - C++ assigns the output slot via a frame-buffer **queue** (`m_videoFrameBuffer->QueuePictureForDecode` → `currPicIdx`, used as `baseArrayLayer`), which tracks which pictures are still live references and never clobbers one.
+  - Rust assigns via `DpbManager::find_or_recycle_slot_excluding` (dpb.rs:268): picks the first empty non-reference slot, else **recycles the oldest by frame_num**. It excludes only the *current* frame's reference slots — so it can recycle a slot whose picture is still a reference for a *future* frame (temporal conflict). Once that happens the recycled slot's image is clobbered and every later frame referencing it decodes garbage; the fb→slot map then also desyncs from C++, so `referenceNameSlotIndices` diverge from frame 11 on.
+  - DPB size is NOT the issue: Rust uses 10 slots (`parse_av1_init` decoder.rs:3910-3912, matches C++ `maxDpbSlots+1=10`); C++ "Num Surfaces:17" = 10 DPB + 7 in-flight.
+- **Why big_buck_bunny/bunny_small pass:** their reference structure keeps the live-reference window short enough that the oldest-first recycle never clobbers a still-needed reference within the tested window. test_av1/split have longer-lived references (GOLDEN/BWDREF/ALTREF refreshed sparsely) so the conflict triggers by frame ~11-13.
+- **Fix (NOT made this iteration — large change):** make Rust DPB slot selection match the C++ queue semantics — i.e., never recycle a slot whose picture is referenced by any *future* frame (or replicate `QueuePictureForDecode`'s free-slot/eviction policy). A small `find_or_recycle_slot_excluding` tweak (e.g., exclude slots whose frame_num is still within the max reference distance, or prefer highest free slot) is the candidate to try next; verify against the C++ per-frame `referenceNameSlotIndices` dump (now reproducible) before trusting pixels.
+- **Housekeeping done:** removed temp `VACC_SLOT_DUMP` DPB-slot-dump debug from decoder.rs (was at the real-decode push site). Code builds clean.
+- **Repro artifacts:** `/tmp/pixel_verify/{rust_run_stderr.txt, cpp_run_stderr.txt, compare_cpp_rust.py}`; C++ per-frame dump trigger left in Vulkan-Video-Samples (harmless, gated to first 20 AV1 decodes).
+
+## Iteration 42 (DPB slot assignment fix)
+- **Goal:** fix the DPB slot-assignment bug diagnosed in iter 41 (oldest-by-frame_num recycle clobbers a slot still referenced by a *future* frame).
+- **Approach A taken (match C++ exactly):** replicated the C++ FIFO slot assignment.
+  - C++ reference (VulkanVideoParser.cpp `DpbSlots`): `m_dpbSlotsAvailable` is a FIFO; `AllocateSlot()` pops the front, `FreeSlot()` pushes the back. A slot is freed ONLY when its picture is no longer in any frame buffer (`ResetPicDpbSlots(refDpbUsedAndValidMask)`, where the mask = every picture currently in a frame buffer). So a popped slot can never be a reference for the current or any future frame.
+  - Rust equivalent (slot == image, frame buffer maps directly to slot): a slot is *available* iff it is not held by any frame buffer. The output slot = oldest available slot (FIFO front).
+- **Fix (files):**
+  - `crates/vk-video-vulkan/src/av1.rs`: added `av1_available_slots: VecDeque<u32>` to `Av1Decoder` (+ init); added `reset_av1_fifo(num_slots)` (key/first frame → queue 0..N-1, mirrors `DpbSlots::Init`) and `allocate_output_slot(num_slots)` (compute in-use set from `frame_buffer_to_dpb_slot`, drop in-use FIFO entries, append newly-available slots in index order, pop front).
+  - `crates/vk-video-vulkan/src/decoder.rs` (~line 1312): AV1 output slot now = `0` for key/first frame (with `reset_av1_fifo`), else `av1_decoder.allocate_output_slot(num_dpb_slots)`. Replaced the buggy `find_or_recycle_slot_excluding(exclude_slots)` call (which excluded only the *current* frame's refs). `reference_name_slot_indices` / frame-buffer→slot mapping left untouched (still used by `referenceNameSlotIndices` + ref selection). `find_or_recycle_slot_excluding` kept for the VP9 path.
+- **Why it's correct:** the output slot is never in any frame buffer, so it can't clobber a live reference (current or future). 8 frame buffers + 1 output <= 10 slots ⇒ an available slot always exists. Reference slots are always in frame buffers and always `is_valid`, so `build_av1_dpb_picture_resources` ref selection is unaffected.
+- **Verification (pixel-verify.py, PSNR vs ffmpeg):**
+  | stream | frames | before | after | verdict |
+  |---|---|---|---|---|
+  | big_buck_bunny_av1.ivf | 300 | 300/300 | **300/300** | **PASS** (no regression) |
+  | test_av1.ivf | 100 | 16/100 | **100/100** | **PASS** |
+  | big_buck_bunny_av1_split.ivf | 20 | 13/20 | **20/20** | **PASS** |
+  | bunny_small_av1.ivf | 5 | 5/5 | **5/5** | **PASS** |
+- **VERDICT: DPB slot assignment is now correct across all tested streams.** All four streams pixel-perfect (maxdiff=0) vs ffmpeg; the previously-failing test_av1 and split now match, and big_buck_bunny/bunny_small show no regression.
+- **Remaining failures:** none on the AV1 streams tested. (test.webm still untestable — EBML/webm container not parsed; separate container issue, not DPB.)
+- **Next step (if any):** none required for DPB. Optional housekeeping: gate the heavy per-frame eprintln debug behind an env var; clean up dead code / env-gated probes from earlier iterations; add webm/EBML container parsing if test.webm support is wanted.
+
+## Iteration 43 (cleanup: gate debug, remove probes/dead code)
+- **Goal:** remove debug scaffolding from 40+ debugging iterations WITHOUT breaking pixel-perfect decode.
+- **Step A — gate per-frame debug behind `VACC_DEBUG=1` (default OFF):**
+  - Added `pub fn vacc_debug()` to `crates/vk-video-vulkan/src/lib.rs` (reads `VACC_DEBUG`) and a private copy in `crates/vk-video-parser/src/av1.rs`.
+  - Gated ~60 per-frame/one-shot dump blocks: `[AV1] Frame {}`, `[PUSH-DIAG]`, `[AV1-DIAG]`/`[FH-DIAG]`/`[AV1-TILE-DIAG]`/`[AV1-TILE-DBG]`/`[AV1-LF-DBG]`, `[OH-DBG]`, `[RUST-PI-ALL]`, `[FENCE-DBG]`, `[SET_FB-REFINFO]`, `[SYNC-FIX-ITER14]`, `[DPB] after frame`, struct-size check (iter 11), `[DPB-DIAG]`/`[DPB-ITER8]` (decoder + av1.rs barriers), `[SPS-PARSE]`, `[AV1-EXTRACT]`, and all `[AV1-PARSE-DBG]` parser prints (15).
+  - Kept always-on: session-creation logs (`[Decoder]`, `[Session]`, `[SESSION-CREATE]`, `[CAPABILITIES]`, `[SPS-DUMP]`, device selection) and error messages.
+- **Step B — removed env-gated probe branches (23 env vars, default paths kept):**
+  - `VACC_TEST` (A/C/D/B-OLD/B-ALL/B-A/B-B/B-C/B-ALL-REF), `VACC_TEST_C`, `VACC_SINGLE_OBU`, `VACC_ITER16` (A-D), `VACC_REFCOUNT`, `VACC_REFORDER`, `VACC_FORCE_Q0_F3`, `VACC_ITER20_VARIANT_A/B`, `VACC_DUMP_REF_SLOT`, `VACC_ALLSLOTS_PROBE`, `VACC_REF_PROBE`, `VACC_OUT_PROBE`, `VACC_STAGING_READBACK`, `VACC_SKIP_READBACK`, `VACC_NOREADBACK_REF`, `VACC_LAYER_PROBE`, `VACC_SEPARATE_DPB`, `VACC_NULL_SESSPARAMS`, `VACC_FH_OFF`, `VACC_RAWDUMP`, `VACC_REFBARRIER`, `VACC_BARRIERDUMP`.
+  - Real behavior preserved: `bs_data = av1_frame.data`, `tile_offset = payload_start + frame_header_size`, `frame_header_offset = 0`, direct `readback_decoded_image(post_decode_layout)`, session params handle, `supports_separate_reference_images` DPB path, OrderHints computed from frame-buffer order hints, `base_q_idx = fh.base_q_index`.
+  - The un-gated fc6 DPB-slot YUV dump (TEST-B) was gated behind `VACC_DEBUG` (it does readbacks + writes /tmp files).
+- **Step C — dead code removed:**
+  - `extract_av1_frame_obu_payload` (decoder.rs, 134 lines, compiler-confirmed unused).
+  - `readback_decoded_image_via_staging` (readback.rs, 354 lines; only user was the removed `VACC_STAGING_READBACK` branch). Shared helpers `find_memory_type`/`cmd_pipeline_barrier_2` kept (used by the main readback).
+  - `find_av1_frame_header_offset` kept (still referenced by gated frame-0 diagnostics).
+- **Line counts:** decoder.rs 4426→3677, av1.rs 2171→1902, readback.rs 725→371, parser av1.rs 2277→2313 (gating wrappers), lib.rs +7. Net ≈ **-1330 lines**.
+- **Warnings:** 19 → **18** (removed `extract_av1_frame_obu_payload` never-used warning; remaining 18 are pre-existing, mostly in parser/H.264 paths).
+- **Verification (pixel-verify.py vs ffmpeg, maxdiff=0):**
+  | stream | frames | verdict |
+  |---|---|---|
+  | big_buck_bunny_av1.ivf | 300 | **300/300 PASS** |
+  | test_av1.ivf | 100 | **100/100 PASS** |
+  | big_buck_bunny_av1_split.ivf | 20 | **20/20 PASS** |
+  | bunny_small_av1.ivf | 5 | **5/5 PASS** |
+  - Verified after EACH step (A, B, C) — all perfect each time.
+  - `VACC_DEBUG=1` sanity: debug output restored (453 lines for 5 frames; RUST-PI-ALL/OH-DBG/FENCE-DBG/etc. all present) and decode still 5/5 perfect.
+  - Default run output dropped from thousands of lines to ~160 (session logs + decode summary only).
+- **Real fixes kept intact:** type-3 OBU extraction (access_unit.rs), POC=display_count, AV1 FIFO slot allocation (`allocate_output_slot`/`reset_av1_fifo`), CDEF carry-over, `gm_params[0]` zeroing, post-decode layout tracking (iter 14 fix).
+- **VERDICT: cleanup complete — code is clean AND still pixel-perfect on all 4 streams.**
