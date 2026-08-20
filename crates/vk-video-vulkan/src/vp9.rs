@@ -149,6 +149,7 @@ impl Vp9Decoder {
             None,
             None,
             None,
+            None,
         )
     }
 

@@ -17,7 +17,9 @@ pub use ash::vk::native::StdVideoH265PictureParameterSet;
 pub use ash::vk::native::StdVideoH265SequenceParameterSet;
 pub use ash::vk::native::StdVideoH265VideoParameterSet;
 
+pub use ash::vk::native::StdVideoAV1ColorConfig;
 pub use ash::vk::native::StdVideoAV1SequenceHeader;
+pub use ash::vk::native::StdVideoAV1TimingInfo;
 pub use ash::vk::native::StdVideoDecodeAV1PictureInfo;
 pub use ash::vk::native::StdVideoDecodeAV1PictureInfoFlags;
 // Note: StdVideoAV1FilmGrainParams does not exist in ash::vk::native.

@@ -1,9 +1,9 @@
-//! Vulkan hardware-accelerated video decode example (H.264 + H.265 + VP9).
+//! Vulkan hardware-accelerated video decode example (H.264 + H.265 + VP9 + AV1).
 //!
 //! Demonstrates a complete Vulkan video decode pipeline using the high-level
 //! VideoDecoder API:
 //!
-//! 1. Detect codec from file extension (.h264 / .h265 / .vp9 / .ivf)
+//! 1. Detect codec from file extension (.h264 / .h265 / .vp9 / .av1 / .ivf)
 //! 2. Create VideoDecoder which handles Vulkan init, session creation, DPB management
 //! 3. Decode frames and read back YUV output
 //!
@@ -11,6 +11,7 @@
 //!   cargo run --example vulkan_decode -- born_trailer.h264
 //!   cargo run --example vulkan_decode -- big_buck_bunney.h265
 //!   cargo run --example vulkan_decode -- test.ivf
+//!   cargo run --example vulkan_decode -- test_av1.ivf
 
 use vk_video_vulkan::VideoDecoder;
 
@@ -112,7 +113,20 @@ fn detect_codec(path: &str) -> &'static str {
     match ext.as_str() {
         "h264" | "avc" | "264" => "H.264/AVC",
         "h265" | "hevc" | "265" => "H.265/HEVC",
-        "vp9" | "ivf" => "VP9",
+        "vp9" => "VP9",
+        "av1" => "AV1",
+        "ivf" => {
+            // IVF can contain VP9 or AV1 - check file stem for hints
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if stem.contains("av1") {
+                "AV1"
+            } else {
+                "VP9"
+            }
+        }
         _ => {
             let stem = std::path::Path::new(path)
                 .file_stem()
@@ -120,6 +134,8 @@ fn detect_codec(path: &str) -> &'static str {
                 .unwrap_or("");
             if stem.contains("h265") || stem.contains("hevc") {
                 "H.265/HEVC"
+            } else if stem.contains("av1") {
+                "AV1"
             } else if stem.contains("vp9") || stem.contains("ivf") {
                 "VP9"
             } else {

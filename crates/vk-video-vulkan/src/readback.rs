@@ -20,8 +20,10 @@ pub fn readback_decoded_image(
     command_pool: vk::CommandPool,
     fence: vk::Fence,
     image: vk::Image,
+    base_array_layer: u32,
     width: u32,
     height: u32,
+    old_layout: vk::ImageLayout,
 ) -> Result<DecodedPixels, VideoError> {
     let y_size = (width * height) as usize;
     let uv_width = width.div_ceil(2);
@@ -111,13 +113,13 @@ pub fn readback_decoded_image(
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
-            old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            old_layout,
             new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::PLANE_0,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer,
                 layer_count: 1,
             },
             _marker: Default::default(),
@@ -133,13 +135,13 @@ pub fn readback_decoded_image(
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image,
-            old_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            old_layout,
             new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::PLANE_1,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer,
                 layer_count: 1,
             },
             _marker: Default::default(),
@@ -173,7 +175,7 @@ pub fn readback_decoded_image(
                     vk::ImageSubresourceLayers::default()
                         .aspect_mask(vk::ImageAspectFlags::PLANE_0)
                         .mip_level(0)
-                        .base_array_layer(0)
+                        .base_array_layer(base_array_layer)
                         .layer_count(1),
                 )
                 .image_offset(vk::Offset3D::default())
@@ -197,7 +199,7 @@ pub fn readback_decoded_image(
                     vk::ImageSubresourceLayers::default()
                         .aspect_mask(vk::ImageAspectFlags::PLANE_1)
                         .mip_level(0)
-                        .base_array_layer(0)
+                        .base_array_layer(base_array_layer)
                         .layer_count(1),
                 )
                 .image_offset(vk::Offset3D::default())
@@ -243,7 +245,7 @@ pub fn readback_decoded_image(
                 aspect_mask: vk::ImageAspectFlags::PLANE_0,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer,
                 layer_count: 1,
             },
             _marker: Default::default(),
@@ -265,7 +267,7 @@ pub fn readback_decoded_image(
                 aspect_mask: vk::ImageAspectFlags::PLANE_1,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer,
                 layer_count: 1,
             },
             _marker: Default::default(),
@@ -336,6 +338,7 @@ pub fn readback_decoded_image(
         })
     }
 }
+
 
 fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,

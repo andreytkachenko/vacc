@@ -73,6 +73,16 @@ impl<'a> BitReader<'a> {
         Ok(out)
     }
 
+    /// Read `n` fixed-width two's-complement signed bits (1..=32), MSB-first.
+    pub fn read_signed_bits(&mut self, n: u8) -> Result<i32, ParserError> {
+        let v = self.read_bits(n)?;
+        if n < 32 && (v & (1 << (n - 1))) != 0 {
+            Ok((v | ((!0u32) << n)) as i32)
+        } else {
+            Ok(v as i32)
+        }
+    }
+
     /// Read one byte (8 bits).
     pub fn read_byte(&mut self) -> Result<u8, ParserError> {
         self.read_bits(8).map(|v| v as u8)
@@ -158,9 +168,132 @@ impl<'a> BitReader<'a> {
         Err(ParserError::InvalidBitstream)
     }
 
-    /// Get current bit position in the stream.
+    /// Read an increment-coded integer per AV1 spec 4.10.4.
+    /// Returns a value in `[range_min, range_max]`.
+    pub fn read_increment(&mut self, range_min: u32, range_max: u32) -> Result<u32, ParserError> {
+        let mut value = range_min;
+        while value < range_max {
+            if self.read_bit()? {
+                value += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(value)
+    }
+
+    /// Read a non-symmetric integer per AV1 spec 4.10.2. Returns a value in `[0, n-1]`.
+    pub fn read_ns(&mut self, n: u32) -> Result<u32, ParserError> {
+        debug_assert!(n > 0);
+        // w = floor(log2(n)) + 1
+        let w = 32 - n.leading_zeros();
+        let m = (1u32 << w) - n;
+        let v = if w - 1 > 0 {
+            self.read_bits((w - 1) as u8)?
+        } else {
+            0
+        };
+        if v < m {
+            Ok(v)
+        } else {
+            let extra_bit = self.read_bit()? as u32;
+            Ok((v << 1) - m + extra_bit)
+        }
+    }
+
+    /// Read a quniform-coded integer per AV1 spec 4.10.1. Returns a value in `[0, n-1]`.
+    fn read_quniform(&mut self, n: u32) -> Result<u32, ParserError> {
+        if n <= 1 {
+            return Ok(0);
+        }
+        // l = floor(log2(n - 1)) + 1
+        let l = 32 - (n - 1).leading_zeros();
+        let m = (1u32 << l) - n;
+        let v = self.read_bits((l - 1) as u8)?;
+        if v < m {
+            Ok(v)
+        } else {
+            Ok((v << 1) - m + self.read_bit()? as u32)
+        }
+    }
+
+    /// Read a subexpfin-coded integer per AV1 spec 4.10.3 (subexp with parameter k).
+    /// Returns a value in `[0, n-1]`.
+    pub fn read_subexpfin(&mut self, n: u32, k: u32) -> Result<u32, ParserError> {
+        let mut i: u32 = 0;
+        let mut mk: u32 = 0;
+        loop {
+            let b = if i == 0 { k } else { k + i - 1 };
+            let a = 1u32 << b;
+            if n <= mk + 3 * a {
+                return Ok(self.read_quniform(n - mk)? + mk);
+            }
+            if !self.read_bit()? {
+                return Ok(self.read_bits(b as u8)? + mk);
+            }
+            i += 1;
+            mk += a;
+        }
+    }
+
+    /// Inverse recenter a non-negative literal v around a reference r.
+    fn inv_recenter_nonneg(r: u32, v: u32) -> u32 {
+        if v > (r << 1) {
+            v
+        } else if (v & 1) == 0 {
+            (v >> 1) + r
+        } else {
+            r - ((v + 1) >> 1)
+        }
+    }
+
+    /// Inverse recenter a non-negative literal v in `[0, n-1]` around a reference r in `[0, n-1]`.
+    fn inv_recenter_finite_nonneg(n: u32, r: u32, v: u32) -> u32 {
+        if (r << 1) <= n {
+            Self::inv_recenter_nonneg(r, v)
+        } else {
+            n - 1 - Self::inv_recenter_nonneg(n - 1 - r, v)
+        }
+    }
+
+    /// Read a refsubexpfin-coded integer (subexpfin with recentering around `ref_val`).
+    pub fn read_refsubexpfin(&mut self, n: u32, k: u32, ref_val: u32) -> Result<u32, ParserError> {
+        let v = self.read_subexpfin(n, k)?;
+        Ok(Self::inv_recenter_finite_nonneg(n, ref_val, v))
+    }
+
+    /// Read a signed refsubexpfin-coded integer (range `[-(n-1), n-1]` centered at `ref_val`).
+    pub fn read_signed_refsubexpfin(
+        &mut self,
+        n: u32,
+        k: u32,
+        ref_val: i32,
+    ) -> Result<i32, ParserError> {
+        let ref_val = ref_val + (n as i32) - 1;
+        let scaled_n = (n << 1) - 1;
+        let v = self.read_refsubexpfin(scaled_n, k, ref_val as u32)?;
+        Ok(v as i32 - (n as i32) + 1)
+    }
+
+    /// Align the bit reader to the next byte boundary.
+    /// If we're in the middle of a byte, discard remaining bits and load the next byte.
+    pub fn align_to_byte(&mut self) -> Result<(), ParserError> {
+        if self.bits_left < 8 && self.bits_left > 0 {
+            // We've consumed some bits from curr_byte, advance to next byte
+            self.load_byte()?;
+        }
+        Ok(())
+    }
+
+    /// Get current bit position in the stream (number of bits consumed).
     pub fn position(&self) -> u64 {
-        (self.pos as u64) * 8 - (8 - self.bits_left) as u64
+        if self.bits_left == 8 {
+            // Haven't consumed any bits from the loaded byte
+            (self.pos as u64 - 1) * 8
+        } else {
+            // Consumed some bits from the loaded byte (or all of it)
+            (self.pos as u64) * 8 - (self.bits_left as u64)
+        }
     }
 
     /// Check if there is more data to read.

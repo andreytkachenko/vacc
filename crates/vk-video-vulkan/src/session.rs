@@ -273,12 +273,24 @@ impl VideoSession {
             _marker: Default::default(),
         };
 
-        // Session create info
+        // Session create info.
+        //
+        // VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR (VK_KHR_video_maintenance1)
+        // is REQUIRED here: without it the session must be initialized with the
+        // session parameters via vkUpdateVideoSessionKHR before the first
+        // vkCmdBeginVideoCodingKHR (VUID-vkCmdBeginVideoCodingKHR-...-09237).
+        // On this NVIDIA driver vkUpdateVideoSessionKHR is not resolvable via
+        // vkGetDeviceProcAddr, so the session would otherwise never receive the
+        // AV1 SPS and the driver silently skips every decode (all-zero DPB).
+        // The C++ reference (Vulkan-Video-Samples) sets this same flag whenever
+        // VK_KHR_video_maintenance1 is supported.
+        let session_flags = vk::VideoSessionCreateFlagsKHR::INLINE_QUERIES;
+
         let session_create_info = vk::VideoSessionCreateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_CREATE_INFO_KHR,
             p_next: std::ptr::null(),
             queue_family_index: params.queue_family_index,
-            flags: vk::VideoSessionCreateFlagsKHR::empty(),
+            flags: session_flags,
             p_video_profile: &profile_info as *const _,
             picture_format: params.picture_format,
             max_coded_extent: params.max_coded_extent,
@@ -288,6 +300,78 @@ impl VideoSession {
             p_std_header_version: std_header_version as *const _,
             _marker: Default::default(),
         };
+
+        // DEBUG (iteration 17): comprehensive session creation parameters
+        eprintln!(
+            "[SESSION-CREATE] ===== VkVideoSessionCreateInfoKHR ====="
+        );
+        eprintln!(
+            "[SESSION-CREATE]   flags                          = {:?}",
+            session_create_info.flags
+        );
+        eprintln!(
+            "[SESSION-CREATE]   queueFamilyIndex               = {}",
+            session_create_info.queue_family_index
+        );
+        eprintln!(
+            "[SESSION-CREATE]   pictureFormat                  = {:?}",
+            session_create_info.picture_format
+        );
+        eprintln!(
+            "[SESSION-CREATE]   referencePictureFormat         = {:?}",
+            session_create_info.reference_picture_format
+        );
+        eprintln!(
+            "[SESSION-CREATE]   maxCodedExtent                 = {}x{}",
+            session_create_info.max_coded_extent.width,
+            session_create_info.max_coded_extent.height
+        );
+        eprintln!(
+            "[SESSION-CREATE]   maxDpbSlots                    = {}",
+            session_create_info.max_dpb_slots
+        );
+        eprintln!(
+            "[SESSION-CREATE]   maxActiveReferencePictures     = {}",
+            session_create_info.max_active_reference_pictures
+        );
+        eprintln!(
+            "[SESSION-CREATE]   VkVideoProfileInfoKHR: codecOp={:?} chromaSub={:?} lumaBit={:?} chromaBit={:?}",
+            profile_info.video_codec_operation,
+            profile_info.chroma_subsampling,
+            profile_info.luma_bit_depth,
+            profile_info.chroma_bit_depth,
+        );
+        // Print codec-specific profile info
+        match &params.codec_profile_info {
+            CodecProfileInfo::H264 { std_profile_idc, picture_layout } => {
+                eprintln!("[SESSION-CREATE]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={}", std_profile_idc, picture_layout);
+            }
+            CodecProfileInfo::H265 { std_profile_idc } => {
+                eprintln!("[SESSION-CREATE]   VkVideoDecodeH265ProfileInfoKHR: stdProfileIdc={}", std_profile_idc);
+            }
+            CodecProfileInfo::Av1 { std_profile, film_grain_support } => {
+                eprintln!("[SESSION-CREATE]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}", std_profile, film_grain_support);
+            }
+            CodecProfileInfo::Vp9 { std_profile } => {
+                eprintln!("[SESSION-CREATE]   VkVideoDecodeVP9ProfileInfoKHR: stdProfile={}", std_profile);
+            }
+        }
+        // Print std header version
+        unsafe {
+            eprintln!(
+                "[SESSION-CREATE]   pStdHeaderVersion->extensionName = \"{}\"",
+                std::ffi::CStr::from_ptr((*std_header_version).extension_name.as_ptr())
+                    .to_string_lossy()
+            );
+            eprintln!(
+                "[SESSION-CREATE]   pStdHeaderVersion->specVersion   = {} (0x{:08X})",
+                std_header_version.spec_version,
+                std_header_version.spec_version
+            );
+        }
+        eprintln!(
+            "[SESSION-CREATE] ==========================================="
+        );
 
         // Get function pointer
         let create_fn = unsafe {
@@ -309,6 +393,7 @@ impl VideoSession {
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(create_fn);
 
+            eprintln!("[Session] Calling vkCreateVideoSessionKHR...");
             let mut session_handle = vk::VideoSessionKHR::null();
             let result = fn_ptr(
                 device.handle(),
@@ -316,6 +401,7 @@ impl VideoSession {
                 std::ptr::null(),
                 &mut session_handle,
             );
+            eprintln!("[Session] vkCreateVideoSessionKHR returned: {:?}", result);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkCreateVideoSessionKHR failed: {:?}",
@@ -326,7 +412,9 @@ impl VideoSession {
         };
 
         // Bind session memory (required after session creation)
+        eprintln!("[Session] Binding session memory...");
         let session_memories = Self::bind_session_memory(instance, device, session)?;
+        eprintln!("[Session] Session memory bound");
 
         Ok((
             Self {
@@ -408,6 +496,7 @@ impl VideoSessionParameters {
         vps: Option<&vk_video_core::picture::H265Vps>,
         sps_h265: Option<&vk_video_core::picture::H265Sps>,
         pps_h265: Option<&vk_video_core::picture::H265Pps>,
+        sps_av1: Option<&vk_video_core::picture::Av1Sps>,
     ) -> VideoResult<Self> {
         use super::codec_types::*;
 
@@ -423,6 +512,83 @@ impl VideoSessionParameters {
             sps_h265.map(super::h265::convert_h265_sps);
         let std_pps_h265: Option<StdVideoH265PictureParameterSet> =
             pps_h265.map(super::h265::convert_h265_pps);
+        // AV1: the sequence header (and the color config / timing info it
+        // points to) must remain valid for the lifetime of the session
+        // parameters object. The driver retains these pointers (it does not
+        // copy the data), so we leak them to keep them alive past create().
+        let std_color_config_av1: Option<*const StdVideoAV1ColorConfig> =
+            sps_av1.map(|sps| {
+                Box::into_raw(Box::new(super::av1::convert_av1_color_config(sps))) as *const _
+            });
+        let std_timing_info_av1: Option<*const StdVideoAV1TimingInfo> =
+            sps_av1.map(|sps| {
+                Box::into_raw(Box::new(super::av1::convert_av1_timing_info(sps))) as *const _
+            });
+        let std_sps_av1: Option<*const StdVideoAV1SequenceHeader> = sps_av1.map(|sps| {
+            let mut header = super::av1::convert_av1_sps(sps);
+            header.pColorConfig = std_color_config_av1.unwrap_or(std::ptr::null());
+            header.pTimingInfo = std_timing_info_av1.unwrap_or(std::ptr::null());
+            // === FULL SPS DIAGNOSTIC DUMP ===
+            eprintln!("[SPS-DUMP] ===== StdVideoAV1SequenceHeader =====");
+            eprintln!("[SPS-DUMP] flags.still_picture                       = {}", header.flags.still_picture());
+            eprintln!("[SPS-DUMP] flags.reduced_still_picture_header        = {}", header.flags.reduced_still_picture_header());
+            eprintln!("[SPS-DUMP] flags.use_128x128_superblock              = {}", header.flags.use_128x128_superblock());
+            eprintln!("[SPS-DUMP] flags.enable_filter_intra                 = {}", header.flags.enable_filter_intra());
+            eprintln!("[SPS-DUMP] flags.enable_intra_edge_filter            = {}", header.flags.enable_intra_edge_filter());
+            eprintln!("[SPS-DUMP] flags.enable_interintra_compound          = {}", header.flags.enable_interintra_compound());
+            eprintln!("[SPS-DUMP] flags.enable_masked_compound              = {}", header.flags.enable_masked_compound());
+            eprintln!("[SPS-DUMP] flags.enable_warped_motion                = {}", header.flags.enable_warped_motion());
+            eprintln!("[SPS-DUMP] flags.enable_dual_filter                  = {}", header.flags.enable_dual_filter());
+            eprintln!("[SPS-DUMP] flags.enable_order_hint                   = {}", header.flags.enable_order_hint());
+            eprintln!("[SPS-DUMP] flags.enable_jnt_comp                     = {}", header.flags.enable_jnt_comp());
+            eprintln!("[SPS-DUMP] flags.enable_ref_frame_mvs                = {}", header.flags.enable_ref_frame_mvs());
+            eprintln!("[SPS-DUMP] flags.frame_id_numbers_present_flag       = {}", header.flags.frame_id_numbers_present_flag());
+            eprintln!("[SPS-DUMP] flags.enable_superres                     = {}", header.flags.enable_superres());
+            eprintln!("[SPS-DUMP] flags.enable_cdef                         = {}", header.flags.enable_cdef());
+            eprintln!("[SPS-DUMP] flags.enable_restoration                  = {}", header.flags.enable_restoration());
+            eprintln!("[SPS-DUMP] flags.film_grain_params_present           = {}", header.flags.film_grain_params_present());
+            eprintln!("[SPS-DUMP] flags.timing_info_present_flag            = {}", header.flags.timing_info_present_flag());
+            eprintln!("[SPS-DUMP] flags.initial_display_delay_present_flag  = {}", header.flags.initial_display_delay_present_flag());
+            eprintln!("[SPS-DUMP] seq_profile                               = {}", header.seq_profile);
+            eprintln!("[SPS-DUMP] frame_width_bits_minus_1                  = {}", header.frame_width_bits_minus_1);
+            eprintln!("[SPS-DUMP] frame_height_bits_minus_1                 = {}", header.frame_height_bits_minus_1);
+            eprintln!("[SPS-DUMP] max_frame_width_minus_1                   = {}", header.max_frame_width_minus_1);
+            eprintln!("[SPS-DUMP] max_frame_height_minus_1                  = {}", header.max_frame_height_minus_1);
+            eprintln!("[SPS-DUMP] delta_frame_id_length_minus_2             = {}", header.delta_frame_id_length_minus_2);
+            eprintln!("[SPS-DUMP] additional_frame_id_length_minus_1        = {}", header.additional_frame_id_length_minus_1);
+            eprintln!("[SPS-DUMP] order_hint_bits_minus_1                   = {}", header.order_hint_bits_minus_1);
+            eprintln!("[SPS-DUMP] seq_force_integer_mv                      = {} (SELECT=2)", header.seq_force_integer_mv);
+            eprintln!("[SPS-DUMP] seq_force_screen_content_tools            = {} (SELECT=2)", header.seq_force_screen_content_tools);
+            if !header.pColorConfig.is_null() {
+                let cc = unsafe { &*header.pColorConfig };
+                eprintln!("[SPS-DUMP] --- ColorConfig ---");
+                eprintln!("[SPS-DUMP] cc.flags.mono_chrome                     = {}", cc.flags.mono_chrome());
+                eprintln!("[SPS-DUMP] cc.flags.color_range                    = {}", cc.flags.color_range());
+                eprintln!("[SPS-DUMP] cc.flags.separate_uv_delta_q            = {}", cc.flags.separate_uv_delta_q());
+                eprintln!("[SPS-DUMP] cc.flags.color_description_present_flag = {}", cc.flags.color_description_present_flag());
+                eprintln!("[SPS-DUMP] cc.BitDepth                             = {}", cc.BitDepth);
+                eprintln!("[SPS-DUMP] cc.subsampling_x                        = {}", cc.subsampling_x);
+                eprintln!("[SPS-DUMP] cc.subsampling_y                        = {}", cc.subsampling_y);
+                eprintln!("[SPS-DUMP] cc.color_primaries                      = {}", cc.color_primaries);
+                eprintln!("[SPS-DUMP] cc.transfer_characteristics             = {}", cc.transfer_characteristics);
+                eprintln!("[SPS-DUMP] cc.matrix_coefficients                  = {}", cc.matrix_coefficients);
+                eprintln!("[SPS-DUMP] cc.chroma_sample_position               = {}", cc.chroma_sample_position);
+            } else {
+                eprintln!("[SPS-DUMP] --- ColorConfig: NULL ---");
+            }
+            if !header.pTimingInfo.is_null() {
+                let ti = unsafe { &*header.pTimingInfo };
+                eprintln!("[SPS-DUMP] --- TimingInfo ---");
+                eprintln!("[SPS-DUMP] ti.flags.equal_picture_interval         = {}", ti.flags.equal_picture_interval());
+                eprintln!("[SPS-DUMP] ti.num_units_in_display_tick            = {}", ti.num_units_in_display_tick);
+                eprintln!("[SPS-DUMP] ti.time_scale                           = {}", ti.time_scale);
+                eprintln!("[SPS-DUMP] ti.num_ticks_per_picture_minus_1        = {}", ti.num_ticks_per_picture_minus_1);
+            } else {
+                eprintln!("[SPS-DUMP] --- TimingInfo: NULL ---");
+            }
+            eprintln!("[SPS-DUMP] ============================================");
+            Box::into_raw(Box::new(header)) as *const _
+        });
 
         let mut h264_add_info = vk::VideoDecodeH264SessionParametersAddInfoKHR::default();
         let mut h264_params = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default();
@@ -481,7 +647,7 @@ impl VideoSessionParameters {
                 av1_params.s_type =
                     vk::StructureType::VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR;
                 av1_params.p_next = std::ptr::null();
-                av1_params.p_std_sequence_header = std::ptr::null();
+                av1_params.p_std_sequence_header = std_sps_av1.unwrap_or(std::ptr::null());
             }
             VideoCodec::DecodeVp9 => {
                 // VP9 doesn't need codec-specific session parameters create info
@@ -502,6 +668,83 @@ impl VideoSessionParameters {
             _marker: Default::default(),
         };
 
+        // DEBUG (iteration 17): comprehensive session parameters creation dump
+        eprintln!(
+            "[SESSION-PARAMS-CREATE] ===== VkVideoSessionParametersCreateInfoKHR ====="
+        );
+        eprintln!(
+            "[SESSION-PARAMS-CREATE]   flags                                  = {:?}",
+            params_create_info.flags
+        );
+        eprintln!(
+            "[SESSION-PARAMS-CREATE]   videoSession                           = {:?} (valid={})",
+            params_create_info.video_session,
+            !params_create_info.video_session.is_null()
+        );
+        eprintln!(
+            "[SESSION-PARAMS-CREATE]   videoSessionParametersTemplate         = {:?} (valid={})",
+            params_create_info.video_session_parameters_template,
+            !params_create_info.video_session_parameters_template.is_null()
+        );
+        match codec {
+            VideoCodec::DecodeAv1 => {
+                eprintln!(
+                    "[SESSION-PARAMS-CREATE]   p_next -> VkVideoDecodeAV1SessionParametersCreateInfoKHR"
+                );
+                eprintln!(
+                    "[SESSION-PARAMS-CREATE]     p_std_sequence_header          = {:?} (valid={})",
+                    av1_params.p_std_sequence_header,
+                    !av1_params.p_std_sequence_header.is_null()
+                );
+                if !av1_params.p_std_sequence_header.is_null() {
+                    unsafe {
+                        let sps = &*av1_params.p_std_sequence_header;
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->seq_profile             = {}",
+                            sps.seq_profile
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->frame_width_bits_minus_1 = {}",
+                            sps.frame_width_bits_minus_1
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->frame_height_bits_minus_1= {}",
+                            sps.frame_height_bits_minus_1
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->max_frame_width_minus_1  = {}",
+                            sps.max_frame_width_minus_1
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->max_frame_height_minus_1 = {}",
+                            sps.max_frame_height_minus_1
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->order_hint_bits_minus_1  = {}",
+                            sps.order_hint_bits_minus_1
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->pColorConfig             = {:?}",
+                            sps.pColorConfig
+                        );
+                        eprintln!(
+                            "[SESSION-PARAMS-CREATE]       sps->pTimingInfo              = {:?}",
+                            sps.pTimingInfo
+                        );
+                    }
+                }
+            }
+            _ => {
+                eprintln!(
+                    "[SESSION-PARAMS-CREATE]   p_next -> codec-specific params for {:?}",
+                    codec
+                );
+            }
+        }
+        eprintln!(
+            "[SESSION-PARAMS-CREATE] ==========================================="
+        );
+
         let create_fn = unsafe {
             instance.get_device_proc_addr(
                 device.handle(),
@@ -521,6 +764,7 @@ impl VideoSessionParameters {
             ) -> vk::Result;
             let fn_ptr: FnType = std::mem::transmute(create_fn);
 
+            eprintln!("[SessionParams] Calling vkCreateVideoSessionParametersKHR...");
             let mut params = vk::VideoSessionParametersKHR::null();
             let result = fn_ptr(
                 device.handle(),
@@ -528,6 +772,7 @@ impl VideoSessionParameters {
                 std::ptr::null(),
                 &mut params,
             );
+            eprintln!("[SessionParams] vkCreateVideoSessionParametersKHR returned: {:?}", result);
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkCreateVideoSessionParametersKHR failed: {:?}",
@@ -561,13 +806,54 @@ impl VideoSessionParameters {
 
     /// Initialize the video session with the given session parameters.
     ///
-    /// With VK_KHR_video_maintenance1 (not maintenance2), vkCmdBeginVideoCodingKHR
-    /// will automatically initialize the session when first called with session parameters.
-    /// This matches the NVIDIA Vulkan-Video-Samples behavior.
-    pub fn update_session(&self, _session: vk::VideoSessionKHR) -> VideoResult<()> {
-        // With VK_KHR_video_maintenance1, the session is auto-initialized by
-        // vkCmdBeginVideoCodingKHR when called with session parameters.
-        // No explicit vkUpdateVideoSessionKHR call needed.
+    /// Explicitly calls vkUpdateVideoSessionKHR so the session is initialized
+    /// with the codec-specific parameters (e.g. the AV1 SPS) before the first
+    /// decode. The function pointer is loaded via the device proc addr, with a
+    /// fallback to the instance proc addr (some drivers do not expose
+    /// core-promoted video commands via vkGetDeviceProcAddr on a 1.2 device).
+    pub fn update_session(&self, session: vk::VideoSessionKHR) -> VideoResult<()> {
+        // Try both the KHR-suffixed extension name and the core (non-KHR) name.
+        // Some drivers only expose core-promoted video commands under one or the other.
+        let update_fn = unsafe {
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkUpdateVideoSessionKHR".as_ptr())
+                .or_else(|| {
+                    self.instance.get_device_proc_addr(
+                        self.device.handle(),
+                        c"vkUpdateVideoSession".as_ptr(),
+                    )
+                })
+        };
+        let update_fn = match update_fn {
+            Some(f) => f,
+            None => {
+                // vkUpdateVideoSessionKHR not loadable via vkGetDeviceProcAddr on this
+                // driver (API 1.2 device). VK_KHR_video_maintenance1 is enabled, so the
+                // session is auto-initialized by vkCmdBeginVideoCodingKHR with the session
+                // parameters. Rely on that (matches the C++ reference, which never calls
+                // vkUpdateVideoSessionKHR).
+                eprintln!("[SessionParams] vkUpdateVideoSessionKHR not found (tried KHR + core names); relying on maintenance1 auto-init");
+                return Ok(());
+            }
+        };
+
+        let result = unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::Device,
+                vk::VideoSessionKHR,
+                vk::VideoSessionParametersKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = std::mem::transmute(update_fn);
+            fn_ptr(self.device.handle(), session, self.parameters)
+        };
+
+        eprintln!("[SessionParams] vkUpdateVideoSessionKHR returned: {:?}", result);
+        if result != vk::Result::SUCCESS {
+            return Err(VideoError::SessionCreation(format!(
+                "vkUpdateVideoSessionKHR failed: {:?}",
+                result
+            )));
+        }
         Ok(())
     }
 }

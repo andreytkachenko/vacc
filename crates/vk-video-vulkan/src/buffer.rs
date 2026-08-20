@@ -37,6 +37,7 @@ impl BitstreamBuffer {
         size: u64,
         offset_alignment: u32,
         size_alignment: u32,
+        queue_family_index: u32,
     ) -> VideoResult<Self> {
         Self::create_with_pnext(
             device,
@@ -45,10 +46,19 @@ impl BitstreamBuffer {
             offset_alignment,
             size_alignment,
             std::ptr::null(),
+            ash::vk::BufferCreateFlags::empty(),
+            queue_family_index,
         )
     }
 
-    /// Create a bitstream buffer with a pNext chain (e.g., VkVideoProfileListInfoKHR).
+    /// Create a bitstream buffer with a pNext chain (e.g., VkVideoProfileListInfoKHR)
+    /// and optional create flags (e.g., VIDEO_PROFILE_INDEPENDENT_KHR).
+    ///
+    /// The buffer is owned by `queue_family_index` (EXCLUSIVE sharing). The C++
+    /// reference (VulkanBistreamBufferImpl.cpp) creates the bitstream buffer owned
+    /// by the video decode queue family (queueFamilyIndexCount = 1); with count = 0
+    /// the owning family is left to the driver, which on NVIDIA can make the decode
+    /// queue unable to read the buffer -> decode silently skipped (all-zero DPB).
     pub fn create_with_pnext(
         device: &ash::Device,
         memory_properties: &ash::vk::PhysicalDeviceMemoryProperties,
@@ -56,19 +66,21 @@ impl BitstreamBuffer {
         offset_alignment: u32,
         size_alignment: u32,
         p_next: *const std::ffi::c_void,
+        flags: ash::vk::BufferCreateFlags,
+        queue_family_index: u32,
     ) -> VideoResult<Self> {
         let aligned_size = Self::aligned_size(size, size_alignment);
 
         let buffer_create_info = ash::vk::BufferCreateInfo {
             s_type: ash::vk::StructureType::BUFFER_CREATE_INFO,
             p_next,
-            flags: ash::vk::BufferCreateFlags::empty(),
+            flags,
             size: aligned_size,
             usage: ash::vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR
                 | ash::vk::BufferUsageFlags::TRANSFER_DST,
             sharing_mode: ash::vk::SharingMode::EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
+            queue_family_index_count: 1,
+            p_queue_family_indices: &queue_family_index as *const u32,
             _marker: std::marker::PhantomData,
         };
 
@@ -129,6 +141,7 @@ impl BitstreamBuffer {
         buffer_size: u64,
         offset_alignment: u32,
         size_alignment: u32,
+        queue_family_index: u32,
     ) -> VideoResult<BitstreamBufferPool> {
         let mut buffers = Vec::with_capacity(count);
         for _ in 0..count {
@@ -138,6 +151,7 @@ impl BitstreamBuffer {
                 buffer_size,
                 offset_alignment,
                 size_alignment,
+                queue_family_index,
             )?);
         }
 
