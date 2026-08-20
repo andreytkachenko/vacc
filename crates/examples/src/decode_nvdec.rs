@@ -18,7 +18,10 @@ fn main() {
     let bitstream_path = if args.len() >= 2 {
         &args[1]
     } else {
-        eprintln!("Usage: {} <bitstream.h264> [max_frames] [out_prefix]", args[0]);
+        eprintln!(
+            "Usage: {} <bitstream.h264> [max_frames] [out_prefix]",
+            args[0]
+        );
         eprintln!("Available: born_trailer.h264");
         std::process::exit(1);
     };
@@ -68,10 +71,20 @@ fn main() {
     println!("Decoder info:");
     println!("  Backend: {}", info.backend);
     println!("  Codec: {}", info.codec);
-    println!("  Coded size: {}x{}", info.coded_size.width, info.coded_size.height);
-    println!("  Display size: {}x{}", info.display_size.width, info.display_size.height);
+    println!(
+        "  Coded size: {}x{}",
+        info.coded_size.width, info.coded_size.height
+    );
+    println!(
+        "  Display size: {}x{}",
+        info.display_size.width, info.display_size.height
+    );
     println!("  Chroma: {}", info.chroma_subsampling);
-    println!("  Bit depth: {}bit/{}bit", info.luma_bit_depth.bit_depth(), info.chroma_bit_depth.bit_depth());
+    println!(
+        "  Bit depth: {}bit/{}bit",
+        info.luma_bit_depth.bit_depth(),
+        info.chroma_bit_depth.bit_depth()
+    );
     println!("  Profile: {:?}", info.profile_idc);
     println!("  DPB slots: {}", info.dpb_slots);
 
@@ -133,8 +146,15 @@ fn main() {
     if frames_decoded > 0 {
         println!("Success: NVDEC H.264 decoding with pixel output is working!");
         println!("\nTo verify pixel-perfect output against ffmpeg:");
-        println!("  ffmpeg -y -i {} -vframes {} -f rawvideo -pix_fmt yuv420p ffmpeg_ref.yuv", bitstream_path, frames_decoded);
-        println!("  diff {}_frame_0.yuv <(dd if=ffmpeg_ref.yuv bs={} count=1 status=none)", out_prefix, frame_size(&info));
+        println!(
+            "  ffmpeg -y -i {} -vframes {} -f rawvideo -pix_fmt yuv420p ffmpeg_ref.yuv",
+            bitstream_path, frames_decoded
+        );
+        println!(
+            "  diff {}_frame_0.yuv <(dd if=ffmpeg_ref.yuv bs={} count=1 status=none)",
+            out_prefix,
+            frame_size(&info)
+        );
     } else {
         eprintln!("Warning: No frames were decoded. Check input file.");
     }
@@ -149,13 +169,15 @@ fn frame_to_yuv420p(pixel_data: &vk_video_core::frame::PixelData) -> Vec<u8> {
     // Copy Y plane
     for y in 0..pixel_data.y.height {
         let src_ptr = unsafe { pixel_data.y.data.add(y * pixel_data.y.pitch) };
-        yuv_data.extend_from_slice(unsafe { std::slice::from_raw_parts(src_ptr, pixel_data.y.width) });
+        yuv_data
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(src_ptr, pixel_data.y.width) });
     }
 
     // Copy U plane
     for y in 0..pixel_data.u.height {
         let src_ptr = unsafe { pixel_data.u.data.add(y * pixel_data.u.pitch) };
-        yuv_data.extend_from_slice(unsafe { std::slice::from_raw_parts(src_ptr, pixel_data.u.width) });
+        yuv_data
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(src_ptr, pixel_data.u.width) });
     }
 
     // Copy V plane

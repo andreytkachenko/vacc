@@ -148,13 +148,13 @@ impl PocCalculator {
                 } else if self.prev_is_reference {
                     // Previous frame was reference: use its POC + offset
                     self.prev_pic_order_cnt
-                        + sps.offset_for_ref_frame[self.last_pic_order_cnt_cycle
-                            as usize % self.num_ref_frames_in_pic_order_cnt_cycle as usize]
+                        + sps.offset_for_ref_frame[self.last_pic_order_cnt_cycle as usize
+                            % self.num_ref_frames_in_pic_order_cnt_cycle as usize]
                 } else {
                     // Previous frame was non-reference: use last ref POC + offset
                     self.last_pic_order_cnt
-                        + sps.offset_for_ref_frame[self.last_pic_order_cnt_cycle
-                            as usize % self.num_ref_frames_in_pic_order_cnt_cycle as usize]
+                        + sps.offset_for_ref_frame[self.last_pic_order_cnt_cycle as usize
+                            % self.num_ref_frames_in_pic_order_cnt_cycle as usize]
                 }
             } else {
                 // Non-reference picture
@@ -176,9 +176,8 @@ impl PocCalculator {
 
             if is_reference {
                 self.last_pic_order_cnt = top_field_order_cnt;
-                self.last_pic_order_cnt_cycle =
-                    (self.last_pic_order_cnt_cycle + 1)
-                        % self.num_ref_frames_in_pic_order_cnt_cycle as i32;
+                self.last_pic_order_cnt_cycle = (self.last_pic_order_cnt_cycle + 1)
+                    % self.num_ref_frames_in_pic_order_cnt_cycle as i32;
             }
             self.prev_is_reference = is_reference;
 

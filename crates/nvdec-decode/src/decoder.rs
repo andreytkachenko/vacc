@@ -44,10 +44,7 @@ use vk_video_core::{
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
     session::Extent2D,
 };
-use vk_video_parser::{
-    h264::H264Parser,
-    BitstreamPacket, ParseResult, VideoParser,
-};
+use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 use crate::device::{
     cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
@@ -57,8 +54,8 @@ use crate::dpb::NvdecDpbManager;
 use crate::error::{NvdecError, NvdecResult};
 use crate::ffi::{
     cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags, cudaVideoDeinterlaceMode,
-    cudaVideoSurfaceFormat, CUVIDPICPARAMS, CUVIDRECT, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
-    CUVIDPROCPARAMS, CUdeviceptr, CUvideodecoder,
+    cudaVideoSurfaceFormat, CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
+    CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
 };
 use crate::picparams::build_cuvid_picparams;
 use crate::poc::PocCalculator;
@@ -204,7 +201,6 @@ pub struct NvdecH264Decoder {
 
     /// Per-instance decode-order picture counter (starts at 0).
     dump_decode_order_count: u32,
-
 }
 
 impl NvdecH264Decoder {
@@ -234,8 +230,14 @@ impl NvdecH264Decoder {
             info: Mutex::new(DecoderInfo {
                 backend: "nvdec".to_string(),
                 codec: VideoCodec::DecodeH264,
-                coded_size: Extent2D { width: 0, height: 0 },
-                display_size: Extent2D { width: 0, height: 0 },
+                coded_size: Extent2D {
+                    width: 0,
+                    height: 0,
+                },
+                display_size: Extent2D {
+                    width: 0,
+                    height: 0,
+                },
                 chroma_subsampling: ChromaSubsampling::_420,
                 luma_bit_depth: ComponentBitDepth::Bit8,
                 chroma_bit_depth: ComponentBitDepth::Bit8,
@@ -299,7 +301,13 @@ impl NvdecH264Decoder {
 
         loop {
             match self.parser.parse(&packet) {
-                Ok(ParseResult::ParameterSet { sps, pps, sps_nal, pps_nal, .. }) => {
+                Ok(ParseResult::ParameterSet {
+                    sps,
+                    pps,
+                    sps_nal,
+                    pps_nal,
+                    ..
+                }) => {
                     // Handle SPS — create or recreate decoder
                     if let Some(sps_box) = sps {
                         if let Some(h264_sps) =
@@ -317,7 +325,8 @@ impl NvdecH264Decoder {
                                 (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
                             };
 
-                            let resolution_changed = prev_w != coded_width || prev_h != coded_height;
+                            let resolution_changed =
+                                prev_w != coded_width || prev_h != coded_height;
                             if resolution_changed {
                                 self.recreate_decoder(h264_sps)?;
                             } else {
@@ -384,12 +393,14 @@ impl NvdecH264Decoder {
                     };
 
                     // Get active SPS/PPS from parser
-                    let sps = self.parser.active_sps().ok_or_else(|| {
-                        NvdecError::DecodeFailed("No active SPS".into())
-                    })?;
-                    let pps = self.parser.active_pps().ok_or_else(|| {
-                        NvdecError::DecodeFailed("No active PPS".into())
-                    })?;
+                    let sps = self
+                        .parser
+                        .active_sps()
+                        .ok_or_else(|| NvdecError::DecodeFailed("No active SPS".into()))?;
+                    let pps = self
+                        .parser
+                        .active_pps()
+                        .ok_or_else(|| NvdecError::DecodeFailed("No active PPS".into()))?;
 
                     // Determine if this is an IDR picture
                     let is_idr = slh.nal_unit_type == 5;
@@ -440,13 +451,12 @@ impl NvdecH264Decoder {
                     let sps_nal = self.sps_nal_data.lock().unwrap().clone();
                     let pps_nal = self.pps_nal_data.lock().unwrap().clone();
                     let need_sps_pps = !*self.sps_pps_fed.lock().unwrap();
-                    let sps_pps_len =
-                        sps_nal.as_ref().map(|n| n.len() + 3).unwrap_or(0)
-                            + pps_nal.as_ref().map(|n| n.len() + 3).unwrap_or(0);
+                    let sps_pps_len = sps_nal.as_ref().map(|n| n.len() + 3).unwrap_or(0)
+                        + pps_nal.as_ref().map(|n| n.len() + 3).unwrap_or(0);
 
                     let mut bitstream_data = Vec::with_capacity(
                         slices.iter().map(|s| s.nal_data.len() + 3).sum::<usize>()
-                            + if need_sps_pps { sps_pps_len } else { 0 }
+                            + if need_sps_pps { sps_pps_len } else { 0 },
                     );
                     if need_sps_pps {
                         if let Some(nal) = &sps_nal {
@@ -467,9 +477,17 @@ impl NvdecH264Decoder {
                     }
 
                     let picparams = build_cuvid_picparams(
-                        sps, pps, slh, slh.frame_num, poc, slh.nal_ref_idc > 0,
-                        curr_pic_idx, &bitstream_data, &slice_offsets,
-                        slices.len() as u32, &dpb_entries,
+                        sps,
+                        pps,
+                        slh,
+                        slh.frame_num,
+                        poc,
+                        slh.nal_ref_idc > 0,
+                        curr_pic_idx,
+                        &bitstream_data,
+                        &slice_offsets,
+                        slices.len() as u32,
+                        &dpb_entries,
                     );
 
                     // Decode the picture
@@ -497,7 +515,8 @@ impl NvdecH264Decoder {
                     };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(
-                            "cuvidDecodePicture failed: {}", result
+                            "cuvidDecodePicture failed: {}",
+                            result
                         )));
                     }
 
@@ -525,7 +544,9 @@ impl NvdecH264Decoder {
                                 &mut decode_status,
                             )
                         };
-                        if decode_status.decodeStatus != crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress {
+                        if decode_status.decodeStatus
+                            != crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress
+                        {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -556,7 +577,13 @@ impl NvdecH264Decoder {
                     if std::env::var("NVDEC_DEBUG_SURFACES").is_ok() {
                         eprintln!(
                             "[DECODE] seq={} fn={} poc={} uw={} pre_surf={} post_surf={} ref={}",
-                            seq, slh.frame_num, poc, unwrapped, curr_pic_idx, pic_index, is_reference
+                            seq,
+                            slh.frame_num,
+                            poc,
+                            unwrapped,
+                            curr_pic_idx,
+                            pic_index,
+                            is_reference
                         );
                     }
 
@@ -884,7 +911,10 @@ impl NvdecH264Decoder {
             }
 
             if std::env::var("NVDEC_DEBUG_SURFACES").is_ok() {
-                eprintln!("[PRESENT] uw_poc={} surf={} seq={}", key.0, min_idx, min_seq);
+                eprintln!(
+                    "[PRESENT] uw_poc={} surf={} seq={}",
+                    key.0, min_idx, min_seq
+                );
             }
             match self.extract_frame(min_idx, min_seq) {
                 Some(frame) => {
@@ -963,13 +993,7 @@ impl NvdecH264Decoder {
         };
 
         let map_result = unsafe {
-            (funcs.map_video_frame64)(
-                decoder,
-                pic_index,
-                &mut dev_ptr,
-                &mut pitch,
-                &proc_params,
-            )
+            (funcs.map_video_frame64)(decoder, pic_index, &mut dev_ptr, &mut pitch, &proc_params)
         };
         if map_result != CUDA_SUCCESS {
             eprintln!("[NVDEC] cuvidMapVideoFrame64 failed: {}", map_result);
@@ -1010,8 +1034,7 @@ impl NvdecH264Decoder {
             }
         };
         let pinned_y = pinned_base;
-        let pinned_uv =
-            unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
+        let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         // Copy the Y plane with a single 2D memcpy (accounts for cropping).
         let mut copy_y = CUDA_MEMCPY2D {
@@ -1238,13 +1261,7 @@ impl NvdecH264Decoder {
             Reserved2: [std::ptr::null_mut()],
         };
         let map_result = unsafe {
-            (funcs.map_video_frame64)(
-                decoder,
-                pic_index,
-                &mut dev_ptr,
-                &mut pitch,
-                &proc_params,
-            )
+            (funcs.map_video_frame64)(decoder, pic_index, &mut dev_ptr, &mut pitch, &proc_params)
         };
         if map_result != CUDA_SUCCESS {
             return;
@@ -1378,11 +1395,8 @@ impl Decoder for NvdecH264Decoder {
         // Extract remaining frames from the reorder buffer in ascending
         // POC (display) order. BTreeMap iteration is already sorted by
         // (unwrapped_poc, seq).
-        let remaining: Vec<((i32, i32), (i32, i32))> = self
-            .reorder
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
+        let remaining: Vec<((i32, i32), (i32, i32))> =
+            self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
 
         for (key, (pic_index, seq)) in remaining {
             if let Some(frame) = self.extract_frame(pic_index, seq) {
@@ -1518,8 +1532,7 @@ fn dump_cuvid_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPARAMS
 
     let h = unsafe { &p.CodecSpecific.h264 };
     let bs = unsafe { std::slice::from_raw_parts(p.pBitstreamData, p.nBitstreamDataLen as usize) };
-    let offsets =
-        unsafe { std::slice::from_raw_parts(p.pSliceDataOffsets, p.nNumSlices as usize) };
+    let offsets = unsafe { std::slice::from_raw_parts(p.pSliceDataOffsets, p.nNumSlices as usize) };
 
     let mut s = String::new();
     s.push_str(&format!("=== PIC {} ===\n", pic_num));
@@ -1596,10 +1609,7 @@ fn dump_cuvid_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPARAMS
     ));
     s.push_str(&format!(
         "PIC: ref_pic_flag={} frame_num={} CurrFieldOrderCnt=[{},{}]\n",
-        h.ref_pic_flag,
-        h.frame_num,
-        h.CurrFieldOrderCnt[0],
-        h.CurrFieldOrderCnt[1]
+        h.ref_pic_flag, h.frame_num, h.CurrFieldOrderCnt[0], h.CurrFieldOrderCnt[1]
     ));
     for (i, e) in h.dpb.iter().enumerate() {
         s.push_str(&format!(

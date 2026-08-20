@@ -39,20 +39,33 @@ impl<'a> Bits<'a> {
     }
     fn se(&mut self) -> i32 {
         let c = self.ue() as i32;
-        if c % 2 == 0 { -(c / 2) } else { (c + 1) / 2 }
+        if c % 2 == 0 {
+            -(c / 2)
+        } else {
+            (c + 1) / 2
+        }
     }
     fn show(&self, start: usize, len: usize) -> String {
         let mut s = String::new();
         for k in start..start + len {
-            s.push(if (self.b[k / 8] >> (7 - (k % 8))) & 1 == 1 { '1' } else { '0' });
+            s.push(if (self.b[k / 8] >> (7 - (k % 8))) & 1 == 1 {
+                '1'
+            } else {
+                '0'
+            });
         }
         s
     }
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "assets/test_baseline.h264".into());
-    let want_fn: u32 = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(2);
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/test_baseline.h264".into());
+    let want_fn: u32 = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(2);
     let data = std::fs::read(&path).unwrap();
     let mut parser = H264Parser::new();
     let packet = BitstreamPacket::new(data);
@@ -95,28 +108,62 @@ fn main() {
                         let mut r = Bits::new(&rbsp);
                         let s = r.i;
                         let first_mb = r.ue();
-                        println!("first_mb_in_slice ue = {}  bits[{}:{}]={}", first_mb, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "first_mb_in_slice ue = {}  bits[{}:{}]={}",
+                            first_mb,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         let s = r.i;
                         let st = r.ue();
-                        println!("slice_type ue = {} (mod5={})  bits[{}:{}]={}", st, st % 5, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "slice_type ue = {} (mod5={})  bits[{}:{}]={}",
+                            st,
+                            st % 5,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         let s = r.i;
                         let pps = r.ue();
-                        println!("pps_id ue = {}  bits[{}:{}]={}", pps, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "pps_id ue = {}  bits[{}:{}]={}",
+                            pps,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         let s = r.i;
                         let fn_ = r.bits(4);
-                        println!("frame_num u(4) = {}  bits[{}:{}]={}", fn_, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "frame_num u(4) = {}  bits[{}:{}]={}",
+                            fn_,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         // assume frame_mbs_only, poc_type=2, no redundant, no colour_plane
                         let s = r.i;
                         let flag = r.bit();
                         println!(
                             "adaptive_ref_pic_marking_mode_flag = {}  bits[{}:{}]={}",
-                            flag, s, r.i, r.show(s, r.i - s)
+                            flag,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
                         );
                         if flag == 1 {
                             loop {
                                 let s = r.i;
                                 let op = r.bits(4);
-                                print!("  MMCO op u(4) = {}  bits[{}:{}]={}", op, s, r.i, r.show(s, r.i - s));
+                                print!(
+                                    "  MMCO op u(4) = {}  bits[{}:{}]={}",
+                                    op,
+                                    s,
+                                    r.i,
+                                    r.show(s, r.i - s)
+                                );
                                 if op == 0 {
                                     println!("  (END)");
                                     break;
@@ -125,12 +172,24 @@ fn main() {
                                     1 | 4 => {
                                         let s2 = r.i;
                                         let v = r.ue();
-                                        println!(" | value ue = {}  bits[{}:{}]={}", v, s2, r.i, r.show(s2, r.i - s2));
+                                        println!(
+                                            " | value ue = {}  bits[{}:{}]={}",
+                                            v,
+                                            s2,
+                                            r.i,
+                                            r.show(s2, r.i - s2)
+                                        );
                                     }
                                     2 | 3 | 5 | 6 | 7 | 9 => {
                                         let s2 = r.i;
                                         let v = r.bits(5);
-                                        println!(" | value u(5) = {}  bits[{}:{}]={}", v, s2, r.i, r.show(s2, r.i - s2));
+                                        println!(
+                                            " | value u(5) = {}  bits[{}:{}]={}",
+                                            v,
+                                            s2,
+                                            r.i,
+                                            r.show(s2, r.i - s2)
+                                        );
                                     }
                                     8 => println!(" | (no value)"),
                                     _ => {
@@ -143,21 +202,51 @@ fn main() {
                         // continue: num_ref_idx etc.
                         let s = r.i;
                         let override_flag = r.bit();
-                        println!("num_ref_idx_active_override_flag = {}  bits[{}:{}]={}", override_flag, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "num_ref_idx_active_override_flag = {}  bits[{}:{}]={}",
+                            override_flag,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         if override_flag == 1 {
                             let s2 = r.i;
                             let n0 = r.ue();
-                            println!("  num_ref_idx_l0_active_minus1 ue = {}  bits[{}:{}]={}", n0, s2, r.i, r.show(s2, r.i - s2));
+                            println!(
+                                "  num_ref_idx_l0_active_minus1 ue = {}  bits[{}:{}]={}",
+                                n0,
+                                s2,
+                                r.i,
+                                r.show(s2, r.i - s2)
+                            );
                         }
                         let s = r.i;
                         let rplm = r.bit();
-                        println!("ref_pic_list_modification_flag = {}  bits[{}:{}]={}", rplm, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "ref_pic_list_modification_flag = {}  bits[{}:{}]={}",
+                            rplm,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         let s = r.i;
                         let cabac_init = r.bit();
-                        println!("cabac_init_flag = {}  bits[{}:{}]={}", cabac_init, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "cabac_init_flag = {}  bits[{}:{}]={}",
+                            cabac_init,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         let s = r.i;
                         let qp = r.se();
-                        println!("slice_qp_delta se = {}  bits[{}:{}]={}", qp, s, r.i, r.show(s, r.i - s));
+                        println!(
+                            "slice_qp_delta se = {}  bits[{}:{}]={}",
+                            qp,
+                            s,
+                            r.i,
+                            r.show(s, r.i - s)
+                        );
                         found = true;
                         break;
                     }

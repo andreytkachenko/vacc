@@ -4,12 +4,10 @@ use ash::vk::{self, Handle};
 
 use super::{
     access_unit::{
-        AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt,
-        InBandParameterSet, VideoCodec as AccessUnitCodec,
+        AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet,
+        VideoCodec as AccessUnitCodec,
     },
-    av1::{
-        Av1Decoder, Av1PictureInfoContainer, VideoDecodeAV1PictureInfoKHR,
-    },
+    av1::{Av1Decoder, Av1PictureInfoContainer, VideoDecodeAV1PictureInfoKHR},
     buffer::BitstreamBuffer,
     device::{VideoCodec, VulkanDevice},
     dpb::{DpbEntry, DpbManager, LastAccessType},
@@ -21,9 +19,7 @@ use super::{
     },
     readback::DecodedPixels,
     session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams},
-    vp9::{
-        convert_vp9_picture_info, VideoDecodeVP9PictureInfoKHR, Vp9Decoder,
-    },
+    vp9::{convert_vp9_picture_info, VideoDecodeVP9PictureInfoKHR, Vp9Decoder},
     VideoError, VideoResult,
 };
 
@@ -138,15 +134,7 @@ impl VideoDecoder {
     pub fn new(data: Vec<u8>, max_frames: usize) -> VideoResult<Self> {
         let decoded_codec = detect_codec_from_data(&data);
 
-        let (
-            parsed,
-            codec,
-            vulkan,
-            session_dpb_slots,
-            _dpb_slots,
-            coded_extent,
-            av1_sps,
-        ) =
+        let (parsed, codec, vulkan, session_dpb_slots, _dpb_slots, coded_extent, av1_sps) =
             match decoded_codec {
                 AccessUnitCodec::H264 => {
                     let parsed = parse_h264(&data)?;
@@ -217,14 +205,8 @@ impl VideoDecoder {
                     )
                 }
                 AccessUnitCodec::Av1 => {
-                    let (
-                        parsed,
-                        vulkan,
-                        session_dpb_slots,
-                        dpb_slots,
-                        coded_extent,
-                        av1_sps,
-                    ) = parse_av1_init(&data)?;
+                    let (parsed, vulkan, session_dpb_slots, dpb_slots, coded_extent, av1_sps) =
+                        parse_av1_init(&data)?;
                     let codec = VideoCodec::DecodeAv1;
                     (
                         parsed,
@@ -1032,9 +1014,10 @@ impl VideoDecoder {
             Av1Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
         av1_decoder.set_session(&self.session);
 
-        let sps = self.av1_sps.as_ref().ok_or_else(|| {
-            VideoError::DecoderInit("AV1 SPS not available".to_string())
-        })?;
+        let sps = self
+            .av1_sps
+            .as_ref()
+            .ok_or_else(|| VideoError::DecoderInit("AV1 SPS not available".to_string()))?;
 
         let mut decoded_frames = Vec::new();
         let mut is_first_frame = true;
@@ -1075,8 +1058,8 @@ impl VideoDecoder {
                 }
             };
 
-              if super::vacc_debug() {
-                  eprintln!(
+            if super::vacc_debug() {
+                eprintln!(
                       "[AV1] Frame {} (disp#{}): type={:?}, show_frame={}, show_existing={}, show_map_idx={}, order_hint={}, primary_ref={}, refresh_flags={:08b}, ref_idx={:?}, payload_start={}",
                       frame_idx,
                       display_count,
@@ -1096,7 +1079,7 @@ impl VideoDecoder {
                       fh.ref_frame_idx,
                       av1_frame.payload_start,
                   );
-              }
+            }
 
             // Handle show_existing_frame: no new decode, output the already-decoded
             // buffer of the referenced frame buffer as this display frame.
@@ -1138,8 +1121,13 @@ impl VideoDecoder {
                     )?;
                     if super::vacc_debug() {
                         let n = pixels.y_plane.len().min(1000).max(1);
-                        let my = pixels.y_plane.iter().take(n)
-                            .map(|&b| b as u32).sum::<u32>() as f64 / n as f64;
+                        let my = pixels
+                            .y_plane
+                            .iter()
+                            .take(n)
+                            .map(|&b| b as u32)
+                            .sum::<u32>() as f64
+                            / n as f64;
                         eprintln!(
                             "[PUSH-DIAG] frame_idx={} display_count={} poc={} show_existing=1 map_idx={} pic_idx={} meanY1k={:.1}",
                             frame_idx, display_count, frame_count, frame_buffer_idx, pic_idx, my
@@ -1253,8 +1241,11 @@ impl VideoDecoder {
             self.bs_buffer.flush_range(0, aligned_size).ok();
 
             // Compute reference name slot indices
-            let reference_name_slot_indices =
-                av1_decoder.compute_reference_name_slot_indices(is_key_frame, &fh.ref_frame_idx, fh.primary_ref_frame);
+            let reference_name_slot_indices = av1_decoder.compute_reference_name_slot_indices(
+                is_key_frame,
+                &fh.ref_frame_idx,
+                fh.primary_ref_frame,
+            );
 
             if super::vacc_debug() {
                 eprintln!(
@@ -1291,14 +1282,14 @@ impl VideoDecoder {
             // Build DPB picture resources
             let (dpb_setup_picture, dpb_ref_pictures, dpb_ref_slot_indices) =
                 build_av1_dpb_picture_resources(
-                     &self.dpb_manager,
-                     &self.dpb_views,
-                     frame_coded_extent,
-                     output_slot,
-                     is_key_frame,
-                     &fh.ref_frame_idx,
-                     &av1_decoder,
-                 );
+                    &self.dpb_manager,
+                    &self.dpb_views,
+                    frame_coded_extent,
+                    output_slot,
+                    is_key_frame,
+                    &fh.ref_frame_idx,
+                    &av1_decoder,
+                );
 
             let dpb_ref_images: Vec<vk::Image> = dpb_ref_slot_indices
                 .iter()
@@ -1334,83 +1325,179 @@ impl VideoDecoder {
                 let once_cell = std::sync::Once::new();
                 once_cell.call_once(|| {
                     eprintln!("=== STRUCT SIZE CHECK (iter 11) ===");
-                    eprintln!("StdVideoDecodeAV1PictureInfo: size={} align={} (expected 136/8)",
+                    eprintln!(
+                        "StdVideoDecodeAV1PictureInfo: size={} align={} (expected 136/8)",
                         std::mem::size_of::<native::StdVideoDecodeAV1PictureInfo>(),
-                        std::mem::align_of::<native::StdVideoDecodeAV1PictureInfo>());
-                    eprintln!("StdVideoDecodeAV1ReferenceInfo: size={} align={} (expected 16/4)",
+                        std::mem::align_of::<native::StdVideoDecodeAV1PictureInfo>()
+                    );
+                    eprintln!(
+                        "StdVideoDecodeAV1ReferenceInfo: size={} align={} (expected 16/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1ReferenceInfo>(),
-                        std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfo>());
-                    eprintln!("StdVideoAV1TileInfo: size={} align={} (expected 48/8)",
+                        std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfo>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1TileInfo: size={} align={} (expected 48/8)",
                         std::mem::size_of::<native::StdVideoAV1TileInfo>(),
-                        std::mem::align_of::<native::StdVideoAV1TileInfo>());
-                    eprintln!("StdVideoAV1Quantization: size={} align={} (expected 16/4)",
+                        std::mem::align_of::<native::StdVideoAV1TileInfo>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1Quantization: size={} align={} (expected 16/4)",
                         std::mem::size_of::<native::StdVideoAV1Quantization>(),
-                        std::mem::align_of::<native::StdVideoAV1Quantization>());
-                    eprintln!("StdVideoAV1Segmentation: size={} align={} (expected 128/2)",
+                        std::mem::align_of::<native::StdVideoAV1Quantization>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1Segmentation: size={} align={} (expected 128/2)",
                         std::mem::size_of::<native::StdVideoAV1Segmentation>(),
-                        std::mem::align_of::<native::StdVideoAV1Segmentation>());
-                    eprintln!("StdVideoAV1LoopFilter: size={} align={} (expected 24/4)",
+                        std::mem::align_of::<native::StdVideoAV1Segmentation>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1LoopFilter: size={} align={} (expected 24/4)",
                         std::mem::size_of::<native::StdVideoAV1LoopFilter>(),
-                        std::mem::align_of::<native::StdVideoAV1LoopFilter>());
-                    eprintln!("StdVideoAV1CDEF: size={} align={} (expected 34/1)",
+                        std::mem::align_of::<native::StdVideoAV1LoopFilter>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1CDEF: size={} align={} (expected 34/1)",
                         std::mem::size_of::<native::StdVideoAV1CDEF>(),
-                        std::mem::align_of::<native::StdVideoAV1CDEF>());
-                    eprintln!("StdVideoAV1LoopRestoration: size={} align={} (expected 20/4)",
+                        std::mem::align_of::<native::StdVideoAV1CDEF>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1LoopRestoration: size={} align={} (expected 20/4)",
                         std::mem::size_of::<native::StdVideoAV1LoopRestoration>(),
-                        std::mem::align_of::<native::StdVideoAV1LoopRestoration>());
-                    eprintln!("StdVideoAV1GlobalMotion: size={} align={} (expected 200/4)",
+                        std::mem::align_of::<native::StdVideoAV1LoopRestoration>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1GlobalMotion: size={} align={} (expected 200/4)",
                         std::mem::size_of::<native::StdVideoAV1GlobalMotion>(),
-                        std::mem::align_of::<native::StdVideoAV1GlobalMotion>());
-                    eprintln!("StdVideoAV1FilmGrain: size={} align={} (expected 136/4)",
+                        std::mem::align_of::<native::StdVideoAV1GlobalMotion>()
+                    );
+                    eprintln!(
+                        "StdVideoAV1FilmGrain: size={} align={} (expected 136/4)",
                         std::mem::size_of::<native::StdVideoAV1FilmGrain>(),
-                        std::mem::align_of::<native::StdVideoAV1FilmGrain>());
-                    eprintln!("StdVideoDecodeAV1PictureInfoFlags: size={} align={} (expected 4/4)",
+                        std::mem::align_of::<native::StdVideoAV1FilmGrain>()
+                    );
+                    eprintln!(
+                        "StdVideoDecodeAV1PictureInfoFlags: size={} align={} (expected 4/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1PictureInfoFlags>(),
-                        std::mem::align_of::<native::StdVideoDecodeAV1PictureInfoFlags>());
-                    eprintln!("StdVideoDecodeAV1ReferenceInfoFlags: size={} align={} (expected 4/4)",
+                        std::mem::align_of::<native::StdVideoDecodeAV1PictureInfoFlags>()
+                    );
+                    eprintln!(
+                        "StdVideoDecodeAV1ReferenceInfoFlags: size={} align={} (expected 4/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1ReferenceInfoFlags>(),
-                        std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfoFlags>());
-                    eprintln!("Av1PictureInfoContainer: size={}",
-                        std::mem::size_of::<Av1PictureInfoContainer>());
+                        std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfoFlags>()
+                    );
+                    eprintln!(
+                        "Av1PictureInfoContainer: size={}",
+                        std::mem::size_of::<Av1PictureInfoContainer>()
+                    );
                     // Test A: VkVideoDecodeInfoKHR layout verification
                     eprintln!("=== TEST A: VkVideoDecodeInfoKHR Layout ===");
-                    eprintln!("VideoDecodeInfoKHR: size={} align={}",
+                    eprintln!(
+                        "VideoDecodeInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoDecodeInfoKHR>(),
-                        std::mem::align_of::<vk::VideoDecodeInfoKHR>());
-                    eprintln!("  s_type offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, s_type));
-                    eprintln!("  p_next offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_next));
-                    eprintln!("  flags offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, flags));
-                    eprintln!("  src_buffer offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer));
-                    eprintln!("  src_buffer_offset offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_offset));
-                    eprintln!("  src_buffer_range offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_range));
-                    eprintln!("  dst_picture_resource offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, dst_picture_resource));
-                    eprintln!("  p_setup_reference_slot offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_setup_reference_slot));
-                    eprintln!("  reference_slot_count offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, reference_slot_count));
-                    eprintln!("  p_reference_slots offset={}", std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_reference_slots));
-                    eprintln!("VideoPictureResourceInfoKHR: size={} align={}",
+                        std::mem::align_of::<vk::VideoDecodeInfoKHR>()
+                    );
+                    eprintln!(
+                        "  s_type offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, s_type)
+                    );
+                    eprintln!(
+                        "  p_next offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_next)
+                    );
+                    eprintln!(
+                        "  flags offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, flags)
+                    );
+                    eprintln!(
+                        "  src_buffer offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer)
+                    );
+                    eprintln!(
+                        "  src_buffer_offset offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_offset)
+                    );
+                    eprintln!(
+                        "  src_buffer_range offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_range)
+                    );
+                    eprintln!(
+                        "  dst_picture_resource offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, dst_picture_resource)
+                    );
+                    eprintln!(
+                        "  p_setup_reference_slot offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_setup_reference_slot)
+                    );
+                    eprintln!(
+                        "  reference_slot_count offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, reference_slot_count)
+                    );
+                    eprintln!(
+                        "  p_reference_slots offset={}",
+                        std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_reference_slots)
+                    );
+                    eprintln!(
+                        "VideoPictureResourceInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoPictureResourceInfoKHR>(),
-                        std::mem::align_of::<vk::VideoPictureResourceInfoKHR>());
-                    eprintln!("  s_type offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, s_type));
-                    eprintln!("  p_next offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, p_next));
-                    eprintln!("  coded_offset offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_offset));
-                    eprintln!("  coded_extent offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_extent));
-                    eprintln!("  base_array_layer offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, base_array_layer));
-                    eprintln!("  image_view_binding offset={}", std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, image_view_binding));
-                    eprintln!("VideoReferenceSlotInfoKHR: size={} align={}",
+                        std::mem::align_of::<vk::VideoPictureResourceInfoKHR>()
+                    );
+                    eprintln!(
+                        "  s_type offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, s_type)
+                    );
+                    eprintln!(
+                        "  p_next offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, p_next)
+                    );
+                    eprintln!(
+                        "  coded_offset offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_offset)
+                    );
+                    eprintln!(
+                        "  coded_extent offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_extent)
+                    );
+                    eprintln!(
+                        "  base_array_layer offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, base_array_layer)
+                    );
+                    eprintln!(
+                        "  image_view_binding offset={}",
+                        std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, image_view_binding)
+                    );
+                    eprintln!(
+                        "VideoReferenceSlotInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoReferenceSlotInfoKHR>(),
-                        std::mem::align_of::<vk::VideoReferenceSlotInfoKHR>());
-                    eprintln!("  s_type offset={}", std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, s_type));
-                    eprintln!("  p_next offset={}", std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_next));
-                    eprintln!("  slot_index offset={}", std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, slot_index));
-                    eprintln!("  p_picture_resource offset={}", std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_picture_resource));
+                        std::mem::align_of::<vk::VideoReferenceSlotInfoKHR>()
+                    );
+                    eprintln!(
+                        "  s_type offset={}",
+                        std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, s_type)
+                    );
+                    eprintln!(
+                        "  p_next offset={}",
+                        std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_next)
+                    );
+                    eprintln!(
+                        "  slot_index offset={}",
+                        std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, slot_index)
+                    );
+                    eprintln!(
+                        "  p_picture_resource offset={}",
+                        std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_picture_resource)
+                    );
                     // Test B: VideoDecodeAV1PictureInfoKHR layout verification
                     eprintln!("=== TEST B: VideoDecodeAV1PictureInfoKHR Layout ===");
-                    eprintln!("Local VideoDecodeAV1PictureInfoKHR: size={} align={}",
+                    eprintln!(
+                        "Local VideoDecodeAV1PictureInfoKHR: size={} align={}",
                         std::mem::size_of::<VideoDecodeAV1PictureInfoKHR>(),
-                        std::mem::align_of::<VideoDecodeAV1PictureInfoKHR>());
-                    eprintln!("Ash VideoDecodeAV1PictureInfoKHR: size={} align={}",
+                        std::mem::align_of::<VideoDecodeAV1PictureInfoKHR>()
+                    );
+                    eprintln!(
+                        "Ash VideoDecodeAV1PictureInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoDecodeAV1PictureInfoKHR>(),
-                        std::mem::align_of::<vk::VideoDecodeAV1PictureInfoKHR>());
+                        std::mem::align_of::<vk::VideoDecodeAV1PictureInfoKHR>()
+                    );
                     eprintln!("=== END STRUCT SIZE CHECK ===");
                 });
             } // if vacc_debug
@@ -1434,36 +1521,76 @@ impl VideoDecoder {
             pic_info.coded_denom = fh.coded_denom;
 
             // Picture-level flags (AV1 spec 7.10 uncompressed_header)
-            pic_info.flags.set_error_resilient_mode(fh.error_resilient_mode as u32);
-            pic_info.flags.set_disable_cdf_update(fh.disable_cdf_update as u32);
+            pic_info
+                .flags
+                .set_error_resilient_mode(fh.error_resilient_mode as u32);
+            pic_info
+                .flags
+                .set_disable_cdf_update(fh.disable_cdf_update as u32);
             pic_info.flags.set_use_superres(fh.use_superres as u32);
-            pic_info.flags.set_render_and_frame_size_different(
-                fh.render_and_frame_size_different as u32,
-            );
-            pic_info.flags.set_allow_screen_content_tools(fh.allow_screen_content_tools as u32);
-            pic_info.flags.set_is_filter_switchable(fh.is_filter_switchable as u32);
-            pic_info.flags.set_force_integer_mv(fh.force_integer_mv as u32);
-            pic_info.flags.set_frame_size_override_flag(fh.frame_size_override_flag as u32);
+            pic_info
+                .flags
+                .set_render_and_frame_size_different(fh.render_and_frame_size_different as u32);
+            pic_info
+                .flags
+                .set_allow_screen_content_tools(fh.allow_screen_content_tools as u32);
+            pic_info
+                .flags
+                .set_is_filter_switchable(fh.is_filter_switchable as u32);
+            pic_info
+                .flags
+                .set_force_integer_mv(fh.force_integer_mv as u32);
+            pic_info
+                .flags
+                .set_frame_size_override_flag(fh.frame_size_override_flag as u32);
             // SPS use_buffer_removal_time = false for our stream
             pic_info.flags.set_buffer_removal_time_present_flag(0);
             pic_info.flags.set_allow_intrabc(fh.allow_intrabc as u32);
-            pic_info.flags.set_frame_refs_short_signaling(fh.frame_refs_short_signaling as u32);
-            pic_info.flags.set_allow_high_precision_mv(fh.allow_high_precision_mv as u32);
-            pic_info.flags.set_is_motion_mode_switchable(fh.is_motion_mode_switchable as u32);
-            pic_info.flags.set_use_ref_frame_mvs(fh.use_ref_frame_mvs as u32);
-            pic_info.flags.set_disable_frame_end_update_cdf(fh.disable_frame_end_update_cdf as u32);
-            pic_info.flags.set_allow_warped_motion(fh.allow_warped_motion as u32);
+            pic_info
+                .flags
+                .set_frame_refs_short_signaling(fh.frame_refs_short_signaling as u32);
+            pic_info
+                .flags
+                .set_allow_high_precision_mv(fh.allow_high_precision_mv as u32);
+            pic_info
+                .flags
+                .set_is_motion_mode_switchable(fh.is_motion_mode_switchable as u32);
+            pic_info
+                .flags
+                .set_use_ref_frame_mvs(fh.use_ref_frame_mvs as u32);
+            pic_info
+                .flags
+                .set_disable_frame_end_update_cdf(fh.disable_frame_end_update_cdf as u32);
+            pic_info
+                .flags
+                .set_allow_warped_motion(fh.allow_warped_motion as u32);
             pic_info.flags.set_reduced_tx_set(fh.reduced_tx_set as u32);
-            pic_info.flags.set_reference_select(fh.reference_select as u32);
-            pic_info.flags.set_skip_mode_present(fh.skip_mode_present as u32);
+            pic_info
+                .flags
+                .set_reference_select(fh.reference_select as u32);
+            pic_info
+                .flags
+                .set_skip_mode_present(fh.skip_mode_present as u32);
 
-            pic_info.flags.set_delta_q_present(fh.delta_q_present as u32);
-            pic_info.flags.set_delta_lf_present(fh.delta_lf_present as u32);
+            pic_info
+                .flags
+                .set_delta_q_present(fh.delta_q_present as u32);
+            pic_info
+                .flags
+                .set_delta_lf_present(fh.delta_lf_present as u32);
             pic_info.flags.set_delta_lf_multi(fh.delta_lf_multi as u32);
-            pic_info.flags.set_segmentation_enabled(fh.segmentation_enabled as u32);
-            pic_info.flags.set_segmentation_update_map(fh.segmentation_update_map as u32);
-            pic_info.flags.set_segmentation_temporal_update(fh.segmentation_temporal_update as u32);
-            pic_info.flags.set_segmentation_update_data(fh.segmentation_update_data as u32);
+            pic_info
+                .flags
+                .set_segmentation_enabled(fh.segmentation_enabled as u32);
+            pic_info
+                .flags
+                .set_segmentation_update_map(fh.segmentation_update_map as u32);
+            pic_info
+                .flags
+                .set_segmentation_temporal_update(fh.segmentation_temporal_update as u32);
+            pic_info
+                .flags
+                .set_segmentation_update_data(fh.segmentation_update_data as u32);
             pic_info.flags.set_UsesLr(fh.uses_lr as u32);
             pic_info.flags.set_usesChromaLr(
                 (fh.loop_restoration_type[1] != 0 || fh.loop_restoration_type[2] != 0) as u32,
@@ -1498,11 +1625,13 @@ impl VideoDecoder {
             {
                 let lst_ref = fh.ref_frame_idx[0] as i32;
                 let gld_ref = fh.ref_frame_idx[1] as i32;
-                let roh: [u32; 8] = std::array::from_fn(|i| {
-                    av1_decoder.get_frame_buffer_order_hint(i)
-                });
+                let roh: [u32; 8] =
+                    std::array::from_fn(|i| av1_decoder.get_frame_buffer_order_hint(i));
                 Av1Decoder::set_frame_refs(
-                    lst_ref, gld_ref, &roh, fh.order_hint,
+                    lst_ref,
+                    gld_ref,
+                    &roh,
+                    fh.order_hint,
                     sps.order_hint_bits_minus1 as u32,
                 )
             } else {
@@ -1520,23 +1649,32 @@ impl VideoDecoder {
                 Some(5), // ALTREF2 (6)
                 Some(6), // ALTREF (7)
             ];
-              for i in 0..8usize {
-                  pic_info.expectedFrameId[i] = 0; // frame_id_numbers = false
-                  if let Some(ri) = ref_name_to_ref_idx[i] {
-                      let fb = effective_ref_frame_idx[ri] as usize;
-                      if fb < 8 {
-                          let oh = (av1_decoder.get_frame_buffer_order_hint(fb) & 0xFF) as u8;
-                          pic_info.OrderHints[i] = oh;
-                      }
-                  }
-              }
-              if frame_idx < 8 && super::vacc_debug() {
-                  eprintln!("[OH-DBG] fc={} OrderHints after pop={:?} eff_rfi={:?} raw_rfi={:?} frss={}", frame_idx, pic_info.OrderHints, effective_ref_frame_idx, fh.ref_frame_idx, fh.frame_refs_short_signaling);
-              }
+            for i in 0..8usize {
+                pic_info.expectedFrameId[i] = 0; // frame_id_numbers = false
+                if let Some(ri) = ref_name_to_ref_idx[i] {
+                    let fb = effective_ref_frame_idx[ri] as usize;
+                    if fb < 8 {
+                        let oh = (av1_decoder.get_frame_buffer_order_hint(fb) & 0xFF) as u8;
+                        pic_info.OrderHints[i] = oh;
+                    }
+                }
+            }
+            if frame_idx < 8 && super::vacc_debug() {
+                eprintln!(
+                    "[OH-DBG] fc={} OrderHints after pop={:?} eff_rfi={:?} raw_rfi={:?} frss={}",
+                    frame_idx,
+                    pic_info.OrderHints,
+                    effective_ref_frame_idx,
+                    fh.ref_frame_idx,
+                    fh.frame_refs_short_signaling
+                );
+            }
 
             // Tile info (mirrors C++ VulkanAV1Decoder.cpp:1185-1289)
             let tile_info = &mut picture_info_container.tile_info;
-            tile_info.flags.set_uniform_tile_spacing_flag(fh.uniform_tile_spacing_flag as u32);
+            tile_info
+                .flags
+                .set_uniform_tile_spacing_flag(fh.uniform_tile_spacing_flag as u32);
             tile_info.TileCols = fh.tile_cols.min(255) as u8;
             tile_info.TileRows = fh.tile_rows.min(255) as u8;
             tile_info.context_update_tile_id = fh.context_update_tile_id as u16;
@@ -1581,8 +1719,10 @@ impl VideoDecoder {
 
             // Loop filter
             let lf = &mut picture_info_container.loop_filter;
-            lf.flags.set_loop_filter_delta_enabled(fh.loop_filter_delta_enabled as u32);
-            lf.flags.set_loop_filter_delta_update(fh.loop_filter_delta_update as u32);
+            lf.flags
+                .set_loop_filter_delta_enabled(fh.loop_filter_delta_enabled as u32);
+            lf.flags
+                .set_loop_filter_delta_update(fh.loop_filter_delta_update as u32);
             lf.loop_filter_level = [
                 fh.loop_filter_level[0],
                 fh.loop_filter_level[1],
@@ -1618,12 +1758,12 @@ impl VideoDecoder {
             }
 
             // Global motion: index 0 = identity, 1..7 from parser models 0..6
-             let gm = &mut picture_info_container.global_motion;
-             gm.GmType[0] = 0;
-             // Slot 0 (INTRA/keyframe) has no global motion: the C++ reference
-             // stores all-zero params for it (not the 65536 identity encoding).
-             gm.gm_params[0] = [0, 0, 0, 0, 0, 0];
-             for i in 1..8 {
+            let gm = &mut picture_info_container.global_motion;
+            gm.GmType[0] = 0;
+            // Slot 0 (INTRA/keyframe) has no global motion: the C++ reference
+            // stores all-zero params for it (not the 65536 identity encoding).
+            gm.gm_params[0] = [0, 0, 0, 0, 0, 0];
+            for i in 1..8 {
                 gm.GmType[i] = fh.global_motion_type[i - 1];
                 gm.gm_params[i] = fh.global_motion_params[i - 1];
             }
@@ -1658,8 +1798,12 @@ impl VideoDecoder {
                 let f = &pi.flags;
                 eprintln!(
                     "[RUST-PI-ALL] fc={} type={} oh={} primref={} refresh={:08x} refidx={:?}",
-                    frame_idx, pi.frame_type as u32, pi.OrderHint, pi.primary_ref_frame,
-                    pi.refresh_frame_flags, fh.ref_frame_idx
+                    frame_idx,
+                    pi.frame_type as u32,
+                    pi.OrderHint,
+                    pi.primary_ref_frame,
+                    pi.refresh_frame_flags,
+                    fh.ref_frame_idx
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} useslr={} chromalr={} grain={}",
@@ -1673,8 +1817,10 @@ impl VideoDecoder {
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   flags2: errres={} discdf={} fso={} brt={}",
-                    f.error_resilient_mode(), f.disable_cdf_update(),
-                    f.frame_size_override_flag(), f.buffer_removal_time_present_flag()
+                    f.error_resilient_mode(),
+                    f.disable_cdf_update(),
+                    f.frame_size_override_flag(),
+                    f.buffer_removal_time_present_flag()
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   interp={} txmode={} deltaqres={} delfres={}",
@@ -1705,32 +1851,61 @@ impl VideoDecoder {
                 let lr = &picture_info_container.loop_restoration;
                 eprintln!(
                     "[RUST-PI-ALL]   lr: type=[{},{},{}] size=[{},{},{}]",
-                    lr.FrameRestorationType[0], lr.FrameRestorationType[1], lr.FrameRestorationType[2],
-                    lr.LoopRestorationSize[0], lr.LoopRestorationSize[1], lr.LoopRestorationSize[2]
+                    lr.FrameRestorationType[0],
+                    lr.FrameRestorationType[1],
+                    lr.FrameRestorationType[2],
+                    lr.LoopRestorationSize[0],
+                    lr.LoopRestorationSize[1],
+                    lr.LoopRestorationSize[2]
                 );
                 let gm = &picture_info_container.global_motion;
                 eprintln!(
                     "[RUST-PI-ALL]   gm: type=[{},{},{},{},{},{},{},{}]",
-                    gm.GmType[0], gm.GmType[1], gm.GmType[2], gm.GmType[3], gm.GmType[4], gm.GmType[5], gm.GmType[6], gm.GmType[7]
+                    gm.GmType[0],
+                    gm.GmType[1],
+                    gm.GmType[2],
+                    gm.GmType[3],
+                    gm.GmType[4],
+                    gm.GmType[5],
+                    gm.GmType[6],
+                    gm.GmType[7]
                 );
                 for i in 0..8 {
                     eprintln!(
                         "[RUST-PI-ALL]   gm_params[{}]=[{},{},{},{},{},{}]",
-                        i, gm.gm_params[i][0], gm.gm_params[i][1], gm.gm_params[i][2],
-                        gm.gm_params[i][3], gm.gm_params[i][4], gm.gm_params[i][5]
+                        i,
+                        gm.gm_params[i][0],
+                        gm.gm_params[i][1],
+                        gm.gm_params[i][2],
+                        gm.gm_params[i][3],
+                        gm.gm_params[i][4],
+                        gm.gm_params[i][5]
                     );
                 }
                 let sg = &picture_info_container.segmentation;
                 eprintln!(
                     "[RUST-PI-ALL]   seg: enabled=[{},{},{},{},{},{},{},{}]",
-                    sg.FeatureEnabled[0], sg.FeatureEnabled[1], sg.FeatureEnabled[2], sg.FeatureEnabled[3],
-                    sg.FeatureEnabled[4], sg.FeatureEnabled[5], sg.FeatureEnabled[6], sg.FeatureEnabled[7]
+                    sg.FeatureEnabled[0],
+                    sg.FeatureEnabled[1],
+                    sg.FeatureEnabled[2],
+                    sg.FeatureEnabled[3],
+                    sg.FeatureEnabled[4],
+                    sg.FeatureEnabled[5],
+                    sg.FeatureEnabled[6],
+                    sg.FeatureEnabled[7]
                 );
                 for i in 0..8 {
                     eprintln!(
                         "[RUST-PI-ALL]   segdata[{}]=[{},{},{},{},{},{},{},{}]",
-                        i, sg.FeatureData[i][0], sg.FeatureData[i][1], sg.FeatureData[i][2], sg.FeatureData[i][3],
-                        sg.FeatureData[i][4], sg.FeatureData[i][5], sg.FeatureData[i][6], sg.FeatureData[i][7]
+                        i,
+                        sg.FeatureData[i][0],
+                        sg.FeatureData[i][1],
+                        sg.FeatureData[i][2],
+                        sg.FeatureData[i][3],
+                        sg.FeatureData[i][4],
+                        sg.FeatureData[i][5],
+                        sg.FeatureData[i][6],
+                        sg.FeatureData[i][7]
                     );
                 }
                 eprintln!(
@@ -1748,18 +1923,25 @@ impl VideoDecoder {
                 let ti = &picture_info_container.tile_info;
                 eprintln!(
                     "[RUST-PI-ALL]   tileinfo: uniform={} cols={} rows={} ctxid={} tsbm1={}",
-                    ti.flags.uniform_tile_spacing_flag(), ti.TileCols, ti.TileRows,
-                    ti.context_update_tile_id, ti.tile_size_bytes_minus_1
+                    ti.flags.uniform_tile_spacing_flag(),
+                    ti.TileCols,
+                    ti.TileRows,
+                    ti.context_update_tile_id,
+                    ti.tile_size_bytes_minus_1
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   tilewidth_sbs_m1={:?} tileheight_sbs_m1={:?}",
-                    &picture_info_container.tile_width_in_sbs_minus_1[..picture_info_container.tile_cols_count],
-                    &picture_info_container.tile_height_in_sbs_minus_1[..picture_info_container.tile_rows_count]
+                    &picture_info_container.tile_width_in_sbs_minus_1
+                        [..picture_info_container.tile_cols_count],
+                    &picture_info_container.tile_height_in_sbs_minus_1
+                        [..picture_info_container.tile_rows_count]
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   tilemicol={:?} tilerow={:?}",
-                    &picture_info_container.tile_mi_col_starts[..picture_info_container.tile_cols_count],
-                    &picture_info_container.tile_mi_row_starts[..picture_info_container.tile_rows_count]
+                    &picture_info_container.tile_mi_col_starts
+                        [..picture_info_container.tile_cols_count],
+                    &picture_info_container.tile_mi_row_starts
+                        [..picture_info_container.tile_rows_count]
                 );
                 // DEBUG (iteration 4): film grain dump
                 let fg = &picture_info_container.film_grain;
@@ -1786,9 +1968,11 @@ impl VideoDecoder {
                     let bytes_to_dump = bs_data.len().min(64);
                     eprintln!(
                         "[RUST-BS-DUMP] fc=2 bitstream: total_size={} dump_len={} bytes={:02x?}",
-                        bs_data.len(), bytes_to_dump, &bs_data[..bytes_to_dump]
+                        bs_data.len(),
+                        bytes_to_dump,
+                        &bs_data[..bytes_to_dump]
                     );
-                eprintln!(
+                    eprintln!(
                     "[RUST-BS-DUMP]   tile_offset={} tile_size={} frame_header_offset={} payload_start={} payload_size={}",
                     tile_offset, tile_size, frame_header_offset,
                     av1_frame.payload_start, av1_frame.payload_size
@@ -1855,7 +2039,9 @@ impl VideoDecoder {
                     std::fs::write(&path, &out).ok();
                     // Compute hash of first 256 bytes of Y plane
                     let hash_input = &px.y_plane[..256.min(px.y_plane.len())];
-                    let hash: u64 = hash_input.iter().fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
+                    let hash: u64 = hash_input
+                        .iter()
+                        .fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
                     eprintln!(
                         "[TEST-B-DPB] slot={} written to {} ({} bytes) Y[0..256] hash={:016x} first16Y={:02x?}",
                         slot, path, out.len(), hash, &px.y_plane[..16.min(px.y_plane.len())]
@@ -1867,7 +2053,8 @@ impl VideoDecoder {
             let cmd_buffer = allocate_command_buffer(&self.vulkan.device, self.command_pool)?;
 
             let output_slot_old_layout = self.dpb_manager.get_slot_layout(output_slot);
-            let sess_params_handle = self.session_params
+            let sess_params_handle = self
+                .session_params
                 .as_ref()
                 .map(|p| p.handle())
                 .unwrap_or(vk::VideoSessionParametersKHR::null());
@@ -1907,7 +2094,8 @@ impl VideoDecoder {
                 if super::vacc_debug() {
                     eprintln!(
                         "[FENCE-DBG] frame{}: before reset_fences (fence={:#x})",
-                        frame_idx, self.fence.as_raw()
+                        frame_idx,
+                        self.fence.as_raw()
                     );
                 }
                 self.vulkan
@@ -1980,37 +2168,39 @@ impl VideoDecoder {
             // 8 frame buffers 0..7 point to the key frame). The bitstream's
             // ref_frame_idx uses the same indexing (e.g. frame 1 has
             // ref_frame_idx=[0,0,0,0,0,0,0] -> all reference frame buffer 0).
-              for i in 0..8usize {
-                  if (fh.refresh_frame_flags & (1 << i)) != 0 {
-                      let fb = i; // bit i -> frame buffer i (C++ UpdateFramePointers)
-                     av1_decoder.set_frame_buffer_dpb_slot(fb, output_slot as i32);
-                     av1_decoder.set_frame_buffer_order_hint(fb, fh.order_hint);
-                     av1_decoder.set_frame_buffer_dims(
-                         fb,
-                         frame_coded_extent.width,
-                         frame_coded_extent.height,
-                     );
-                     av1_decoder.set_frame_buffer_ref_info(
-                         fb,
-                         &cur_order_hints,
-                         cur_order_hint,
-                         cur_ohb,
-                         cur_frame_type,
-                         cur_disable_cdf,
-                         cur_seg_enabled,
-                     );
-                       if frame_idx < 8 && super::vacc_debug() {
-                           // DEBUG: print ALL ref_info values being SET for this frame buffer
-                           let mut bias = 0u8;
-                          for rn in 1..8usize {
-                              let rel = <super::av1::Av1Decoder>::get_relative_dist(
-                                  cur_order_hint as i32,
-                                  cur_order_hints[rn] as i32,
-                                  cur_ohb,
-                              );
-                              if rel <= 0 { bias |= 1 << rn; }
-                          }
-                          eprintln!(
+            for i in 0..8usize {
+                if (fh.refresh_frame_flags & (1 << i)) != 0 {
+                    let fb = i; // bit i -> frame buffer i (C++ UpdateFramePointers)
+                    av1_decoder.set_frame_buffer_dpb_slot(fb, output_slot as i32);
+                    av1_decoder.set_frame_buffer_order_hint(fb, fh.order_hint);
+                    av1_decoder.set_frame_buffer_dims(
+                        fb,
+                        frame_coded_extent.width,
+                        frame_coded_extent.height,
+                    );
+                    av1_decoder.set_frame_buffer_ref_info(
+                        fb,
+                        &cur_order_hints,
+                        cur_order_hint,
+                        cur_ohb,
+                        cur_frame_type,
+                        cur_disable_cdf,
+                        cur_seg_enabled,
+                    );
+                    if frame_idx < 8 && super::vacc_debug() {
+                        // DEBUG: print ALL ref_info values being SET for this frame buffer
+                        let mut bias = 0u8;
+                        for rn in 1..8usize {
+                            let rel = <super::av1::Av1Decoder>::get_relative_dist(
+                                cur_order_hint as i32,
+                                cur_order_hints[rn] as i32,
+                                cur_ohb,
+                            );
+                            if rel <= 0 {
+                                bias |= 1 << rn;
+                            }
+                        }
+                        eprintln!(
                               "[SET_FB-REFINFO] fc={} SET fb={} -> slot={}: OrderHint={}, frame_type={}, dcdf={}, seg={}, SavedOH=[{},{},{},{},{},{},{},{}], RefDist=[_,{},{},{},{},{},{},{}], Bias={:02x}",
                               frame_idx, fb, output_slot,
                               cur_order_hint, cur_frame_type, cur_disable_cdf, cur_seg_enabled,
@@ -2025,9 +2215,9 @@ impl VideoDecoder {
                               <super::av1::Av1Decoder>::get_relative_dist(cur_order_hint as i32, cur_order_hints[7] as i32, cur_ohb),
                               bias
                           );
-                      }
-                 }
-             }
+                    }
+                }
+            }
 
             self.dpb_manager.register_frame(output_slot, frame_count);
 
@@ -2051,7 +2241,8 @@ impl VideoDecoder {
             } else {
                 vk::ImageLayout::VIDEO_DECODE_DST_KHR
             };
-            self.dpb_manager.set_slot_layout(output_slot, post_decode_layout);
+            self.dpb_manager
+                .set_slot_layout(output_slot, post_decode_layout);
 
             if super::vacc_debug() {
                 eprintln!(
@@ -2059,7 +2250,11 @@ impl VideoDecoder {
                     frame_idx,
                     output_slot,
                     post_decode_layout,
-                    if dpb_setup_picture.is_some() { "yes" } else { "no" }
+                    if dpb_setup_picture.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    }
                 );
             }
 
@@ -2103,8 +2298,13 @@ impl VideoDecoder {
 
             if super::vacc_debug() {
                 let n = pixels.y_plane.len().min(1000).max(1);
-                let my = pixels.y_plane.iter().take(n)
-                    .map(|&b| b as u32).sum::<u32>() as f64 / n as f64;
+                let my = pixels
+                    .y_plane
+                    .iter()
+                    .take(n)
+                    .map(|&b| b as u32)
+                    .sum::<u32>() as f64
+                    / n as f64;
                 eprintln!(
                     "[PUSH-DIAG] frame_idx={} display_count={} poc={} show_existing=0 map_idx=- pic_idx={} meanY1k={:.1}",
                     frame_idx, display_count, frame_count, output_slot, my
@@ -2984,10 +3184,7 @@ fn destroy_session_parameters(
         return;
     }
     if let Some(ptr) = unsafe {
-        instance.get_device_proc_addr(
-            device,
-            c"vkDestroyVideoSessionParametersKHR".as_ptr(),
-        )
+        instance.get_device_proc_addr(device, c"vkDestroyVideoSessionParametersKHR".as_ptr())
     } {
         unsafe {
             type FnType = unsafe extern "system" fn(
@@ -3005,9 +3202,9 @@ fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::Vi
     if session.is_null() {
         return;
     }
-    if let Some(ptr) = unsafe {
-        instance.get_device_proc_addr(device, c"vkDestroyVideoSessionKHR".as_ptr())
-    } {
+    if let Some(ptr) =
+        unsafe { instance.get_device_proc_addr(device, c"vkDestroyVideoSessionKHR".as_ptr()) }
+    {
         unsafe {
             type FnType = unsafe extern "system" fn(
                 vk::Device,
@@ -3216,7 +3413,11 @@ fn parse_av1_init(
             s.max_frame_height_minus_1 as u32 + 1,
             s.profile as u32,
             if s.high_bitdepth {
-                if s.twelve_bit { 12 } else { 10 }
+                if s.twelve_bit {
+                    12
+                } else {
+                    10
+                }
             } else {
                 8
             },
@@ -3309,66 +3510,200 @@ fn parse_av1_sps_from_data(
     let packet = BitstreamPacket::new(frame_data);
     match parser.parse(&packet) {
         Ok(ParseResult::ParameterSet { sps: s, .. }) => {
-            let result = s.and_then(|sp| sp.downcast_ref::<vk_video_core::picture::Av1Sps>().cloned());
+            let result =
+                s.and_then(|sp| sp.downcast_ref::<vk_video_core::picture::Av1Sps>().cloned());
             if let Some(ref sps) = result {
                 if super::vacc_debug() {
-                eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
-                eprintln!("[SPS-PARSE] profile                               = {}", sps.profile);
-                eprintln!("[SPS-PARSE] level                                 = {}", sps.level);
-                eprintln!("[SPS-PARSE] still_picture                         = {}", sps.still_picture);
-                eprintln!("[SPS-PARSE] reduced_still_picture_header          = {}", sps.reduced_still_picture_header);
-                eprintln!("[SPS-PARSE] use_128x128_superblock                = {}", sps.use_128x128_superblock);
-                eprintln!("[SPS-PARSE] enable_filter_intra                   = {}", sps.enable_filter_intra);
-                eprintln!("[SPS-PARSE] enable_intra_edge_filter              = {}", sps.enable_intra_edge_filter);
-                eprintln!("[SPS-PARSE] enable_interintra_compound            = {}", sps.enable_interintra_compound);
-                eprintln!("[SPS-PARSE] enable_masked_compound                = {}", sps.enable_masked_compound);
-                eprintln!("[SPS-PARSE] enable_warped_motion                  = {}", sps.enable_warped_motion);
-                eprintln!("[SPS-PARSE] enable_dual_filter                    = {}", sps.enable_dual_filter);
-                eprintln!("[SPS-PARSE] enable_order_hint                     = {}", sps.enable_order_hint);
-                eprintln!("[SPS-PARSE] enable_jnt_motion                     = {}", sps.enable_jnt_motion);
-                eprintln!("[SPS-PARSE] enable_ref_frame_mvs                  = {}", sps.enable_ref_frame_mvs);
-                eprintln!("[SPS-PARSE] seq_force_screen_content_tools        = {} (SELECT=2)", sps.seq_force_screen_content_tools);
-                eprintln!("[SPS-PARSE] seq_force_integer_mv                  = {} (SELECT=2)", sps.seq_force_integer_mv);
-                eprintln!("[SPS-PARSE] separate_uv_delta_q                   = {}", sps.separate_uv_delta_q);
-                eprintln!("[SPS-PARSE] enable_superres                       = {}", sps.enable_superres);
-                eprintln!("[SPS-PARSE] enable_cdef                           = {}", sps.enable_cdef);
-                eprintln!("[SPS-PARSE] enable_restoration                    = {}", sps.enable_restoration);
-                eprintln!("[SPS-PARSE] film_grain_params_present             = {}", sps.film_grain_params_present);
-                eprintln!("[SPS-PARSE] timing_info_present_flag              = {}", sps.timing_info_present_flag);
-                eprintln!("[SPS-PARSE] initial_display_delay_present_flag    = {}", sps.initial_display_delay_present_flag);
-                eprintln!("[SPS-PARSE] frame_width_bits                      = {} (-> minus_1={})", sps.frame_width_bits, sps.frame_width_bits.saturating_sub(1));
-                eprintln!("[SPS-PARSE] frame_height_bits                     = {} (-> minus_1={})", sps.frame_height_bits, sps.frame_height_bits.saturating_sub(1));
-                eprintln!("[SPS-PARSE] max_frame_width_minus_1               = {}", sps.max_frame_width_minus_1);
-                eprintln!("[SPS-PARSE] max_frame_height_minus_1              = {}", sps.max_frame_height_minus_1);
-                eprintln!("[SPS-PARSE] frame_id_numbers_present_flag         = {}", sps.frame_id_numbers_present_flag);
-                eprintln!("[SPS-PARSE] delta_frame_id_length_minus2          = {}", sps.delta_frame_id_length_minus2);
-                eprintln!("[SPS-PARSE] additional_frame_id_length_minus1     = {}", sps.additional_frame_id_length_minus1);
-                eprintln!("[SPS-PARSE] order_hint_bits_minus1                = {}", sps.order_hint_bits_minus1);
-                eprintln!("[SPS-PARSE] high_bitdepth                         = {}", sps.high_bitdepth);
-                eprintln!("[SPS-PARSE] twelve_bit                            = {}", sps.twelve_bit);
-                eprintln!("[SPS-PARSE] mono_chrome                           = {}", sps.mono_chrome);
-                eprintln!("[SPS-PARSE] color_description_present             = {}", sps.color_description_present);
-                eprintln!("[SPS-PARSE] color_primaries                       = {}", sps.color_primaries);
-                eprintln!("[SPS-PARSE] transfer_characteristics              = {}", sps.transfer_characteristics);
-                eprintln!("[SPS-PARSE] matrix_coefficients                   = {}", sps.matrix_coefficients);
-                eprintln!("[SPS-PARSE] color_range                           = {}", sps.color_range);
-                eprintln!("[SPS-PARSE] subsampling_x                         = {}", sps.subsampling_x);
-                eprintln!("[SPS-PARSE] subsampling_y                         = {}", sps.subsampling_y);
-                eprintln!("[SPS-PARSE] chroma_sample_position                = {}", sps.chroma_sample_position);
-                eprintln!("[SPS-PARSE] num_units_in_display_tick             = {}", sps.num_units_in_display_tick);
-                eprintln!("[SPS-PARSE] time_scale                            = {}", sps.time_scale);
-                eprintln!("[SPS-PARSE] equal_picture_interval                = {}", sps.equal_picture_interval);
-                eprintln!("[SPS-PARSE] ============================================");
+                    eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
+                    eprintln!(
+                        "[SPS-PARSE] profile                               = {}",
+                        sps.profile
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] level                                 = {}",
+                        sps.level
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] still_picture                         = {}",
+                        sps.still_picture
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] reduced_still_picture_header          = {}",
+                        sps.reduced_still_picture_header
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] use_128x128_superblock                = {}",
+                        sps.use_128x128_superblock
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_filter_intra                   = {}",
+                        sps.enable_filter_intra
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_intra_edge_filter              = {}",
+                        sps.enable_intra_edge_filter
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_interintra_compound            = {}",
+                        sps.enable_interintra_compound
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_masked_compound                = {}",
+                        sps.enable_masked_compound
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_warped_motion                  = {}",
+                        sps.enable_warped_motion
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_dual_filter                    = {}",
+                        sps.enable_dual_filter
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_order_hint                     = {}",
+                        sps.enable_order_hint
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_jnt_motion                     = {}",
+                        sps.enable_jnt_motion
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_ref_frame_mvs                  = {}",
+                        sps.enable_ref_frame_mvs
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] seq_force_screen_content_tools        = {} (SELECT=2)",
+                        sps.seq_force_screen_content_tools
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] seq_force_integer_mv                  = {} (SELECT=2)",
+                        sps.seq_force_integer_mv
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] separate_uv_delta_q                   = {}",
+                        sps.separate_uv_delta_q
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_superres                       = {}",
+                        sps.enable_superres
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_cdef                           = {}",
+                        sps.enable_cdef
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] enable_restoration                    = {}",
+                        sps.enable_restoration
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] film_grain_params_present             = {}",
+                        sps.film_grain_params_present
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] timing_info_present_flag              = {}",
+                        sps.timing_info_present_flag
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] initial_display_delay_present_flag    = {}",
+                        sps.initial_display_delay_present_flag
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] frame_width_bits                      = {} (-> minus_1={})",
+                        sps.frame_width_bits,
+                        sps.frame_width_bits.saturating_sub(1)
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] frame_height_bits                     = {} (-> minus_1={})",
+                        sps.frame_height_bits,
+                        sps.frame_height_bits.saturating_sub(1)
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] max_frame_width_minus_1               = {}",
+                        sps.max_frame_width_minus_1
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] max_frame_height_minus_1              = {}",
+                        sps.max_frame_height_minus_1
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] frame_id_numbers_present_flag         = {}",
+                        sps.frame_id_numbers_present_flag
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] delta_frame_id_length_minus2          = {}",
+                        sps.delta_frame_id_length_minus2
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] additional_frame_id_length_minus1     = {}",
+                        sps.additional_frame_id_length_minus1
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] order_hint_bits_minus1                = {}",
+                        sps.order_hint_bits_minus1
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] high_bitdepth                         = {}",
+                        sps.high_bitdepth
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] twelve_bit                            = {}",
+                        sps.twelve_bit
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] mono_chrome                           = {}",
+                        sps.mono_chrome
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] color_description_present             = {}",
+                        sps.color_description_present
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] color_primaries                       = {}",
+                        sps.color_primaries
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] transfer_characteristics              = {}",
+                        sps.transfer_characteristics
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] matrix_coefficients                   = {}",
+                        sps.matrix_coefficients
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] color_range                           = {}",
+                        sps.color_range
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] subsampling_x                         = {}",
+                        sps.subsampling_x
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] subsampling_y                         = {}",
+                        sps.subsampling_y
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] chroma_sample_position                = {}",
+                        sps.chroma_sample_position
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] num_units_in_display_tick             = {}",
+                        sps.num_units_in_display_tick
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] time_scale                            = {}",
+                        sps.time_scale
+                    );
+                    eprintln!(
+                        "[SPS-PARSE] equal_picture_interval                = {}",
+                        sps.equal_picture_interval
+                    );
+                    eprintln!("[SPS-PARSE] ============================================");
                 }
             }
             result
         }
-        Ok(r) => {
-            None
-        }
-        Err(e) => {
-            None
-        }
+        Ok(r) => None,
+        Err(e) => None,
     }
 }
 
@@ -3567,7 +3902,8 @@ fn build_av1_dpb_picture_resources(
     if super::vacc_debug() {
         eprintln!(
             "[DPB-ITER8]   AV1 SETUP picture: output_slot={} view={:#x} base_array_layer=0",
-            output_slot, dpb_views[output_slot as usize].as_raw()
+            output_slot,
+            dpb_views[output_slot as usize].as_raw()
         );
     }
 
@@ -3580,36 +3916,36 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
     // For low-overhead format, the frame header is at the start of the Frame OBU
     // The OBU header is 1-2 bytes, followed by the size field (1-2 bytes for leb128)
     // Then the frame header data starts
-    
+
     if data.is_empty() {
         return 0;
     }
 
     // Try to find the Frame OBU (type 6) or FrameHeader OBU (type 3)
     // In low-overhead format, the first OBU is typically the Frame OBU
-    
+
     // Parse OBU header
     if data.len() < 1 {
         return 0;
     }
-    
+
     let first_byte = data[0];
     let obu_type = (first_byte >> 3) & 0x0F;
     let extension_flag = (first_byte >> 2) & 1 != 0;
-    
+
     // OBU header size: 1 byte + 1 byte if extension_flag
     let header_size = 1 + usize::from(extension_flag);
-    
+
     if data.len() <= header_size {
         return 0;
     }
-    
+
     // For Frame OBU (type 6) or FrameHeader OBU (type 3), the frame header
     // starts right after the OBU header and size field
     if obu_type == 6 || obu_type == 3 {
         // Skip OBU header
         let mut offset = header_size;
-        
+
         // Check if there's a size field
         let has_size_field = (first_byte >> 1) & 1 != 0;
         if has_size_field {
@@ -3622,10 +3958,10 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
                 offset += 1;
             }
         }
-        
+
         return offset as u32;
     }
-    
+
     // For other OBUs (e.g., temporal delimiter), try to find the frame OBU
     let mut offset = 0;
     while offset < data.len().saturating_sub(1) {
@@ -3633,10 +3969,10 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
         let obu_type = (first_byte >> 3) & 0x0F;
         let extension_flag = (first_byte >> 2) & 1 != 0;
         let has_size_field = (first_byte >> 1) & 1 != 0;
-        
+
         let header_size = 1 + usize::from(extension_flag);
         let mut size_offset = offset + header_size;
-        
+
         if has_size_field && size_offset < data.len() {
             // Read leb128 size
             while size_offset < data.len() {
@@ -3646,7 +3982,7 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
                 }
                 size_offset += 1;
             }
-            
+
             // Read the size value
             let mut size: usize = 0;
             let mut shift = 0;
@@ -3660,18 +3996,18 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
                     break;
                 }
             }
-            
+
             if obu_type == 6 || obu_type == 3 {
                 // Frame OBU found - frame header starts after header + size
                 return (offset + header_size + (pos - start)) as u32;
             }
-            
+
             // Skip this OBU
             offset = pos + size;
         } else {
             offset += 1;
         }
     }
-    
+
     0
 }

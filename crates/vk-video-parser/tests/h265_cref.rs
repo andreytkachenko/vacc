@@ -38,17 +38,15 @@ static GT: &str = include_str!("h265_cref_50.txt");
 /// decoded pixels (single-slice stream, empty ref-list-mod loop, merge-level is
 /// parse-only), which is why the C reference is still pixel-perfect. We keep the
 /// Rust parser spec-correct and skip these fields rather than replicate the bug.
-const NVIDIA_PPS_BUG_FIELDS: &[&str] = &[
-    "lf_across_slices",
-    "lists_mod",
-    "log2_par_merge_minus2",
-];
+const NVIDIA_PPS_BUG_FIELDS: &[&str] = &["lf_across_slices", "lists_mod", "log2_par_merge_minus2"];
 
 use std::collections::HashMap;
 use vk_video_core::codec::VideoCodec;
 use vk_video_core::picture::{H265Pps, H265Sps};
 use vk_video_parser::h265::H265Parser;
-use vk_video_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser};
+use vk_video_parser::{
+    BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
+};
 
 /// One ground-truth picture (cuvid parser output).
 #[derive(Debug, Clone)]
@@ -222,15 +220,27 @@ fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
         "pcm_diff_cb".into(),
         sps.log2_diff_max_min_pcm_luma_coding_block_size as i64,
     );
-    m.insert("pcm_bdl".into(), sps.pcm_sample_bit_depth_luma_minus1 as i64);
-    m.insert("pcm_bdc".into(), sps.pcm_sample_bit_depth_chroma_minus1 as i64);
+    m.insert(
+        "pcm_bdl".into(),
+        sps.pcm_sample_bit_depth_luma_minus1 as i64,
+    );
+    m.insert(
+        "pcm_bdc".into(),
+        sps.pcm_sample_bit_depth_chroma_minus1 as i64,
+    );
     m.insert("pcm_lf".into(), b(sps.pcm_loop_filter_disabled_flag));
     m.insert(
         "strong_intra_smooth".into(),
         b(sps.strong_intra_smoothing_enabled_flag),
     );
-    m.insert("max_thd_intra".into(), sps.max_transform_hierarchy_depth_intra as i64);
-    m.insert("max_thd_inter".into(), sps.max_transform_hierarchy_depth_inter as i64);
+    m.insert(
+        "max_thd_intra".into(),
+        sps.max_transform_hierarchy_depth_intra as i64,
+    );
+    m.insert(
+        "max_thd_inter".into(),
+        sps.max_transform_hierarchy_depth_inter as i64,
+    );
     m.insert("amp".into(), b(sps.amp_enabled_flag));
     m.insert("sep_colour".into(), b(sps.separate_colour_plane_flag));
     m.insert(
@@ -243,17 +253,32 @@ fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
     m.insert("temporal_mvp".into(), b(sps.sps_temporal_mvp_enabled_flag));
     m.insert("sao".into(), b(sps.sample_adaptive_offset_enabled_flag));
     m.insert("scaling_list".into(), b(sps.scaling_list_enabled_flag));
-    m.insert("bit_depth_luma_minus8".into(), sps.bit_depth_luma_minus8 as i64);
-    m.insert("bit_depth_chroma_minus8".into(), sps.bit_depth_chroma_minus8 as i64);
+    m.insert(
+        "bit_depth_luma_minus8".into(),
+        sps.bit_depth_luma_minus8 as i64,
+    );
+    m.insert(
+        "bit_depth_chroma_minus8".into(),
+        sps.bit_depth_chroma_minus8 as i64,
+    );
     // [sps_ext] (log2_max_transform_skip / sao scales live in the PPS struct)
     m.insert(
         "log2_max_transform_skip_minus2".into(),
         pps.log2_max_transform_skip_block_size_minus2 as i64,
     );
-    m.insert("sao_scale_luma".into(), pps.log2_sao_offset_scale_luma as i64);
-    m.insert("sao_scale_chroma".into(), pps.log2_sao_offset_scale_chroma as i64);
+    m.insert(
+        "sao_scale_luma".into(),
+        pps.log2_sao_offset_scale_luma as i64,
+    );
+    m.insert(
+        "sao_scale_chroma".into(),
+        pps.log2_sao_offset_scale_chroma as i64,
+    );
     m.insert("sps_range".into(), b(sps.sps_range_extension_flag));
-    m.insert("intra_smooth_dis".into(), b(sps.intra_smoothing_disabled_flag));
+    m.insert(
+        "intra_smooth_dis".into(),
+        b(sps.intra_smoothing_disabled_flag),
+    );
     // [pps]
     m.insert(
         "dep_slices".into(),
@@ -263,23 +288,35 @@ fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
         "slice_hdr_ext".into(),
         b(pps.slice_segment_header_extension_present_flag),
     );
-    m.insert("sign_data_hiding".into(), b(pps.sign_data_hiding_enabled_flag));
+    m.insert(
+        "sign_data_hiding".into(),
+        b(pps.sign_data_hiding_enabled_flag),
+    );
     m.insert("cu_qp_delta".into(), b(pps.cu_qp_delta_enabled_flag));
     m.insert("diff_cu_qp_depth".into(), pps.diff_cu_qp_delta_depth as i64);
     m.insert("init_qp_minus26".into(), pps.pps_init_qp_minus26 as i64);
     m.insert("cb_qp_off".into(), pps.pps_cb_qp_offset as i64);
     m.insert("cr_qp_off".into(), pps.pps_cr_qp_offset as i64);
-    m.insert("constrained_intra".into(), b(pps.constrained_intra_pred_flag));
+    m.insert(
+        "constrained_intra".into(),
+        b(pps.constrained_intra_pred_flag),
+    );
     m.insert("weighted_pred".into(), b(pps.weighted_pred_flag));
     m.insert("weighted_bipred".into(), b(pps.weighted_bipred_flag));
     m.insert("transform_skip".into(), b(pps.transform_skip_enabled_flag));
     m.insert("tq_bypass".into(), b(pps.transquant_bypass_enabled_flag));
-    m.insert("entropy_sync".into(), b(pps.entropy_coding_sync_enabled_flag));
+    m.insert(
+        "entropy_sync".into(),
+        b(pps.entropy_coding_sync_enabled_flag),
+    );
     m.insert(
         "log2_par_merge_minus2".into(),
         pps.log2_parallel_merge_level_minus2 as i64,
     );
-    m.insert("extra_slice_bits".into(), pps.num_extra_slice_header_bits as i64);
+    m.insert(
+        "extra_slice_bits".into(),
+        pps.num_extra_slice_header_bits as i64,
+    );
     m.insert(
         "lf_across_tiles".into(),
         b(pps.loop_filter_across_tiles_enabled_flag),
@@ -288,7 +325,10 @@ fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
         "lf_across_slices".into(),
         b(pps.pps_loop_filter_across_slices_enabled_flag),
     );
-    m.insert("output_flag_present".into(), b(pps.output_flag_present_flag));
+    m.insert(
+        "output_flag_present".into(),
+        b(pps.output_flag_present_flag),
+    );
     m.insert(
         "num_ref_l0_def_minus1".into(),
         pps.num_ref_idx_l0_default_active_minus1 as i64,
@@ -315,8 +355,14 @@ fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
     m.insert("tc_div2".into(), pps.pps_tc_offset_div2 as i64);
     m.insert("tiles".into(), b(pps.tiles_enabled_flag));
     m.insert("uniform_spacing".into(), b(pps.uniform_spacing_flag));
-    m.insert("num_tile_cols_minus1".into(), pps.num_tile_columns_minus1 as i64);
-    m.insert("num_tile_rows_minus1".into(), pps.num_tile_rows_minus1 as i64);
+    m.insert(
+        "num_tile_cols_minus1".into(),
+        pps.num_tile_columns_minus1 as i64,
+    );
+    m.insert(
+        "num_tile_rows_minus1".into(),
+        pps.num_tile_rows_minus1 as i64,
+    );
     // [pps_ext]
     m.insert("pps_range".into(), b(pps.pps_range_extension_flag));
     m.insert(
@@ -384,10 +430,10 @@ fn h265_parser_matches_cuvid_ground_truth() {
 
                 // --- slice type / flags ---
                 let intra = info.slice_type == 0; // 0=I, 1=P, 2=B
-                // Known IDR quirk: the IDR slice header is mis-parsed as a B
-                // slice (subtle bit-alignment nuance; the POC is still correct,
-                // which is asserted above). The parser's intra flag is therefore
-                // unreliable for IDR pictures, so only assert it for non-IDR pics.
+                                                  // Known IDR quirk: the IDR slice header is mis-parsed as a B
+                                                  // slice (subtle bit-alignment nuance; the POC is still correct,
+                                                  // which is asserted above). The parser's intra flag is therefore
+                                                  // unreliable for IDR pictures, so only assert it for non-IDR pics.
                 if !g.idr {
                     assert_eq!(intra, g.intra, "pic {pic}: intra flag mismatch");
                 }
@@ -427,16 +473,23 @@ fn h265_parser_matches_cuvid_ground_truth() {
                 };
 
                 assert_eq!(
-                    before.len(), g.nstb,
+                    before.len(),
+                    g.nstb,
                     "pic {pic}: NumPocStCurrBefore mismatch (parser={} gt={})",
-                    before.len(), g.nstb
+                    before.len(),
+                    g.nstb
                 );
                 assert_eq!(
-                    after.len(), g.nsta,
+                    after.len(),
+                    g.nsta,
                     "pic {pic}: NumPocStCurrAfter mismatch (parser={} gt={})",
-                    after.len(), g.nsta
+                    after.len(),
+                    g.nsta
                 );
-                assert_eq!(g.nlt, 0, "pic {pic}: GT has long-term refs (unsupported here)");
+                assert_eq!(
+                    g.nlt, 0,
+                    "pic {pic}: GT has long-term refs (unsupported here)"
+                );
                 assert_eq!(
                     before, g.refpocs_before,
                     "pic {pic}: StCurrBefore POCs mismatch (parser={:?} gt={:?})",
@@ -467,9 +520,10 @@ fn h265_parser_matches_cuvid_ground_truth() {
                         );
                         continue;
                     }
-                    let gtv = g.params.get(k).unwrap_or_else(|| {
-                        panic!("pic {pic}: GT missing param {k}")
-                    });
+                    let gtv = g
+                        .params
+                        .get(k)
+                        .unwrap_or_else(|| panic!("pic {pic}: GT missing param {k}"));
                     assert_eq!(
                         v, gtv,
                         "pic {pic}: param {k} mismatch (parser={} gt={})",
@@ -488,7 +542,12 @@ fn h265_parser_matches_cuvid_ground_truth() {
         }
     }
 
-    assert_eq!(pic_idx, gt.len(), "parser produced {pic_idx} pictures, GT has {}", gt.len());
+    assert_eq!(
+        pic_idx,
+        gt.len(),
+        "parser produced {pic_idx} pictures, GT has {}",
+        gt.len()
+    );
     eprintln!(
         "OK: {pic_idx} pictures matched cuvid ground truth (POC, RPS, flags, {param_checks} SPS/PPS param checks)"
     );

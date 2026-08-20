@@ -244,23 +244,43 @@ fn test_poc_type0_explicit_basic() {
 
     // Frame 0: lsb=0, expected POC=0
     let slh0 = create_slice_header(0, 0, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh0, false), 0, "Frame 0 POC should be 0");
+    assert_eq!(
+        calc.calculate(&sps, &slh0, false),
+        0,
+        "Frame 0 POC should be 0"
+    );
 
     // Frame 1: lsb=2, expected POC=2
     let slh1 = create_slice_header(1, 2, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh1, false), 2, "Frame 1 POC should be 2");
+    assert_eq!(
+        calc.calculate(&sps, &slh1, false),
+        2,
+        "Frame 1 POC should be 2"
+    );
 
     // Frame 2: lsb=4, expected POC=4
     let slh2 = create_slice_header(2, 4, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh2, false), 4, "Frame 2 POC should be 4");
+    assert_eq!(
+        calc.calculate(&sps, &slh2, false),
+        4,
+        "Frame 2 POC should be 4"
+    );
 
     // Frame 3: lsb=6, expected POC=6
     let slh3 = create_slice_header(3, 6, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh3, false), 6, "Frame 3 POC should be 6");
+    assert_eq!(
+        calc.calculate(&sps, &slh3, false),
+        6,
+        "Frame 3 POC should be 6"
+    );
 
     // Frame 4: lsb=100, expected POC=100 (still no wrap, diff=94 < 256)
     let slh4 = create_slice_header(4, 100, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh4, false), 100, "Frame 4 POC should be 100");
+    assert_eq!(
+        calc.calculate(&sps, &slh4, false),
+        100,
+        "Frame 4 POC should be 100"
+    );
 }
 
 /// Test 2: POC type 0 with lsb wrap from high to low (MSB increases).
@@ -283,7 +303,11 @@ fn test_poc_type0_explicit_wrap_up() {
 
     // Jump to lsb=500 (diff=250 < 256, no wrap)
     let slh_500 = create_slice_header(2, 500, [0, 0], 1, 1);
-    assert_eq!(calc.calculate(&sps, &slh_500, false), 500, "Frame at POC=500");
+    assert_eq!(
+        calc.calculate(&sps, &slh_500, false),
+        500,
+        "Frame at POC=500"
+    );
 
     // Next frame: lsb=10 (wrapped around)
     // prev_lsb - curr_lsb = 500 - 10 = 490 >= 512/2 = 256, so MSB increases
@@ -620,11 +644,19 @@ fn test_poc_type1_wrap_to_zero() {
 
     // Frame 14 (ref): prev_is_reference=false → last_pic_order_cnt + offset[0] = 0 + 4 = 4
     let slh14 = create_slice_header(14, 0, [0, 0], 1, 3);
-    assert_eq!(calc.calculate(&sps, &slh14, true), 4, "Frame 14 POC should be 4");
+    assert_eq!(
+        calc.calculate(&sps, &slh14, true),
+        4,
+        "Frame 14 POC should be 4"
+    );
 
     // Frame 15 (ref): prev_is_reference=true → prev + offset[1] = 4 + (-4) = 0
     let slh15 = create_slice_header(15, 0, [0, 0], 1, 3);
-    assert_eq!(calc.calculate(&sps, &slh15, true), 0, "Frame 15 POC should be 0");
+    assert_eq!(
+        calc.calculate(&sps, &slh15, true),
+        0,
+        "Frame 15 POC should be 0"
+    );
 
     // Frame 0 (ref, wrapped): frame_num 0 < prev_frame_num 15, so wrap detected.
     // last_pic_order_cnt_cycle resets to 0.
@@ -661,11 +693,19 @@ fn test_poc_type2_implicit_from_frame_num() {
 
     // Frame 0 (ref): frame_num=0, POC=0*2=0
     let slh0 = create_slice_header(0, 0, [0, 0], 1, 3); // nal_ref_idc=3 (reference)
-    assert_eq!(calc.calculate(&sps, &slh0, true), 0, "Frame 0 (ref) POC should be 0");
+    assert_eq!(
+        calc.calculate(&sps, &slh0, true),
+        0,
+        "Frame 0 (ref) POC should be 0"
+    );
 
     // Frame 1 (ref): frame_num=1, POC=1*2=2
     let slh1 = create_slice_header(1, 0, [0, 0], 1, 3);
-    assert_eq!(calc.calculate(&sps, &slh1, true), 2, "Frame 1 (ref) POC should be 2");
+    assert_eq!(
+        calc.calculate(&sps, &slh1, true),
+        2,
+        "Frame 1 (ref) POC should be 2"
+    );
 
     // Frame 2 (non-ref): frame_num=100, POC=100*2+1=201
     let slh2 = create_slice_header(100, 0, [0, 0], 1, 0); // nal_ref_idc=0 (non-reference)

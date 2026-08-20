@@ -162,12 +162,12 @@ pub mod picparams;
 pub mod poc;
 
 pub use decoder::NvdecH264Decoder;
-pub use h265::NvdecH265Decoder;
 pub use device::{
     cu_memcpy_2d, init_nvdec, is_available, is_codec_supported, query_decoder_caps, CUDA_MEMCPY2D,
     CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST,
 };
 pub use error::{NvdecError, NvdecResult};
+pub use h265::NvdecH265Decoder;
 
 /// Convenience type alias for the H.264 decoder.
 ///

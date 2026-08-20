@@ -9,8 +9,8 @@ use vk_video_core::picture::{H264Pps, H264Sps, H265Pps, H265Sps};
 use vk_video_parser::h265::SliceHeaderInfo;
 
 use crate::ffi::{
-    CUVIDH264DPBENTRY, CUVIDH264FMOASO, CUVIDH264PICPARAMS, CUVIDH264SVCMVC, CUVIDHEVCPICPARAMS,
-    CUVIDPICPARAMS, CUVIDCODECSPECIFIC,
+    CUVIDCODECSPECIFIC, CUVIDH264DPBENTRY, CUVIDH264FMOASO, CUVIDH264PICPARAMS, CUVIDH264SVCMVC,
+    CUVIDHEVCPICPARAMS, CUVIDPICPARAMS,
 };
 
 /// cuvid neutral default 4x4 quantization matrix (intra luma).
@@ -98,10 +98,15 @@ pub fn build_cuvid_h264_picparams(
         deblocking_filter_control_present_flag: pps.deblocking_filter_control_present_flag as c_int,
         redundant_pic_cnt_present_flag: pps.redundant_pic_cnt_present_flag as c_int,
         transform_8x8_mode_flag: pps.transform_8x8_mode_flag as c_int,
-        MbaffFrameFlag: if sps.frame_mbs_only_flag { 0 }
-                        else if slh.field_pic_flag { 0 }
-                        else if sps.mb_adaptive_frame_field_flag { 1 }
-                        else { 0 },
+        MbaffFrameFlag: if sps.frame_mbs_only_flag {
+            0
+        } else if slh.field_pic_flag {
+            0
+        } else if sps.mb_adaptive_frame_field_flag {
+            1
+        } else {
+            0
+        },
         constrained_intra_pred_flag: pps.constrained_intra_pred_flag as c_int,
         chroma_qp_index_offset: pps.chroma_qp_index_offset as c_int,
         second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset as c_int,
@@ -181,9 +186,14 @@ pub fn build_cuvid_picparams(
 
     // H.264 slice_type mod 5: 0=P, 1=B, 2=I, 3=SP, 4=SI
     // Intra-coded: I (2) and SI (4)
-    let intra_pic_flag = if slh.slice_type == 2 || slh.slice_type == 4 { 1 } else { 0 };
+    let intra_pic_flag = if slh.slice_type == 2 || slh.slice_type == 4 {
+        1
+    } else {
+        0
+    };
 
-    let h264_params = build_cuvid_h264_picparams(sps, pps, slh, frame_num, poc, is_reference, dpb_entries);
+    let h264_params =
+        build_cuvid_h264_picparams(sps, pps, slh, frame_num, poc, is_reference, dpb_entries);
 
     CUVIDPICPARAMS {
         PicWidthInMbs: pic_width_in_mbs,
@@ -286,7 +296,8 @@ pub fn build_cuvid_hevc_picparams(
         log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_luma_transform_block_size,
         pcm_enabled_flag: sps.pcm_enabled_flag as c_uchar,
         log2_min_pcm_luma_coding_block_size_minus3: sps.log2_min_pcm_luma_coding_block_size_minus3,
-        log2_diff_max_min_pcm_luma_coding_block_size: sps.log2_diff_max_min_pcm_luma_coding_block_size,
+        log2_diff_max_min_pcm_luma_coding_block_size: sps
+            .log2_diff_max_min_pcm_luma_coding_block_size,
         pcm_sample_bit_depth_luma_minus1: sps.pcm_sample_bit_depth_luma_minus1,
         pcm_sample_bit_depth_chroma_minus1: sps.pcm_sample_bit_depth_chroma_minus1,
         pcm_loop_filter_disabled_flag: sps.pcm_loop_filter_disabled_flag as c_uchar,
@@ -314,7 +325,8 @@ pub fn build_cuvid_hevc_picparams(
         reserved1: [0; 10],
         // --- PPS ---
         dependent_slice_segments_enabled_flag: pps.dependent_slice_segments_enabled_flag as c_uchar,
-        slice_segment_header_extension_present_flag: pps.slice_segment_header_extension_present_flag as c_uchar,
+        slice_segment_header_extension_present_flag: pps.slice_segment_header_extension_present_flag
+            as c_uchar,
         sign_data_hiding_enabled_flag: pps.sign_data_hiding_enabled_flag as c_uchar,
         cu_qp_delta_enabled_flag: pps.cu_qp_delta_enabled_flag as c_uchar,
         diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth,
@@ -330,14 +342,17 @@ pub fn build_cuvid_hevc_picparams(
         log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level_minus2,
         num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
         loop_filter_across_tiles_enabled_flag: pps.loop_filter_across_tiles_enabled_flag as c_uchar,
-        loop_filter_across_slices_enabled_flag: pps.pps_loop_filter_across_slices_enabled_flag as c_uchar,
+        loop_filter_across_slices_enabled_flag: pps.pps_loop_filter_across_slices_enabled_flag
+            as c_uchar,
         output_flag_present_flag: pps.output_flag_present_flag as c_uchar,
         num_ref_idx_l0_default_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
         num_ref_idx_l1_default_active_minus1: pps.num_ref_idx_l1_default_active_minus1,
         lists_modification_present_flag: pps.lists_modification_present_flag as c_uchar,
         cabac_init_present_flag: pps.cabac_init_present_flag as c_uchar,
-        pps_slice_chroma_qp_offsets_present_flag: pps.pps_slice_chroma_qp_offsets_present_flag as c_uchar,
-        deblocking_filter_override_enabled_flag: pps.deblocking_filter_override_enabled_flag as c_uchar,
+        pps_slice_chroma_qp_offsets_present_flag: pps.pps_slice_chroma_qp_offsets_present_flag
+            as c_uchar,
+        deblocking_filter_override_enabled_flag: pps.deblocking_filter_override_enabled_flag
+            as c_uchar,
         pps_deblocking_filter_disabled_flag: pps.pps_deblocking_filter_disabled_flag as c_uchar,
         pps_beta_offset_div2: pps.pps_beta_offset_div2,
         pps_tc_offset_div2: pps.pps_tc_offset_div2,
@@ -367,10 +382,12 @@ pub fn build_cuvid_hevc_picparams(
         explicit_rdpcm_enabled_flag: sps.explicit_rdpcm_enabled_flag as c_uchar,
         extended_precision_processing_flag: sps.extended_precision_processing_flag as c_uchar,
         intra_smoothing_disabled_flag: sps.intra_smoothing_disabled_flag as c_uchar,
-        persistent_rice_adaptation_enabled_flag: sps.persistent_rice_adaptation_enabled_flag as c_uchar,
+        persistent_rice_adaptation_enabled_flag: sps.persistent_rice_adaptation_enabled_flag
+            as c_uchar,
         cabac_bypass_alignment_enabled_flag: sps.cabac_bypass_alignment_enabled_flag as c_uchar,
         pps_range_extension_flag: pps.pps_range_extension_flag as c_uchar,
-        cross_component_prediction_enabled_flag: pps.cross_component_prediction_enabled_flag as c_uchar,
+        cross_component_prediction_enabled_flag: pps.cross_component_prediction_enabled_flag
+            as c_uchar,
         chroma_qp_offset_list_enabled_flag: pps.chroma_qp_offset_list_enabled_flag as c_uchar,
         diff_cu_chroma_qp_offset_depth: pps.diff_cu_chroma_qp_offset_depth,
         chroma_qp_offset_list_len_minus1: pps.chroma_qp_offset_list_len_minus1,
@@ -453,8 +470,7 @@ pub fn dump_cuvid_hevc_picparams(path: &std::path::Path, pic_num: u32, p: &CUVID
 
     let h = unsafe { &p.CodecSpecific.hevc };
     let bs = unsafe { std::slice::from_raw_parts(p.pBitstreamData, p.nBitstreamDataLen as usize) };
-    let offsets =
-        unsafe { std::slice::from_raw_parts(p.pSliceDataOffsets, p.nNumSlices as usize) };
+    let offsets = unsafe { std::slice::from_raw_parts(p.pSliceDataOffsets, p.nNumSlices as usize) };
 
     let mut s = String::new();
     s.push_str(&format!("=== PIC {} (decode) ===\n", pic_num));

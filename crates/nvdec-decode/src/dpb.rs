@@ -155,7 +155,6 @@ impl NvdecDpbManager {
         self.entries.iter().rev().find(|e| e.pic_index == pic_index)
     }
 
-
     /// Sequence id of the most recently added frame (`next_seq - 1`).
     pub fn last_seq(&self) -> i32 {
         self.next_seq - 1
@@ -205,7 +204,8 @@ impl NvdecDpbManager {
         // long_term_pic_num (smallest non-negative value not used).
         if idr_long_term_ref_flag {
             self.current_is_long_term = true;
-            let used_indices: std::collections::HashSet<u32> = self.entries
+            let used_indices: std::collections::HashSet<u32> = self
+                .entries
                 .iter()
                 .filter(|e| e.is_valid && e.is_long_term)
                 .filter_map(|e| e.long_term_frame_idx)
@@ -488,7 +488,8 @@ impl NvdecDpbManager {
 
     /// Count the number of valid reference frames in the DPB.
     fn count_references(&self) -> usize {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| e.is_valid && e.is_reference)
             .count()
     }
@@ -711,7 +712,7 @@ mod tests {
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(5, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid);   // lt_idx=0 < 3, kept
+        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 3, kept
         assert!(!dpb.entries[1].is_valid); // lt_idx=3 >= 3, unmarked
     }
 
@@ -743,9 +744,9 @@ mod tests {
     #[test]
     fn test_to_cuvid_dpb_entries_non_reference_excluded() {
         let mut dpb = NvdecDpbManager::new(16);
-        dpb.add_frame(0, 0, true);   // reference
-        dpb.add_frame(1, 2, false);  // non-reference
-        dpb.add_frame(2, 4, true);   // reference
+        dpb.add_frame(0, 0, true); // reference
+        dpb.add_frame(1, 2, false); // non-reference
+        dpb.add_frame(2, 4, true); // reference
 
         let cuvid = dpb.to_cuvid_dpb_entries();
 
@@ -791,22 +792,22 @@ mod tests {
         // DPB size limited to 3 reference frames
         let mut dpb = NvdecDpbManager::new(3);
 
-        dpb.add_frame(0, 0, true);   // pic_index=0, poc=0
-        dpb.add_frame(1, 2, true);   // pic_index=1, poc=2
-        dpb.add_frame(2, 4, true);   // pic_index=2, poc=4
+        dpb.add_frame(0, 0, true); // pic_index=0, poc=0
+        dpb.add_frame(1, 2, true); // pic_index=1, poc=2
+        dpb.add_frame(2, 4, true); // pic_index=2, poc=4
 
         assert_eq!(dpb.count_references(), 3);
 
         // Adding 4th reference should evict oldest (poc=0)
-        dpb.add_frame(3, 6, true);   // pic_index=3, poc=6
+        dpb.add_frame(3, 6, true); // pic_index=3, poc=6
 
         assert_eq!(dpb.count_references(), 3);
 
         // Verify oldest was evicted
-        assert!(!dpb.entries[0].is_valid);  // poc=0 evicted
-        assert!(dpb.entries[1].is_valid);   // poc=2
-        assert!(dpb.entries[2].is_valid);   // poc=4
-        assert!(dpb.entries[3].is_valid);   // poc=6
+        assert!(!dpb.entries[0].is_valid); // poc=0 evicted
+        assert!(dpb.entries[1].is_valid); // poc=2
+        assert!(dpb.entries[2].is_valid); // poc=4
+        assert!(dpb.entries[3].is_valid); // poc=6
 
         // Verify CUVID output only has 3 valid entries
         let cuvid = dpb.to_cuvid_dpb_entries();
@@ -831,13 +832,12 @@ mod tests {
         assert!(dpb.entries[0].is_long_term);
 
         // Adding 3rd reference should evict oldest SHORT-TERM (poc=2), not long-term
-        dpb.add_frame(2, 4, true);   // pic_index=2, poc=4
+        dpb.add_frame(2, 4, true); // pic_index=2, poc=4
 
-        assert!(dpb.entries[0].is_valid);   // long-term preserved
-        assert!(!dpb.entries[1].is_valid);  // short-term evicted
-        assert!(dpb.entries[2].is_valid);   // new frame
+        assert!(dpb.entries[0].is_valid); // long-term preserved
+        assert!(!dpb.entries[1].is_valid); // short-term evicted
+        assert!(dpb.entries[2].is_valid); // new frame
     }
-
 
     #[test]
     fn test_get_entry_by_pic_index() {
@@ -944,9 +944,21 @@ mod tests {
 
         let cuvid = dpb.to_cuvid_dpb_entries();
         for i in 0..16 {
-            assert_eq!(cuvid[i].PicIdx, -1, "Entry {} should be empty after IDR reset", i);
-            assert_eq!(cuvid[i].not_existing, 0, "Entry {} should have not_existing=0 after IDR reset", i);
-            assert_eq!(cuvid[i].used_for_reference, 0, "Entry {} should have used_for_reference=0 after IDR reset", i);
+            assert_eq!(
+                cuvid[i].PicIdx, -1,
+                "Entry {} should be empty after IDR reset",
+                i
+            );
+            assert_eq!(
+                cuvid[i].not_existing, 0,
+                "Entry {} should have not_existing=0 after IDR reset",
+                i
+            );
+            assert_eq!(
+                cuvid[i].used_for_reference, 0,
+                "Entry {} should have used_for_reference=0 after IDR reset",
+                i
+            );
         }
     }
 
@@ -954,9 +966,9 @@ mod tests {
     fn test_non_reference_frame_not_in_dpb() {
         // Non-reference frames should not appear in CUVID DPB entries
         let mut dpb = NvdecDpbManager::new(16);
-        dpb.add_frame(0, 0, true);   // reference
-        dpb.add_frame(1, 2, false);  // non-reference
-        dpb.add_frame(2, 4, true);   // reference
+        dpb.add_frame(0, 0, true); // reference
+        dpb.add_frame(1, 2, false); // non-reference
+        dpb.add_frame(2, 4, true); // reference
 
         let cuvid = dpb.to_cuvid_dpb_entries();
 
@@ -978,8 +990,8 @@ mod tests {
         dpb.set_max_frame_num(64);
 
         // Add frames near wraparound boundary
-        dpb.add_frame(60, 120, true);  // frame_num=60
-        dpb.add_frame(62, 124, true);  // frame_num=62
+        dpb.add_frame(60, 120, true); // frame_num=60
+        dpb.add_frame(62, 124, true); // frame_num=62
 
         // Current frame_num=3 (wrapped around), unmark picNumX = 64 + 3 - (2+1) = 64
         // Since frame_num wraps at 64, picNumX=64 is out of range, so let's use
@@ -993,12 +1005,12 @@ mod tests {
         // Current=3, diff=5 (minus1=4): picNumX = 64 + 3 - 5 = 62 -> matches frame_num=62!
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 1, // unmark_short_term
-            value: 4, // difference_of_pic_nums_minus1=4, diff=5
+            value: 4,                               // difference_of_pic_nums_minus1=4, diff=5
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(3, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid);  // frame_num=60 still valid
+        assert!(dpb.entries[0].is_valid); // frame_num=60 still valid
         assert!(!dpb.entries[1].is_valid); // frame_num=62 unmarked
     }
 
@@ -1036,7 +1048,7 @@ mod tests {
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(0, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid);   // lt_idx=4 < 5, kept
+        assert!(dpb.entries[0].is_valid); // lt_idx=4 < 5, kept
         assert!(!dpb.entries[1].is_valid); // lt_idx=5 >= 5, unmarked
     }
 
@@ -1078,7 +1090,7 @@ mod tests {
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(2, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid);   // lt_idx=0 < 1, kept
+        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 1, kept
         assert!(!dpb.entries[1].is_valid); // lt_idx=1 >= 1, invalidated
     }
 
@@ -1155,8 +1167,8 @@ mod tests {
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(3, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid);  // lt_idx=0 < 4, kept
-        assert!(dpb.entries[1].is_valid);  // lt_idx=3 < 4, kept
+        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 4, kept
+        assert!(dpb.entries[1].is_valid); // lt_idx=3 < 4, kept
         assert!(!dpb.entries[2].is_valid); // lt_idx=7 >= 4, invalidated
     }
 

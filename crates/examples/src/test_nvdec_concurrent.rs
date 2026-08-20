@@ -66,10 +66,7 @@ fn main() {
             let info = decoder.info();
             println!(
                 "[Thread {}] Decoder created: {}x{} profile={:?}",
-                i,
-                info.display_size.width,
-                info.display_size.height,
-                info.profile_idc
+                i, info.display_size.width, info.display_size.height, info.profile_idc
             );
 
             let mut count = 0;
@@ -81,10 +78,7 @@ fn main() {
             }
 
             let elapsed = start.elapsed();
-            println!(
-                "[Thread {}] Decoded {} frames in {:?}",
-                i, count, elapsed
-            );
+            println!("[Thread {}] Decoded {} frames in {:?}", i, count, elapsed);
             Ok::<_, nvdec_decode::NvdecError>((count, elapsed))
         }));
     }
@@ -92,10 +86,7 @@ fn main() {
     for (i, handle) in handles.into_iter().enumerate() {
         match handle.join() {
             Ok(Ok((count, elapsed))) => {
-                println!(
-                    "  Thread {}: OK - {} frames in {:?}",
-                    i, count, elapsed
-                );
+                println!("  Thread {}: OK - {} frames in {:?}", i, count, elapsed);
                 if count == 0 {
                     eprintln!("  WARNING: Thread {} decoded 0 frames!", i);
                     all_ok = false;

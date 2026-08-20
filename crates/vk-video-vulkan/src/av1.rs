@@ -363,7 +363,8 @@ pub struct VideoDecodeAV1PictureInfoKHR {
     /// Each value must equal the slotIndex of one of the reference slots passed to
     /// vkCmdDecodeVideoKHR (VUID-vkCmdDecodeVideoKHR-referenceNameSlotIndices-09262),
     /// or be negative if the reference name is not used.
-    pub reference_name_slot_indices: [i32; av1_vk_constants::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR as usize],
+    pub reference_name_slot_indices:
+        [i32; av1_vk_constants::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR as usize],
     pub frame_header_offset: u32,
     pub tile_count: u32,
     pub p_tile_offsets: *const u32,
@@ -382,7 +383,9 @@ impl VideoDecodeAV1PictureInfoKHR {
         p_tile_sizes: *const u32,
     ) -> Self {
         Self {
-            s_type: vk::StructureType::from_raw(av1_vk_constants::VIDEO_DECODE_AV1_PICTURE_INFO_KHR),
+            s_type: vk::StructureType::from_raw(
+                av1_vk_constants::VIDEO_DECODE_AV1_PICTURE_INFO_KHR,
+            ),
             p_next: std::ptr::null(),
             p_std_picture_info,
             reference_name_slot_indices,
@@ -496,8 +499,7 @@ impl Default for Av1PictureInfoContainer {
 pub fn convert_av1_color_config(
     sps: &vk_video_core::picture::Av1Sps,
 ) -> ash::vk::native::StdVideoAV1ColorConfig {
-    let mut flags =
-        unsafe { std::mem::zeroed::<ash::vk::native::StdVideoAV1ColorConfigFlags>() };
+    let mut flags = unsafe { std::mem::zeroed::<ash::vk::native::StdVideoAV1ColorConfigFlags>() };
     flags.set_mono_chrome(if sps.mono_chrome { 1 } else { 0 });
     flags.set_color_range(if sps.color_range { 1 } else { 0 });
     flags.set_separate_uv_delta_q(if sps.separate_uv_delta_q { 1 } else { 0 });
@@ -506,7 +508,11 @@ pub fn convert_av1_color_config(
     ash::vk::native::StdVideoAV1ColorConfig {
         flags,
         BitDepth: if sps.high_bitdepth {
-            if sps.twelve_bit { 12 } else { 10 }
+            if sps.twelve_bit {
+                12
+            } else {
+                10
+            }
         } else {
             8
         },
@@ -547,7 +553,11 @@ pub fn convert_av1_sps(
     let mut flags =
         unsafe { std::mem::zeroed::<ash::vk::native::StdVideoAV1SequenceHeaderFlags>() };
     flags.set_still_picture(if sps.still_picture { 1 } else { 0 });
-    flags.set_reduced_still_picture_header(if sps.reduced_still_picture_header { 1 } else { 0 });
+    flags.set_reduced_still_picture_header(if sps.reduced_still_picture_header {
+        1
+    } else {
+        0
+    });
     flags.set_use_128x128_superblock(if sps.use_128x128_superblock { 1 } else { 0 });
     flags.set_enable_filter_intra(if sps.enable_filter_intra { 1 } else { 0 });
     flags.set_enable_intra_edge_filter(if sps.enable_intra_edge_filter { 1 } else { 0 });
@@ -558,7 +568,11 @@ pub fn convert_av1_sps(
     flags.set_enable_order_hint(if sps.enable_order_hint { 1 } else { 0 });
     flags.set_enable_jnt_comp(if sps.enable_jnt_motion { 1 } else { 0 });
     flags.set_enable_ref_frame_mvs(if sps.enable_ref_frame_mvs { 1 } else { 0 });
-    flags.set_frame_id_numbers_present_flag(if sps.frame_id_numbers_present_flag { 1 } else { 0 });
+    flags.set_frame_id_numbers_present_flag(if sps.frame_id_numbers_present_flag {
+        1
+    } else {
+        0
+    });
     flags.set_enable_superres(if sps.enable_superres { 1 } else { 0 });
     flags.set_enable_cdef(if sps.enable_cdef { 1 } else { 0 });
     flags.set_enable_restoration(if sps.enable_restoration { 1 } else { 0 });
@@ -734,15 +748,15 @@ impl Av1Decoder {
         disable_cdf: u8,
         seg_enabled: u8,
     ) {
-          if frame_buffer_idx < 8 {
-              self.frame_buffer_saved_order_hints[frame_buffer_idx] = *order_hints;
-              // C++ VulkanAV1Decoder.cpp UpdateFramePointers loops refName =
-              // LAST_FRAME(1) .. NUM_REF_FRAMES-1(7) and stores the RAW signed
-              // distance (m_pBuffers[i].RefFrameSignBias[refName] =
-              // GetRelativeDist(pStd->OrderHint, pStd->OrderHints[refName])).
-              // Index 0 (INTRA) is never set (stays 0). The RefFrameSignBias
-              // bitmask is computed at read time as (dist <= 0).
-              for ref_name in 1..8usize {
+        if frame_buffer_idx < 8 {
+            self.frame_buffer_saved_order_hints[frame_buffer_idx] = *order_hints;
+            // C++ VulkanAV1Decoder.cpp UpdateFramePointers loops refName =
+            // LAST_FRAME(1) .. NUM_REF_FRAMES-1(7) and stores the RAW signed
+            // distance (m_pBuffers[i].RefFrameSignBias[refName] =
+            // GetRelativeDist(pStd->OrderHint, pStd->OrderHints[refName])).
+            // Index 0 (INTRA) is never set (stays 0). The RefFrameSignBias
+            // bitmask is computed at read time as (dist <= 0).
+            for ref_name in 1..8usize {
                 let rel = Self::get_relative_dist(
                     current_order_hint as i32,
                     order_hints[ref_name] as i32,
@@ -831,47 +845,76 @@ impl Av1Decoder {
         {
             let mut best: Option<usize> = None;
             for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint { continue; }
-                if best.map_or(true, |b| shifted[i] >= shifted[b]) { best = Some(i); }
+                if used[i] || shifted[i] < cur_frame_hint {
+                    continue;
+                }
+                if best.map_or(true, |b| shifted[i] >= shifted[b]) {
+                    best = Some(i);
+                }
             }
-            if let Some(r) = best { rfi[6] = r as i32; used[r] = true; }
+            if let Some(r) = best {
+                rfi[6] = r as i32;
+                used[r] = true;
+            }
         }
         // BWDREF: hint >= curFrameHint, smallest
         {
             let mut best: Option<usize> = None;
             for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint { continue; }
-                if best.map_or(true, |b| shifted[i] < shifted[b]) { best = Some(i); }
+                if used[i] || shifted[i] < cur_frame_hint {
+                    continue;
+                }
+                if best.map_or(true, |b| shifted[i] < shifted[b]) {
+                    best = Some(i);
+                }
             }
-            if let Some(r) = best { rfi[4] = r as i32; used[r] = true; }
+            if let Some(r) = best {
+                rfi[4] = r as i32;
+                used[r] = true;
+            }
         }
         // ALTREF2: hint >= curFrameHint, smallest
         {
             let mut best: Option<usize> = None;
             for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint { continue; }
-                if best.map_or(true, |b| shifted[i] < shifted[b]) { best = Some(i); }
+                if used[i] || shifted[i] < cur_frame_hint {
+                    continue;
+                }
+                if best.map_or(true, |b| shifted[i] < shifted[b]) {
+                    best = Some(i);
+                }
             }
-            if let Some(r) = best { rfi[5] = r as i32; used[r] = true; }
+            if let Some(r) = best {
+                rfi[5] = r as i32;
+                used[r] = true;
+            }
         }
         // LAST2, LAST3, BWDREF: hint < curFrameHint, largest
-        for &ref_name in &[2, 3, 5, 6, 7] { // LAST2=2, LAST3=3, BWDREF=5, ALTREF2=6, ALTREF=7
+        for &ref_name in &[2, 3, 5, 6, 7] {
+            // LAST2=2, LAST3=3, BWDREF=5, ALTREF2=6, ALTREF=7
             let idx = ref_name - 1;
             if rfi[idx] < 0 {
                 let mut best: Option<usize> = None;
                 for i in 0..8usize {
-                    if used[i] || shifted[i] >= cur_frame_hint { continue; }
-                    if best.map_or(true, |b| shifted[i] >= shifted[b]) { best = Some(i); }
+                    if used[i] || shifted[i] >= cur_frame_hint {
+                        continue;
+                    }
+                    if best.map_or(true, |b| shifted[i] >= shifted[b]) {
+                        best = Some(i);
+                    }
                 }
-                if let Some(r) = best { rfi[idx] = r as i32; used[r] = true; }
+                if let Some(r) = best {
+                    rfi[idx] = r as i32;
+                    used[r] = true;
+                }
             }
         }
         // Fallback: assign buffer with smallest shiftedOrderHint to remaining -1 slots
-        let fallback = (0..8usize)
-            .min_by_key(|&i| shifted[i])
-            .unwrap_or(0);
+        let fallback = (0..8usize).min_by_key(|&i| shifted[i]).unwrap_or(0);
         for i in 0..7 {
-            if rfi[i] < 0 { rfi[i] = fallback as i32; }
+            if rfi[i] < 0 {
+                rfi[i] = fallback as i32;
+            }
         }
         rfi
     }
@@ -1018,7 +1061,7 @@ impl Av1Decoder {
         // Build reference slots for BeginVideoCoding. For AV1, the pNext chain of
         // each reference slot must include a VkVideoDecodeAV1DpbSlotInfoKHR with
         // the reference picture's StdVideoDecodeAV1ReferenceInfo (Vulkan spec
-         // VUID for AV1 decode; the C++ reference does the same).
+        // VUID for AV1 decode; the C++ reference does the same).
         let ref_std_infos: Vec<ash::vk::native::StdVideoDecodeAV1ReferenceInfo> = (0..dpb_ref_pictures.len())
             .map(|i| {
                 let mut info =
@@ -1072,9 +1115,7 @@ impl Av1Decoder {
         if self.frame_count < 16 && super::vacc_debug() {
             eprintln!(
                 "[RUST-REFINFO] frame{}: refNameIdx={:?} ref_slots={:?}",
-                self.frame_count,
-                av1_decode_info.reference_name_slot_indices,
-                dpb_ref_slot_indices,
+                self.frame_count, av1_decode_info.reference_name_slot_indices, dpb_ref_slot_indices,
             );
             for (i, info) in ref_std_infos.iter().enumerate() {
                 eprintln!(
@@ -1099,7 +1140,8 @@ impl Av1Decoder {
             Box::leak(ref_std_infos.into_boxed_slice()).as_ptr()
         };
 
-        let ref_slot_infos: Vec<vk::VideoDecodeAV1DpbSlotInfoKHR<'static>> = (0..dpb_ref_pictures.len())
+        let ref_slot_infos: Vec<vk::VideoDecodeAV1DpbSlotInfoKHR<'static>> = (0..dpb_ref_pictures
+            .len())
             .map(|i| vk::VideoDecodeAV1DpbSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR,
                 p_next: std::ptr::null(),
@@ -1144,7 +1186,6 @@ impl Av1Decoder {
             });
         }
 
-
         // Setup slot (current frame output). Per VUID-vkCmdDecodeVideoKHR-pDecodeInfo-09254,
         // for AV1 the pNext chain of pSetupReferenceSlot MUST include a
         // VkVideoDecodeAV1DpbSlotInfoKHR. The C++ reference does the same, populating
@@ -1153,8 +1194,9 @@ impl Av1Decoder {
         // decode (all-zero output).
         let setup_std_info_ptr: *mut ash::vk::native::StdVideoDecodeAV1ReferenceInfo =
             if dpb_setup_picture.is_some() {
-                let mut info =
-                    unsafe { std::mem::zeroed::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>() };
+                let mut info = unsafe {
+                    std::mem::zeroed::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>()
+                };
                 info.OrderHint = picture_info_container.std_picture_info.OrderHint;
                 info.SavedOrderHints = picture_info_container.std_picture_info.OrderHints;
                 // C++ VulkanAV1Decoder.cpp:317-319 sets the setup slot's
@@ -1253,10 +1295,9 @@ impl Av1Decoder {
             && !av1_decode_info.p_tile_offsets.is_null()
             && !av1_decode_info.p_tile_sizes.is_null()
         {
-            (
-                unsafe { *av1_decode_info.p_tile_offsets },
-                unsafe { *av1_decode_info.p_tile_sizes },
-            )
+            (unsafe { *av1_decode_info.p_tile_offsets }, unsafe {
+                *av1_decode_info.p_tile_sizes
+            })
         } else {
             (0, 0)
         };
@@ -1322,7 +1363,8 @@ impl Av1Decoder {
             );
             eprintln!(
                 "[RUST-DEC-F3]   decode p_reference_slots: {:?} count={}",
-                dpb_ref_slot_indices, dpb_ref_pictures.len()
+                dpb_ref_slot_indices,
+                dpb_ref_pictures.len()
             );
             eprintln!(
                 "[RUST-DEC-F3]   referenceNameSlotIndices={:?} ref_slot_indices={:?}",
@@ -1332,10 +1374,9 @@ impl Av1Decoder {
                 && !av1_decode_info.p_tile_offsets.is_null()
                 && !av1_decode_info.p_tile_sizes.is_null()
             {
-                (
-                    unsafe { *av1_decode_info.p_tile_offsets },
-                    unsafe { *av1_decode_info.p_tile_sizes },
-                )
+                (unsafe { *av1_decode_info.p_tile_offsets }, unsafe {
+                    *av1_decode_info.p_tile_sizes
+                })
             } else {
                 (0, 0)
             };
@@ -1385,8 +1426,14 @@ impl Av1Decoder {
             );
             eprintln!(
                 "[RUST-PI-F3] lf refd=[{},{},{},{},{},{},{},{}]",
-                lf.loop_filter_ref_deltas[0], lf.loop_filter_ref_deltas[1], lf.loop_filter_ref_deltas[2], lf.loop_filter_ref_deltas[3],
-                lf.loop_filter_ref_deltas[4], lf.loop_filter_ref_deltas[5], lf.loop_filter_ref_deltas[6], lf.loop_filter_ref_deltas[7]
+                lf.loop_filter_ref_deltas[0],
+                lf.loop_filter_ref_deltas[1],
+                lf.loop_filter_ref_deltas[2],
+                lf.loop_filter_ref_deltas[3],
+                lf.loop_filter_ref_deltas[4],
+                lf.loop_filter_ref_deltas[5],
+                lf.loop_filter_ref_deltas[6],
+                lf.loop_filter_ref_deltas[7]
             );
             let c = &picture_info_container.cdef;
             eprintln!(
@@ -1400,16 +1447,25 @@ impl Av1Decoder {
             let lr = &picture_info_container.loop_restoration;
             eprintln!(
                 "[RUST-PI-F3] lr: type=[{},{},{}] size=[{},{},{}]",
-                lr.FrameRestorationType[0] as u32, lr.FrameRestorationType[1] as u32, lr.FrameRestorationType[2] as u32,
-                lr.LoopRestorationSize[0], lr.LoopRestorationSize[1], lr.LoopRestorationSize[2]
+                lr.FrameRestorationType[0] as u32,
+                lr.FrameRestorationType[1] as u32,
+                lr.FrameRestorationType[2] as u32,
+                lr.LoopRestorationSize[0],
+                lr.LoopRestorationSize[1],
+                lr.LoopRestorationSize[2]
             );
             let gm = &picture_info_container.global_motion;
             eprintln!("[RUST-PI-F3] gm: type={:?}", gm.GmType);
             for i in 0..8 {
                 eprintln!(
                     "[RUST-PI-F3] gm_params[{}]=[{},{},{},{},{},{}]",
-                    i, gm.gm_params[i][0], gm.gm_params[i][1], gm.gm_params[i][2],
-                    gm.gm_params[i][3], gm.gm_params[i][4], gm.gm_params[i][5]
+                    i,
+                    gm.gm_params[i][0],
+                    gm.gm_params[i][1],
+                    gm.gm_params[i][2],
+                    gm.gm_params[i][3],
+                    gm.gm_params[i][4],
+                    gm.gm_params[i][5]
                 );
             }
             let sg = &picture_info_container.segmentation;
@@ -1442,8 +1498,13 @@ impl Av1Decoder {
                 if !ref_std_infos_ptr.is_null() {
                     let ri = unsafe { &*ref_std_infos_ptr.add(i) };
                     let ri_ptr = ri as *const _ as *const u8;
-                    let ri_size = std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
-                    dump_bytes(&format!("StdVideoDecodeAV1ReferenceInfo[{}]", i), ri_ptr, ri_size);
+                    let ri_size =
+                        std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
+                    dump_bytes(
+                        &format!("StdVideoDecodeAV1ReferenceInfo[{}]", i),
+                        ri_ptr,
+                        ri_size,
+                    );
                 }
             }
 
@@ -1451,7 +1512,8 @@ impl Av1Decoder {
             if !setup_std_info_ptr.is_null() {
                 let si = unsafe { &*setup_std_info_ptr };
                 let si_ptr = si as *const _ as *const u8;
-                let si_size = std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
+                let si_size =
+                    std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
                 dump_bytes("StdVideoDecodeAV1ReferenceInfo[SETUP]", si_ptr, si_size);
             }
 
@@ -1464,7 +1526,11 @@ impl Av1Decoder {
             for (i, res) in dpb_ref_pictures.iter().enumerate() {
                 let pr_ptr = res as *const _ as *const u8;
                 let pr_size = std::mem::size_of::<vk::VideoPictureResourceInfoKHR>();
-                dump_bytes(&format!("VkVideoPictureResourceInfoKHR[REF{}]", i), pr_ptr, pr_size);
+                dump_bytes(
+                    &format!("VkVideoPictureResourceInfoKHR[REF{}]", i),
+                    pr_ptr,
+                    pr_size,
+                );
             }
 
             // 6. Setup VkVideoPictureResourceInfoKHR
@@ -1489,7 +1555,9 @@ impl Av1Decoder {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device
                 .begin_command_buffer(cmd_buffer, &begin_info)
-                .map_err(|e| VideoError::CommandBufferRecording(format!("Begin failed: {:?}", e)))?;
+                .map_err(|e| {
+                    VideoError::CommandBufferRecording(format!("Begin failed: {:?}", e))
+                })?;
 
             // Begin video coding with reference slots
             let begin_coding_info = vk::VideoBeginCodingInfoKHR {
@@ -1509,7 +1577,11 @@ impl Av1Decoder {
                 let bci_size = std::mem::size_of::<vk::VideoBeginCodingInfoKHR>();
                 let slice = std::slice::from_raw_parts(bci_ptr, bci_size);
                 let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
-                eprintln!("[RUST-BYTES] VkVideoBeginCodingInfoKHR: {} bytes: {}", bci_size, hex.join(" "));
+                eprintln!(
+                    "[RUST-BYTES] VkVideoBeginCodingInfoKHR: {} bytes: {}",
+                    bci_size,
+                    hex.join(" ")
+                );
             }
 
             self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info)?;
@@ -1688,63 +1760,82 @@ impl Av1Decoder {
                 _marker: Default::default(),
             };
 
-             let decode_info = vk::VideoDecodeInfoKHR {
-                  s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                  p_next: av1_decode_info as *const _ as *const _,
-                  flags: vk::VideoDecodeFlagsKHR::empty(),
-                  src_buffer: bitstream_buffer,
-                  src_buffer_offset: bitstream_offset,
-                  src_buffer_range: bitstream_range,
-                  dst_picture_resource,
-                   p_setup_reference_slot: if has_setup_slot && !slots_ptr.is_null() {
-                       unsafe { slots_ptr.add(num_refs) }
-                   } else {
-                       std::ptr::null()
-                   },
-                   reference_slot_count: num_refs as u32,
-                   p_reference_slots: if num_refs == 0 { std::ptr::null() } else { slots_ptr },
-                  _marker: Default::default(),
-              };
+            let decode_info = vk::VideoDecodeInfoKHR {
+                s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
+                p_next: av1_decode_info as *const _ as *const _,
+                flags: vk::VideoDecodeFlagsKHR::empty(),
+                src_buffer: bitstream_buffer,
+                src_buffer_offset: bitstream_offset,
+                src_buffer_range: bitstream_range,
+                dst_picture_resource,
+                p_setup_reference_slot: if has_setup_slot && !slots_ptr.is_null() {
+                    unsafe { slots_ptr.add(num_refs) }
+                } else {
+                    std::ptr::null()
+                },
+                reference_slot_count: num_refs as u32,
+                p_reference_slots: if num_refs == 0 {
+                    std::ptr::null()
+                } else {
+                    slots_ptr
+                },
+                _marker: Default::default(),
+            };
 
-              // DEBUG: verify s_type value
-              if self.frame_count == 2 && super::vacc_debug() {
-                  eprintln!("[S-TYPE-CHECK] VIDEO_DECODE_INFO_KHR raw value = {}",
-                      vk::StructureType::VIDEO_DECODE_INFO_KHR.as_raw());
-                  eprintln!("[S-TYPE-CHECK] decode_info.s_type raw value = {}",
-                      decode_info.s_type.as_raw());
-                  eprintln!("[S-TYPE-CHECK] VIDEO_PICTURE_RESOURCE_INFO_KHR raw value = {}",
-                      vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR.as_raw());
-                  eprintln!("[S-TYPE-CHECK] VIDEO_DECODE_AV1_PICTURE_INFO_KHR raw value = {}",
-                      vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR.as_raw());
-              }
+            // DEBUG: verify s_type value
+            if self.frame_count == 2 && super::vacc_debug() {
+                eprintln!(
+                    "[S-TYPE-CHECK] VIDEO_DECODE_INFO_KHR raw value = {}",
+                    vk::StructureType::VIDEO_DECODE_INFO_KHR.as_raw()
+                );
+                eprintln!(
+                    "[S-TYPE-CHECK] decode_info.s_type raw value = {}",
+                    decode_info.s_type.as_raw()
+                );
+                eprintln!(
+                    "[S-TYPE-CHECK] VIDEO_PICTURE_RESOURCE_INFO_KHR raw value = {}",
+                    vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR.as_raw()
+                );
+                eprintln!(
+                    "[S-TYPE-CHECK] VIDEO_DECODE_AV1_PICTURE_INFO_KHR raw value = {}",
+                    vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR.as_raw()
+                );
+            }
 
-              // BYTE DUMP: VkVideoDecodeInfoKHR + pNext chain for fc2 (Test C)
-               if self.frame_count == 2 && super::vacc_debug() {
-                  // Dump VkVideoDecodeInfoKHR
-                  let di_ptr = &decode_info as *const _ as *const u8;
-                  let di_size = std::mem::size_of::<vk::VideoDecodeInfoKHR>();
-                  let di_slice = std::slice::from_raw_parts(di_ptr, di_size);
-                  let di_hex: Vec<String> = di_slice.iter().map(|b| format!("{:02x}", b)).collect();
-                  eprintln!("[RAW-DEC-INFO] fc2: VkVideoDecodeInfoKHR size={} bytes:", di_size);
-                  for chunk in di_hex.chunks(32) {
-                      eprintln!("  {}", chunk.join(" "));
-                  }
-                  // Dump pNext chain (VideoDecodeAV1PictureInfoKHR + StdVideoDecodeAV1PictureInfo)
-                  unsafe {
-                      if !decode_info.p_next.is_null() {
-                          let pnext = decode_info.p_next as *const u8;
-                          let pnext_size = std::cmp::min(200u64, 200);
-                          let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
-                          let pnext_hex: Vec<String> = pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
-                          eprintln!("[RAW-PNEXT] fc2: first {} bytes of pNext chain:", pnext_size);
-                          for chunk in pnext_hex.chunks(32) {
-                              eprintln!("  {}", chunk.join(" "));
-                          }
-                      }
-                  }
-              }
+            // BYTE DUMP: VkVideoDecodeInfoKHR + pNext chain for fc2 (Test C)
+            if self.frame_count == 2 && super::vacc_debug() {
+                // Dump VkVideoDecodeInfoKHR
+                let di_ptr = &decode_info as *const _ as *const u8;
+                let di_size = std::mem::size_of::<vk::VideoDecodeInfoKHR>();
+                let di_slice = std::slice::from_raw_parts(di_ptr, di_size);
+                let di_hex: Vec<String> = di_slice.iter().map(|b| format!("{:02x}", b)).collect();
+                eprintln!(
+                    "[RAW-DEC-INFO] fc2: VkVideoDecodeInfoKHR size={} bytes:",
+                    di_size
+                );
+                for chunk in di_hex.chunks(32) {
+                    eprintln!("  {}", chunk.join(" "));
+                }
+                // Dump pNext chain (VideoDecodeAV1PictureInfoKHR + StdVideoDecodeAV1PictureInfo)
+                unsafe {
+                    if !decode_info.p_next.is_null() {
+                        let pnext = decode_info.p_next as *const u8;
+                        let pnext_size = std::cmp::min(200u64, 200);
+                        let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
+                        let pnext_hex: Vec<String> =
+                            pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
+                        eprintln!(
+                            "[RAW-PNEXT] fc2: first {} bytes of pNext chain:",
+                            pnext_size
+                        );
+                        for chunk in pnext_hex.chunks(32) {
+                            eprintln!("  {}", chunk.join(" "));
+                        }
+                    }
+                }
+            }
 
-             self.cmd_decode_video(cmd_buffer, &decode_info)?;
+            self.cmd_decode_video(cmd_buffer, &decode_info)?;
 
             // End video coding
             self.cmd_end_video_coding(cmd_buffer)?;
@@ -1766,16 +1857,14 @@ impl Av1Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) -> VideoResult<()> {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdPipelineBarrier2KHR".as_ptr(),
-            )
-};
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdPipelineBarrier2KHR".as_ptr())
+        };
         let Some(fn_ptr) = fn_ptr else {
             return Err(VideoError::CommandBufferRecording(
                 "vkCmdPipelineBarrier2KHR not found".to_string(),
             ));
-};
+        };
 
         unsafe {
             // Note: vkCmdPipelineBarrier2KHR returns void; no result to check.
@@ -1793,16 +1882,14 @@ impl Av1Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) -> VideoResult<()> {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdBeginVideoCodingKHR".as_ptr(),
-            )
-};
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdBeginVideoCodingKHR".as_ptr())
+        };
         let Some(fn_ptr) = fn_ptr else {
             return Err(VideoError::CommandBufferRecording(
                 "vkCmdBeginVideoCodingKHR not found".to_string(),
             ));
-};
+        };
 
         unsafe {
             // Note: vkCmdBeginVideoCodingKHR returns void; no result to check.
@@ -1816,22 +1903,25 @@ impl Av1Decoder {
         Ok(())
     }
 
-    fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) -> VideoResult<()> {
+    fn cmd_decode_video(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        info: &vk::VideoDecodeInfoKHR<'_>,
+    ) -> VideoResult<()> {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdDecodeVideoKHR".as_ptr(),
-            )
-};
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdDecodeVideoKHR".as_ptr())
+        };
         let Some(fn_ptr) = fn_ptr else {
             return Err(VideoError::CommandBufferRecording(
                 "vkCmdDecodeVideoKHR not found".to_string(),
             ));
-};
+        };
 
         unsafe {
             // Note: vkCmdDecodeVideoKHR returns void; no result to check.
-            type FnType = unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
+            type FnType =
+                unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
             let f: FnType = std::mem::transmute(fn_ptr);
             f(cmd_buffer, info);
         }
@@ -1846,23 +1936,19 @@ impl Av1Decoder {
             _marker: Default::default(),
         };
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdControlVideoCodingKHR".as_ptr(),
-            )
-};
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdControlVideoCodingKHR".as_ptr())
+        };
         let Some(fn_ptr) = fn_ptr else {
             return Err(VideoError::CommandBufferRecording(
                 "vkCmdControlVideoCodingKHR not found".to_string(),
             ));
-};
+        };
 
         unsafe {
             // Note: vkCmdControlVideoCodingKHR returns void; no result to check.
-            type FnType = unsafe extern "system" fn(
-                vk::CommandBuffer,
-                *const vk::VideoCodingControlInfoKHR,
-            );
+            type FnType =
+                unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoCodingControlInfoKHR);
             let f: FnType = std::mem::transmute(fn_ptr);
             f(cmd_buffer, &coding_control_info);
         }
@@ -1878,23 +1964,19 @@ impl Av1Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdEndVideoCodingKHR".as_ptr(),
-            )
-};
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdEndVideoCodingKHR".as_ptr())
+        };
         let Some(fn_ptr) = fn_ptr else {
             return Err(VideoError::CommandBufferRecording(
                 "vkCmdEndVideoCodingKHR not found".to_string(),
             ));
-};
+        };
 
         unsafe {
             // Note: vkCmdEndVideoCodingKHR returns void; no result to check.
-            type FnType = unsafe extern "system" fn(
-                vk::CommandBuffer,
-                *const vk::VideoEndCodingInfoKHR,
-            );
+            type FnType =
+                unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEndCodingInfoKHR);
             let f: FnType = std::mem::transmute(fn_ptr);
             f(cmd_buffer, &end_coding_info);
         }

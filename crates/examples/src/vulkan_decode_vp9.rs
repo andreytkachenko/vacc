@@ -355,9 +355,8 @@ fn main() {
         video_caps.min_bitstream_buffer_offset_alignment
     );
     // Align buffer size to minBitstreamBufferSizeAlignment
-    let max_frame_size_aligned = ((max_frame_size as u64).div_ceil(bs_size_align)
-        * bs_size_align)
-        .max(bs_size_align);
+    let max_frame_size_aligned =
+        ((max_frame_size as u64).div_ceil(bs_size_align) * bs_size_align).max(bs_size_align);
     let mut bs_buffer = create_vp9_bitstream_buffer(
         &vulkan.device,
         &vulkan.memory_properties,
@@ -1835,9 +1834,8 @@ fn cmd_pipeline_barrier_2(
     cmd_buffer: vk::CommandBuffer,
     dep_info: &vk::DependencyInfo<'_>,
 ) {
-    let fn_ptr = unsafe {
-        instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr())
-    };
+    let fn_ptr =
+        unsafe { instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr()) };
     if let Some(ptr) = fn_ptr {
         unsafe {
             type FnType =

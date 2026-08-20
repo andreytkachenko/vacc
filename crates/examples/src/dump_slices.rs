@@ -56,7 +56,8 @@ fn main() {
                 }
                 pic += slices.len();
             }
-            Ok(vk_video_parser::ParseResult::Nothing) | Ok(vk_video_parser::ParseResult::EndOfStream) => break,
+            Ok(vk_video_parser::ParseResult::Nothing)
+            | Ok(vk_video_parser::ParseResult::EndOfStream) => break,
             Err(e) => {
                 eprintln!("parse error: {}", e);
                 break;

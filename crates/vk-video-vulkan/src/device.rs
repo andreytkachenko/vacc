@@ -170,7 +170,7 @@ impl VideoDeviceBuilder {
         self
     }
 
-    pub     fn build(self) -> VideoResult<VulkanDevice> {
+    pub fn build(self) -> VideoResult<VulkanDevice> {
         eprintln!("[VideoDeviceBuilder] Creating entry...");
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
@@ -412,8 +412,8 @@ impl VideoDeviceBuilder {
                     .take_while(|&&b| b != 0)
                     .map(|b| *b as u8 as char)
                     .collect();
-                let exts =
-                    unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+                let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
+                    .unwrap_or_default();
                 let ext_names: Vec<String> = exts
                     .iter()
                     .map(|e| {
@@ -539,7 +539,10 @@ impl VideoDeviceBuilder {
         }
 
         // VK_KHR_video_maintenance2 (optional but required for NULL session params on AV1)
-        if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_maintenance2") {
+        if available_names
+            .iter()
+            .any(|n| n.as_str() == "VK_KHR_video_maintenance2")
+        {
             extensions.push("VK_KHR_video_maintenance2");
         } else {
             eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_maintenance2 not available (NULL session params invalid for AV1 decode)");
@@ -552,18 +555,18 @@ impl VideoDeviceBuilder {
             && available_names
                 .iter()
                 .any(|n| n.as_str() == "VK_KHR_video_decode_h264")
-            {
-                extensions.push("VK_KHR_video_decode_h264");
-            }
+        {
+            extensions.push("VK_KHR_video_decode_h264");
+        }
         if builder
             .video_codecs
             .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
             && available_names
                 .iter()
                 .any(|n| n.as_str() == "VK_KHR_video_decode_h265")
-            {
-                extensions.push("VK_KHR_video_decode_h265");
-            }
+        {
+            extensions.push("VK_KHR_video_decode_h265");
+        }
         if builder
             .video_codecs
             .contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
@@ -874,9 +877,7 @@ impl VulkanDevice {
             }
 
             // DEBUG (iteration 17): print capabilities
-            eprintln!(
-                "[CAPABILITIES] ===== VkVideoCapabilitiesKHR ====="
-            );
+            eprintln!("[CAPABILITIES] ===== VkVideoCapabilitiesKHR =====");
             eprintln!(
                 "[CAPABILITIES]   flags                          = {:?}",
                 caps.flags
@@ -916,9 +917,7 @@ impl VulkanDevice {
                     decode_caps.flags
                 );
             }
-            eprintln!(
-                "[CAPABILITIES] ==========================================="
-            );
+            eprintln!("[CAPABILITIES] ===========================================");
 
             caps
         };
@@ -927,7 +926,10 @@ impl VulkanDevice {
     }
 
     /// Query supported video formats for a codec.
-    pub fn query_supported_formats(&self, codec: VideoCodec) -> Vec<vk::VideoFormatPropertiesKHR<'_>> {
+    pub fn query_supported_formats(
+        &self,
+        codec: VideoCodec,
+    ) -> Vec<vk::VideoFormatPropertiesKHR<'_>> {
         let codec_op = codec.to_vk_flag();
 
         // Common semi-planar 420 formats
@@ -989,8 +991,7 @@ impl VulkanDevice {
         let get_format_props_fn = unsafe {
             self.entry.get_instance_proc_addr(
                 self.instance.handle(),
-                c"vkGetPhysicalDeviceVideoFormatPropertiesKHR"
-                    .as_ptr(),
+                c"vkGetPhysicalDeviceVideoFormatPropertiesKHR".as_ptr(),
             )
         };
 

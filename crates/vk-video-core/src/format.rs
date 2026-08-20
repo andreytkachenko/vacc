@@ -292,7 +292,6 @@ pub enum H264PictureLayout {
     BottomField = 8,
 }
 
-
 /// Video profile - a complete specification of video capabilities.
 ///
 /// This corresponds to `VkVideoProfileInfoKHR` + codec-specific

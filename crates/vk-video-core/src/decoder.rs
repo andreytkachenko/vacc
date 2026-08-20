@@ -14,8 +14,8 @@
 //! ```
 
 use crate::codec::VideoCodec;
-use crate::frame::DecodedFrame;
 use crate::format::{ChromaSubsampling, ComponentBitDepth, VideoFormat};
+use crate::frame::DecodedFrame;
 use crate::session::Extent2D;
 
 /// Information about a decoder instance.
@@ -94,5 +94,3 @@ pub trait Decoder {
     /// Invalidates the DPB and prepares for a new stream or seek.
     fn reset(&mut self) -> Result<(), Self::Error>;
 }
-
-

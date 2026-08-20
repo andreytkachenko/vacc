@@ -1,7 +1,7 @@
 //! Diagnostic: parse an HEVC stream with H265Parser and print per-picture
 //! POC / RPS info to derive cuvid NumBitsForShortTermRPSInSlice and DPB rules.
-use vk_video_parser::{BitstreamPacket, ParseResult, VideoParser, h265::H265Parser};
 use vk_video_core::picture::H265Sps;
+use vk_video_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
 
 fn ue_bits(v: u32) -> u32 {
     if v == 0 {
@@ -51,15 +51,31 @@ fn main() {
                 {
                     let rps = info.slice_strps.as_ref();
                     // recover raw deltas from cumulative offsets
-                    let mut raw0: Vec<i32> = vec![0; info.slice_strps.as_ref().map(|r| r.num_negative_pics as usize).unwrap_or(0)];
-                    let mut raw1: Vec<i32> = vec![0; info.slice_strps.as_ref().map(|r| r.num_positive_pics as usize).unwrap_or(0)];
+                    let mut raw0: Vec<i32> = vec![
+                        0;
+                        info.slice_strps
+                            .as_ref()
+                            .map(|r| r.num_negative_pics as usize)
+                            .unwrap_or(0)
+                    ];
+                    let mut raw1: Vec<i32> = vec![
+                        0;
+                        info.slice_strps
+                            .as_ref()
+                            .map(|r| r.num_positive_pics as usize)
+                            .unwrap_or(0)
+                    ];
                     let mut refpoc0: Vec<i32> = vec![];
                     let mut refpoc1: Vec<i32> = vec![];
                     if let Some(r) = rps {
                         let mut cum_prev: i32 = 0;
                         for i in 0..r.num_negative_pics as usize {
                             let stored = r.delta_poc_s0_minus1[i] as i32;
-                            let signed = if stored > 32767 { stored - 65536 } else { stored };
+                            let signed = if stored > 32767 {
+                                stored - 65536
+                            } else {
+                                stored
+                            };
                             let raw = cum_prev - signed; // = (raw_delta+1)
                             raw0[i] = raw - 1;
                             refpoc0.push(info.curr_pic_order_cnt_val + signed);

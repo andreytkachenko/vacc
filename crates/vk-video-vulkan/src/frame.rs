@@ -95,8 +95,7 @@ impl DecodedFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct YCbCrConversionParams {
     pub model_conversion: u32,
     pub range: u32,
@@ -105,7 +104,6 @@ pub struct YCbCrConversionParams {
     pub matrix_coefficients: u32,
     pub video_full_range: bool,
 }
-
 
 /// Decoded frame pool.
 pub struct DecodedFramePool {

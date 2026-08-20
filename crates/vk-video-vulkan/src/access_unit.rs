@@ -493,10 +493,9 @@ fn parse_h265_slice_header(
 
                     for j in (0..ref_strps.num_negative_pics as usize).rev() {
                         let new_poc = ref_poc_s0[j] + delta_rps;
-                        if new_poc > curr_poc && use_delta_flag[j]
-                            && used_by_curr_pic_flag[j] {
-                                ref_pocs.push(new_poc);
-                            }
+                        if new_poc > curr_poc && use_delta_flag[j] && used_by_curr_pic_flag[j] {
+                            ref_pocs.push(new_poc);
+                        }
                     }
                     if delta_rps > 0 && use_delta_flag[num_ref_entries] {
                         let new_poc = curr_poc + delta_rps;
@@ -504,13 +503,19 @@ fn parse_h265_slice_header(
                             ref_pocs.push(new_poc);
                         }
                     }
-                    for (j, &poc) in ref_poc_s1.iter().enumerate().take(ref_strps.num_positive_pics as usize) {
+                    for (j, &poc) in ref_poc_s1
+                        .iter()
+                        .enumerate()
+                        .take(ref_strps.num_positive_pics as usize)
+                    {
                         let new_poc = poc + delta_rps;
                         let entry_idx = ref_strps.num_negative_pics as usize + j;
-                        if new_poc > curr_poc && use_delta_flag[entry_idx]
-                            && used_by_curr_pic_flag[entry_idx] {
-                                ref_pocs.push(new_poc);
-                            }
+                        if new_poc > curr_poc
+                            && use_delta_flag[entry_idx]
+                            && used_by_curr_pic_flag[entry_idx]
+                        {
+                            ref_pocs.push(new_poc);
+                        }
                     }
                 }
             } else {
@@ -1082,8 +1087,7 @@ pub fn extract_all_access_units(
                 } else if codec == VideoCodec::H265 {
                     if let Some((_, nal_type, _, _)) = parse_h265_nal_header(nal_data) {
                         current_is_idr = nal_type == 19 || nal_type == 20;
-                        current_is_reference =
-                            (16..=23).contains(&nal_type) || nal_type % 2 == 1;
+                        current_is_reference = (16..=23).contains(&nal_type) || nal_type % 2 == 1;
                         prev_frame_num += 1;
                         current_frame_num = prev_frame_num;
                         current_slice_type = if current_is_idr {
@@ -1624,8 +1628,10 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                 }
             }
             let is_frame = obu_type == 6;
-            let is_show_existing =
-                obu_type == 3 && size > 0 && size_pos < packet.len() && (packet[size_pos] & 0x80) != 0;
+            let is_show_existing = obu_type == 3
+                && size > 0
+                && size_pos < packet.len()
+                && (packet[size_pos] & 0x80) != 0;
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());

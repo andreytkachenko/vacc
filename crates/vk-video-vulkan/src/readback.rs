@@ -77,11 +77,7 @@ pub fn readback_decoded_image(
     let mapped_ptr = unsafe {
         device
             .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-            .map_err(|e| {
-                VideoError::Io(std::io::Error::other(
-                    e.to_string(),
-                ))
-            })?
+            .map_err(|e| VideoError::Io(std::io::Error::other(e.to_string())))?
     };
 
     let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -339,16 +335,17 @@ pub fn readback_decoded_image(
     }
 }
 
-
 fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     required_flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
-        && mem_props.memory_types[i as usize]
-            .property_flags
-            .contains(required_flags))
+    (0..mem_props.memory_type_count).find(|&i| {
+        (type_bits & (1 << i)) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(required_flags)
+    })
 }
 
 fn cmd_pipeline_barrier_2(
@@ -357,9 +354,8 @@ fn cmd_pipeline_barrier_2(
     cmd_buffer: vk::CommandBuffer,
     dep_info: &vk::DependencyInfo<'_>,
 ) {
-    let fn_ptr = unsafe {
-        instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr())
-    };
+    let fn_ptr =
+        unsafe { instance.get_device_proc_addr(device, c"vkCmdPipelineBarrier2KHR".as_ptr()) };
     if let Some(ptr) = fn_ptr {
         unsafe {
             type FnType =

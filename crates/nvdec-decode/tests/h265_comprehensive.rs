@@ -12,7 +12,7 @@
 //! 9. SAO conditional parsing
 //! 10. FFI struct sizes matching NVIDIA SDK
 
-use vk_video_core::picture::{H265Pps, H265Sps, H265ShortTermRefPicSet};
+use vk_video_core::picture::{H265Pps, H265ShortTermRefPicSet, H265Sps};
 use vk_video_parser::{
     h265::{H265Parser, SliceHeaderInfo},
     BitstreamPacket, ParseResult, VideoParser,
@@ -24,25 +24,19 @@ use vk_video_parser::{
 
 /// VPS NAL unit from big_buck_bunney.h265 (type=32, 24 bytes)
 const TEST_VPS_DATA: &[u8] = &[
-    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x21, 0x60,
-    0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x21, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
     0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09,
 ];
 
 /// SPS NAL unit from big_buck_bunney.h265 (type=33, 43 bytes)
 const TEST_SPS_DATA: &[u8] = &[
-    0x42, 0x01, 0x01, 0x21, 0x60, 0x00, 0x00, 0x03,
-    0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-    0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5,
-    0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0x10, 0x10,
-    0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
-    0x01, 0xe0, 0x80,
+    0x42, 0x01, 0x01, 0x21, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0x10, 0x10,
+    0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x80,
 ];
 
 /// PPS NAL unit from big_buck_bunney.h265 (type=34, 7 bytes)
-const TEST_PPS_DATA: &[u8] = &[
-    0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40,
-];
+const TEST_PPS_DATA: &[u8] = &[0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40];
 
 /// Initialize a parser with VPS, SPS, PPS from the test data.
 fn init_parser() -> H265Parser {
@@ -99,7 +93,7 @@ fn create_p_slice_data(poc_lsb: u16) -> Vec<u8> {
     // 3 extra bits: 1 (sps_flag) + 0 (temporal_mvp) + x = 10x
     let poc_lsb_u8 = poc_lsb as u8;
     let first_payload_byte = 0xA0 | ((poc_lsb_u8 >> 5) & 0x07); // 10101000 | top 3 bits of POC
-    // Bottom 5 bits of POC + sps_flag(1) + temporal_mvp(0) + padding
+                                                                // Bottom 5 bits of POC + sps_flag(1) + temporal_mvp(0) + padding
     let second_payload_byte = ((poc_lsb_u8 << 3) & 0xF8) | 0x04; // 00000100 for sps_flag=1, temporal=0
     data.push(first_payload_byte);
     data.push(second_payload_byte);
@@ -141,19 +135,15 @@ fn test_nal_data_included_in_slice_entry() {
                 "NAL data should include the 2-byte NAL header"
             );
             // First two bytes should be the NAL header
-            assert_eq!(
-                slice.nal_data[0], 0x02,
-                "NAL header byte 0 should match"
-            );
-            assert_eq!(
-                slice.nal_data[1], 0x01,
-                "NAL header byte 1 should match"
-            );
+            assert_eq!(slice.nal_data[0], 0x02, "NAL header byte 0 should match");
+            assert_eq!(slice.nal_data[1], 0x01, "NAL header byte 1 should match");
             // Total length should match the original NAL data
             assert_eq!(
-                slice.nal_data.len(), original_len,
+                slice.nal_data.len(),
+                original_len,
                 "NAL data length should match original: got {}, expected {}",
-                slice.nal_data.len(), original_len
+                slice.nal_data.len(),
+                original_len
             );
         }
         other => panic!("Expected Slice result, got {:?}", other),
@@ -238,7 +228,9 @@ fn test_poc_after_reset() {
     param_payload.extend_from_slice(&[0x00, 0x00, 0x01]);
     param_payload.extend_from_slice(TEST_PPS_DATA);
     let param_packet = BitstreamPacket::new(param_payload);
-    parser.parse(&param_packet).expect("Parameter set parse failed after reset");
+    parser
+        .parse(&param_packet)
+        .expect("Parameter set parse failed after reset");
 
     // Parse a new IDR slice - POC should be 0 after reset
     let idr_data = create_idr_slice_data();
@@ -284,7 +276,7 @@ fn test_used_by_curr_pic_filtering() {
     rps.delta_poc_s0_minus1[0] = 65535; // -1 as u16
     rps.delta_poc_s0_minus1[1] = 65533; // -3 as u16
     rps.used_by_curr_pic_s0_flag = 0b01; // Only first pic used
-    // S1: pic at delta +2 (used), pic at delta +5 (not used)
+                                         // S1: pic at delta +2 (used), pic at delta +5 (not used)
     rps.delta_poc_s1_minus1[0] = 2;
     rps.delta_poc_s1_minus1[1] = 5;
     rps.used_by_curr_pic_s1_flag = 0b01; // Only first pic used
@@ -304,7 +296,11 @@ fn test_used_by_curr_pic_filtering() {
             continue;
         }
         let stored = rps.delta_poc_s0_minus1[i] as i32;
-        let signed = if stored > 32767 { stored - 65536 } else { stored };
+        let signed = if stored > 32767 {
+            stored - 65536
+        } else {
+            stored
+        };
         ref_s0.push(curr_poc + signed);
     }
 
@@ -314,14 +310,26 @@ fn test_used_by_curr_pic_filtering() {
             continue;
         }
         let stored = rps.delta_poc_s1_minus1[i] as i32;
-        let signed = if stored > 32767 { stored - 65536 } else { stored };
+        let signed = if stored > 32767 {
+            stored - 65536
+        } else {
+            stored
+        };
         ref_s1.push(curr_poc + signed);
     }
 
-    assert_eq!(ref_s0.len(), 1, "S0 should only have 1 reference (filtered)");
+    assert_eq!(
+        ref_s0.len(),
+        1,
+        "S0 should only have 1 reference (filtered)"
+    );
     assert_eq!(ref_s0[0], 9, "S0 reference POC should be 9");
 
-    assert_eq!(ref_s1.len(), 1, "S1 should only have 1 reference (filtered)");
+    assert_eq!(
+        ref_s1.len(),
+        1,
+        "S1 should only have 1 reference (filtered)"
+    );
     assert_eq!(ref_s1[0], 12, "S1 reference POC should be 12");
 }
 
@@ -406,7 +414,10 @@ fn test_predictive_rps_bit_count() {
     // num_entries = num_negative_pics + num_positive_pics = 3
     // For each entry + 1: use_delta_flag(1) + used_by_curr_pic_flag(1) = 2 bits
     // Total: 1 + 5 + 1 + (3+1)*2 = 7 + 8 = 15 bits
-    let expected_bits: u32 = ue_bits(0) + ue_bits(4) + 1 + (rps.num_negative_pics as u32 + rps.num_positive_pics as u32 + 1) * 2;
+    let expected_bits: u32 = ue_bits(0)
+        + ue_bits(4)
+        + 1
+        + (rps.num_negative_pics as u32 + rps.num_positive_pics as u32 + 1) * 2;
 
     // The hevc_rps_bit_count function computes this
     // We can't call it directly (it's in nvdec-decode), but we can verify the formula
@@ -457,7 +468,10 @@ fn test_dpb_state_uses_surface_indices() {
     // Verify ref_pic_idx points to itself for valid surfaces
     assert_eq!(state.ref_pic_idx[3], 3, "ref_pic_idx[3] should be 3");
     assert_eq!(state.ref_pic_idx[5], 5, "ref_pic_idx[5] should be 5");
-    assert_eq!(state.ref_pic_idx[0], -1, "ref_pic_idx[0] should be -1 (not a ref)");
+    assert_eq!(
+        state.ref_pic_idx[0], -1,
+        "ref_pic_idx[0] should be -1 (not a ref)"
+    );
 }
 
 // ============================================================================
@@ -479,8 +493,14 @@ fn test_range_extension_flags_parsed() {
     let sps = parser.active_sps().expect("No active SPS");
 
     // The test SPS from big_buck_bunny does NOT have range extension
-    assert!(!sps.sps_extension_present_flag, "Test SPS should not have extension");
-    assert!(!sps.sps_range_extension_flag, "Test SPS should not have range extension");
+    assert!(
+        !sps.sps_extension_present_flag,
+        "Test SPS should not have extension"
+    );
+    assert!(
+        !sps.sps_range_extension_flag,
+        "Test SPS should not have range extension"
+    );
 
     // Verify that range extension fields are still accessible (default values)
     assert!(!sps.transform_skip_rotation_enabled_flag);
@@ -514,7 +534,8 @@ fn test_sao_conditional_parsing() {
 
     // Check the SAO conditions for the test SPS
     let sps_sao_luma_allowed = sps.sample_adaptive_offset_enabled_flag
-        && (sps.max_transform_hierarchy_depth_intra > sps.log2_min_luma_transform_block_size_minus2);
+        && (sps.max_transform_hierarchy_depth_intra
+            > sps.log2_min_luma_transform_block_size_minus2);
     let sps_sao_chroma_allowed = sps_sao_luma_allowed && (sps.chroma_format_idc != 3);
 
     // For big_buck_bunny: SAO is enabled, max_transform_hierarchy_depth_intra >= log2_min_luma_transform_block_size_minus2
@@ -560,8 +581,8 @@ fn test_sao_conditional_parsing() {
 #[test]
 fn test_ffi_struct_sizes() {
     use nvdec_decode::ffi::{
-        CUVIDCODECSPECIFIC, CUVIDDECODECREATEINFO, CUVIDHEVCPICPARAMS, CUVIDPICPARAMS,
-        CUVIDRECT, CUVIDVP9PICPARAMS,
+        CUVIDCODECSPECIFIC, CUVIDDECODECREATEINFO, CUVIDHEVCPICPARAMS, CUVIDPICPARAMS, CUVIDRECT,
+        CUVIDVP9PICPARAMS,
     };
 
     // CUVIDHEVCPICPARAMS: 1484 bytes on 64-bit Linux

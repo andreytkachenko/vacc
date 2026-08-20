@@ -570,8 +570,7 @@ pub struct H265Sps {
 
 /// H.265 Short-Term Reference Picture Set.
 /// Matches StdVideoH265ShortTermRefPicSet layout.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct H265ShortTermRefPicSet {
     pub inter_ref_pic_set_prediction_flag: bool,
     pub delta_idx_minus1: u32,
@@ -585,7 +584,6 @@ pub struct H265ShortTermRefPicSet {
     pub delta_poc_s0_minus1: [u16; 16],
     pub delta_poc_s1_minus1: [u16; 16],
 }
-
 
 impl H265Sps {
     pub fn new() -> Self {
@@ -656,17 +654,17 @@ impl H265Sps {
 
             pcm_loop_filter_disabled_flag: false,
             sps_extension_present_flag: false,
-             sps_range_extension_flag: false,
-             transform_skip_rotation_enabled_flag: false,
-             transform_skip_context_enabled_flag: false,
-             implicit_rdpcm_enabled_flag: false,
-             explicit_rdpcm_enabled_flag: false,
-             extended_precision_processing_flag: false,
-             intra_smoothing_disabled_flag: false,
-             persistent_rice_adaptation_enabled_flag: false,
-             cabac_bypass_alignment_enabled_flag: false,
-             high_precision_offsets_enabled_flag: false,
-             palette_mode_enabled_flag: false,
+            sps_range_extension_flag: false,
+            transform_skip_rotation_enabled_flag: false,
+            transform_skip_context_enabled_flag: false,
+            implicit_rdpcm_enabled_flag: false,
+            explicit_rdpcm_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            intra_smoothing_disabled_flag: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            high_precision_offsets_enabled_flag: false,
+            palette_mode_enabled_flag: false,
         }
     }
 }

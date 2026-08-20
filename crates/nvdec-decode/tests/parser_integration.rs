@@ -860,22 +860,30 @@ fn test_poc_type_1_delta_based() {
 
     // Frame 0 (ref): prev_is_reference=false → last_pic_order_cnt + offset[0] = 0 + 4 = 4
     let poc0 = if prev_is_reference {
-        prev_pic_order_cnt + offset_for_ref_frame[last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize]
+        prev_pic_order_cnt
+            + offset_for_ref_frame
+                [last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize]
     } else {
-        last_pic_order_cnt + offset_for_ref_frame[last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize]
+        last_pic_order_cnt
+            + offset_for_ref_frame
+                [last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize]
     };
     assert_eq!(poc0, 4);
     prev_pic_order_cnt = poc0;
     last_pic_order_cnt = poc0;
-    last_pic_order_cnt_cycle = (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
+    last_pic_order_cnt_cycle =
+        (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
     prev_is_reference = true;
 
     // Frame 1 (ref): prev_is_reference=true → prev_pic_order_cnt + offset[1] = 4 + (-4) = 0
-    let poc1 = prev_pic_order_cnt + offset_for_ref_frame[last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize];
+    let poc1 = prev_pic_order_cnt
+        + offset_for_ref_frame
+            [last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize];
     assert_eq!(poc1, 0);
     prev_pic_order_cnt = poc1;
     last_pic_order_cnt = poc1;
-    last_pic_order_cnt_cycle = (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
+    last_pic_order_cnt_cycle =
+        (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
 }
 
 #[test]

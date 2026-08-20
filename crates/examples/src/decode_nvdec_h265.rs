@@ -124,7 +124,12 @@ fn main() {
                     if frames_decoded <= 8 || frame_idx % 50 == 0 {
                         println!(
                             "  Frame {}: POC={} {}x{} -> {} ({} bytes)",
-                            frame_idx, frame.poc, frame.width, frame.height, output_path, nv12.len()
+                            frame_idx,
+                            frame.poc,
+                            frame.width,
+                            frame.height,
+                            output_path,
+                            nv12.len()
                         );
                     }
                 }

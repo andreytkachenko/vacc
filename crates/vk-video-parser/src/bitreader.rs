@@ -500,12 +500,12 @@ mod tests {
         // se(v) per H.264 spec 9.1: even codeNum → -(codeNum/2), odd → (codeNum+1)/2
         // Each case: (raw bits MSB-first, zero-padded to a byte, expected value)
         let cases: &[(&str, u8, i32)] = &[
-            ("1", 0b10000000, 0),    // codeNum 0
-            ("010", 0b01000000, 1),  // codeNum 1
-            ("011", 0b01100000, -1), // codeNum 2
-            ("00100", 0b00100000, 2), // codeNum 3
+            ("1", 0b10000000, 0),      // codeNum 0
+            ("010", 0b01000000, 1),    // codeNum 1
+            ("011", 0b01100000, -1),   // codeNum 2
+            ("00100", 0b00100000, 2),  // codeNum 3
             ("00101", 0b00101000, -2), // codeNum 4
-            ("00110", 0b00110000, 3), // codeNum 5
+            ("00110", 0b00110000, 3),  // codeNum 5
             ("00111", 0b00111000, -3), // codeNum 6
         ];
 
@@ -715,8 +715,12 @@ mod tests {
         eprintln!("wp={} wbi={} bits_from_pq(24)={:024b}", wp, wbi, window);
         // Fresh reader: read up to wbi, then the raw ue codes for the se(v) fields
         let mut r2 = BitReader::new(&data, false);
-        for _ in 0..2 { r2.read_ue().unwrap(); } // pps_id, sps_id
-        for _ in 0..2 { r2.read_bits(1).unwrap(); } // entropy, bottom
+        for _ in 0..2 {
+            r2.read_ue().unwrap();
+        } // pps_id, sps_id
+        for _ in 0..2 {
+            r2.read_bits(1).unwrap();
+        } // entropy, bottom
         r2.read_ue().unwrap(); // nsg
         r2.read_ue().unwrap(); // nr0
         r2.read_ue().unwrap(); // nr1
@@ -725,6 +729,9 @@ mod tests {
         let pq_code = r2.read_ue().unwrap();
         let ps_code = r2.read_ue().unwrap();
         let cq_code = r2.read_ue().unwrap();
-        eprintln!("pq_code={} ps_code={} cq_code={}", pq_code, ps_code, cq_code);
+        eprintln!(
+            "pq_code={} ps_code={} cq_code={}",
+            pq_code, ps_code, cq_code
+        );
     }
 }

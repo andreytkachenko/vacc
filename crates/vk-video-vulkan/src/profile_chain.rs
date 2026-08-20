@@ -182,7 +182,11 @@ pub fn create_dpb_image_array_with_profile(
             );
             eprintln!(
                 "[DPB-IV-CREATE]   image extent: {}x{}x{} arrayLayers={} flags={:?}",
-                width, height, 1, num_slots, vk::ImageCreateFlags::MUTABLE_FORMAT
+                width,
+                height,
+                1,
+                num_slots,
+                vk::ImageCreateFlags::MUTABLE_FORMAT
             );
         }
 
@@ -354,8 +358,10 @@ fn find_memory_type(
     type_bits: u32,
     required_flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
-        && mem_props.memory_types[i as usize]
-            .property_flags
-            .contains(required_flags))
+    (0..mem_props.memory_type_count).find(|&i| {
+        (type_bits & (1 << i)) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(required_flags)
+    })
 }

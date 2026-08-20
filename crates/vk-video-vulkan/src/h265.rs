@@ -195,8 +195,7 @@ impl H265Decoder {
 
         // First: create StdVideoDecodeH265ReferenceInfo for setup slot
         let setup_ref_std_info = dpb_setup_picture.as_ref().map(|info| {
-            let mut ref_std_info =
-                unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
+            let mut ref_std_info = unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
             ref_std_info.PicOrderCntVal = info.pic_order_cnt;
             ref_std_info.flags.set_used_for_long_term_reference(0);
             ref_std_info.flags.set_unused_for_reference(0);
@@ -285,16 +284,16 @@ impl H265Decoder {
 
         // Build combined slots array for BeginVideoCoding.
         // MUST keep this alive until after cmd_begin_video_coding is called!
-        let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> =
-            if !ref_slots.is_empty() {
-                let mut combined = ref_slots.clone();
-                if let Some(ref setup) = setup_slot {
-                    combined.push(*setup);
-                }
-                combined
-            } else {
-                setup_slot.into_iter().collect()
-            };
+        let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> = if !ref_slots.is_empty()
+        {
+            let mut combined = ref_slots.clone();
+            if let Some(ref setup) = setup_slot {
+                combined.push(*setup);
+            }
+            combined
+        } else {
+            setup_slot.into_iter().collect()
+        };
 
         let begin_slot_count = begin_video_coding_slots.len() as u32;
         let begin_slot_ptr = if begin_video_coding_slots.is_empty() {
@@ -526,10 +525,7 @@ impl H265Decoder {
 
         for &ref_poc in ref_pocs {
             // Find the DPB entry with this POC
-            if let Some(entry) = dpb_entries
-                .iter()
-                .find(|e| e.pic_order_cnt[0] == ref_poc)
-            {
+            if let Some(entry) = dpb_entries.iter().find(|e| e.pic_order_cnt[0] == ref_poc) {
                 let slot_idx = (entry.slot_index & 0xf) as u8;
 
                 if ref_poc < pic_order_cnt_val {
@@ -560,10 +556,8 @@ impl H265Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdPipelineBarrier2KHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdPipelineBarrier2KHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -581,10 +575,8 @@ impl H265Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdBeginVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdBeginVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -600,10 +592,8 @@ impl H265Decoder {
 
     fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdDecodeVideoKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdDecodeVideoKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -624,10 +614,8 @@ impl H265Decoder {
             _marker: Default::default(),
         };
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdControlVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdControlVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -650,10 +638,8 @@ impl H265Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdEndVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdEndVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {

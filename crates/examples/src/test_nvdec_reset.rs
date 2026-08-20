@@ -23,8 +23,13 @@ fn main() {
         let mut count1 = 0;
         while let Ok(Some(frame)) = decoder.decode() {
             count1 += 1;
-            println!("  [before] Frame {}: POC={}, idx={}", count1, frame.poc, frame.frame_index);
-            if count1 >= 10 { break; }
+            println!(
+                "  [before] Frame {}: POC={}, idx={}",
+                count1, frame.poc, frame.frame_index
+            );
+            if count1 >= 10 {
+                break;
+            }
         }
         println!("Before reset: {} frames decoded", count1);
 
@@ -36,15 +41,23 @@ fn main() {
         let mut count2 = 0;
         while let Ok(Some(frame)) = decoder.decode() {
             count2 += 1;
-            println!("  [after]  Frame {}: POC={}, idx={}", count2, frame.poc, frame.frame_index);
-            if count2 >= 10 { break; }
+            println!(
+                "  [after]  Frame {}: POC={}, idx={}",
+                count2, frame.poc, frame.frame_index
+            );
+            if count2 >= 10 {
+                break;
+            }
         }
         println!("After reset: {} frames decoded", count2);
 
         if count1 == count2 {
             println!("Test 1 PASSED - same frame count before/after reset");
         } else {
-            println!("Test 1 WARNING - frame count differs (before={}, after={})", count1, count2);
+            println!(
+                "Test 1 WARNING - frame count differs (before={}, after={})",
+                count1, count2
+            );
         }
     }
 
@@ -61,9 +74,14 @@ fn main() {
             while let Ok(Some(frame)) = decoder.decode() {
                 count += 1;
                 if cycle == 0 {
-                    println!("  Cycle {}: Frame {} POC={} idx={}", cycle, count, frame.poc, frame.frame_index);
+                    println!(
+                        "  Cycle {}: Frame {} POC={} idx={}",
+                        cycle, count, frame.poc, frame.frame_index
+                    );
                 }
-                if count >= 5 { break; }
+                if count >= 5 {
+                    break;
+                }
             }
             println!("Cycle {}: {} frames", cycle, count);
 
@@ -77,7 +95,10 @@ fn main() {
         }
 
         if all_same {
-            println!("Test 2 PASSED - consistent frame counts across {} cycles", first_count.unwrap());
+            println!(
+                "Test 2 PASSED - consistent frame counts across {} cycles",
+                first_count.unwrap()
+            );
         } else {
             println!("Test 2 FAILED - inconsistent frame counts across cycles");
         }
@@ -92,7 +113,9 @@ fn main() {
         let mut count1 = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count1 += 1;
-            if count1 >= 3 { break; }
+            if count1 >= 3 {
+                break;
+            }
         }
         println!("Initial decode: {} frames", count1);
 
@@ -103,18 +126,26 @@ fn main() {
         // Flush after reset drains all pending frames from the pipeline
         // This is expected - reset re-parsed all data, so many frames are pending
         let flushed = decoder.flush().expect("flush failed");
-        println!("Flush after reset: {} frames (expected: all pending drained)", flushed.len());
+        println!(
+            "Flush after reset: {} frames (expected: all pending drained)",
+            flushed.len()
+        );
 
         // After flush, decode returns None (no more data to parse)
         let post_flush = decoder.decode().expect("decode failed");
-        println!("Decode after flush: {:?}", if post_flush.is_some() { "Some" } else { "None" });
+        println!(
+            "Decode after flush: {:?}",
+            if post_flush.is_some() { "Some" } else { "None" }
+        );
 
         // Reset again and decode without flushing
         decoder.reset().expect("reset failed again");
         let mut count2 = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count2 += 1;
-            if count2 >= 5 { break; }
+            if count2 >= 5 {
+                break;
+            }
         }
         println!("Decode after second reset (no flush): {} frames", count2);
 
@@ -151,7 +182,9 @@ fn main() {
         let mut count = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count += 1;
-            if count >= 5 { break; }
+            if count >= 5 {
+                break;
+            }
         }
         println!("Reset cycle: {} frames", count);
         drop(decoder);
@@ -159,7 +192,11 @@ fn main() {
         let mem_after = get_gpu_mem().unwrap_or(0);
         println!("GPU memory after: {} MiB", mem_after);
 
-        let diff = if mem_after > mem_before { mem_after - mem_before } else { mem_before - mem_after };
+        let diff = if mem_after > mem_before {
+            mem_after - mem_before
+        } else {
+            mem_before - mem_after
+        };
         if diff < 20 {
             println!("Test 5 PASSED - GPU memory stable (delta={} MiB)", diff);
         } else {

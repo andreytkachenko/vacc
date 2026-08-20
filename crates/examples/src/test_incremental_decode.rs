@@ -108,7 +108,10 @@ struct DecodeResult {
 fn decode_non_incremental(data: &[u8]) -> DecodeResult {
     let mut decoder = NvdecDecoder::new(data.to_vec()).unwrap();
     let info = decoder.info();
-    println!("  Decoder: {}x{} @ {}bps", info.coded_size.width, info.coded_size.height, info.codec);
+    println!(
+        "  Decoder: {}x{} @ {}bps",
+        info.coded_size.width, info.coded_size.height, info.codec
+    );
 
     let mut total_frames = 0;
     loop {
@@ -144,7 +147,10 @@ fn decode_incremental(data: &[u8], chunk_size: usize) -> DecodeResult {
     let (mut decoder, actual_init_size) = match NvdecDecoder::new(data[..init_size].to_vec()) {
         Ok(d) => (d, init_size),
         Err(e) => {
-            eprintln!("  Failed with init_size={} (min={}), err: {}", init_size, min_init, e);
+            eprintln!(
+                "  Failed with init_size={} (min={}), err: {}",
+                init_size, min_init, e
+            );
             // Try with a larger buffer
             let larger = std::cmp::min(init_size + 64 * 1024, data.len());
             match NvdecDecoder::new(data[..larger].to_vec()) {
@@ -163,11 +169,7 @@ fn decode_incremental(data: &[u8], chunk_size: usize) -> DecodeResult {
     let info = decoder.info();
     println!(
         "  Decoder: {}x{} @ {}bps (init with {} bytes, min_au={})",
-        info.coded_size.width,
-        info.coded_size.height,
-        info.codec,
-        actual_init_size,
-        min_init
+        info.coded_size.width, info.coded_size.height, info.codec, actual_init_size, min_init
     );
 
     let mut total_frames = 0;
@@ -254,7 +256,9 @@ fn find_next_start_code(data: &[u8], start: usize) -> usize {
     let mut pos = start;
     while pos + 3 < data.len() {
         if data[pos] == 0 && data[pos + 1] == 0 {
-            if data[pos + 2] == 1 || (pos + 3 < data.len() && data[pos + 2] == 0 && data[pos + 3] == 1) {
+            if data[pos + 2] == 1
+                || (pos + 3 < data.len() && data[pos + 2] == 0 && data[pos + 3] == 1)
+            {
                 return pos;
             }
         }

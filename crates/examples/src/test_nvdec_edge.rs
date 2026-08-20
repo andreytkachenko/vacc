@@ -17,10 +17,12 @@ fn main() {
         let mut count = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count += 1;
-            if count >= 5 { break; }
+            if count >= 5 {
+                break;
+            }
         }
         println!("Decoded {} frames", count);
-        
+
         let flushed = decoder.flush().expect("flush failed");
         println!("Flush returned {} pending frames", flushed.len());
     }
@@ -33,10 +35,12 @@ fn main() {
         let mut count = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count += 1;
-            if count >= 3 { break; }
+            if count >= 3 {
+                break;
+            }
         }
         println!("Decoded {} frames before reset", count);
-        
+
         decoder.reset().expect("reset failed");
         println!("Reset succeeded");
     }
@@ -49,7 +53,9 @@ fn main() {
         let mut count = 0;
         while let Ok(Some(_)) = decoder.decode() {
             count += 1;
-            if count >= 10 { break; }
+            if count >= 10 {
+                break;
+            }
         }
         println!("Cycle {}: decoded {} frames", cycle, count);
         drop(decoder);

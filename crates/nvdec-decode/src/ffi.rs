@@ -50,7 +50,9 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use std::os::raw::{c_char, c_int, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort, c_void};
+use std::os::raw::{
+    c_char, c_int, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort, c_void,
+};
 
 /// CUDA result type (from cuda.h).
 ///
@@ -1187,7 +1189,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDH264PICPARAMS>();
         println!("CUVIDH264PICPARAMS size: {}", size);
         // NVIDIA SDK: 984 bytes on 64-bit
-        assert_eq!(size, 984, "CUVIDH264PICPARAMS size mismatch: expected 984, got {}", size);
+        assert_eq!(
+            size, 984,
+            "CUVIDH264PICPARAMS size mismatch: expected 984, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1195,7 +1201,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDHEVCPICPARAMS>();
         println!("CUVIDHEVCPICPARAMS size: {}", size);
         // NVIDIA SDK: 1568 bytes on 64-bit (with RExt fields)
-        assert_eq!(size, 1484, "CUVIDHEVCPICPARAMS size mismatch: expected 1484, got {}", size);
+        assert_eq!(
+            size, 1484,
+            "CUVIDHEVCPICPARAMS size mismatch: expected 1484, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1203,7 +1213,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDVP9PICPARAMS>();
         println!("CUVIDVP9PICPARAMS size: {}", size);
         // NVIDIA SDK: 352 bytes on 64-bit
-        assert_eq!(size, 352, "CUVIDVP9PICPARAMS size mismatch: expected 352, got {}", size);
+        assert_eq!(
+            size, 352,
+            "CUVIDVP9PICPARAMS size mismatch: expected 352, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1211,7 +1225,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDAV1PICPARAMS>();
         println!("CUVIDAV1PICPARAMS size: {}", size);
         // NVIDIA SDK: 1916 bytes on 64-bit (with film grain params)
-        assert_eq!(size, 1916, "CUVIDAV1PICPARAMS size mismatch: expected 1916, got {}", size);
+        assert_eq!(
+            size, 1916,
+            "CUVIDAV1PICPARAMS size mismatch: expected 1916, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1219,7 +1237,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDPICPARAMS>();
         println!("CUVIDPICPARAMS size: {}", size);
         // NVIDIA SDK: 4280 bytes on 64-bit (includes 4096-byte union)
-        assert_eq!(size, 4280, "CUVIDPICPARAMS size mismatch: expected 4280, got {}", size);
+        assert_eq!(
+            size, 4280,
+            "CUVIDPICPARAMS size mismatch: expected 4280, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1227,7 +1249,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDCODECSPECIFIC>();
         println!("CUVIDCODECSPECIFIC size: {}", size);
         // NVIDIA SDK: 4096 bytes (union of codec-specific params + reserved)
-        assert_eq!(size, 4096, "CUVIDCODECSPECIFIC size mismatch: expected 4096, got {}", size);
+        assert_eq!(
+            size, 4096,
+            "CUVIDCODECSPECIFIC size mismatch: expected 4096, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1263,7 +1289,11 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDH264DPBENTRY>();
         println!("CUVIDH264DPBENTRY size: {}", size);
         // 5 * c_int + FieldOrderCnt[2] = 7 * 4 = 28 bytes
-        assert_eq!(size, 28, "CUVIDH264DPBENTRY size mismatch: expected 28, got {}", size);
+        assert_eq!(
+            size, 28,
+            "CUVIDH264DPBENTRY size mismatch: expected 28, got {}",
+            size
+        );
     }
 
     #[test]
@@ -1292,7 +1322,10 @@ mod struct_size_tests {
             12
         );
         assert_eq!(offset_of!(CUVIDH264PICPARAMS, frame_mbs_only_flag), 16);
-        assert_eq!(offset_of!(CUVIDH264PICPARAMS, direct_8x8_inference_flag), 20);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, direct_8x8_inference_flag),
+            20
+        );
         assert_eq!(offset_of!(CUVIDH264PICPARAMS, num_ref_frames), 24);
         // 4 c_uchar fields at offset 28-31
         assert_eq!(
@@ -1329,7 +1362,10 @@ mod struct_size_tests {
         );
         assert_eq!(offset_of!(CUVIDH264PICPARAMS, transform_8x8_mode_flag), 68);
         assert_eq!(offset_of!(CUVIDH264PICPARAMS, MbaffFrameFlag), 72);
-        assert_eq!(offset_of!(CUVIDH264PICPARAMS, constrained_intra_pred_flag), 76);
+        assert_eq!(
+            offset_of!(CUVIDH264PICPARAMS, constrained_intra_pred_flag),
+            76
+        );
         assert_eq!(offset_of!(CUVIDH264PICPARAMS, chroma_qp_index_offset), 80);
         assert_eq!(
             offset_of!(CUVIDH264PICPARAMS, second_chroma_qp_index_offset),
@@ -1509,10 +1545,7 @@ mod struct_size_tests {
 
         // CUVIDH264SVCMVC: max(MVC, SVC) - SVC is larger due to *const CUVIDPICPARAMS
         let svc_mvc_size = std::mem::size_of::<CUVIDH264SVCMVC>();
-        assert!(
-            svc_mvc_size > 0,
-            "CUVIDH264SVCMVC size must be > 0"
-        );
+        assert!(svc_mvc_size > 0, "CUVIDH264SVCMVC size must be > 0");
         println!("CUVIDH264SVCMVC size: {} bytes", svc_mvc_size);
     }
 

@@ -14,7 +14,8 @@ use vk_video_core::picture::{
     Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType, Vp9InterpolationFilter, Vp9Profile,
     VP9_FRAME_MARKER, VP9_FRAME_SYNC_CODE, VP9_LOOP_FILTER_ADJUSTMENTS, VP9_MAX_PROBABILITY,
     VP9_MAX_REF_FRAMES, VP9_MAX_SEGMENTATION_PRED_PROB, VP9_MAX_SEGMENTATION_TREE_PROBS,
-    VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES, VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
+    VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES,
+    VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
 };
 
 /// VP9 parser state.
@@ -99,10 +100,9 @@ impl Vp9Parser {
         };
 
         // Profile 3: check zero bit
-        if profile == 3
-            && r.read_bits(1)? != 0 {
-                return Err(ParserError::InvalidBitstream);
-            }
+        if profile == 3 && r.read_bits(1)? != 0 {
+            return Err(ParserError::InvalidBitstream);
+        }
 
         // show_existing_frame
         frame_data.show_existing_frame = r.read_bit()?;
@@ -761,7 +761,9 @@ impl VideoParser for Vp9Parser {
                     slice_header: None,
                     nal_data: Vec::new(),
                 }],
-                bytes_consumed: data.len().saturating_sub(frame_data.compressed_header_offset as usize),
+                bytes_consumed: data
+                    .len()
+                    .saturating_sub(frame_data.compressed_header_offset as usize),
             }),
             Err(e) => Err(e),
         }

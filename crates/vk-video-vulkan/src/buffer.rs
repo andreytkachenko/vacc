@@ -163,10 +163,12 @@ impl BitstreamBuffer {
         type_bits: u32,
         required_flags: ash::vk::MemoryPropertyFlags,
     ) -> Option<u32> {
-        (0..mem_props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(required_flags))
+        (0..mem_props.memory_type_count).find(|&i| {
+            (type_bits & (1 << i)) != 0
+                && mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(required_flags)
+        })
     }
 
     fn aligned_size(size: u64, alignment: u32) -> u64 {

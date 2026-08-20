@@ -294,15 +294,13 @@ pub struct Av1FrameHeader {
 }
 
 /// Annex B state for tracking temporal and frame units.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct AnnexBState {
     temporal_unit_size: u32,
     frame_unit_size: u32,
     temporal_unit_consumed: u32,
     frame_unit_consumed: u32,
 }
-
 
 /// Stream format detected for the bitstream.
 #[derive(Debug, Clone)]
@@ -491,7 +489,6 @@ impl Av1Parser {
             return Ok(None);
         }
 
-
         let mut reader = BitReader::new(data, false);
 
         if self.should_probe_for_annexb {
@@ -512,11 +509,9 @@ impl Av1Parser {
 
         let header = Self::parse_obu_header(&mut reader)?;
 
-
-        if matches!(self.stream_format, StreamFormat::LowOverhead)
-            && !header.has_size_field {
-                return Err(ParserError::InvalidBitstream);
-            }
+        if matches!(self.stream_format, StreamFormat::LowOverhead) && !header.has_size_field {
+            return Err(ParserError::InvalidBitstream);
+        }
 
         // OBU size is byte-aligned after the OBU header (1 or 2 bytes).
         // Skip to the correct byte offset directly.
@@ -545,7 +540,6 @@ impl Av1Parser {
 
         let size_bytes = (size_reader.position() / 8) as usize;
         let start_offset = header_bytes + size_bytes;
-
 
         Ok(Some((header, start_offset, obu_size)))
     }
@@ -615,8 +609,6 @@ impl Av1Parser {
 
         // reduced_still_picture_header (1 bit)
         sps.reduced_still_picture_header = r.read_bit()?;
-
-
 
         if sps.reduced_still_picture_header {
             // For reduced still picture header, many fields are implicit
@@ -689,7 +681,6 @@ impl Av1Parser {
             }
         }
 
-
         // frame_width_bits_minus_1 (4 bits)
         let frame_width_bits_minus_1 = r.read_bits(4)? as u8;
         sps.frame_width_bits = frame_width_bits_minus_1 + 1;
@@ -704,8 +695,6 @@ impl Av1Parser {
         // max_frame_height_minus_1 (frame_height_bits_minus_1 + 1 bits)
         sps.max_frame_height_minus_1 = r.read_bits(frame_height_bits_minus_1 + 1)? as u16;
 
-
-
         // frame_id_numbers_present_flag (1 bit) - implicit in reduced_still_picture_header
         sps.frame_id_numbers_present_flag = if sps.reduced_still_picture_header {
             false
@@ -713,15 +702,12 @@ impl Av1Parser {
             r.read_bit()?
         };
 
-
         if sps.frame_id_numbers_present_flag {
             // delta_frame_id_length_minus2 (4 bits)
             sps.delta_frame_id_length_minus2 = r.read_bits(4)? as u8;
 
             // additional_frame_id_length_minus1 (3 bits)
             sps.additional_frame_id_length_minus1 = r.read_bits(3)? as u8;
-
-
 
             let frame_id_length = sps.additional_frame_id_length_minus1 as u32
                 + sps.delta_frame_id_length_minus2 as u32
@@ -772,7 +758,6 @@ impl Av1Parser {
 
                 // enable_ref_frame_mvs (1 bit)
                 sps.enable_ref_frame_mvs = r.read_bit()?;
-
             } else {
                 sps.enable_jnt_motion = false;
                 sps.enable_second_ref_frame = false;
@@ -804,14 +789,10 @@ impl Av1Parser {
             if sps.enable_order_hint {
                 // order_hint_bits_minus1 (3 bits)
                 sps.order_hint_bits_minus1 = r.read_bits(3)? as u8;
-
             } else {
                 sps.order_hint_bits_minus1 = 0;
             }
         }
-
-
-
 
         // enable_superres (1 bit)
         sps.enable_superres = r.read_bit()?;
@@ -973,8 +954,6 @@ impl Av1Parser {
         let current_pos = r.position();
         let remaining_bits = total_bits - current_pos;
 
-
-
         if remaining_bits == 0 {
             return Ok(());
         }
@@ -1030,7 +1009,10 @@ impl Av1Parser {
 
         // 1. show_existing_frame (1 bit)
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] start: obu_data.len={} bitpos=0", obu_data.len());
+            eprintln!(
+                "[AV1-PARSE-DBG] start: obu_data.len={} bitpos=0",
+                obu_data.len()
+            );
         }
         fh.show_existing_frame = r.read_bit()?;
         if fh.show_existing_frame {
@@ -1052,26 +1034,38 @@ impl Av1Parser {
             r.read_bit()?
         };
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] show_frame={} showable={} bitpos={}", show_frame, fh.showable_frame, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] show_frame={} showable={} bitpos={}",
+                show_frame,
+                fh.showable_frame,
+                r.position()
+            );
         }
 
         // 4. error_resilient_mode (inferred for SWITCH || (KEY && show_frame))
-        fh.error_resilient_mode =
-            if fh.frame_type == 3 || (fh.frame_type == 0 && show_frame) {
-                true
-            } else {
-                r.read_bit()?
-            };
+        fh.error_resilient_mode = if fh.frame_type == 3 || (fh.frame_type == 0 && show_frame) {
+            true
+        } else {
+            r.read_bit()?
+        };
         let error_resilient = fh.error_resilient_mode;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] error_resilient={} bitpos={}", error_resilient, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] error_resilient={} bitpos={}",
+                error_resilient,
+                r.position()
+            );
         }
 
         // 5. disable_cdf_update (1 bit)
         fh.disable_cdf_update = r.read_bit()?;
         let disable_cdf = fh.disable_cdf_update;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] disable_cdf={} bitpos={}", disable_cdf, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] disable_cdf={} bitpos={}",
+                disable_cdf,
+                r.position()
+            );
         }
 
         // 6. allow_screen_content_tools
@@ -1082,7 +1076,11 @@ impl Av1Parser {
         };
         let allow_sct = fh.allow_screen_content_tools;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] allow_sct={} bitpos={}", allow_sct, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] allow_sct={} bitpos={}",
+                allow_sct,
+                r.position()
+            );
         }
 
         // 7. force_integer_mv
@@ -1100,7 +1098,11 @@ impl Av1Parser {
         }
         let force_imv = fh.force_integer_mv;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] force_imv={} bitpos={}", force_imv, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] force_imv={} bitpos={}",
+                force_imv,
+                r.position()
+            );
         }
 
         // 8. frame_id (if frame_id_numbers_present)
@@ -1131,7 +1133,11 @@ impl Av1Parser {
         }
         let order_hint = fh.order_hint;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] order_hint={} bitpos={}", order_hint, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] order_hint={} bitpos={}",
+                order_hint,
+                r.position()
+            );
         }
 
         // 11. primary_ref_frame
@@ -1142,64 +1148,74 @@ impl Av1Parser {
         };
         let primary_ref = fh.primary_ref_frame;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] primary_ref={} bitpos={}", primary_ref, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] primary_ref={} bitpos={}",
+                primary_ref,
+                r.position()
+            );
         }
 
         // 13. refresh_frame_flags
         if vacc_debug() {
             eprintln!(
                 "[AV1-PARSE-DBG] before refresh_frame_flags: frame_type={} bitpos={}",
-                fh.frame_type, r.position()
+                fh.frame_type,
+                r.position()
             );
         }
-        fh.refresh_frame_flags =
-            if fh.frame_type == 3 || (fh.frame_type == 0 && show_frame) {
-                0xFF
-            } else {
-                r.read_bits(8)? as u8
-            };
+        fh.refresh_frame_flags = if fh.frame_type == 3 || (fh.frame_type == 0 && show_frame) {
+            0xFF
+        } else {
+            r.read_bits(8)? as u8
+        };
         let refresh = fh.refresh_frame_flags;
         if vacc_debug() {
-            eprintln!("[AV1-PARSE-DBG] refresh_frame_flags={:08b} bitpos={}", refresh, r.position());
+            eprintln!(
+                "[AV1-PARSE-DBG] refresh_frame_flags={:08b} bitpos={}",
+                refresh,
+                r.position()
+            );
         }
 
         // 14. ref_order_hint (if !intra || refresh != 0xFF, and error_resilient, and order_hint)
-        if (!frame_is_intra || refresh != 0xFF)
-            && sps.enable_order_hint
-            && error_resilient
-        {
+        if (!frame_is_intra || refresh != 0xFF) && sps.enable_order_hint && error_resilient {
             for _i in 0..8 {
                 let _oh = r.read_bits(sps.order_hint_bits_minus1 + 1)?;
             }
         }
 
         // Helper closure: read superres + render_size (shared by frame_size paths)
-        let mut read_superres_render = |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
-            if sps.enable_superres {
-                fh.use_superres = r.read_bit()?;
-                if fh.use_superres {
-                    fh.coded_denom = r.read_bits(3)? as u8; // coded_denom_minus_4 raw (match C++ VulkanAV1Decoder.cpp)
+        let mut read_superres_render =
+            |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
+                if sps.enable_superres {
+                    fh.use_superres = r.read_bit()?;
+                    if fh.use_superres {
+                        fh.coded_denom = r.read_bits(3)? as u8; // coded_denom_minus_4 raw (match C++ VulkanAV1Decoder.cpp)
+                    } else {
+                        fh.coded_denom = 0;
+                    }
                 } else {
+                    fh.use_superres = false;
                     fh.coded_denom = 0;
                 }
-            } else {
-                fh.use_superres = false;
-                fh.coded_denom = 0;
-            }
-            Ok(())
-        };
-        let mut read_render_size = |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
-            fh.render_and_frame_size_different = r.read_bit()?;
-            if fh.render_and_frame_size_different {
-                fh.render_width = r.read_bits(16)? + 1;
-                fh.render_height = r.read_bits(16)? + 1;
-            } else {
-                fh.render_width = fh.frame_width;
-                fh.render_height = fh.frame_height;
-            }
-            Ok(())
-        };
-        let inherit_size = |fh: &mut Av1FrameHeader, primary_ref: u8, sizes: &[(u32, u32); 8], sps: &vk_video_core::picture::Av1Sps| {
+                Ok(())
+            };
+        let mut read_render_size =
+            |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
+                fh.render_and_frame_size_different = r.read_bit()?;
+                if fh.render_and_frame_size_different {
+                    fh.render_width = r.read_bits(16)? + 1;
+                    fh.render_height = r.read_bits(16)? + 1;
+                } else {
+                    fh.render_width = fh.frame_width;
+                    fh.render_height = fh.frame_height;
+                }
+                Ok(())
+            };
+        let inherit_size = |fh: &mut Av1FrameHeader,
+                            primary_ref: u8,
+                            sizes: &[(u32, u32); 8],
+                            sps: &vk_video_core::picture::Av1Sps| {
             match sizes.get(primary_ref as usize) {
                 Some(&(w, h)) if w > 0 && h > 0 => {
                     fh.frame_width = w;
@@ -1224,11 +1240,7 @@ impl Av1Parser {
             read_superres_render(&mut fh, &mut r)?;
             read_render_size(&mut fh, &mut r)?;
             // allow_intrabc
-            fh.allow_intrabc = if allow_sct {
-                r.read_bit()?
-            } else {
-                false
-            };
+            fh.allow_intrabc = if allow_sct { r.read_bit()? } else { false };
             fh.use_ref_frame_mvs = false;
         } else {
             // ---- INTER ----
@@ -1242,7 +1254,8 @@ impl Av1Parser {
             if vacc_debug() {
                 eprintln!(
                     "[AV1-PARSE-DBG] frame_refs_short_signaling={} bitpos={}",
-                    frss, r.position()
+                    frss,
+                    r.position()
                 );
             }
             if frss {
@@ -1304,11 +1317,7 @@ impl Av1Parser {
             }
 
             // allow_high_precision_mv
-            fh.allow_high_precision_mv = if force_imv {
-                false
-            } else {
-                r.read_bit()?
-            };
+            fh.allow_high_precision_mv = if force_imv { false } else { r.read_bit()? };
 
             // interpolation_filter
             fh.is_filter_switchable = r.read_bit()?;
@@ -1340,11 +1349,7 @@ impl Av1Parser {
         }
 
         // 16. disable_frame_end_update_cdf
-        fh.disable_frame_end_update_cdf = if disable_cdf {
-            true
-        } else {
-            r.read_bit()?
-        };
+        fh.disable_frame_end_update_cdf = if disable_cdf { true } else { r.read_bit()? };
 
         // 17. tile_info
         self.parse_tile_info(&mut r, &mut fh, sps)?;
@@ -1361,11 +1366,12 @@ impl Av1Parser {
         // 22. coded_lossless
         let mut coded_lossless = true;
         for i in 0..8 {
-            let qindex = if fh.segmentation_enabled && (fh.segment_feature_enabled[i] & (1 << 2)) != 0 {
-                (fh.base_q_index as i16 + fh.segment_feature_data[i][2]).clamp(0, 255)
-            } else {
-                fh.base_q_index as i16
-            };
+            let qindex =
+                if fh.segmentation_enabled && (fh.segment_feature_enabled[i] & (1 << 2)) != 0 {
+                    (fh.base_q_index as i16 + fh.segment_feature_data[i][2]).clamp(0, 255)
+                } else {
+                    fh.base_q_index as i16
+                };
             if qindex != 0
                 || fh.delta_q_y_dc != 0
                 || fh.delta_q_u_dc != 0
@@ -1424,7 +1430,8 @@ impl Av1Parser {
         }
 
         // 29. allow_warped_motion
-        fh.allow_warped_motion = if !frame_is_intra && !error_resilient && sps.enable_warped_motion {
+        fh.allow_warped_motion = if !frame_is_intra && !error_resilient && sps.enable_warped_motion
+        {
             r.read_bit()?
         } else {
             false
@@ -1489,7 +1496,10 @@ impl Av1Parser {
         let mut best = -1i32;
         let mut best_hint = -1i32;
         for i in 0..8 {
-            if !used[i] && shifted[i] >= cur_frame_hint as i32 && (best < 0 || shifted[i] >= best_hint) {
+            if !used[i]
+                && shifted[i] >= cur_frame_hint as i32
+                && (best < 0 || shifted[i] >= best_hint)
+            {
                 best = i as i32;
                 best_hint = shifted[i];
             }
@@ -1502,7 +1512,10 @@ impl Av1Parser {
         let mut best = -1i32;
         let mut best_hint = -1i32;
         for i in 0..8 {
-            if !used[i] && shifted[i] >= cur_frame_hint as i32 && (best < 0 || shifted[i] < best_hint) {
+            if !used[i]
+                && shifted[i] >= cur_frame_hint as i32
+                && (best < 0 || shifted[i] < best_hint)
+            {
                 best = i as i32;
                 best_hint = shifted[i];
             }
@@ -1515,7 +1528,10 @@ impl Av1Parser {
         let mut best = -1i32;
         let mut best_hint = -1i32;
         for i in 0..8 {
-            if !used[i] && shifted[i] >= cur_frame_hint as i32 && (best < 0 || shifted[i] < best_hint) {
+            if !used[i]
+                && shifted[i] >= cur_frame_hint as i32
+                && (best < 0 || shifted[i] < best_hint)
+            {
                 best = i as i32;
                 best_hint = shifted[i];
             }
@@ -1530,7 +1546,10 @@ impl Av1Parser {
                 let mut best = -1i32;
                 let mut best_hint = -1i32;
                 for i in 0..8 {
-                    if !used[i] && shifted[i] < cur_frame_hint as i32 && (best < 0 || shifted[i] >= best_hint) {
+                    if !used[i]
+                        && shifted[i] < cur_frame_hint as i32
+                        && (best < 0 || shifted[i] >= best_hint)
+                    {
                         best = i as i32;
                         best_hint = shifted[i];
                     }
@@ -1572,8 +1591,16 @@ impl Av1Parser {
     /// AV1 spec 7.11: IsSkipModeAllowed. Returns (ref0, ref1) as bitstream
     /// reference name indices (0=LAST..6=INTRA) of the nearest forward and
     /// backward references, or None if skip mode is not allowed.
-    fn skip_mode_refs(&self, fh: &Av1FrameHeader, sps: &vk_video_core::picture::Av1Sps) -> Option<(i32, i32)> {
-        if !sps.enable_order_hint || fh.frame_type == 0 || fh.frame_type == 2 || !fh.reference_select {
+    fn skip_mode_refs(
+        &self,
+        fh: &Av1FrameHeader,
+        sps: &vk_video_core::picture::Av1Sps,
+    ) -> Option<(i32, i32)> {
+        if !sps.enable_order_hint
+            || fh.frame_type == 0
+            || fh.frame_type == 2
+            || !fh.reference_select
+        {
             return None;
         }
         let ohb = sps.order_hint_bits_minus1 as u32;
@@ -1585,13 +1612,21 @@ impl Av1Parser {
         let mut ref1_off = -1i32;
         for i in 0..7 {
             let frame_idx = fh.ref_frame_idx[i] as usize;
-            let ref_off = self.ref_frame_order_hints.get(frame_idx).copied().unwrap_or(0) as i32;
+            let ref_off = self
+                .ref_frame_order_hints
+                .get(frame_idx)
+                .copied()
+                .unwrap_or(0) as i32;
             let rel_off = Self::get_relative_dist1(ref_off, cur, ohb);
-            if rel_off < 0 && (ref0_off == -1 || Self::get_relative_dist1(ref_off, ref0_off, ohb) > 0) {
+            if rel_off < 0
+                && (ref0_off == -1 || Self::get_relative_dist1(ref_off, ref0_off, ohb) > 0)
+            {
                 ref0 = i as i32;
                 ref0_off = ref_off;
             }
-            if rel_off > 0 && (ref1_off == -1 || Self::get_relative_dist1(ref_off, ref1_off, ohb) < 0) {
+            if rel_off > 0
+                && (ref1_off == -1 || Self::get_relative_dist1(ref_off, ref1_off, ohb) < 0)
+            {
                 ref1 = i as i32;
                 ref1_off = ref_off;
             }
@@ -1602,7 +1637,11 @@ impl Av1Parser {
         if ref0 != -1 {
             for i in 0..7 {
                 let frame_idx = fh.ref_frame_idx[i] as usize;
-                let ref_off = self.ref_frame_order_hints.get(frame_idx).copied().unwrap_or(0) as i32;
+                let ref_off = self
+                    .ref_frame_order_hints
+                    .get(frame_idx)
+                    .copied()
+                    .unwrap_or(0) as i32;
                 if Self::get_relative_dist1(ref_off, ref0_off, ohb) < 0
                     && (ref1_off == -1 || Self::get_relative_dist1(ref_off, ref1_off, ohb) > 0)
                 {
@@ -1624,14 +1663,30 @@ impl Av1Parser {
         fh: &mut Av1FrameHeader,
         sps: &vk_video_core::picture::Av1Sps,
     ) -> ParserResult<()> {
-        let frame_width = if fh.frame_width > 0 { fh.frame_width } else { sps.max_frame_width_minus_1 as u32 + 1 };
-        let frame_height = if fh.frame_height > 0 { fh.frame_height } else { sps.max_frame_height_minus_1 as u32 + 1 };
+        let frame_width = if fh.frame_width > 0 {
+            fh.frame_width
+        } else {
+            sps.max_frame_width_minus_1 as u32 + 1
+        };
+        let frame_height = if fh.frame_height > 0 {
+            fh.frame_height
+        } else {
+            sps.max_frame_height_minus_1 as u32 + 1
+        };
 
         let mi_cols = 2 * ((frame_width + 7) >> 3);
         let mi_rows = 2 * ((frame_height + 7) >> 3);
         let use_128 = sps.use_128x128_superblock;
-        let sb_cols = if use_128 { (mi_cols + 31) >> 5 } else { (mi_cols + 15) >> 4 };
-        let sb_rows = if use_128 { (mi_rows + 31) >> 5 } else { (mi_rows + 15) >> 4 };
+        let sb_cols = if use_128 {
+            (mi_cols + 31) >> 5
+        } else {
+            (mi_cols + 15) >> 4
+        };
+        let sb_rows = if use_128 {
+            (mi_rows + 31) >> 5
+        } else {
+            (mi_rows + 15) >> 4
+        };
         let sb_shift = if use_128 { 5 } else { 4 };
         let sb_size = sb_shift + 2;
         let _ = mi_cols;
@@ -1649,7 +1704,10 @@ impl Av1Parser {
         let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
         let max_log2_tile_cols = tile_log2(1, std::cmp::min(sb_cols, 64));
         let max_log2_tile_rows = tile_log2(1, std::cmp::min(sb_rows, 64));
-        let min_log2_tiles = std::cmp::max(min_log2_tile_cols, tile_log2(max_tile_area_sb, sb_rows * sb_cols));
+        let min_log2_tiles = std::cmp::max(
+            min_log2_tile_cols,
+            tile_log2(max_tile_area_sb, sb_rows * sb_cols),
+        );
 
         let uniform = r.read_bit()?;
         fh.uniform_tile_spacing_flag = uniform;
@@ -1712,7 +1770,11 @@ impl Av1Parser {
             while start_sb < sb_cols && i < 64 {
                 fh.tile_mi_col_starts[i as usize] = (start_sb << sb_shift) as u16;
                 let max_width = std::cmp::min(sb_cols - start_sb, max_tile_width_sb);
-                let w = if max_width > 1 { r.read_ns(max_width - 1)? } else { 0 };
+                let w = if max_width > 1 {
+                    r.read_ns(max_width - 1)?
+                } else {
+                    0
+                };
                 fh.tile_width_in_sbs_minus_1[i as usize] = w as u16;
                 let size_sb = w + 1;
                 widest_tile_sb = std::cmp::max(size_sb, widest_tile_sb);
@@ -1723,14 +1785,23 @@ impl Av1Parser {
             tile_cols = i;
 
             let num_sb = sb_cols * sb_rows;
-            let max_tile_area_sb = if min_log2_tiles > 0 { num_sb >> (min_log2_tiles + 1) } else { num_sb };
-            let max_tile_height_sb = std::cmp::max(max_tile_area_sb / std::cmp::max(1, widest_tile_sb), 1u32);
+            let max_tile_area_sb = if min_log2_tiles > 0 {
+                num_sb >> (min_log2_tiles + 1)
+            } else {
+                num_sb
+            };
+            let max_tile_height_sb =
+                std::cmp::max(max_tile_area_sb / std::cmp::max(1, widest_tile_sb), 1u32);
             let mut start_sb = 0u32;
             let mut i = 0u32;
             while start_sb < sb_rows && i < 64 {
                 fh.tile_mi_row_starts[i as usize] = (start_sb << sb_shift) as u16;
                 let max_height = std::cmp::min(sb_rows - start_sb, max_tile_height_sb);
-                let h = if max_height > 1 { r.read_ns(max_height - 1)? } else { 0 };
+                let h = if max_height > 1 {
+                    r.read_ns(max_height - 1)?
+                } else {
+                    0
+                };
                 fh.tile_height_in_sbs_minus_1[i as usize] = h as u16;
                 let size_sb = h + 1;
                 start_sb += size_sb;
@@ -1778,7 +1849,11 @@ impl Av1Parser {
 
         fh.delta_q_y_dc = read_delta_q(r)?;
         if !sps.mono_chrome {
-            let diff_uv_delta = if sps.separate_uv_delta_q { r.read_bit()? } else { false };
+            let diff_uv_delta = if sps.separate_uv_delta_q {
+                r.read_bit()?
+            } else {
+                false
+            };
             fh.diff_uv_delta = diff_uv_delta;
             fh.delta_q_u_dc = read_delta_q(r)?;
             fh.delta_q_u_ac = read_delta_q(r)?;
@@ -1836,52 +1911,60 @@ impl Av1Parser {
             fh.segmentation_temporal_update = false;
         } else {
             fh.segmentation_update_map = r.read_bit()?;
-            fh.segmentation_temporal_update = if fh.segmentation_update_map { r.read_bit()? } else { false };
+            fh.segmentation_temporal_update = if fh.segmentation_update_map {
+                r.read_bit()?
+            } else {
+                false
+            };
             fh.segmentation_update_data = r.read_bit()?;
         }
 
-    if fh.segmentation_update_data {
-        // C++ VulkanAV1Decoder.cpp:1387: reset FeatureEnabled before reading
-        // (avoids OR-ing with a stale value if the header is reused).
-        for seg in 0..8 {
-            fh.segment_feature_enabled[seg] = 0;
-        }
-        // feature bits: {8,6,6,6,6,3,0,0}, signed: {1,1,1,1,1,0,0,0}
-        let feature_bits = [8u8, 6, 6, 6, 6, 3, 0, 0];
-        let feature_signed = [true, true, true, true, true, false, false, false];
-        for seg in 0..8 {
-            for feat in 0..8 {
-                let enabled = r.read_bit()?;
-                if enabled {
-                    fh.segment_feature_enabled[seg] |= 1 << feat;
-                    let bits = feature_bits[feat];
-                    if bits > 0 {
-                        let val = if feature_signed[feat] {
-                            r.read_signed_bits(bits)? as i16
-                        } else {
-                            r.read_bits(bits)? as i16
-                        };
-                        fh.segment_feature_data[seg][feat] = val;
+        if fh.segmentation_update_data {
+            // C++ VulkanAV1Decoder.cpp:1387: reset FeatureEnabled before reading
+            // (avoids OR-ing with a stale value if the header is reused).
+            for seg in 0..8 {
+                fh.segment_feature_enabled[seg] = 0;
+            }
+            // feature bits: {8,6,6,6,6,3,0,0}, signed: {1,1,1,1,1,0,0,0}
+            let feature_bits = [8u8, 6, 6, 6, 6, 3, 0, 0];
+            let feature_signed = [true, true, true, true, true, false, false, false];
+            for seg in 0..8 {
+                for feat in 0..8 {
+                    let enabled = r.read_bit()?;
+                    if enabled {
+                        fh.segment_feature_enabled[seg] |= 1 << feat;
+                        let bits = feature_bits[feat];
+                        if bits > 0 {
+                            let val = if feature_signed[feat] {
+                                r.read_signed_bits(bits)? as i16
+                            } else {
+                                r.read_bits(bits)? as i16
+                            };
+                            fh.segment_feature_data[seg][feat] = val;
+                        }
                     }
                 }
             }
+        } else if primary_ref != 7 {
+            // C++ VulkanAV1Decoder.cpp:1405-1413: inherit segmentation state from
+            // the primary reference frame buffer when segmentation_update_data is
+            // false (the feature data is not re-signaled in the bitstream).
+            let ref_idx = fh.ref_frame_idx[primary_ref as usize] as usize;
+            if let Some((feature_enabled, feature_data)) = self.ref_segmentation.get(ref_idx) {
+                fh.segment_feature_enabled = *feature_enabled;
+                fh.segment_feature_data = *feature_data;
+            }
         }
-    } else if primary_ref != 7 {
-        // C++ VulkanAV1Decoder.cpp:1405-1413: inherit segmentation state from
-        // the primary reference frame buffer when segmentation_update_data is
-        // false (the feature data is not re-signaled in the bitstream).
-        let ref_idx = fh.ref_frame_idx[primary_ref as usize] as usize;
-        if let Some((feature_enabled, feature_data)) = self.ref_segmentation.get(ref_idx) {
-            fh.segment_feature_enabled = *feature_enabled;
-            fh.segment_feature_data = *feature_data;
-        }
-    }
-    Ok(())
+        Ok(())
     }
 
     /// AV1 spec 7.25/7.26: delta_q_params + delta_lf_params.
     fn parse_delta_q_lf(&self, r: &mut BitReader, fh: &mut Av1FrameHeader) -> ParserResult<()> {
-        fh.delta_q_present = if fh.base_q_index > 0 { r.read_bit()? } else { false };
+        fh.delta_q_present = if fh.base_q_index > 0 {
+            r.read_bit()?
+        } else {
+            false
+        };
         if fh.delta_q_present {
             fh.delta_q_res = r.read_bits(2)? as u8;
             if !fh.allow_intrabc {
@@ -2119,12 +2202,14 @@ impl Av1Parser {
             wmmat[5] = 65536;
 
             if gm_type >= 2 {
-                wmmat[2] = r.read_signed_refsubexpfin(4097, 3, (ref_params[2] >> 1) - 32768)? * 2 + 65536;
+                wmmat[2] =
+                    r.read_signed_refsubexpfin(4097, 3, (ref_params[2] >> 1) - 32768)? * 2 + 65536;
                 wmmat[3] = r.read_signed_refsubexpfin(4097, 3, ref_params[3] >> 1)? * 2;
             }
             if gm_type >= 3 {
                 wmmat[4] = r.read_signed_refsubexpfin(4097, 3, ref_params[4] >> 1)? * 2;
-                wmmat[5] = r.read_signed_refsubexpfin(4097, 3, (ref_params[5] >> 1) - 32768)? * 2 + 65536;
+                wmmat[5] =
+                    r.read_signed_refsubexpfin(4097, 3, (ref_params[5] >> 1) - 32768)? * 2 + 65536;
             } else {
                 wmmat[4] = -wmmat[3];
                 wmmat[5] = wmmat[2];
@@ -2147,7 +2232,6 @@ impl Av1Parser {
         }
         Ok(())
     }
-    
 
     /// Update reference frame tracking state after parsing a frame header (AV1 spec 7.20).
     fn update_ref_frames(&mut self, fh: &Av1FrameHeader) {

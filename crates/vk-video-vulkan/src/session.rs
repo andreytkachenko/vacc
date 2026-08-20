@@ -3,9 +3,7 @@
 use ash::vk;
 use ash::vk::Handle;
 
-use super::vp9::{
-    vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR,
-};
+use super::vp9::{vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR};
 use super::{device::VideoCodec, VideoError, VideoResult};
 
 /// Codec-specific profile information for session creation.
@@ -175,10 +173,7 @@ impl VideoSession {
         }
 
         let bind_fn = unsafe {
-            instance.get_device_proc_addr(
-                device.handle(),
-                c"vkBindVideoSessionMemoryKHR".as_ptr(),
-            )
+            instance.get_device_proc_addr(device.handle(), c"vkBindVideoSessionMemoryKHR".as_ptr())
         }
         .ok_or_else(|| {
             VideoError::SessionCreation("vkBindVideoSessionMemoryKHR not found".to_string())
@@ -302,9 +297,7 @@ impl VideoSession {
         };
 
         // DEBUG (iteration 17): comprehensive session creation parameters
-        eprintln!(
-            "[SESSION-CREATE] ===== VkVideoSessionCreateInfoKHR ====="
-        );
+        eprintln!("[SESSION-CREATE] ===== VkVideoSessionCreateInfoKHR =====");
         eprintln!(
             "[SESSION-CREATE]   flags                          = {:?}",
             session_create_info.flags
@@ -323,8 +316,7 @@ impl VideoSession {
         );
         eprintln!(
             "[SESSION-CREATE]   maxCodedExtent                 = {}x{}",
-            session_create_info.max_coded_extent.width,
-            session_create_info.max_coded_extent.height
+            session_create_info.max_coded_extent.width, session_create_info.max_coded_extent.height
         );
         eprintln!(
             "[SESSION-CREATE]   maxDpbSlots                    = {}",
@@ -343,17 +335,29 @@ impl VideoSession {
         );
         // Print codec-specific profile info
         match &params.codec_profile_info {
-            CodecProfileInfo::H264 { std_profile_idc, picture_layout } => {
+            CodecProfileInfo::H264 {
+                std_profile_idc,
+                picture_layout,
+            } => {
                 eprintln!("[SESSION-CREATE]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={}", std_profile_idc, picture_layout);
             }
             CodecProfileInfo::H265 { std_profile_idc } => {
-                eprintln!("[SESSION-CREATE]   VkVideoDecodeH265ProfileInfoKHR: stdProfileIdc={}", std_profile_idc);
+                eprintln!(
+                    "[SESSION-CREATE]   VkVideoDecodeH265ProfileInfoKHR: stdProfileIdc={}",
+                    std_profile_idc
+                );
             }
-            CodecProfileInfo::Av1 { std_profile, film_grain_support } => {
+            CodecProfileInfo::Av1 {
+                std_profile,
+                film_grain_support,
+            } => {
                 eprintln!("[SESSION-CREATE]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}", std_profile, film_grain_support);
             }
             CodecProfileInfo::Vp9 { std_profile } => {
-                eprintln!("[SESSION-CREATE]   VkVideoDecodeVP9ProfileInfoKHR: stdProfile={}", std_profile);
+                eprintln!(
+                    "[SESSION-CREATE]   VkVideoDecodeVP9ProfileInfoKHR: stdProfile={}",
+                    std_profile
+                );
             }
         }
         // Print std header version
@@ -365,20 +369,14 @@ impl VideoSession {
             );
             eprintln!(
                 "[SESSION-CREATE]   pStdHeaderVersion->specVersion   = {} (0x{:08X})",
-                std_header_version.spec_version,
-                std_header_version.spec_version
+                std_header_version.spec_version, std_header_version.spec_version
             );
         }
-        eprintln!(
-            "[SESSION-CREATE] ==========================================="
-        );
+        eprintln!("[SESSION-CREATE] ===========================================");
 
         // Get function pointer
         let create_fn = unsafe {
-            instance.get_device_proc_addr(
-                device.handle(),
-                c"vkCreateVideoSessionKHR".as_ptr(),
-            )
+            instance.get_device_proc_addr(device.handle(), c"vkCreateVideoSessionKHR".as_ptr())
         }
         .ok_or_else(|| {
             VideoError::SessionCreation("vkCreateVideoSessionKHR not found".to_string())
@@ -449,10 +447,8 @@ impl Drop for VideoSession {
         }
 
         let destroy_fn = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkDestroyVideoSessionKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkDestroyVideoSessionKHR".as_ptr())
         };
 
         if let Some(ptr) = destroy_fn {
@@ -516,73 +512,203 @@ impl VideoSessionParameters {
         // points to) must remain valid for the lifetime of the session
         // parameters object. The driver retains these pointers (it does not
         // copy the data), so we leak them to keep them alive past create().
-        let std_color_config_av1: Option<*const StdVideoAV1ColorConfig> =
-            sps_av1.map(|sps| {
-                Box::into_raw(Box::new(super::av1::convert_av1_color_config(sps))) as *const _
-            });
-        let std_timing_info_av1: Option<*const StdVideoAV1TimingInfo> =
-            sps_av1.map(|sps| {
-                Box::into_raw(Box::new(super::av1::convert_av1_timing_info(sps))) as *const _
-            });
+        let std_color_config_av1: Option<*const StdVideoAV1ColorConfig> = sps_av1.map(|sps| {
+            Box::into_raw(Box::new(super::av1::convert_av1_color_config(sps))) as *const _
+        });
+        let std_timing_info_av1: Option<*const StdVideoAV1TimingInfo> = sps_av1.map(|sps| {
+            Box::into_raw(Box::new(super::av1::convert_av1_timing_info(sps))) as *const _
+        });
         let std_sps_av1: Option<*const StdVideoAV1SequenceHeader> = sps_av1.map(|sps| {
             let mut header = super::av1::convert_av1_sps(sps);
             header.pColorConfig = std_color_config_av1.unwrap_or(std::ptr::null());
             header.pTimingInfo = std_timing_info_av1.unwrap_or(std::ptr::null());
             // === FULL SPS DIAGNOSTIC DUMP ===
             eprintln!("[SPS-DUMP] ===== StdVideoAV1SequenceHeader =====");
-            eprintln!("[SPS-DUMP] flags.still_picture                       = {}", header.flags.still_picture());
-            eprintln!("[SPS-DUMP] flags.reduced_still_picture_header        = {}", header.flags.reduced_still_picture_header());
-            eprintln!("[SPS-DUMP] flags.use_128x128_superblock              = {}", header.flags.use_128x128_superblock());
-            eprintln!("[SPS-DUMP] flags.enable_filter_intra                 = {}", header.flags.enable_filter_intra());
-            eprintln!("[SPS-DUMP] flags.enable_intra_edge_filter            = {}", header.flags.enable_intra_edge_filter());
-            eprintln!("[SPS-DUMP] flags.enable_interintra_compound          = {}", header.flags.enable_interintra_compound());
-            eprintln!("[SPS-DUMP] flags.enable_masked_compound              = {}", header.flags.enable_masked_compound());
-            eprintln!("[SPS-DUMP] flags.enable_warped_motion                = {}", header.flags.enable_warped_motion());
-            eprintln!("[SPS-DUMP] flags.enable_dual_filter                  = {}", header.flags.enable_dual_filter());
-            eprintln!("[SPS-DUMP] flags.enable_order_hint                   = {}", header.flags.enable_order_hint());
-            eprintln!("[SPS-DUMP] flags.enable_jnt_comp                     = {}", header.flags.enable_jnt_comp());
-            eprintln!("[SPS-DUMP] flags.enable_ref_frame_mvs                = {}", header.flags.enable_ref_frame_mvs());
-            eprintln!("[SPS-DUMP] flags.frame_id_numbers_present_flag       = {}", header.flags.frame_id_numbers_present_flag());
-            eprintln!("[SPS-DUMP] flags.enable_superres                     = {}", header.flags.enable_superres());
-            eprintln!("[SPS-DUMP] flags.enable_cdef                         = {}", header.flags.enable_cdef());
-            eprintln!("[SPS-DUMP] flags.enable_restoration                  = {}", header.flags.enable_restoration());
-            eprintln!("[SPS-DUMP] flags.film_grain_params_present           = {}", header.flags.film_grain_params_present());
-            eprintln!("[SPS-DUMP] flags.timing_info_present_flag            = {}", header.flags.timing_info_present_flag());
-            eprintln!("[SPS-DUMP] flags.initial_display_delay_present_flag  = {}", header.flags.initial_display_delay_present_flag());
-            eprintln!("[SPS-DUMP] seq_profile                               = {}", header.seq_profile);
-            eprintln!("[SPS-DUMP] frame_width_bits_minus_1                  = {}", header.frame_width_bits_minus_1);
-            eprintln!("[SPS-DUMP] frame_height_bits_minus_1                 = {}", header.frame_height_bits_minus_1);
-            eprintln!("[SPS-DUMP] max_frame_width_minus_1                   = {}", header.max_frame_width_minus_1);
-            eprintln!("[SPS-DUMP] max_frame_height_minus_1                  = {}", header.max_frame_height_minus_1);
-            eprintln!("[SPS-DUMP] delta_frame_id_length_minus_2             = {}", header.delta_frame_id_length_minus_2);
-            eprintln!("[SPS-DUMP] additional_frame_id_length_minus_1        = {}", header.additional_frame_id_length_minus_1);
-            eprintln!("[SPS-DUMP] order_hint_bits_minus_1                   = {}", header.order_hint_bits_minus_1);
-            eprintln!("[SPS-DUMP] seq_force_integer_mv                      = {} (SELECT=2)", header.seq_force_integer_mv);
-            eprintln!("[SPS-DUMP] seq_force_screen_content_tools            = {} (SELECT=2)", header.seq_force_screen_content_tools);
+            eprintln!(
+                "[SPS-DUMP] flags.still_picture                       = {}",
+                header.flags.still_picture()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.reduced_still_picture_header        = {}",
+                header.flags.reduced_still_picture_header()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.use_128x128_superblock              = {}",
+                header.flags.use_128x128_superblock()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_filter_intra                 = {}",
+                header.flags.enable_filter_intra()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_intra_edge_filter            = {}",
+                header.flags.enable_intra_edge_filter()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_interintra_compound          = {}",
+                header.flags.enable_interintra_compound()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_masked_compound              = {}",
+                header.flags.enable_masked_compound()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_warped_motion                = {}",
+                header.flags.enable_warped_motion()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_dual_filter                  = {}",
+                header.flags.enable_dual_filter()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_order_hint                   = {}",
+                header.flags.enable_order_hint()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_jnt_comp                     = {}",
+                header.flags.enable_jnt_comp()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_ref_frame_mvs                = {}",
+                header.flags.enable_ref_frame_mvs()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.frame_id_numbers_present_flag       = {}",
+                header.flags.frame_id_numbers_present_flag()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_superres                     = {}",
+                header.flags.enable_superres()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_cdef                         = {}",
+                header.flags.enable_cdef()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.enable_restoration                  = {}",
+                header.flags.enable_restoration()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.film_grain_params_present           = {}",
+                header.flags.film_grain_params_present()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.timing_info_present_flag            = {}",
+                header.flags.timing_info_present_flag()
+            );
+            eprintln!(
+                "[SPS-DUMP] flags.initial_display_delay_present_flag  = {}",
+                header.flags.initial_display_delay_present_flag()
+            );
+            eprintln!(
+                "[SPS-DUMP] seq_profile                               = {}",
+                header.seq_profile
+            );
+            eprintln!(
+                "[SPS-DUMP] frame_width_bits_minus_1                  = {}",
+                header.frame_width_bits_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] frame_height_bits_minus_1                 = {}",
+                header.frame_height_bits_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] max_frame_width_minus_1                   = {}",
+                header.max_frame_width_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] max_frame_height_minus_1                  = {}",
+                header.max_frame_height_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] delta_frame_id_length_minus_2             = {}",
+                header.delta_frame_id_length_minus_2
+            );
+            eprintln!(
+                "[SPS-DUMP] additional_frame_id_length_minus_1        = {}",
+                header.additional_frame_id_length_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] order_hint_bits_minus_1                   = {}",
+                header.order_hint_bits_minus_1
+            );
+            eprintln!(
+                "[SPS-DUMP] seq_force_integer_mv                      = {} (SELECT=2)",
+                header.seq_force_integer_mv
+            );
+            eprintln!(
+                "[SPS-DUMP] seq_force_screen_content_tools            = {} (SELECT=2)",
+                header.seq_force_screen_content_tools
+            );
             if !header.pColorConfig.is_null() {
                 let cc = unsafe { &*header.pColorConfig };
                 eprintln!("[SPS-DUMP] --- ColorConfig ---");
-                eprintln!("[SPS-DUMP] cc.flags.mono_chrome                     = {}", cc.flags.mono_chrome());
-                eprintln!("[SPS-DUMP] cc.flags.color_range                    = {}", cc.flags.color_range());
-                eprintln!("[SPS-DUMP] cc.flags.separate_uv_delta_q            = {}", cc.flags.separate_uv_delta_q());
-                eprintln!("[SPS-DUMP] cc.flags.color_description_present_flag = {}", cc.flags.color_description_present_flag());
-                eprintln!("[SPS-DUMP] cc.BitDepth                             = {}", cc.BitDepth);
-                eprintln!("[SPS-DUMP] cc.subsampling_x                        = {}", cc.subsampling_x);
-                eprintln!("[SPS-DUMP] cc.subsampling_y                        = {}", cc.subsampling_y);
-                eprintln!("[SPS-DUMP] cc.color_primaries                      = {}", cc.color_primaries);
-                eprintln!("[SPS-DUMP] cc.transfer_characteristics             = {}", cc.transfer_characteristics);
-                eprintln!("[SPS-DUMP] cc.matrix_coefficients                  = {}", cc.matrix_coefficients);
-                eprintln!("[SPS-DUMP] cc.chroma_sample_position               = {}", cc.chroma_sample_position);
+                eprintln!(
+                    "[SPS-DUMP] cc.flags.mono_chrome                     = {}",
+                    cc.flags.mono_chrome()
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.flags.color_range                    = {}",
+                    cc.flags.color_range()
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.flags.separate_uv_delta_q            = {}",
+                    cc.flags.separate_uv_delta_q()
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.flags.color_description_present_flag = {}",
+                    cc.flags.color_description_present_flag()
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.BitDepth                             = {}",
+                    cc.BitDepth
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.subsampling_x                        = {}",
+                    cc.subsampling_x
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.subsampling_y                        = {}",
+                    cc.subsampling_y
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.color_primaries                      = {}",
+                    cc.color_primaries
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.transfer_characteristics             = {}",
+                    cc.transfer_characteristics
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.matrix_coefficients                  = {}",
+                    cc.matrix_coefficients
+                );
+                eprintln!(
+                    "[SPS-DUMP] cc.chroma_sample_position               = {}",
+                    cc.chroma_sample_position
+                );
             } else {
                 eprintln!("[SPS-DUMP] --- ColorConfig: NULL ---");
             }
             if !header.pTimingInfo.is_null() {
                 let ti = unsafe { &*header.pTimingInfo };
                 eprintln!("[SPS-DUMP] --- TimingInfo ---");
-                eprintln!("[SPS-DUMP] ti.flags.equal_picture_interval         = {}", ti.flags.equal_picture_interval());
-                eprintln!("[SPS-DUMP] ti.num_units_in_display_tick            = {}", ti.num_units_in_display_tick);
-                eprintln!("[SPS-DUMP] ti.time_scale                           = {}", ti.time_scale);
-                eprintln!("[SPS-DUMP] ti.num_ticks_per_picture_minus_1        = {}", ti.num_ticks_per_picture_minus_1);
+                eprintln!(
+                    "[SPS-DUMP] ti.flags.equal_picture_interval         = {}",
+                    ti.flags.equal_picture_interval()
+                );
+                eprintln!(
+                    "[SPS-DUMP] ti.num_units_in_display_tick            = {}",
+                    ti.num_units_in_display_tick
+                );
+                eprintln!(
+                    "[SPS-DUMP] ti.time_scale                           = {}",
+                    ti.time_scale
+                );
+                eprintln!(
+                    "[SPS-DUMP] ti.num_ticks_per_picture_minus_1        = {}",
+                    ti.num_ticks_per_picture_minus_1
+                );
             } else {
                 eprintln!("[SPS-DUMP] --- TimingInfo: NULL ---");
             }
@@ -669,9 +795,7 @@ impl VideoSessionParameters {
         };
 
         // DEBUG (iteration 17): comprehensive session parameters creation dump
-        eprintln!(
-            "[SESSION-PARAMS-CREATE] ===== VkVideoSessionParametersCreateInfoKHR ====="
-        );
+        eprintln!("[SESSION-PARAMS-CREATE] ===== VkVideoSessionParametersCreateInfoKHR =====");
         eprintln!(
             "[SESSION-PARAMS-CREATE]   flags                                  = {:?}",
             params_create_info.flags
@@ -684,7 +808,9 @@ impl VideoSessionParameters {
         eprintln!(
             "[SESSION-PARAMS-CREATE]   videoSessionParametersTemplate         = {:?} (valid={})",
             params_create_info.video_session_parameters_template,
-            !params_create_info.video_session_parameters_template.is_null()
+            !params_create_info
+                .video_session_parameters_template
+                .is_null()
         );
         match codec {
             VideoCodec::DecodeAv1 => {
@@ -741,9 +867,7 @@ impl VideoSessionParameters {
                 );
             }
         }
-        eprintln!(
-            "[SESSION-PARAMS-CREATE] ==========================================="
-        );
+        eprintln!("[SESSION-PARAMS-CREATE] ===========================================");
 
         let create_fn = unsafe {
             instance.get_device_proc_addr(
@@ -772,7 +896,10 @@ impl VideoSessionParameters {
                 std::ptr::null(),
                 &mut params,
             );
-            eprintln!("[SessionParams] vkCreateVideoSessionParametersKHR returned: {:?}", result);
+            eprintln!(
+                "[SessionParams] vkCreateVideoSessionParametersKHR returned: {:?}",
+                result
+            );
             if result != vk::Result::SUCCESS {
                 return Err(VideoError::SessionCreation(format!(
                     "vkCreateVideoSessionParametersKHR failed: {:?}",
@@ -847,7 +974,10 @@ impl VideoSessionParameters {
             fn_ptr(self.device.handle(), session, self.parameters)
         };
 
-        eprintln!("[SessionParams] vkUpdateVideoSessionKHR returned: {:?}", result);
+        eprintln!(
+            "[SessionParams] vkUpdateVideoSessionKHR returned: {:?}",
+            result
+        );
         if result != vk::Result::SUCCESS {
             return Err(VideoError::SessionCreation(format!(
                 "vkUpdateVideoSessionKHR failed: {:?}",

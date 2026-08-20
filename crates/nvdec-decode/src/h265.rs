@@ -26,8 +26,8 @@ use crate::{
     error::{NvdecError, NvdecResult},
     ffi::{
         cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags, cudaVideoDeinterlaceMode,
-        cudaVideoSurfaceFormat, CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
-        CUdeviceptr, CUvideodecoder, CUDA_SUCCESS,
+        cudaVideoSurfaceFormat, CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
+        CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
     },
     picparams::{build_cuvid_hevc_picparams, dump_cuvid_hevc_picparams, H265DpbState},
 };
@@ -301,8 +301,8 @@ fn hevc_rps_bit_count(
         bits += ue(rps.delta_idx_minus1); // delta_idx_minus1
         bits += ue(rps.abs_delta_rps_minus1 as u32); // abs_delta_rps_minus1
         bits += 1; // delta_rps_sign
-        // For each entry in the reference RPS + 1, there's a use_delta_flag
-        // and potentially a used_by_curr_pic_flag
+                   // For each entry in the reference RPS + 1, there's a use_delta_flag
+                   // and potentially a used_by_curr_pic_flag
         let ref_rps_idx = rps.delta_idx_minus1 as usize;
         // We can't easily compute the exact reference RPS size here,
         // so use a conservative estimate based on the current RPS
@@ -419,8 +419,14 @@ impl NvdecH265Decoder {
             info: Mutex::new(DecoderInfo {
                 backend: "nvdec".to_string(),
                 codec: VideoCodec::DecodeH265,
-                coded_size: Extent2D { width: 0, height: 0 },
-                display_size: Extent2D { width: 0, height: 0 },
+                coded_size: Extent2D {
+                    width: 0,
+                    height: 0,
+                },
+                display_size: Extent2D {
+                    width: 0,
+                    height: 0,
+                },
                 chroma_subsampling: ChromaSubsampling::_420,
                 luma_bit_depth: ComponentBitDepth::Bit8,
                 chroma_bit_depth: ComponentBitDepth::Bit8,
@@ -507,13 +513,19 @@ impl NvdecH265Decoder {
                             // before each CRA) was misdetected as a resolution
                             // change, triggering recreate_decoder and wiping the
                             // DPB's stale refs that a CRA needs to decode.
-                            let log2_ctb_size = h265_sps.log2_min_luma_coding_block_size_minus3 as u32
-                                + h265_sps.log2_diff_max_min_luma_coding_block_size as u32 + 2;
+                            let log2_ctb_size = h265_sps.log2_min_luma_coding_block_size_minus3
+                                as u32
+                                + h265_sps.log2_diff_max_min_luma_coding_block_size as u32
+                                + 2;
                             let ctb_size = 1u32 << log2_ctb_size;
                             let coded_width =
-                                ((h265_sps.pic_width_in_luma_samples as u32 + ctb_size - 1) / ctb_size) * ctb_size;
+                                ((h265_sps.pic_width_in_luma_samples as u32 + ctb_size - 1)
+                                    / ctb_size)
+                                    * ctb_size;
                             let coded_height =
-                                ((h265_sps.pic_height_in_luma_samples as u32 + ctb_size - 1) / ctb_size) * ctb_size;
+                                ((h265_sps.pic_height_in_luma_samples as u32 + ctb_size - 1)
+                                    / ctb_size)
+                                    * ctb_size;
                             let resolution_changed =
                                 prev_w != coded_width || prev_h != coded_height;
                             if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
@@ -534,7 +546,8 @@ impl NvdecH265Decoder {
                                 }
                             }
                             // POC wrap period from the SPS.
-                            self.poc_period = 1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+                            self.poc_period =
+                                1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
                         }
                     }
                 }
@@ -573,12 +586,12 @@ impl NvdecH265Decoder {
 
                     // Reset DPB on IRAP (IDR) pictures.
                     if info.is_idr {
-                         let mut dpb = self.dpb.lock().unwrap();
-                         dpb.reset();
-                         self.poc_cycle = 0;
-                         self.prev_decoded_poc = None;
-                         self.last_decoded = None;
-                     }
+                        let mut dpb = self.dpb.lock().unwrap();
+                        dpb.reset();
+                        self.poc_cycle = 0;
+                        self.prev_decoded_poc = None;
+                        self.last_decoded = None;
+                    }
                     if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
                         let dpb = self.dpb.lock().unwrap();
                         let occ: Vec<i32> = dpb
@@ -608,13 +621,21 @@ impl NvdecH265Decoder {
                             let s0: Vec<i32> = (0..r.num_negative_pics as usize)
                                 .map(|i| {
                                     let st = r.delta_poc_s0_minus1[i] as i32;
-                                    if st > 32767 { st - 65536 } else { st }
+                                    if st > 32767 {
+                                        st - 65536
+                                    } else {
+                                        st
+                                    }
                                 })
                                 .collect();
                             let s1: Vec<i32> = (0..r.num_positive_pics as usize)
                                 .map(|i| {
                                     let st = r.delta_poc_s1_minus1[i] as i32;
-                                    if st > 32767 { st - 65536 } else { st }
+                                    if st > 32767 {
+                                        st - 65536
+                                    } else {
+                                        st
+                                    }
                                 })
                                 .collect();
                             eprintln!(
@@ -679,10 +700,7 @@ impl NvdecH265Decoder {
                             s0.sort_by(|a, b| b.cmp(a));
                             s1.sort();
                             if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                                eprintln!(
-                                    "[dbg-cra] poc={} dpb_s0={:?} dpb_s1={:?}",
-                                    poc, s0, s1
-                                );
+                                eprintln!("[dbg-cra] poc={} dpb_s0={:?} dpb_s1={:?}", poc, s0, s1);
                             }
                             direct_rps_bit_count(poc, &s0, &s1)
                         } else {
@@ -768,7 +786,10 @@ impl NvdecH265Decoder {
                     // DEBUG: dump the reference surfaces (as the decoder will see
                     // them) BEFORE decoding, when NVDEC_DUMP_REFS is set.
                     if std::env::var("NVDEC_DUMP_REFS").is_ok() {
-                        for (list, arr) in [("l0", &dpb_state.st_curr_before), ("l1", &dpb_state.st_curr_after)] {
+                        for (list, arr) in [
+                            ("l0", &dpb_state.st_curr_before),
+                            ("l1", &dpb_state.st_curr_after),
+                        ] {
                             let n = if list == "l0" {
                                 dpb_state.num_poc_st_curr_before
                             } else {
@@ -788,10 +809,7 @@ impl NvdecH265Decoder {
                     }
 
                     let result = unsafe {
-                        (funcs.decode_picture)(
-                            decoder_handle as *mut std::ffi::c_void,
-                            &picparams,
-                        )
+                        (funcs.decode_picture)(decoder_handle as *mut std::ffi::c_void, &picparams)
                     };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(
@@ -835,7 +853,9 @@ impl NvdecH265Decoder {
                         let st = decode_status.decodeStatus;
                         let st_name = match st {
                             crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Invalid => "Invalid",
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress => "InProgress",
+                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress => {
+                                "InProgress"
+                            }
                             crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Success => "Success",
                             crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error => "Error",
                             crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error_Concealed => {
@@ -874,7 +894,8 @@ impl NvdecH265Decoder {
 
                     // Track for display-order presentation.
                     let unwrapped = self.unwrapped_poc(poc);
-                    self.reorder.insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
+                    self.reorder
+                        .insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
 
                     self.extract_ready_frames();
                 }
@@ -916,7 +937,11 @@ impl NvdecH265Decoder {
                 continue;
             }
             let stored = rps.delta_poc_s0_minus1[i] as i32;
-            let signed = if stored > 32767 { stored - 65536 } else { stored };
+            let signed = if stored > 32767 {
+                stored - 65536
+            } else {
+                stored
+            };
             ref_s0.push(info.curr_pic_order_cnt_val + signed);
         }
 
@@ -927,7 +952,11 @@ impl NvdecH265Decoder {
                 continue;
             }
             let stored = rps.delta_poc_s1_minus1[i] as i32;
-            let signed = if stored > 32767 { stored - 65536 } else { stored };
+            let signed = if stored > 32767 {
+                stored - 65536
+            } else {
+                stored
+            };
             ref_s1.push(info.curr_pic_order_cnt_val + signed);
         }
 
@@ -939,7 +968,8 @@ impl NvdecH265Decoder {
         // Calculate CTB (Coding Tree Block) size for proper surface alignment.
         // Matches CUVID's alignment: surfaces are CTB-aligned, not 16-pixel aligned.
         let log2_ctb_size = sps.log2_min_luma_coding_block_size_minus3 as u32
-            + sps.log2_diff_max_min_luma_coding_block_size as u32 + 2;
+            + sps.log2_diff_max_min_luma_coding_block_size as u32
+            + 2;
         let ctb_size = 1u32 << log2_ctb_size;
 
         let pic_width = sps.pic_width_in_luma_samples as u32;
@@ -1106,7 +1136,10 @@ impl NvdecH265Decoder {
 
     /// Recreate the decoder due to a resolution change.
     fn recreate_decoder(&mut self, sps: &H265Sps) -> NvdecResult<()> {
-        eprintln!("[recreate] decoder recreated {}x{}", sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples);
+        eprintln!(
+            "[recreate] decoder recreated {}x{}",
+            sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples
+        );
         let funcs = get_funcs()?;
         let _ = cu_ctx_set_current();
         let decoder_handle = {
@@ -1304,8 +1337,7 @@ impl NvdecH265Decoder {
             }
         };
         let pinned_y = pinned_base;
-        let pinned_uv =
-            unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
+        let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         let mut copy_y = CUDA_MEMCPY2D {
             srcXInBytes: crop_left as u64,
@@ -1624,8 +1656,9 @@ impl NvdecH265Decoder {
             histogram_dptr: std::ptr::null_mut(),
             Reserved2: [std::ptr::null_mut()],
         };
-        if unsafe { (funcs.map_video_frame64)(decoder, surface_idx, &mut dev_ptr, &mut pitch, &proc_params) }
-            != CUDA_SUCCESS
+        if unsafe {
+            (funcs.map_video_frame64)(decoder, surface_idx, &mut dev_ptr, &mut pitch, &proc_params)
+        } != CUDA_SUCCESS
         {
             return;
         }
@@ -1723,11 +1756,8 @@ impl Decoder for NvdecH265Decoder {
             let mut pending = self.pending_frames.lock().unwrap();
             pending.drain(..).collect()
         };
-        let remaining: Vec<((i32, i32), (i32, i32, i32))> = self
-            .reorder
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
+        let remaining: Vec<((i32, i32), (i32, i32, i32))> =
+            self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
         for (key, (pic_index, seq, poc)) in remaining {
             if let Some(frame) = self.extract_frame(pic_index, seq, poc) {
                 self.last_presented_unwrapped = Some(key.0);

@@ -348,10 +348,13 @@ pub fn find_next_start_code(data: &[u8], start: usize) -> Option<(usize, usize)>
         }
         // Check for 3-byte start code: 0x00 0x00 0x01
         // Must NOT be preceded by 0x00 (to avoid matching inside RBSP data)
-        else if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1
-            && (i == 0 || remaining[i - 1] != 0) {
-                return Some((start + i, 3));
-            }
+        else if remaining[i] == 0
+            && remaining[i + 1] == 0
+            && remaining[i + 2] == 1
+            && (i == 0 || remaining[i - 1] != 0)
+        {
+            return Some((start + i, 3));
+        }
         i += 1;
     }
     None

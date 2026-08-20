@@ -5,11 +5,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 #[test]
 fn dump_mmco() {
-    let data = std::fs::read(format!(
-        "{}/assets/bframe_test.h264",
-        PROJECT_ROOT
-    ))
-    .unwrap();
+    let data = std::fs::read(format!("{}/assets/bframe_test.h264", PROJECT_ROOT)).unwrap();
     let mut parser = H264Parser::new();
     let packet = BitstreamPacket::new(data);
     let mut pic = 0;
@@ -39,17 +35,29 @@ fn dump_mmco() {
                     let ops: Vec<String> = h
                         .dec_ref_pic_marking
                         .iter()
-                        .map(|e| format!("op{}(v={})", e.memory_management_control_operation, e.value))
+                        .map(|e| {
+                            format!("op{}(v={})", e.memory_management_control_operation, e.value)
+                        })
                         .collect();
                     let mod0: Vec<String> = h
                         .ref_pic_list_modification_l0
                         .iter()
-                        .map(|e| format!("L0[i={} len={} op={} d={}]", e.index, e.length, e.op, e.difference))
+                        .map(|e| {
+                            format!(
+                                "L0[i={} len={} op={} d={}]",
+                                e.index, e.length, e.op, e.difference
+                            )
+                        })
                         .collect();
                     let mod1: Vec<String> = h
                         .ref_pic_list_modification_l1
                         .iter()
-                        .map(|e| format!("L1[i={} len={} op={} d={}]", e.index, e.length, e.op, e.difference))
+                        .map(|e| {
+                            format!(
+                                "L1[i={} len={} op={} d={}]",
+                                e.index, e.length, e.op, e.difference
+                            )
+                        })
                         .collect();
                     eprintln!(
                         "pic {} fn={} poc_lsb={} st={} ref={} nal={} nref0={} nref1={} mods=[{} | {}] ops=[{}]",

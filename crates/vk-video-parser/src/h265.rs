@@ -5,11 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::nal::{self, H265NalUnitType, NalUnit};
-use crate::{
-    DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser,
-};
 use crate::bitreader::BitReader;
+use crate::nal::{self, H265NalUnitType, NalUnit};
+use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 
 /// Parsed slice header information for H.265.
 #[derive(Debug, Clone)]
@@ -108,9 +106,7 @@ impl H265Parser {
             active_vps: None,
             active_sps: None,
             active_pps: None,
-            detected_format: DetectedVideoFormat::new(
-                vk_video_core::codec::VideoCodec::DecodeH265,
-            ),
+            detected_format: DetectedVideoFormat::new(vk_video_core::codec::VideoCodec::DecodeH265),
             frame_count: 0,
             first_slice_header: None,
             // Initialize per VulkanH265Parser.cpp:110
@@ -134,7 +130,11 @@ impl H265Parser {
     ///
     /// For SPS: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=0
     /// For VPS: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=1
-    fn parse_ptl(r: &mut BitReader, max_sub_layers: u8, sub_layer_level_present: bool) -> ParserResult<(u8, u8, bool)> {
+    fn parse_ptl(
+        r: &mut BitReader,
+        max_sub_layers: u8,
+        sub_layer_level_present: bool,
+    ) -> ParserResult<(u8, u8, bool)> {
         // --- Profile fields (ProfilePresentFlag = 1) ---
         // general_profile_space(2) + general_tier_flag(1) + general_profile_idc(5) = 8 bits
         let profile_bits = r.read_bits(8)?;
@@ -202,22 +202,37 @@ impl H265Parser {
                     // Predicted from another matrix (scaling_list_pred_mode_flag == 0)
                     // Per H.265 spec 7.3.4.2: predMatrixId = matrixId + scaling_list_pred_matrix_id_delta
                     let scaling_list_pred_matrix_id_delta = r.read_ue()? as i32;
-                    let pred_matrix_id = ((matrix_id as i32) + scaling_list_pred_matrix_id_delta) as usize;
+                    let pred_matrix_id =
+                        ((matrix_id as i32) + scaling_list_pred_matrix_id_delta) as usize;
 
                     // Copy AC coefficients from predicted matrix
                     match size_id {
-                        0 => scaling_lists.scaling_list_4x4[matrix_id as usize] = scaling_lists.scaling_list_4x4[pred_matrix_id],
-                        1 => scaling_lists.scaling_list_8x8[matrix_id as usize] = scaling_lists.scaling_list_8x8[pred_matrix_id],
-                        2 => scaling_lists.scaling_list_16x16[matrix_id as usize] = scaling_lists.scaling_list_16x16[pred_matrix_id],
-                        3 => scaling_lists.scaling_list_32x32[matrix_id as usize] = scaling_lists.scaling_list_32x32[pred_matrix_id],
+                        0 => {
+                            scaling_lists.scaling_list_4x4[matrix_id as usize] =
+                                scaling_lists.scaling_list_4x4[pred_matrix_id]
+                        }
+                        1 => {
+                            scaling_lists.scaling_list_8x8[matrix_id as usize] =
+                                scaling_lists.scaling_list_8x8[pred_matrix_id]
+                        }
+                        2 => {
+                            scaling_lists.scaling_list_16x16[matrix_id as usize] =
+                                scaling_lists.scaling_list_16x16[pred_matrix_id]
+                        }
+                        3 => {
+                            scaling_lists.scaling_list_32x32[matrix_id as usize] =
+                                scaling_lists.scaling_list_32x32[pred_matrix_id]
+                        }
                         _ => {}
                     }
 
                     // Copy DC coefficients for 16x16 and 32x32
                     if size_id == 2 {
-                        scaling_lists.scaling_list_dc_coef_16x16[matrix_id as usize][0] = scaling_lists.scaling_list_dc_coef_16x16[pred_matrix_id][0];
+                        scaling_lists.scaling_list_dc_coef_16x16[matrix_id as usize][0] =
+                            scaling_lists.scaling_list_dc_coef_16x16[pred_matrix_id][0];
                     } else if size_id == 3 {
-                        scaling_lists.scaling_list_dc_coef_32x32[matrix_id as usize][0] = scaling_lists.scaling_list_dc_coef_32x32[pred_matrix_id][0];
+                        scaling_lists.scaling_list_dc_coef_32x32[matrix_id as usize][0] =
+                            scaling_lists.scaling_list_dc_coef_32x32[pred_matrix_id][0];
                     }
                 } else {
                     let coef_num = (1u32 << (4 + (size_id as u32) * 2)).min(64);
@@ -229,9 +244,11 @@ impl H265Parser {
                         next_coef = scaling_list_dc_coef_minus8 + 8;
                         // Store DC coefficient
                         if size_id == 2 {
-                            scaling_lists.scaling_list_dc_coef_16x16[matrix_id as usize][0] = next_coef as i8;
+                            scaling_lists.scaling_list_dc_coef_16x16[matrix_id as usize][0] =
+                                next_coef as i8;
                         } else {
-                            scaling_lists.scaling_list_dc_coef_32x32[matrix_id as usize][0] = next_coef as i8;
+                            scaling_lists.scaling_list_dc_coef_32x32[matrix_id as usize][0] =
+                                next_coef as i8;
                         }
                     }
 
@@ -244,10 +261,22 @@ impl H265Parser {
                         }
                         // Store coefficient in the appropriate array
                         match size_id {
-                            0 => scaling_lists.scaling_list_4x4[matrix_id as usize][i] = next_coef as u8,
-                            1 => scaling_lists.scaling_list_8x8[matrix_id as usize][i] = next_coef as u8,
-                            2 => scaling_lists.scaling_list_16x16[matrix_id as usize][i] = next_coef as u8,
-                            3 => scaling_lists.scaling_list_32x32[matrix_id as usize][i] = next_coef as u8,
+                            0 => {
+                                scaling_lists.scaling_list_4x4[matrix_id as usize][i] =
+                                    next_coef as u8
+                            }
+                            1 => {
+                                scaling_lists.scaling_list_8x8[matrix_id as usize][i] =
+                                    next_coef as u8
+                            }
+                            2 => {
+                                scaling_lists.scaling_list_16x16[matrix_id as usize][i] =
+                                    next_coef as u8
+                            }
+                            3 => {
+                                scaling_lists.scaling_list_32x32[matrix_id as usize][i] =
+                                    next_coef as u8
+                            }
                             _ => {}
                         }
                     }
@@ -347,12 +376,12 @@ impl H265Parser {
 
     /// Parse a short-term reference picture set (STRPS).
     /// Based on VulkanH265Parser.cpp:1730-1917.
-    /// 
+    ///
     /// For the direct encoding case (!inter_ref_pic_set_prediction_flag),
     /// the C++ computes cumulative POCs:
     ///   DeltaPocS0[i] = ((i == 0) ? 0 : DeltaPocS0[i-1]) - (delta_poc_s0_minus1[i] + 1)
     ///   DeltaPocS1[i] = ((i == 0) ? 0 : DeltaPocS1[i-1]) + (delta_poc_s1_minus1[i] + 1)
-    /// 
+    ///
     /// For the predictive encoding case (inter_ref_pic_set_prediction_flag),
     /// the RPS is resolved against a previous STRPS using delta-based prediction.
     /// This matches C++: VulkanH265Parser.cpp:1738-1862.
@@ -387,8 +416,15 @@ impl H265Parser {
             strps.abs_delta_rps_minus1 = r.read_ue()? as u16;
 
             // Resolve predictive RPS against reference STRPS
-            Self::resolve_predictive_rps(r, delta_rps_sign, strps.abs_delta_rps_minus1,
-                idx, delta_idx_minus1, prev_strps, &mut strps)?;
+            Self::resolve_predictive_rps(
+                r,
+                delta_rps_sign,
+                strps.abs_delta_rps_minus1,
+                idx,
+                delta_idx_minus1,
+                prev_strps,
+                &mut strps,
+            )?;
         } else {
             // Direct encoding
             // Matches C++: VulkanH265Parser.cpp:1870-1914
@@ -463,7 +499,11 @@ impl H265Parser {
         for i in 0..rstrps.num_negative_pics as usize {
             let stored = rstrps.delta_poc_s0_minus1[i] as i32;
             // Convert wrapped u16 back to negative cumulative offset
-            let delta_poc = if stored > 32767 { stored - 65536 } else { stored };
+            let delta_poc = if stored > 32767 {
+                stored - 65536
+            } else {
+                stored
+            };
             ref_delta_poc_s0.push(delta_poc);
         }
         // S1: stored as u16, positive cumulative offsets
@@ -590,7 +630,8 @@ impl H265Parser {
         let _reserved_16 = r.read_bits(16)?;
 
         // Parse profile_tier_level (VPS: ProfilePresentFlag=1, SubLayerLevelPresentFlag=1)
-        let (vps_profile_idc, vps_level_idc, vps_tier_flag) = Self::parse_ptl(&mut r, vps.vps_max_sub_layers_minus1, true)?;
+        let (vps_profile_idc, vps_level_idc, vps_tier_flag) =
+            Self::parse_ptl(&mut r, vps.vps_max_sub_layers_minus1, true)?;
         vps.profile_idc = vps_profile_idc;
         vps.level_idc = vps_level_idc;
         vps.tier_flag = vps_tier_flag;
@@ -661,7 +702,8 @@ impl H265Parser {
             vps.vps_extension_flag = r.read_bit()?;
         }
 
-        self.vps_cache.insert(vps.vps_video_parameter_set_id, vps.clone());
+        self.vps_cache
+            .insert(vps.vps_video_parameter_set_id, vps.clone());
         self.active_vps = Some(vps);
 
         Ok(self.active_vps.clone().unwrap())
@@ -679,7 +721,8 @@ impl H265Parser {
         let sps_temporal_id_nesting_flag = r.read_bit()?;
 
         // Parse profile_tier_level (SPS: SubLayerLevelPresentFlag=1 per H.265 spec)
-        let (sps_profile_idc, sps_level_idc, sps_tier_flag) = Self::parse_ptl(&mut r, sps_max_sub_layers_minus1, true)?;
+        let (sps_profile_idc, sps_level_idc, sps_tier_flag) =
+            Self::parse_ptl(&mut r, sps_max_sub_layers_minus1, true)?;
 
         let mut sps = vk_video_core::picture::H265Sps::new();
         sps.sps_video_parameter_set_id = sps_video_parameter_set_id;
@@ -717,12 +760,16 @@ impl H265Parser {
         // DPB management info (per VulkanH265Parser.cpp:500-515)
         // Read max_dec_pic_buffering_minus1, max_num_reorder_pics, max_latency_increase_plus1
         // for sub-layers [sps_sub_layer_ordering_info_present_flag ? 0 : sps_max_sub_layers_minus1 .. sps_max_sub_layers_minus1]
-        let dpb_start = if sps.sps_sub_layer_ordering_info_present_flag { 0 } else { sps_max_sub_layers_minus1 as usize };
-         for i in dpb_start..=(sps_max_sub_layers_minus1 as usize) {
-             sps.max_dec_pic_buffering_minus1[i] = r.read_ue()? as u8;
-              sps.max_num_reorder_pics[i] = r.read_ue()? as u8;
-              sps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
-          }
+        let dpb_start = if sps.sps_sub_layer_ordering_info_present_flag {
+            0
+        } else {
+            sps_max_sub_layers_minus1 as usize
+        };
+        for i in dpb_start..=(sps_max_sub_layers_minus1 as usize) {
+            sps.max_dec_pic_buffering_minus1[i] = r.read_ue()? as u8;
+            sps.max_num_reorder_pics[i] = r.read_ue()? as u8;
+            sps.max_latency_increase_plus1[i] = r.read_ue()? as u8;
+        }
         // Propagate DPB params from highest sublayer to all lower sublayers when flag=0 (spec NOTE)
         if !sps.sps_sub_layer_ordering_info_present_flag {
             let highest = sps_max_sub_layers_minus1 as usize;
@@ -902,7 +949,8 @@ impl H265Parser {
             }
         }
 
-        self.sps_cache.insert(sps.sps_seq_parameter_set_id, sps.clone());
+        self.sps_cache
+            .insert(sps.sps_seq_parameter_set_id, sps.clone());
         self.active_sps = Some(sps);
 
         Ok(self.active_sps.clone().unwrap())
@@ -988,7 +1036,9 @@ impl H265Parser {
         }
 
         // Get associated SPS for scaling list inheritance
-        let sps = self.sps_cache.get(&pps.pps_seq_parameter_set_id)
+        let sps = self
+            .sps_cache
+            .get(&pps.pps_seq_parameter_set_id)
             .ok_or(ParserError::InvalidBitstream)?;
 
         pps.pps_scaling_list_data_present_flag = r.read_bit()?;
@@ -1031,7 +1081,8 @@ impl H265Parser {
                 //   && max_transform_hierarchy_depth_intra > log2_min_luma_transform_block_size_minus2
                 // sps_sao_chroma_allowed_flag = sps_sao_luma_allowed_flag && chroma_format_idc != 3
                 let sps_sao_luma_allowed = sps.sample_adaptive_offset_enabled_flag
-                    && (sps.max_transform_hierarchy_depth_intra > sps.log2_min_luma_transform_block_size_minus2);
+                    && (sps.max_transform_hierarchy_depth_intra
+                        > sps.log2_min_luma_transform_block_size_minus2);
                 let sps_sao_chroma_allowed = sps_sao_luma_allowed && (sps.chroma_format_idc != 3);
                 if sps_sao_luma_allowed {
                     pps.log2_sao_offset_scale_luma = r.read_ue()? as u8;
@@ -1042,14 +1093,16 @@ impl H265Parser {
             }
             if pps_multilayer_extension_flag {
                 let _poc_reset_info_present_flag = r.read_bit()?;
-                if r.read_bit()? { // infer_scaling_list_flag
+                if r.read_bit()? {
+                    // infer_scaling_list_flag
                     let _ = r.read_bits(6)?; // scaling_list_ref_layer_id
                 }
                 let _ = r.read_ue()?; // num_ref_loc_offsets
             }
         }
 
-        self.pps_cache.insert(pps.pps_pic_parameter_set_id, pps.clone());
+        self.pps_cache
+            .insert(pps.pps_pic_parameter_set_id, pps.clone());
         self.active_pps = Some(pps);
 
         Ok(self.active_pps.clone().unwrap())
@@ -1127,10 +1180,13 @@ impl H265Parser {
             };
 
             // slice_segment_address: CeilLog2(PicSizeInCtbsY) bits
-            let log2_ctb_size = sps.log2_min_luma_coding_block_size_minus3 as u32 + 3
+            let log2_ctb_size = sps.log2_min_luma_coding_block_size_minus3 as u32
+                + 3
                 + sps.log2_diff_max_min_luma_coding_block_size as u32;
-            let pic_width_in_ctbs = (sps.pic_width_in_luma_samples as u32 + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
-            let pic_height_in_ctbs = (sps.pic_height_in_luma_samples as u32 + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
+            let pic_width_in_ctbs =
+                (sps.pic_width_in_luma_samples as u32 + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
+            let pic_height_in_ctbs =
+                (sps.pic_height_in_luma_samples as u32 + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
             let pic_size_in_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
             let slice_segment_address_bits = (pic_size_in_ctbs as f64).log2().ceil() as u8;
             let _slice_segment_address = r.read_bits(slice_segment_address_bits)?;
@@ -1201,11 +1257,13 @@ impl H265Parser {
 
             if self.has_prev_pic {
                 if ((info.pic_order_cnt_lsb as i32) < self.prev_pic_order_cnt_lsb)
-                    && (self.prev_pic_order_cnt_lsb - info.pic_order_cnt_lsb as i32 >= max_pic_order_cnt_lsb as i32 / 2)
+                    && (self.prev_pic_order_cnt_lsb - info.pic_order_cnt_lsb as i32
+                        >= max_pic_order_cnt_lsb as i32 / 2)
                 {
                     pic_order_cnt_msb = self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb as i32;
                 } else if (info.pic_order_cnt_lsb as i32 > self.prev_pic_order_cnt_lsb)
-                    && (info.pic_order_cnt_lsb as i32 - self.prev_pic_order_cnt_lsb > max_pic_order_cnt_lsb as i32 / 2)
+                    && (info.pic_order_cnt_lsb as i32 - self.prev_pic_order_cnt_lsb
+                        > max_pic_order_cnt_lsb as i32 / 2)
                 {
                     pic_order_cnt_msb = self.prev_pic_order_cnt_msb - max_pic_order_cnt_lsb as i32;
                 } else {
@@ -1226,8 +1284,7 @@ impl H265Parser {
         let temporal_id = (nal_data[1] & 0x07) - 1; // nuh_temporal_id_plus1 - 1
         let is_rasl = nal_unit_type >= 22 && nal_unit_type <= 23;
         let is_sub_layer_non_ref = nal_unit_type % 2 == 0;
-        if temporal_id == 0 && !is_rasl && !is_sub_layer_non_ref
-        {
+        if temporal_id == 0 && !is_rasl && !is_sub_layer_non_ref {
             self.prev_pic_order_cnt_lsb = info.pic_order_cnt_lsb as i32;
             self.prev_pic_order_cnt_msb = pic_order_cnt_msb;
             self.has_prev_pic = true;
@@ -1271,7 +1328,8 @@ impl H265Parser {
 
                 for i in 0u8..(num_long_term_sps + num_long_term_pics) {
                     if i < num_long_term_sps && sps.num_long_term_ref_pics_sps > 1 {
-                        let lt_idx_bits = (sps.num_long_term_ref_pics_sps as f64).log2().ceil() as u8;
+                        let lt_idx_bits =
+                            (sps.num_long_term_ref_pics_sps as f64).log2().ceil() as u8;
                         let _ = r.read_bits(lt_idx_bits)?;
                     } else if i >= num_long_term_sps {
                         let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u8 + 4;
@@ -1393,9 +1451,10 @@ impl VideoParser for H265Parser {
                     let nal_data = nal.data.clone();
                     match self.parse_vps(&nal_data) {
                         Ok(_vps) => {
-                            result_vps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                self.active_vps.clone().unwrap(),
-                            ));
+                            result_vps =
+                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                    self.active_vps.clone().unwrap(),
+                                ));
                         }
                         Err(_) => {}
                     }
@@ -1408,17 +1467,31 @@ impl VideoParser for H265Parser {
                     let nal_data = nal.data.clone();
                     match self.parse_sps(&nal_data) {
                         Ok(sps) => {
-                            result_sps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                self.active_sps.clone().unwrap(),
-                            ));
+                            result_sps =
+                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                    self.active_sps.clone().unwrap(),
+                                ));
                             // Update detected format from SPS
                             self.detected_format.coded_width = sps.pic_width_in_luma_samples as u32;
-                            self.detected_format.coded_height = sps.pic_height_in_luma_samples as u32;
+                            self.detected_format.coded_height =
+                                sps.pic_height_in_luma_samples as u32;
                             match sps.chroma_format_idc {
-                                0 => self.detected_format.chroma_subsampling = vk_video_core::format::ChromaSubsampling::Monochrome,
-                                1 => self.detected_format.chroma_subsampling = vk_video_core::format::ChromaSubsampling::_420,
-                                2 => self.detected_format.chroma_subsampling = vk_video_core::format::ChromaSubsampling::_422,
-                                3 => self.detected_format.chroma_subsampling = vk_video_core::format::ChromaSubsampling::_444,
+                                0 => {
+                                    self.detected_format.chroma_subsampling =
+                                        vk_video_core::format::ChromaSubsampling::Monochrome
+                                }
+                                1 => {
+                                    self.detected_format.chroma_subsampling =
+                                        vk_video_core::format::ChromaSubsampling::_420
+                                }
+                                2 => {
+                                    self.detected_format.chroma_subsampling =
+                                        vk_video_core::format::ChromaSubsampling::_422
+                                }
+                                3 => {
+                                    self.detected_format.chroma_subsampling =
+                                        vk_video_core::format::ChromaSubsampling::_444
+                                }
                                 _ => {}
                             }
                             let luma_bd = 8 + sps.bit_depth_luma_minus8;
@@ -1449,9 +1522,10 @@ impl VideoParser for H265Parser {
                     let nal_data = nal.data.clone();
                     match self.parse_pps(&nal_data) {
                         Ok(_pps) => {
-                            result_pps = Some(vk_video_core::picture::BoxedPictureParametersSet::new(
-                                self.active_pps.clone().unwrap(),
-                            ));
+                            result_pps =
+                                Some(vk_video_core::picture::BoxedPictureParametersSet::new(
+                                    self.active_pps.clone().unwrap(),
+                                ));
                         }
                         Err(_) => {}
                     }
@@ -1489,14 +1563,16 @@ impl VideoParser for H265Parser {
 
                     // Parse the first slice header of this frame
                     if self.first_slice_header.is_none() {
-                        if let Ok(slice_info) = self.parse_slice_segment_header(&nal_data, nal_type) {
+                        if let Ok(slice_info) = self.parse_slice_segment_header(&nal_data, nal_type)
+                        {
                             self.first_slice_header = Some(slice_info);
                         }
                     }
 
                     // Collect slice NAL data
                     slice_nals.push(crate::SliceEntry {
-                        slice_header: self.first_slice_header
+                        slice_header: self
+                            .first_slice_header
                             .clone()
                             .map(crate::SliceHeader::H265),
                         nal_data,
@@ -1530,11 +1606,12 @@ impl VideoParser for H265Parser {
         } else if !slice_nals.is_empty() {
             self.nal_cursor = i;
             self.frame_count += 1;
-            let bytes_consumed = if let (Some(first_off), Some(last_end)) = (first_slice_offset, last_slice_end) {
-                last_end - first_off
-            } else {
-                0
-            };
+            let bytes_consumed =
+                if let (Some(first_off), Some(last_end)) = (first_slice_offset, last_slice_end) {
+                    last_end - first_off
+                } else {
+                    0
+                };
             // Clear first_slice_header so the next picture gets a fresh parse
             self.first_slice_header.take();
             Ok(ParseResult::Slice {
@@ -1763,26 +1840,20 @@ mod tests {
     /// VPS NAL unit from big_buck_bunney.h265 (type=32, 24 bytes)
     /// Hex: 40010c01ffff216000000300900000030000030078959809
     const TEST_VPS_DATA: &[u8] = &[
-        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x21, 0x60,
-        0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
-        0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09,
+        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x21, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09,
     ];
 
     /// SPS NAL unit from big_buck_bunney.h265 (type=33, 43 bytes)
     const TEST_SPS_DATA: &[u8] = &[
-        0x42, 0x01, 0x01, 0x21, 0x60, 0x00, 0x00, 0x03,
-        0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-        0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5,
-        0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0x10, 0x10,
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
-        0x01, 0xe0, 0x80,
+        0x42, 0x01, 0x01, 0x21, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5, 0x96, 0x56, 0x69, 0x24, 0xca, 0xf0,
+        0x10, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x80,
     ];
 
     /// PPS NAL unit from big_buck_bunney.h265 (type=34, 7 bytes)
     /// Hex: 4401c172b46240
-    const TEST_PPS_DATA: &[u8] = &[
-        0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40,
-    ];
+    const TEST_PPS_DATA: &[u8] = &[0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40];
 
     #[test]
     fn test_vps_parsing_alignment() {
@@ -1791,10 +1862,19 @@ mod tests {
         let vps = parser.parse_vps(TEST_VPS_DATA).expect("VPS parse failed");
 
         // VPS base fields (C++: video_parameter_set_rbsp() lines 908-941)
-        assert_eq!(vps.vps_video_parameter_set_id, 0, "vps_video_parameter_set_id");
+        assert_eq!(
+            vps.vps_video_parameter_set_id, 0,
+            "vps_video_parameter_set_id"
+        );
         assert_eq!(vps.vps_max_layers_minus1, 0, "vps_max_layers_minus1");
-        assert_eq!(vps.vps_max_sub_layers_minus1, 0, "vps_max_sub_layers_minus1");
-        assert!(vps.vps_temporal_id_nesting_flag, "vps_temporal_id_nesting_flag");
+        assert_eq!(
+            vps.vps_max_sub_layers_minus1, 0,
+            "vps_max_sub_layers_minus1"
+        );
+        assert!(
+            vps.vps_temporal_id_nesting_flag,
+            "vps_temporal_id_nesting_flag"
+        );
 
         // Profile/level (C++: profile_tier_level() lines 1631-1669)
         assert_eq!(vps.profile_idc, 1, "profile_idc (Main)");
@@ -1805,7 +1885,10 @@ mod tests {
         assert_eq!(vps.vps_num_layer_sets, 1, "vps_num_layer_sets");
 
         // VPS timing (C++: lines 991-1051)
-        assert!(!vps.vps_timing_info_present_flag, "vps_timing_info_present_flag");
+        assert!(
+            !vps.vps_timing_info_present_flag,
+            "vps_timing_info_present_flag"
+        );
     }
 
     #[test]
@@ -1915,8 +1998,16 @@ mod tests {
                 let detected = parser.detected_format();
                 assert_eq!(detected.coded_width, 1920, "coded_width from SPS");
                 assert_eq!(detected.coded_height, 1080, "coded_height from SPS");
-                assert_eq!(detected.chroma_subsampling, vk_video_core::format::ChromaSubsampling::_420, "chroma from SPS");
-                assert_eq!(detected.luma_bit_depth, vk_video_core::format::ComponentBitDepth::Bit8, "luma bit depth from SPS");
+                assert_eq!(
+                    detected.chroma_subsampling,
+                    vk_video_core::format::ChromaSubsampling::_420,
+                    "chroma from SPS"
+                );
+                assert_eq!(
+                    detected.luma_bit_depth,
+                    vk_video_core::format::ComponentBitDepth::Bit8,
+                    "luma bit depth from SPS"
+                );
             }
             _ => panic!("Expected ParameterSet result, got {:?}", result),
         }
@@ -1926,10 +2017,10 @@ mod tests {
     fn test_ptl_parsing_alignment() {
         // Test PTL parsing matches C++ profile_tier_level() exactly
         // C++: lines 1631-1669
-        
+
         // SPS PTL: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=0
         // VPS PTL: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=1
-        
+
         // Test SPS PTL (max_sub_layers=0, sub_layer_level_present=false)
         let sps_ptl_data: Vec<u8> = vec![
             0x21, // profile_space=0, tier=0, idc=1 (8 bits)
@@ -1937,7 +2028,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // source+reserved (48 bits)
             0x78, // level_idc = 120 (level 4.0)
         ];
-        
+
         let mut r = BitReader::new(&sps_ptl_data, false);
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, false).unwrap();
         assert_eq!(profile, 1, "SPS profile_idc");
@@ -1951,7 +2042,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // source+reserved (48 bits)
             0x78, // level_idc = 120 (level 4.0)
         ];
-        
+
         let mut r = BitReader::new(&vps_ptl_data, false);
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, true).unwrap();
         assert_eq!(profile, 1, "VPS profile_idc");
@@ -2050,7 +2141,11 @@ mod tests {
                 continue;
             }
             let stored = rps.delta_poc_s0_minus1[i] as i32;
-            let signed = if stored > 32767 { stored - 65536 } else { stored };
+            let signed = if stored > 32767 {
+                stored - 65536
+            } else {
+                stored
+            };
             ref_s0.push(curr_poc + signed);
         }
 
@@ -2060,7 +2155,11 @@ mod tests {
                 continue;
             }
             let stored = rps.delta_poc_s1_minus1[i] as i32;
-            let signed = if stored > 32767 { stored - 65536 } else { stored };
+            let signed = if stored > 32767 {
+                stored - 65536
+            } else {
+                stored
+            };
             ref_s1.push(curr_poc + signed);
         }
 
@@ -2082,15 +2181,35 @@ mod tests {
 
         // Set bit 0 and bit 2 for S0
         rps.used_by_curr_pic_s0_flag = 0b101; // bits 0 and 2
-        // Set bit 1 for S1
+                                              // Set bit 1 for S1
         rps.used_by_curr_pic_s1_flag = 0b010; // bit 1
 
         // Verify bit extraction
-        assert_eq!((rps.used_by_curr_pic_s0_flag >> 0) & 1, 1, "S0 bit 0 should be set");
-        assert_eq!((rps.used_by_curr_pic_s0_flag >> 1) & 1, 0, "S0 bit 1 should be clear");
-        assert_eq!((rps.used_by_curr_pic_s0_flag >> 2) & 1, 1, "S0 bit 2 should be set");
-        assert_eq!((rps.used_by_curr_pic_s1_flag >> 0) & 1, 0, "S1 bit 0 should be clear");
-        assert_eq!((rps.used_by_curr_pic_s1_flag >> 1) & 1, 1, "S1 bit 1 should be set");
+        assert_eq!(
+            (rps.used_by_curr_pic_s0_flag >> 0) & 1,
+            1,
+            "S0 bit 0 should be set"
+        );
+        assert_eq!(
+            (rps.used_by_curr_pic_s0_flag >> 1) & 1,
+            0,
+            "S0 bit 1 should be clear"
+        );
+        assert_eq!(
+            (rps.used_by_curr_pic_s0_flag >> 2) & 1,
+            1,
+            "S0 bit 2 should be set"
+        );
+        assert_eq!(
+            (rps.used_by_curr_pic_s1_flag >> 0) & 1,
+            0,
+            "S1 bit 0 should be clear"
+        );
+        assert_eq!(
+            (rps.used_by_curr_pic_s1_flag >> 1) & 1,
+            1,
+            "S1 bit 1 should be set"
+        );
     }
 
     // =========================================================================
@@ -2110,7 +2229,7 @@ mod tests {
         assert_eq!(ref_strps.num_negative_pics, 1);
         assert_eq!(ref_strps.num_positive_pics, 1);
         assert_eq!(ref_strps.delta_poc_s0_minus1[0], 65535); // -1
-        assert_eq!(ref_strps.delta_poc_s1_minus1[0], 1);     // +1
+        assert_eq!(ref_strps.delta_poc_s1_minus1[0], 1); // +1
 
         // Verify the reference RPS has correct used flags
         assert_eq!(ref_strps.used_by_curr_pic_s0_flag, 1);
@@ -2179,10 +2298,7 @@ mod tests {
         match idr_result {
             ParseResult::Slice { slices, .. } => {
                 if let Some(crate::SliceHeader::H265(info)) = &slices[0].slice_header {
-                    assert_eq!(
-                        info.curr_pic_order_cnt_val, 0,
-                        "IDR POC should always be 0"
-                    );
+                    assert_eq!(info.curr_pic_order_cnt_val, 0, "IDR POC should always be 0");
                 }
             }
             other => panic!("Expected Slice, got {:?}", other),
@@ -2232,7 +2348,8 @@ mod tests {
 
         // Verify SAO conditions for the test SPS
         let sao_luma_allowed = sps.sample_adaptive_offset_enabled_flag
-            && (sps.max_transform_hierarchy_depth_intra > sps.log2_min_luma_transform_block_size_minus2);
+            && (sps.max_transform_hierarchy_depth_intra
+                > sps.log2_min_luma_transform_block_size_minus2);
 
         if sao_luma_allowed {
             // The test SPS has SAO enabled and depth_intra >= min_transform_block_size
@@ -2255,10 +2372,16 @@ mod tests {
         let pps = parser.active_pps().expect("No active PPS");
 
         // The test PPS from big_buck_bunny has pps_extension_present_flag = false
-        assert!(!pps.pps_extension_present_flag, "Test PPS should not have extension");
+        assert!(
+            !pps.pps_extension_present_flag,
+            "Test PPS should not have extension"
+        );
         // Therefore SAO scale fields should be at default values
         assert_eq!(pps.log2_sao_offset_scale_luma, 0, "Default SAO luma scale");
-        assert_eq!(pps.log2_sao_offset_scale_chroma, 0, "Default SAO chroma scale");
+        assert_eq!(
+            pps.log2_sao_offset_scale_chroma, 0,
+            "Default SAO chroma scale"
+        );
     }
 
     // =========================================================================
@@ -2285,10 +2408,22 @@ mod tests {
         parser.reset();
 
         // Verify caches are cleared
-        assert!(parser.active_sps().is_none(), "SPS should be cleared after reset");
-        assert!(parser.active_pps().is_none(), "PPS should be cleared after reset");
-        assert!(parser.active_vps.is_none(), "VPS should be cleared after reset");
-        assert!(parser.first_slice_header().is_none(), "first_slice_header should be cleared");
+        assert!(
+            parser.active_sps().is_none(),
+            "SPS should be cleared after reset"
+        );
+        assert!(
+            parser.active_pps().is_none(),
+            "PPS should be cleared after reset"
+        );
+        assert!(
+            parser.active_vps.is_none(),
+            "VPS should be cleared after reset"
+        );
+        assert!(
+            parser.first_slice_header().is_none(),
+            "first_slice_header should be cleared"
+        );
     }
 
     /// Test that frame_count is incremented correctly.

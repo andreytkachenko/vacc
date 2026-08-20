@@ -460,10 +460,8 @@ impl Vp9Decoder {
         dep_info: &vk::DependencyInfo<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdPipelineBarrier2KHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdPipelineBarrier2KHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -482,10 +480,8 @@ impl Vp9Decoder {
         info: &vk::VideoBeginCodingInfoKHR<'_>,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdBeginVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdBeginVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -502,10 +498,8 @@ impl Vp9Decoder {
     // Helper: dispatch cmdDecodeVideoKHR
     fn cmd_decode_video(&self, cmd_buffer: vk::CommandBuffer, info: &vk::VideoDecodeInfoKHR<'_>) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdDecodeVideoKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdDecodeVideoKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -526,10 +520,8 @@ impl Vp9Decoder {
             _marker: Default::default(),
         };
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdControlVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdControlVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -553,10 +545,8 @@ impl Vp9Decoder {
         };
 
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdEndVideoCodingKHR".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdEndVideoCodingKHR".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
@@ -753,8 +743,7 @@ pub struct StdVideoVP9LoopFilterFlags {
 
 /// VP9 Loop filter (from vulkan_video_codec_vp9std.h).
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StdVideoVP9LoopFilter {
     pub flags: StdVideoVP9LoopFilterFlags,
     pub loop_filter_level: u8,
@@ -764,7 +753,6 @@ pub struct StdVideoVP9LoopFilter {
     pub update_mode_delta: u8,
     pub loop_filter_mode_deltas: [i8; 2], // STD_VIDEO_VP9_LOOP_FILTER_ADJUSTMENTS = 2
 }
-
 
 /// VP9 Segmentation flags (from vulkan_video_codec_vp9std.h).
 /// Bitfield: 4 flags + 28 reserved = 4 bytes.
