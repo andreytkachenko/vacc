@@ -949,14 +949,44 @@ impl NvdecH265Decoder {
         let coded_width = ((pic_width + ctb_size - 1) / ctb_size) * ctb_size;
         let coded_height = ((pic_height + ctb_size - 1) / ctb_size) * ctb_size;
 
-        // Display area: use SPS picture dimensions (matches CUVID's behavior).
-        // CUVID sets display_area to the full coded size, not the conformance window.
-        let display_left: i32 = 0;
-        let display_top: i32 = 0;
-        let display_right = coded_width as i32;
-        let display_bottom = coded_height as i32;
-        let display_width = coded_width;
-        let display_height = coded_height;
+        // Display area: the actual picture region within the CTB-padded surface.
+        // The surface is CTB-aligned (coded_width x coded_height), but the real
+        // picture is pic_width x pic_height. Apply the SPS conformance window
+        // crop (offsets are in chroma-sample units; scale to luma samples by the
+        // chroma subsampling factor).
+        let (sub_w, sub_h) = match sps.chroma_format_idc {
+            0 => (1, 1), // 4:0:0
+            1 => (2, 2), // 4:2:0
+            2 => (2, 1), // 4:2:2
+            _ => (1, 1), // 4:4:4
+        };
+        let crop_left = if sps.conformance_window_flag {
+            sps.conf_win_left_offset * sub_w
+        } else {
+            0
+        };
+        let crop_top = if sps.conformance_window_flag {
+            sps.conf_win_top_offset * sub_h
+        } else {
+            0
+        };
+        let crop_right = if sps.conformance_window_flag {
+            sps.conf_win_right_offset * sub_w
+        } else {
+            0
+        };
+        let crop_bottom = if sps.conformance_window_flag {
+            sps.conf_win_bottom_offset * sub_h
+        } else {
+            0
+        };
+
+        let display_left = crop_left as i32;
+        let display_top = crop_top as i32;
+        let display_right = (pic_width - crop_right) as i32;
+        let display_bottom = (pic_height - crop_bottom) as i32;
+        let display_width = (display_right - display_left) as u32;
+        let display_height = (display_bottom - display_top) as u32;
 
         let output_format = if sps.bit_depth_luma_minus8 > 0 {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_P016
@@ -982,11 +1012,14 @@ impl NvdecH265Decoder {
             ulMaxWidth: coded_width as _,
             ulMaxHeight: coded_height as _,
             Reserved1: 0,
+            // The decoder's display_area must match ulTargetWidth/Height (the
+            // CTB-aligned coded size) or cuvid scales the output. The actual
+            // picture crop is applied during readback via `display_area` below.
             display_area: CUVIDRECT {
-                left: display_left as _,
-                top: display_top as _,
-                right: display_right as _,
-                bottom: display_bottom as _,
+                left: 0,
+                top: 0,
+                right: coded_width as _,
+                bottom: coded_height as _,
             },
             OutputFormat: output_format,
             DeinterlaceMode: cudaVideoDeinterlaceMode::cudaVideoDeinterlaceMode_Weave,
