@@ -331,7 +331,7 @@ impl<'a> BitReader<'a> {
 
         // Bits remaining in current byte
         if self.bits_left > 0 {
-            let mask = (1u8 << self.bits_left) - 1;
+            let mask = ((1u16 << self.bits_left) - 1) as u8;
             remaining_value = (self.curr_byte & mask) as u64;
             remaining_bits = self.bits_left as u32;
         }

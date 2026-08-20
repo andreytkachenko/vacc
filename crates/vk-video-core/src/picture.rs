@@ -555,7 +555,16 @@ pub struct H265Sps {
     pub pcm_loop_filter_disabled_flag: bool,
     pub sps_extension_present_flag: bool,
     pub sps_range_extension_flag: bool,
+    // Range extension flags (only valid when sps_range_extension_flag == 1)
+    pub transform_skip_rotation_enabled_flag: bool,
+    pub transform_skip_context_enabled_flag: bool,
+    pub implicit_rdpcm_enabled_flag: bool,
+    pub explicit_rdpcm_enabled_flag: bool,
+    pub extended_precision_processing_flag: bool,
     pub intra_smoothing_disabled_flag: bool,
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    pub cabac_bypass_alignment_enabled_flag: bool,
+    pub high_precision_offsets_enabled_flag: bool,
     pub palette_mode_enabled_flag: bool,
 }
 
@@ -647,9 +656,17 @@ impl H265Sps {
 
             pcm_loop_filter_disabled_flag: false,
             sps_extension_present_flag: false,
-            sps_range_extension_flag: false,
-            intra_smoothing_disabled_flag: false,
-            palette_mode_enabled_flag: false,
+             sps_range_extension_flag: false,
+             transform_skip_rotation_enabled_flag: false,
+             transform_skip_context_enabled_flag: false,
+             implicit_rdpcm_enabled_flag: false,
+             explicit_rdpcm_enabled_flag: false,
+             extended_precision_processing_flag: false,
+             intra_smoothing_disabled_flag: false,
+             persistent_rice_adaptation_enabled_flag: false,
+             cabac_bypass_alignment_enabled_flag: false,
+             high_precision_offsets_enabled_flag: false,
+             palette_mode_enabled_flag: false,
         }
     }
 }

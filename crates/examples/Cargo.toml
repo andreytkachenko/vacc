@@ -25,6 +25,14 @@ name = "decode_nvdec"
 path = "src/decode_nvdec.rs"
 
 [[example]]
+name = "decode_nvdec_h265"
+path = "src/decode_nvdec_h265.rs"
+
+[[example]]
+name = "diag_h265"
+path = "src/diag_h265.rs"
+
+[[example]]
 name = "test_nvdec_edge"
 path = "src/test_nvdec_edge.rs"
 

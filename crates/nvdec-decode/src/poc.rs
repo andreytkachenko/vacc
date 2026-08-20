@@ -16,6 +16,7 @@ pub struct PocCalculator {
     last_pic_order_cnt_cycle: i32, // PicOrderCntCycle of last reference frame
     num_ref_frames_in_pic_order_cnt_cycle: u32,
     prev_is_reference: bool,
+    has_prev_pic: bool,
 }
 
 impl PocCalculator {
@@ -37,6 +38,7 @@ impl PocCalculator {
             last_pic_order_cnt_cycle: 0,
             num_ref_frames_in_pic_order_cnt_cycle: 0,
             prev_is_reference: false,
+            has_prev_pic: false,
         }
     }
 
@@ -55,6 +57,7 @@ impl PocCalculator {
         self.last_pic_order_cnt = 0;
         self.last_pic_order_cnt_cycle = 0;
         self.prev_is_reference = false;
+        self.has_prev_pic = false;
     }
 
     /// Calculate the Picture Order Count for a slice.
@@ -89,12 +92,14 @@ impl PocCalculator {
         let max_pic_order_cnt_lsb = sps.max_pic_order_cnt_lsb as i32;
         let pic_order_cnt_lsb = slh.pic_order_cnt_lsb;
 
-        let pic_order_cnt_msb = if pic_order_cnt_lsb < self.prev_pic_order_cnt_lsb
+        let pic_order_cnt_msb = if self.has_prev_pic
+            && pic_order_cnt_lsb < self.prev_pic_order_cnt_lsb
             && (self.prev_pic_order_cnt_lsb - pic_order_cnt_lsb) >= max_pic_order_cnt_lsb / 2
         {
             // Large decrease → wrapped upward
             self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb
-        } else if pic_order_cnt_lsb > self.prev_pic_order_cnt_lsb
+        } else if self.has_prev_pic
+            && pic_order_cnt_lsb > self.prev_pic_order_cnt_lsb
             && (pic_order_cnt_lsb - self.prev_pic_order_cnt_lsb) > max_pic_order_cnt_lsb / 2
         {
             // Large increase → wrapped downward
@@ -106,6 +111,7 @@ impl PocCalculator {
 
         self.prev_pic_order_cnt_lsb = pic_order_cnt_lsb;
         self.prev_pic_order_cnt_msb = pic_order_cnt_msb;
+        self.has_prev_pic = true;
 
         pic_order_cnt_msb + pic_order_cnt_lsb
     }

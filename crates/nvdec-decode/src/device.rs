@@ -107,6 +107,8 @@ struct CudaFuncs {
     cu_init: unsafe extern "C" fn(u32) -> u32,
     cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> u32,
     cu_ctx_create_v2: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> u32,
+    cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> u32,
+    cu_device_primary_ctx_release: unsafe extern "C" fn(i32) -> u32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_ctx_synchronize: unsafe extern "C" fn() -> u32,
     cu_memcpy_2d: unsafe extern "C" fn(*const CUDA_MEMCPY2D) -> u32,
@@ -261,10 +263,15 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             .get::<unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> u32>(
                 b"cuCtxCreate_v2\0",
             )
-            .map_err(|e| {
-                NvdecError::LibLoadError(format!("Failed to resolve cuCtxCreate_v2: {}", e))
-            })?;
-
+            .map_err(|e| NvdecError::LibLoadError(format!("Failed to resolve cuCtxCreate_v2: {}", e)))?;
+        let cu_device_primary_ctx_retain = *lib
+            .get::<unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> u32>(
+                b"cuDevicePrimaryCtxRetain\0",
+            )
+            .map_err(|e| NvdecError::LibLoadError(format!("Failed to resolve cuDevicePrimaryCtxRetain: {}", e)))?;
+        let cu_device_primary_ctx_release = *lib
+            .get::<unsafe extern "C" fn(i32) -> u32>(b"cuDevicePrimaryCtxRelease\0")
+            .map_err(|e| NvdecError::LibLoadError(format!("Failed to resolve cuDevicePrimaryCtxRelease: {}", e)))?;
         let cu_ctx_set_current = *lib
             .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(b"cuCtxSetCurrent\0")
             .map_err(|e| {
@@ -341,6 +348,8 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             cu_init,
             cu_device_get,
             cu_ctx_create_v2,
+            cu_device_primary_ctx_retain,
+            cu_device_primary_ctx_release,
             cu_ctx_set_current,
             cu_ctx_synchronize,
             cu_memcpy_2d,

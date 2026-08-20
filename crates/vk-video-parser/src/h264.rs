@@ -1278,6 +1278,8 @@ impl VideoParser for H264Parser {
             // Clear current_frame_num for next frame
             self.current_frame_num = None;
             self.current_poc_lsb = None;
+            // Clear first_slice_header so the next picture gets a fresh parse
+            self.first_slice_header.take();
             Ok(ParseResult::Slice { slices, bytes_consumed })
         } else {
             self.nal_cursor = i;

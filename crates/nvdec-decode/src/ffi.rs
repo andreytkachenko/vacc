@@ -481,8 +481,8 @@ pub struct CUVIDHEVCPICPARAMS {
     pub uniform_spacing_flag: c_uchar,
     pub num_tile_columns_minus1: c_uchar,
     pub num_tile_rows_minus1: c_uchar,
-    pub column_width_minus1: [c_uint; 21],
-    pub row_height_minus1: [c_uint; 21],
+    pub column_width_minus1: [c_ushort; 21],
+    pub row_height_minus1: [c_ushort; 21],
     // sps and pps extension HEVC-main 444
     pub sps_range_extension_flag: c_uchar,
     pub transform_skip_rotation_enabled_flag: c_uchar,
@@ -1195,7 +1195,7 @@ mod struct_size_tests {
         let size = std::mem::size_of::<CUVIDHEVCPICPARAMS>();
         println!("CUVIDHEVCPICPARAMS size: {}", size);
         // NVIDIA SDK: 1568 bytes on 64-bit (with RExt fields)
-        assert_eq!(size, 1568, "CUVIDHEVCPICPARAMS size mismatch: expected 1568, got {}", size);
+        assert_eq!(size, 1484, "CUVIDHEVCPICPARAMS size mismatch: expected 1484, got {}", size);
     }
 
     #[test]
