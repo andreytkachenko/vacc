@@ -151,6 +151,8 @@
 //! - [`ffi`] — Raw FFI bindings for `cuviddec.h` types and functions
 //! - [`picparams`] — CUVIDPICPARAMS construction from parser output
 //! - [`poc`] — H.264 Picture Order Count calculation
+//! - [`vp9`] — VP9 decoder (`NvdecVp9Decoder`), DPB state, and
+//!   `CUVIDPICPARAMS` construction
 
 pub mod decoder;
 pub mod device;
@@ -160,6 +162,7 @@ pub mod ffi;
 pub mod h265;
 pub mod picparams;
 pub mod poc;
+pub mod vp9;
 
 pub use decoder::NvdecH264Decoder;
 pub use device::{
@@ -168,6 +171,7 @@ pub use device::{
 };
 pub use error::{NvdecError, NvdecResult};
 pub use h265::NvdecH265Decoder;
+pub use vp9::{build_cuvid_vp9_picparams, NvdecVp9Decoder, Vp9DpbState};
 
 /// Convenience type alias for the H.264 decoder.
 ///

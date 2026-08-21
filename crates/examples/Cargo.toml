@@ -14,6 +14,14 @@ path = "src/vulkan_decode.rs"
 name = "vulkan_decode_vp9"
 path = "src/vulkan_decode_vp9.rs"
 
+[[example]]
+name = "decode_nvdec_vp9_cuvid"
+path = "src/decode_nvdec_vp9_cuvid.rs"
+
+[[example]]
+name = "decode_nvdec_vp9"
+path = "src/decode_nvdec_vp9.rs"
+
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }

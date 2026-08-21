@@ -531,8 +531,15 @@ pub struct CUVIDHEVCPICPARAMS {
 }
 
 /// VP9 picture parameters
+///
+/// Layout matches the C struct in Video Codec SDK 12.0.16 (`cuviddec.h`)
+/// exactly: **220 bytes** on 64-bit Linux. The two C bitfield groups cannot be
+/// expressed in Rust, so they are represented as raw integers (`flags: u16`
+/// and `segment_flags: u8`) with getter/setter helpers using the x86-64
+/// LSB-first bit order.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct CUVIDVP9PICPARAMS {
     pub width: c_uint,
     pub height: c_uint,
@@ -540,19 +547,12 @@ pub struct CUVIDVP9PICPARAMS {
     pub GoldenRefIdx: c_uchar,
     pub AltRefIdx: c_uchar,
     pub colorSpace: c_uchar,
-    pub profile: c_uint,
-    pub frameContextIdx: c_uint,
-    pub frameType: c_uint,
-    pub showFrame: c_uint,
-    pub errorResilient: c_uint,
-    pub frameParallelDecoding: c_uint,
-    pub subSamplingX: c_uint,
-    pub subSamplingY: c_uint,
-    pub intraOnly: c_uint,
-    pub allow_high_precision_mv: c_uint,
-    pub refreshEntropyProbs: c_uint,
-    pub reserved2Bits: c_uint,
-    pub reserved16Bits: c_uint,
+    /// Packed bitfields (x86-64 LSB-first): profile:3 | frameContextIdx:2 |
+    /// frameType:1 | showFrame:1 | errorResilient:1 | frameParallelDecoding:1 |
+    /// subSamplingX:1 | subSamplingY:1 | intraOnly:1 | allow_high_precision_mv:1 |
+    /// refreshEntropyProbs:1 | reserved2Bits:2
+    pub flags: u16,
+    pub reserved16Bits: u16,
     pub refFrameSignBias: [c_uchar; 4],
     pub bitDepthMinus8Luma: c_uchar,
     pub bitDepthMinus8Chroma: c_uchar,
@@ -561,13 +561,11 @@ pub struct CUVIDVP9PICPARAMS {
     pub modeRefLfEnabled: c_uchar,
     pub log2_tile_columns: c_uchar,
     pub log2_tile_rows: c_uchar,
-    pub segmentEnabled: c_uint,
-    pub segmentMapUpdate: c_uint,
-    pub segmentMapTemporalUpdate: c_uint,
-    pub segmentFeatureMode: c_uint,
-    pub reserved4Bits: c_uint,
+    /// Packed bitfields: segmentEnabled:1 | segmentMapUpdate:1 |
+    /// segmentMapTemporalUpdate:1 | segmentFeatureMode:1 | reserved4Bits:4
+    pub segment_flags: u8,
     pub segmentFeatureEnable: [[c_uchar; 4]; 8],
-    pub segmentFeatureData: [[c_int; 4]; 8],
+    pub segmentFeatureData: [[i16; 4]; 8],
     pub mb_segment_tree_probs: [c_uchar; 7],
     pub segment_pred_probs: [c_uchar; 3],
     pub reservedSegment16Bits: [c_uchar; 2],
@@ -578,11 +576,170 @@ pub struct CUVIDVP9PICPARAMS {
     pub activeRefIdx: [c_uint; 3],
     pub resetFrameContext: c_uint,
     pub mcomp_filter_type: c_uint,
+    /// Values are signed i32 in practice (sign-extended i8 loop-filter deltas).
     pub mbRefLfDelta: [c_uint; 4],
     pub mbModeLfDelta: [c_uint; 2],
     pub frameTagSize: c_uint,
     pub offsetToDctParts: c_uint,
     pub reserved128Bits: [c_uint; 4],
+}
+
+// Verified against the SDK header: sizeof(CUVIDVP9PICPARAMS) == 220.
+const _: () = {
+    assert!(std::mem::size_of::<CUVIDVP9PICPARAMS>() == 220);
+};
+
+impl CUVIDVP9PICPARAMS {
+    /// Create a zeroed `CUVIDVP9PICPARAMS`.
+    pub fn new() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
+    // ── `flags` bitfields (u16, x86-64 LSB-first) ──────────────────────
+
+    /// VP9 profile (0-3). Bits 0-2.
+    pub fn profile(&self) -> u32 {
+        (self.flags & 0b111) as u32
+    }
+    pub fn set_profile(&mut self, v: u32) {
+        self.flags = (self.flags & !0b111) | ((v & 0b111) as u16);
+    }
+
+    /// Frame context index (0-3). Bits 3-4.
+    pub fn frame_context_idx(&self) -> u32 {
+        ((self.flags >> 3) & 0b11) as u32
+    }
+    pub fn set_frame_context_idx(&mut self, v: u32) {
+        self.flags = (self.flags & !(0b11 << 3)) | (((v & 0b11) as u16) << 3);
+    }
+
+    /// Frame type: 0 = key, 1 = inter. Bit 5.
+    pub fn frame_type(&self) -> u32 {
+        ((self.flags >> 5) & 1) as u32
+    }
+    pub fn set_frame_type(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 5)) | (((v & 1) as u16) << 5);
+    }
+
+    /// Show frame. Bit 6.
+    pub fn show_frame(&self) -> u32 {
+        ((self.flags >> 6) & 1) as u32
+    }
+    pub fn set_show_frame(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 6)) | (((v & 1) as u16) << 6);
+    }
+
+    /// Error resilient mode. Bit 7.
+    pub fn error_resilient(&self) -> u32 {
+        ((self.flags >> 7) & 1) as u32
+    }
+    pub fn set_error_resilient(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 7)) | (((v & 1) as u16) << 7);
+    }
+
+    /// Frame parallel decoding mode. Bit 8.
+    pub fn frame_parallel_decoding(&self) -> u32 {
+        ((self.flags >> 8) & 1) as u32
+    }
+    pub fn set_frame_parallel_decoding(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 8)) | (((v & 1) as u16) << 8);
+    }
+
+    /// Chroma subsampling x. Bit 9.
+    pub fn sub_sampling_x(&self) -> u32 {
+        ((self.flags >> 9) & 1) as u32
+    }
+    pub fn set_sub_sampling_x(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 9)) | (((v & 1) as u16) << 9);
+    }
+
+    /// Chroma subsampling y. Bit 10.
+    pub fn sub_sampling_y(&self) -> u32 {
+        ((self.flags >> 10) & 1) as u32
+    }
+    pub fn set_sub_sampling_y(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 10)) | (((v & 1) as u16) << 10);
+    }
+
+    /// Intra-only frame. Bit 11.
+    pub fn intra_only(&self) -> u32 {
+        ((self.flags >> 11) & 1) as u32
+    }
+    pub fn set_intra_only(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 11)) | (((v & 1) as u16) << 11);
+    }
+
+    /// Allow high-precision motion vectors. Bit 12.
+    pub fn allow_high_precision_mv(&self) -> u32 {
+        ((self.flags >> 12) & 1) as u32
+    }
+    pub fn set_allow_high_precision_mv(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 12)) | (((v & 1) as u16) << 12);
+    }
+
+    /// Refresh entropy probabilities (from `refresh_frame_context`). Bit 13.
+    pub fn refresh_entropy_probs(&self) -> u32 {
+        ((self.flags >> 13) & 1) as u32
+    }
+    pub fn set_refresh_entropy_probs(&mut self, v: u32) {
+        self.flags = (self.flags & !(1 << 13)) | (((v & 1) as u16) << 13);
+    }
+
+    /// Reserved. Bits 14-15.
+    pub fn reserved2_bits(&self) -> u32 {
+        ((self.flags >> 14) & 0b11) as u32
+    }
+    pub fn set_reserved2_bits(&mut self, v: u32) {
+        self.flags = (self.flags & !(0b11 << 14)) | (((v & 0b11) as u16) << 14);
+    }
+
+    // ── `segment_flags` bitfields (u8, x86-64 LSB-first) ───────────────
+
+    /// Segmentation enabled. Bit 0.
+    pub fn segment_enabled(&self) -> u32 {
+        (self.segment_flags & 1) as u32
+    }
+    pub fn set_segment_enabled(&mut self, v: u32) {
+        self.segment_flags = (self.segment_flags & !1) | ((v & 1) as u8);
+    }
+
+    /// Segmentation map update. Bit 1.
+    pub fn segment_map_update(&self) -> u32 {
+        ((self.segment_flags >> 1) & 1) as u32
+    }
+    pub fn set_segment_map_update(&mut self, v: u32) {
+        self.segment_flags = (self.segment_flags & !(1 << 1)) | (((v & 1) as u8) << 1);
+    }
+
+    /// Segmentation map temporal update. Bit 2.
+    pub fn segment_map_temporal_update(&self) -> u32 {
+        ((self.segment_flags >> 2) & 1) as u32
+    }
+    pub fn set_segment_map_temporal_update(&mut self, v: u32) {
+        self.segment_flags = (self.segment_flags & !(1 << 2)) | (((v & 1) as u8) << 2);
+    }
+
+    /// Segmentation feature data update mode. Bit 3.
+    pub fn segment_feature_mode(&self) -> u32 {
+        ((self.segment_flags >> 3) & 1) as u32
+    }
+    pub fn set_segment_feature_mode(&mut self, v: u32) {
+        self.segment_flags = (self.segment_flags & !(1 << 3)) | (((v & 1) as u8) << 3);
+    }
+
+    /// Reserved. Bits 4-7.
+    pub fn reserved4_bits(&self) -> u32 {
+        ((self.segment_flags >> 4) & 0b1111) as u32
+    }
+    pub fn set_reserved4_bits(&mut self, v: u32) {
+        self.segment_flags = (self.segment_flags & !(0b1111 << 4)) | (((v & 0b1111) as u8) << 4);
+    }
+}
+
+impl Default for CUVIDVP9PICPARAMS {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// AV1 picture parameters
@@ -1212,10 +1369,10 @@ mod struct_size_tests {
     fn test_cuvid_vp9_picparams_size() {
         let size = std::mem::size_of::<CUVIDVP9PICPARAMS>();
         println!("CUVIDVP9PICPARAMS size: {}", size);
-        // NVIDIA SDK: 352 bytes on 64-bit
+        // NVIDIA SDK: 220 bytes on 64-bit (packed C bitfields)
         assert_eq!(
-            size, 352,
-            "CUVIDVP9PICPARAMS size mismatch: expected 352, got {}",
+            size, 220,
+            "CUVIDVP9PICPARAMS size mismatch: expected 220, got {}",
             size
         );
     }

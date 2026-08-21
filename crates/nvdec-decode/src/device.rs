@@ -167,6 +167,18 @@ pub struct NvdecFuncs {
         i32,
         *mut crate::ffi::CUVIDGETDECODESTATUS,
     ) -> u32,
+    /// Create a video parser (`cuvidCreateVideoParser`).
+    pub create_video_parser: unsafe extern "C" fn(
+        *mut *mut std::ffi::c_void,
+        *const crate::ffi::CUVIDPARSERPARAMS,
+    ) -> u32,
+    /// Parse video data (`cuvidParseVideoData`).
+    pub parse_video_data: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *const crate::ffi::CUVIDSOURCEDATAPACKET,
+    ) -> u32,
+    /// Destroy a video parser (`cuvidDestroyVideoParser`).
+    pub destroy_video_parser: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
 }
 
 static CUDA_LIB: OnceLock<(Library, CudaFuncs)> = OnceLock::new();
@@ -501,6 +513,38 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
                 NvdecError::LibLoadError(format!("Failed to resolve cuvidGetDecodeStatus: {}", e))
             })?;
 
+        let create_video_parser = *lib
+            .get::<unsafe extern "C" fn(
+                *mut *mut std::ffi::c_void,
+                *const crate::ffi::CUVIDPARSERPARAMS,
+            ) -> u32>(b"cuvidCreateVideoParser\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!(
+                    "Failed to resolve cuvidCreateVideoParser: {}",
+                    e
+                ))
+            })?;
+
+        let parse_video_data = *lib
+            .get::<unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *const crate::ffi::CUVIDSOURCEDATAPACKET,
+            ) -> u32>(b"cuvidParseVideoData\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuvidParseVideoData: {}", e))
+            })?;
+
+        let destroy_video_parser = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(
+                b"cuvidDestroyVideoParser\0",
+            )
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!(
+                    "Failed to resolve cuvidDestroyVideoParser: {}",
+                    e
+                ))
+            })?;
+
         let funcs = NvdecFuncs {
             get_decoder_caps,
             create_decoder,
@@ -510,6 +554,9 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
             unmap_video_frame64,
             reconfigure_decoder,
             get_decode_status,
+            create_video_parser,
+            parse_video_data,
+            destroy_video_parser,
         };
 
         Ok((lib, funcs))

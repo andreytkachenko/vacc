@@ -606,10 +606,10 @@ fn test_ffi_struct_sizes() {
         "CUVIDCODECSPECIFIC size mismatch"
     );
 
-    // CUVIDVP9PICPARAMS: 352 bytes
+    // CUVIDVP9PICPARAMS: 220 bytes (packed C bitfields)
     assert_eq!(
         std::mem::size_of::<CUVIDVP9PICPARAMS>(),
-        352,
+        220,
         "CUVIDVP9PICPARAMS size mismatch"
     );
 
