@@ -140,12 +140,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "cros-libva"
 version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b1546af142fbf11a5cad3d1ee2ef64e4d7b69a28b244a79484024a1bc931c17"
 dependencies = [
  "bitflags",
+ "crc32fast",
  "log",
  "pkg-config",
  "thiserror 1.0.69",

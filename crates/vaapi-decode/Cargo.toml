@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
-libva = { package = "cros-libva", version = "0.0.7" }
+libva = { package = "cros-libva", path = "../libva" }
 memmap2 = "0.9"
 bitflags = { workspace = true }
 thiserror = { workspace = true }

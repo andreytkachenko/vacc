@@ -3,6 +3,8 @@ members = [
     "crates/vk-video-core",
     "crates/vk-video-parser",
     "crates/vk-video-vulkan",
+    "crates/vaapi-decode",
+    "crates/libva",
     "crates/examples",
 ]
 resolver = "2"

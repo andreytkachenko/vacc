@@ -155,14 +155,25 @@ fn frame_to_yuv420p(frame: &vk_video_core::frame::DecodedFrame) -> Vec<u8> {
             });
         }
 
-        // Copy U plane
+        // Copy U plane (handle NV12 vs planar)
         let u_pitch = pixel_data.u.pitch;
         let u_width = pixel_data.u.width;
-        for y in 0..uv_disp_h {
-            let src_start = y * u_pitch;
-            yuv_data.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(pixel_data.u.data.add(src_start), uv_disp_w.min(u_width))
-            });
+        if pixel_data.v.is_none() {
+            // NV12: U and V are interleaved. Deinterleave U (even bytes).
+            for y in 0..uv_disp_h {
+                let src_start = y * u_pitch;
+                for x in 0..uv_disp_w {
+                    let u_byte = unsafe { *pixel_data.u.data.add(src_start + x * 2) };
+                    yuv_data.push(u_byte);
+                }
+            }
+        } else {
+            for y in 0..uv_disp_h {
+                let src_start = y * u_pitch;
+                yuv_data.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(pixel_data.u.data.add(src_start), uv_disp_w.min(u_width))
+                });
+            }
         }
 
         // Copy V plane (handle NV12 vs planar)

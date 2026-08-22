@@ -22,5 +22,5 @@ ash = { workspace = true }
 vaapi-decode = { workspace = true }
 
 [[example]]
-name = "decode_vaapi"
-path = "src/decode_vaapi.rs"
+ name = "decode_vaapi"
+ path = "src/decode_vaapi.rs"

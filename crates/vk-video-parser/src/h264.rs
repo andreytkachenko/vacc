@@ -28,6 +28,14 @@ pub struct H264Parser {
     processed_up_to: usize,
     /// Current frame number being collected (to group slices by frame).
     current_frame_num: Option<u32>,
+    /// Cached NAL units of the current payload (rebuilt when payload size changes).
+    cached_nals: Vec<NalUnit>,
+    /// Length of the payload the NAL cache was built from.
+    cached_payload_len: usize,
+    /// Cursor index into `cached_nals` (next NAL to process).
+    nal_cursor: usize,
+    /// Current pic_order_cnt_lsb being collected (to group slices by frame).
+    current_poc_lsb: Option<i32>,
 }
 
 impl H264Parser {
@@ -48,6 +56,10 @@ impl H264Parser {
             idr_found: false,
             processed_up_to: 0,
             current_frame_num: None,
+            cached_nals: Vec::new(),
+            cached_payload_len: 0,
+            nal_cursor: 0,
+            current_poc_lsb: None,
         }
     }
 
@@ -399,7 +411,6 @@ impl H264Parser {
                 }
                 _ => {
                     // Invalid slice_group_map_type, but continue parsing
-                    eprintln!("[PPS] Invalid slice_group_map_type: {}", slice_group_map_type);
                 }
             }
         }
@@ -546,11 +557,19 @@ impl H264Parser {
         // Skip NAL header byte (1 byte), enable EPB removal
         let mut r = BitReader::new(&data[1..], true);
         let header_start_pos = r.position();
+        if std::env::var("DBG_H264").is_ok() && nal_ref_idc == 2 {
+            let hex: Vec<String> = data.iter().take(24).map(|b| format!("{:02x}", b)).collect();
+            eprintln!("[DBG-NALBYTES] nal_type={} ref_idc={} sz={} first24={}", nal_unit_type, nal_ref_idc, data.len(), hex.join(" "));
+        }
 
         let first_mb_in_slice = r.read_ue()?;
-        let slice_type = r.read_ue()? % 5;
+                let raw_slice_type = r.read_ue()?;
+        // Reduce the raw H.264 slice_type modulo 5 to the internal convention
+        // used throughout this codebase: 0=P, 1=B, 2=I, 3=SP, 4=SI. This matches
+        // the reference implementation and the VA-API driver's expectation
+        // (see h264_slice_type_to_vaapi in decoder.rs).
+        let slice_type = raw_slice_type % 5;
         let pps_id = r.read_ue()?;
-
         let pps = self
             .active_pps
             .as_ref()
@@ -568,7 +587,9 @@ impl H264Parser {
 
         let frame_num_bits = sps.log2_max_frame_num_minus4 as u32 + 4;
         let frame_num = r.read_bits(frame_num_bits as u8)?;
-
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PARSER] nal_type={} slice_type={} pps_id={} frame_num={} bitpos_after_fn={}", nal_unit_type, slice_type, pps_id, frame_num, r.position());
+        }
         let mut slh = SliceHeader {
             first_mb_in_slice,
             slice_type,
@@ -631,7 +652,7 @@ impl H264Parser {
         if sps.pic_order_cnt_type == 0 {
             let poc_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
             slh.pic_order_cnt_lsb = r.read_bits(poc_bits as u8)? as i32;
-            if pps.bottom_field_pic_order_in_frame_present_flag && !slh.field_pic_flag {
+                        if pps.bottom_field_pic_order_in_frame_present_flag && !slh.field_pic_flag {
                 slh.delta_pic_order_cnt[0] = r.read_se()?; // delta_pic_order_cnt_bottom
             }
         }
@@ -645,17 +666,28 @@ impl H264Parser {
         }
 
         // POC type 2: implicit, nothing to read
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_poc pos={} poc_lsb={}", r.position(), slh.pic_order_cnt_lsb);
+        }
 
         if pps.redundant_pic_cnt_present_flag {
             slh.redundant_pic_cnt = r.read_ue()? as i32;
         }
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_redundant pos={}", r.position());
+        }
 
-        // Slice type classification (H.264 spec: 0/P, 1/B, 2/SP, 3/SI, 4/I, +5 for field)
+        // Slice type classification. The streams (and the decoder's
+        // h264_slice_type_to_vaapi) use the convention 0=P, 1=B, 2=I, 3=SP,
+        // 4=SI (see decoder.rs:88). This must match the decoder so that an
+        // I-slice (2) does not read the P/SP-only ref-list / cabac_init_idc
+        // fields, which would shift the slice-data bit offset and corrupt
+        // CABAC decoding.
         let is_p = slice_type == 0 || slice_type == 5;
         let is_b = slice_type == 1 || slice_type == 6;
-        let is_sp = slice_type == 2 || slice_type == 7;
-        let is_i = slice_type == 4 || slice_type == 9;
-        let is_si = slice_type == 3 || slice_type == 8;
+        let is_i = slice_type == 2 || slice_type == 7;
+        let is_sp = slice_type == 3 || slice_type == 8;
+        let is_si = slice_type == 4 || slice_type == 9;
 
         // B-slice: direct_spatial_mv_pred_flag
         if is_b {
@@ -666,12 +698,15 @@ impl H264Parser {
 
         if is_p || is_sp || is_b {
             slh.num_ref_idx_active_override_flag = r.read_bit()?;
-            if slh.num_ref_idx_active_override_flag {
+                        if slh.num_ref_idx_active_override_flag {
                 slh.num_ref_idx_l0_active_minus1 = r.read_ue()?;
                 if is_b {
                     slh.num_ref_idx_l1_active_minus1 = r.read_ue()?;
                 }
             }
+        }
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_refidx pos={}", r.position());
         }
 
         // Reference picture list modification (for P/SP/B slices, H.264 spec 7.4.3)
@@ -679,9 +714,39 @@ impl H264Parser {
             let (mod_l0, mod_l1) = Self::parse_ref_pic_list_modification(&mut r, slice_type)?;
             slh.ref_pic_list_modification_l0 = mod_l0;
             slh.ref_pic_list_modification_l1 = mod_l1;
+                    }
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_refpicmod pos={}", r.position());
         }
 
         // Pred weight table
+        if std::env::var("DBG_H264").is_ok() && nal_ref_idc == 2 {
+            // Fresh decode to cross-check alignment: re-read from start to PWT.
+            let mut fr = BitReader::new(&data[1..], true);
+            let _ = fr.read_ue(); let _ = fr.read_ue(); let _ = fr.read_ue();
+            let _ = fr.read_bits(frame_num_bits as u8);
+            if sps.pic_order_cnt_type == 0 { let _ = fr.read_bits((sps.log2_max_pic_order_cnt_lsb_minus4 as u8)+4); }
+            let ov2 = fr.read_bit().unwrap_or(false);
+            if ov2 { let _ = fr.read_ue(); }
+            let m2 = fr.read_bit().unwrap_or(false);
+            if m2 {
+                loop {
+                    let idc = fr.read_ue().unwrap_or(3);
+                    if idc == 0 { let _ = fr.read_ue(); }
+                    else if idc == 1 { let _ = fr.read_bits(8); }
+                    if idc >= 3 { break; }
+                }
+            }
+            let ll2 = fr.read_ue().unwrap_or(0);
+            let cl2 = fr.read_ue().unwrap_or(0);
+            // L0[1] luma_off
+            let _ = fr.read_bit(); // L0[0] luma
+            let _ = fr.read_bit(); // L0[0] chroma
+            let lf1 = fr.read_bit().unwrap_or(false);
+            let lw1 = if lf1 { fr.read_se().unwrap_or(0) } else { 0 };
+            let lo1 = if lf1 { fr.read_se().unwrap_or(0) } else { 0 };
+            eprintln!("[DBG-FRESH] pwt pos={} luma_log2={} chroma_log2={} L0[1] luma_w={} luma_off={}", fr.position(), ll2, cl2, lw1, lo1);
+        }
          let has_pred_weight_table =
              (pps.weighted_pred_flag && (is_p || is_sp))
                  || (pps.weighted_bipred_idc == 1 && is_b);
@@ -721,11 +786,16 @@ impl H264Parser {
         // CABAC init IDC (not for I/SI slices)
         if pps.entropy_coding_mode_flag && !is_i && !is_si {
             slh.cabac_init_idc = r.read_ue()? as u8;
+                    }
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_mmco/cabac pos={} nal_ref_idc={}", r.position(), nal_ref_idc);
         }
 
         // Slice QP delta
         slh.slice_qp_delta = r.read_se()?;
-
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_qp pos={} qp={}", r.position(), slh.slice_qp_delta);
+        }
         // Deblocking filter parameters
         if pps.deblocking_filter_control_present_flag {
             slh.disable_deblocking_filter_idc = r.read_ue()? as i8;
@@ -734,11 +804,41 @@ impl H264Parser {
                 slh.slice_beta_offset_div2 = r.read_se()?;
             }
         }
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-SLH] after_deblock pos={}", r.position());
+        }
 
         // Calculate header bit size (bits consumed from slice header start)
         slh.header_bit_size = (r.position() - header_start_pos) as u16;
-
         Ok(slh)
+    }
+
+    /// Parse one ref_pic_list_modification() entry list (H.264 spec 7.4.3).
+    ///
+    /// Per spec, the value syntax element depends on the idc:
+    ///   0: difference_of_pic_nums_minus1  ue(v)
+    ///   1: long_term_pic_num              u(8)
+    ///   2: (no value — remove entry)
+    ///   3: (no value — end of list)
+    fn parse_ref_pic_list_mod_entries(r: &mut BitReader) -> ParserResult<Vec<RefPicListModificationEntry>> {
+        let mut entries = Vec::new();
+        loop {
+            let modification_of_pic_nums_idc = r.read_ue()?;
+            let value = match modification_of_pic_nums_idc {
+                0 => r.read_ue()?,   // difference_of_pic_nums_minus1
+                1 => r.read_bits(8)?, // long_term_pic_num
+                2 | 3 => 0,          // no value
+                _ => 0,              // invalid idc; stop after recording
+            };
+            entries.push(RefPicListModificationEntry {
+                modification_of_pic_nums_idc,
+                value,
+            });
+            if modification_of_pic_nums_idc >= 3 {
+                break;
+            }
+        }
+        Ok(entries)
     }
 
     /// Parse reference picture list modification (H.264 spec 7.4.3).
@@ -748,38 +848,19 @@ impl H264Parser {
     ) -> ParserResult<(Vec<RefPicListModificationEntry>, Vec<RefPicListModificationEntry>)> {
         let is_b = slice_type == 1; // B-slice after modulo 5
 
-        let mut mod_l0 = Vec::new();
-        let mut mod_l1 = Vec::new();
-
         // Ref pic list 0 modification (for P/SP/B slices)
-        if r.read_bit()? { // ref_pic_list_modification_flag_l0
-            loop {
-                let modification_of_pic_nums_idc = r.read_ue()?;
-                let value = r.read_ue()?;
-                mod_l0.push(RefPicListModificationEntry {
-                    modification_of_pic_nums_idc,
-                    value,
-                });
-                if modification_of_pic_nums_idc == 3 {
-                    break;
-                }
-            }
-        }
+        let mod_l0 = if r.read_bit()? { // ref_pic_list_modification_flag_l0
+            Self::parse_ref_pic_list_mod_entries(r)?
+        } else {
+            Vec::new()
+        };
 
         // Ref pic list 1 modification (for B slices only)
-        if is_b && r.read_bit()? { // ref_pic_list_modification_flag_l1
-            loop {
-                let modification_of_pic_nums_idc = r.read_ue()?;
-                let value = r.read_ue()?;
-                mod_l1.push(RefPicListModificationEntry {
-                    modification_of_pic_nums_idc,
-                    value,
-                });
-                if modification_of_pic_nums_idc == 3 {
-                    break;
-                }
-            }
-        }
+        let mod_l1 = if is_b && r.read_bit()? { // ref_pic_list_modification_flag_l1
+            Self::parse_ref_pic_list_mod_entries(r)?
+        } else {
+            Vec::new()
+        };
 
         Ok((mod_l0, mod_l1))
     }
@@ -799,13 +880,22 @@ impl H264Parser {
         u8, [[i16; 2]; 32], [[i16; 2]; 32], // chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1
     )> {
         let is_b = slice_type == 1; // B-slice after modulo 5
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PWT] start pos={} slice_type={} l0m={} l1m={} chroma_idc={}", r.position(), slice_type, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, sps.chroma_format_idc);
+        }
         let luma_log2_weight_denom = r.read_ue()? as u8;
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PWT] luma_log2_weight_denom={} pos={}", luma_log2_weight_denom, r.position());
+        }
 
         let chroma_log2_weight_denom = if sps.chroma_format_idc != 0 {
             r.read_ue()? as u8
         } else {
             0
         };
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PWT] chroma_log2_weight_denom={} pos={}", chroma_log2_weight_denom, r.position());
+        }
 
         // L0 weights: loop count based on actual num_ref_idx_l0_active_minus1
         // Per H.264 spec 7.4.4
@@ -816,21 +906,30 @@ impl H264Parser {
         let mut chroma_weight_l0 = [[0i16; 2]; 32];
         let mut chroma_offset_l0 = [[0i16; 2]; 32];
 
+        // luma_weight_l0_flag / chroma_weight_l0_flag are each read ONCE and
+        // apply to every active L0 reference (H.264 spec 7.4.4).
+        let luma_weight_l0_flag_bit = r.read_bit()?;
+        let chroma_weight_l0_flag_bit = if sps.chroma_format_idc != 0 { r.read_bit()? } else { false };
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PWT] L0 luma_flag={} chroma_flag={} pos={}", luma_weight_l0_flag_bit, chroma_weight_l0_flag_bit, r.position());
+        }
         for i in 0..=(num_ref_idx_l0_active_minus1 as usize) {
-            let lw_flag = r.read_bit()?;
-            if lw_flag {
+            if luma_weight_l0_flag_bit {
                 luma_weight_l0_flag |= 1 << i;
                 luma_weight_l0[i] = r.read_se()? as i16;
                 luma_offset_l0[i] = r.read_se()? as i16;
+                if std::env::var("DBG_H264").is_ok() {
+                    eprintln!("[DBG-PWT] L0[{}] luma_w={} luma_off={} pos={}", i, luma_weight_l0[i], luma_offset_l0[i], r.position());
+                }
             }
-            if sps.chroma_format_idc != 0 {
-                let cw_flag = r.read_bit()?;
-                if cw_flag {
-                    chroma_weight_l0_flag |= 1 << i;
-                    chroma_weight_l0[i][0] = r.read_se()? as i16;
-                    chroma_offset_l0[i][0] = r.read_se()? as i16;
-                    chroma_weight_l0[i][1] = r.read_se()? as i16;
-                    chroma_offset_l0[i][1] = r.read_se()? as i16;
+            if chroma_weight_l0_flag_bit {
+                chroma_weight_l0_flag |= 1 << i;
+                chroma_weight_l0[i][0] = r.read_se()? as i16;
+                chroma_offset_l0[i][0] = r.read_se()? as i16;
+                chroma_weight_l0[i][1] = r.read_se()? as i16;
+                chroma_offset_l0[i][1] = r.read_se()? as i16;
+                if std::env::var("DBG_H264").is_ok() {
+                    eprintln!("[DBG-PWT] L0[{}] chroma_w=({},{}) chroma_off=({},{}) pos={}", i, chroma_weight_l0[i][0], chroma_weight_l0[i][1], chroma_offset_l0[i][0], chroma_offset_l0[i][1], r.position());
                 }
             }
         }
@@ -844,22 +943,21 @@ impl H264Parser {
         let mut chroma_offset_l1 = [[0i16; 2]; 32];
 
         if is_b {
+            // luma_weight_l1_flag / chroma_weight_l1_flag read ONCE (spec 7.4.4)
+            let luma_weight_l1_flag_bit = r.read_bit()?;
+            let chroma_weight_l1_flag_bit = if sps.chroma_format_idc != 0 { r.read_bit()? } else { false };
             for i in 0..=(num_ref_idx_l1_active_minus1 as usize) {
-                let lw_flag = r.read_bit()?;
-                if lw_flag {
+                if luma_weight_l1_flag_bit {
                     luma_weight_l1_flag |= 1 << i;
                     luma_weight_l1[i] = r.read_se()? as i16;
                     luma_offset_l1[i] = r.read_se()? as i16;
                 }
-                if sps.chroma_format_idc != 0 {
-                    let cw_flag = r.read_bit()?;
-                    if cw_flag {
-                        chroma_weight_l1_flag |= 1 << i;
-                        chroma_weight_l1[i][0] = r.read_se()? as i16;
-                        chroma_offset_l1[i][0] = r.read_se()? as i16;
-                        chroma_weight_l1[i][1] = r.read_se()? as i16;
-                        chroma_offset_l1[i][1] = r.read_se()? as i16;
-                    }
+                if chroma_weight_l1_flag_bit {
+                    chroma_weight_l1_flag |= 1 << i;
+                    chroma_weight_l1[i][0] = r.read_se()? as i16;
+                    chroma_offset_l1[i][0] = r.read_se()? as i16;
+                    chroma_weight_l1[i][1] = r.read_se()? as i16;
+                    chroma_offset_l1[i][1] = r.read_se()? as i16;
                 }
             }
         }
@@ -889,10 +987,16 @@ impl H264Parser {
         } else {
             // Non-IDR picture marking: first read adaptive_ref_pic_marking_mode_flag (H.264 spec 7.4.5)
             let adaptive_ref_pic_marking_mode_flag = r.read_bit()?;
+            if std::env::var("DBG_H264").is_ok() {
+                eprintln!("[DBG-MMCO] adaptive={} pos={}", adaptive_ref_pic_marking_mode_flag, r.position());
+            }
             if adaptive_ref_pic_marking_mode_flag {
                 // Adaptive memory management: read operations until memory_management_control_operation=0
                 loop {
                     let memory_management_control_operation = r.read_ue()?;
+                    if std::env::var("DBG_H264").is_ok() {
+                        eprintln!("[DBG-MMCO] op={} pos={}", memory_management_control_operation, r.position());
+                    }
                     if memory_management_control_operation == 0 {
                         break;
                     }
@@ -934,10 +1038,6 @@ impl H264Parser {
                 let nal_data = &data[start + code_len..end];
                 if !nal_data.is_empty() {
                     if let Some((_, _, nal_unit_type)) = nal::parse_h264_nal_header(nal_data) {
-                        if nal_units.len() < 5 {
-                            eprintln!("[extract_nal] NAL#{}: offset={}, type={}, size={}",
-                                nal_units.len(), start, nal_unit_type, nal_data.len());
-                        }
                         nal_units.push(NalUnit::new(
                             nal_unit_type,
                             nal_data.to_vec(),
@@ -953,7 +1053,6 @@ impl H264Parser {
             }
         }
 
-        eprintln!("[extract_nal] Total NALs: {}", nal_units.len());
         nal_units
     }
 }
@@ -968,37 +1067,49 @@ impl VideoParser for H264Parser {
     }
 
     fn parse(&mut self, packet: &crate::bitstream::BitstreamPacket) -> ParserResult<ParseResult> {
-        eprintln!("[parse] Called with packet size={}, processed_up_to={}, parser_ptr={:p}", packet.payload.len(), self.processed_up_to, self as *const _);
         if packet.is_eos() {
             return Ok(ParseResult::EndOfStream);
         }
 
-        let nal_units = self.extract_nal_units(&packet.payload);
+        // Rebuild the NAL cache if a packet of a different size arrived (a new
+        // chunk of data). Otherwise reuse the cached NALs and advance the
+        // cursor, avoiding an O(n^2) re-scan/re-copy of the bitstream.
+        if packet.payload.len() != self.cached_payload_len {
+            self.cached_nals = self.extract_nal_units(&packet.payload);
+            self.cached_payload_len = packet.payload.len();
+            self.nal_cursor = 0;
+            self.processed_up_to = 0;
+        }
+
+        if self.nal_cursor >= self.cached_nals.len() {
+            return Ok(ParseResult::Nothing);
+        }
 
         let mut result_sps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut result_pps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut slices: Vec<SliceEntry> = Vec::new();
-        let mut first_slice_offset: Option<usize> = None;
         let mut last_slice_end: Option<usize> = None;
+        // Cursor index of the first collected slice NAL. Used to roll the
+        // cursor back when a parameter set is returned instead of the slices
+        // (GOP boundary case), so the slices are re-processed next call.
+        let mut first_slice_cursor: Option<usize> = None;
 
-        for nal in &nal_units {
-            // Skip NALs that have already been processed
-            eprintln!("[parse] Checking NAL at offset={}, size={}, type={}, processed_up_to={}", 
-                nal.offset, nal.size, nal.nal_unit_type, self.processed_up_to);
-            if nal.offset + nal.size <= self.processed_up_to {
-                eprintln!("[parse] Skipping already-processed NAL");
-                continue;
-            }
+        let mut i = self.nal_cursor;
+        while i < self.cached_nals.len() {
+            let nal = &self.cached_nals[i];
 
             match H264NalUnitType::from_u8(nal.nal_unit_type) {
                 Some(H264NalUnitType::Sps) => {
-                    eprintln!("[parse] Found SPS NAL, size={}", nal.data.len());
-                    eprintln!("[parse] SPS hex: {}", nal.data.iter().take(24).map(|b| format!("{:02x}", b)).collect::<String>());
-                    match self.parse_sps(&nal.data) {
+                    // A picture is in progress: defer this parameter set until
+                    // the current picture's slices are returned, otherwise the
+                    // last picture before a GOP boundary would be dropped.
+                    if !slices.is_empty() {
+                        break;
+                    }
+                    let nal_data = nal.data.clone();
+                    let (off, sz) = (nal.offset, nal.size);
+                    match self.parse_sps(&nal_data) {
                         Ok(sps) => {
-                            eprintln!("[parse] SPS parsed OK: width_mbs={}, height_mbs={}, poc_type={}, max_ref={}, cropping={}", 
-                                sps.pic_width_in_mbs_minus1, sps.pic_height_in_map_units_minus1,
-                                sps.pic_order_cnt_type, sps.max_num_ref_frames, sps.frame_cropping_flag);
                             let sps_id = sps.seq_parameter_set_id;
                             self.sps_cache.insert(sps_id, sps.clone());
                             self.active_sps = Some(sps);
@@ -1006,21 +1117,24 @@ impl VideoParser for H264Parser {
                                 self.active_sps.clone().unwrap(),
                             ));
                             // Mark this NAL as processed
-                            self.processed_up_to = nal.offset + nal.size;
+                            self.processed_up_to = off + sz;
+                            i += 1;
                         }
-                        Err(e) => {
-                            eprintln!("[parse] SPS parse ERROR: {:?}", e);
+                        Err(_) => {
+                            i += 1;
                         }
                     }
                 }
                 Some(H264NalUnitType::Pps) => {
-                    eprintln!("[parse] Found PPS NAL, size={}, hex={}", 
-                        nal.data.len(), 
-                        nal.data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<String>());
-                    match self.parse_pps(&nal.data) {
+                    // Same as SPS: don't swallow a parameter set while a
+                    // picture's slices have already been collected.
+                    if !slices.is_empty() {
+                        break;
+                    }
+                    let nal_data = nal.data.clone();
+                    let (off, sz) = (nal.offset, nal.size);
+                    match self.parse_pps(&nal_data) {
                         Ok(pps) => {
-                            eprintln!("[parse] PPS parsed OK: pps_id={}, sps_id={}",
-                                pps.pic_parameter_set_id, pps.seq_parameter_set_id);
                             let pps_id = pps.pic_parameter_set_id;
                             self.pps_cache.insert(pps_id, pps.clone());
                             self.active_pps = Some(pps);
@@ -1028,107 +1142,146 @@ impl VideoParser for H264Parser {
                                 self.active_pps.clone().unwrap(),
                             ));
                             // Mark this NAL as processed
-                            self.processed_up_to = nal.offset + nal.size;
+                            self.processed_up_to = off + sz;
+                            i += 1;
                         }
-                        Err(e) => {
-                            eprintln!("[parse] PPS parse ERROR: {:?}", e);
+                        Err(_) => {
+                            i += 1;
                         }
                     }
                 }
                 Some(H264NalUnitType::Sei) => {
                     // SEI - skip, not needed for decoding
+                    i += 1;
                 }
                 Some(H264NalUnitType::NonIdrSlice)
                 | Some(H264NalUnitType::IdrSlice)
                 | Some(H264NalUnitType::DataPartitionA)
                 | Some(H264NalUnitType::DataPartitionB)
                 | Some(H264NalUnitType::DataPartitionC) => {
-                    let (is_trailing, nal_ref_idc, nal_unit_type) =
-                        nal::parse_h264_nal_header(&nal.data).unwrap_or((false, 0, 0));
+                    // Copy the NAL data out so the borrow of self.cached_nals
+                    // ends before the &mut self calls below.
+                    let nal_data = nal.data.clone();
+                    let (off, sz) = (nal.offset, nal.size);
+                    let (_, nal_ref_idc, nal_unit_type) =
+                        nal::parse_h264_nal_header(&nal_data).unwrap_or((false, 0, 0));
 
                     if self.first_slice_header.is_none() {
-                        if let Ok(slh) = self.parse_slice_header(&nal.data, nal_ref_idc, nal_unit_type) {
-                            self.first_slice_header = Some(slh);
-                            self.frame_count += 1;
+                        match self.parse_slice_header(&nal_data, nal_ref_idc, nal_unit_type) {
+                            Ok(slh) => {
+                                self.first_slice_header = Some(slh);
+                                self.frame_count += 1;
+                            }
+                            Err(_) => {}
                         }
                     }
 
                     // Parse slice header for this NAL
-                    let slice_header = if let Ok(slh) = self.parse_slice_header(&nal.data, nal_ref_idc, nal_unit_type) {
-                        Some(ParserSliceHeader::H264(slh))
-                    } else {
-                        None
+                    let slice_header = match self.parse_slice_header(&nal_data, nal_ref_idc, nal_unit_type) {
+                        Ok(slh) => {
+                            if std::env::var("DBG_H264").is_ok() {
+                                eprintln!("[DBG-SLICE] off={} sz={} nal_ref_idc={} slh OK fn={} poc_lsb={}", off, sz, nal_ref_idc, slh.frame_num, slh.pic_order_cnt_lsb);
+                            }
+                            Some(ParserSliceHeader::H264(slh))
+                        }
+                        Err(e) => {
+                            if std::env::var("DBG_H264").is_ok() {
+                                eprintln!("[DBG-SLICE] off={} sz={} nal_ref_idc={} slh FAIL: {}", off, sz, nal_ref_idc, e);
+                            }
+                            None
+                        }
                     };
 
-                    // Track the first frame's frame_num
-                    let current_frame_num = if let Some(ParserSliceHeader::H264(slh)) = &slice_header {
-                        slh.frame_num
-                    } else {
-                        continue;
-                    };
+                    // Track the first frame's frame_num and pic_order_cnt_lsb
+                    let (current_frame_num, current_poc_lsb) =
+                        if let Some(ParserSliceHeader::H264(slh)) = &slice_header {
+                            (slh.frame_num, slh.pic_order_cnt_lsb)
+                        } else {
+                            // Unparseable slice header: skip this NAL.
+                            i += 1;
+                            continue;
+                        };
 
                     // Only collect slices for the first frame
                     if slices.is_empty() {
-                        // First slice - record its frame_num
+                        // First slice - record its frame_num and poc_lsb
                         self.current_frame_num = Some(current_frame_num);
+                        self.current_poc_lsb = Some(current_poc_lsb);
+                        first_slice_cursor = Some(i);
                     }
 
-                    // Stop collecting if frame_num changes (new frame)
-                    if let Some(first_frame_num) = self.current_frame_num {
-                        if current_frame_num != first_frame_num {
-                            // New frame detected, stop collecting
+                    // Stop collecting if frame_num OR pic_order_cnt_lsb changes
+                    // (a new picture). Two slice NALs belong to the same picture
+                    // only if they share both frame_num and pic_order_cnt_lsb.
+                    if let (Some(first_frame_num), Some(first_poc_lsb)) =
+                        (self.current_frame_num, self.current_poc_lsb)
+                    {
+                        if current_frame_num != first_frame_num || current_poc_lsb != first_poc_lsb {
+                            // New picture detected, stop collecting (do not
+                            // consume this NAL; it starts the next picture).
                             break;
                         }
                     }
 
-                    // Track offsets for bytes_consumed calculation
-                    if first_slice_offset.is_none() {
-                        first_slice_offset = Some(nal.offset);
-                    }
-                    last_slice_end = Some(nal.offset + nal.size);
+                    // Track the end of the last slice for bytes_consumed
+                    last_slice_end = Some(off + sz);
 
                     slices.push(SliceEntry {
                         slice_header,
-                        nal_data: nal.data.clone(),
+                        nal_data,
                     });
+                    i += 1;
                 }
                 Some(H264NalUnitType::FillerData) | Some(H264NalUnitType::SeqEnd) | Some(H264NalUnitType::StreamEnd) => {
                     // Skip filler and end codes
+                    i += 1;
                 }
-                _ => {}
+                _ => {
+                    i += 1;
+                }
             }
         }
 
         if result_sps.is_some() || result_pps.is_some() {
-            eprintln!("[parse] Returning ParameterSet, processed_up_to={}", self.processed_up_to);
+            // If slices were collected but a parameter set is returned instead
+            // (a [SPS][PPS][slice] sequence spanning a GOP boundary), roll the
+            // cursor back to the first collected slice so it is re-processed on
+            // the next parse() call. This mirrors the original behavior where
+            // processed_up_to was not advanced past unreturned slices.
+            self.nal_cursor = if !slices.is_empty() {
+                first_slice_cursor.unwrap_or(i)
+            } else {
+                i
+            };
             Ok(ParseResult::ParameterSet {
                 sps: result_sps,
                 pps: result_pps,
                 vps: None,
             })
         } else if !slices.is_empty() {
-            // Calculate bytes consumed: from first slice start to last slice end
-            let bytes_consumed = if let (Some(first), Some(last)) = (first_slice_offset, last_slice_end) {
-                last - first
-            } else {
-                0
-            };
+            self.nal_cursor = i;
+            // Bytes consumed is measured from the start of the input window to
+            // the end of the last slice NAL. The decoder advances parse_offset
+            // by this amount, so the next window starts right at the next start
+            // code (no leftover tail), and each picture is consumed exactly once.
+            let bytes_consumed = last_slice_end.unwrap_or(0);
             // Update processed_up_to to the end of the last slice in this frame
             if let Some(last) = last_slice_end {
                 self.processed_up_to = last;
             }
-            eprintln!("[parse] Returning {} slices, bytes_consumed={}, processed_up_to={}", slices.len(), bytes_consumed, self.processed_up_to);
             // Clear current_frame_num for next frame
             self.current_frame_num = None;
+            self.current_poc_lsb = None;
+            // Clear first_slice_header so the next picture gets a fresh parse
+            self.first_slice_header.take();
             Ok(ParseResult::Slice { slices, bytes_consumed })
         } else {
-            eprintln!("[parse] Returning Nothing, processed_up_to={}", self.processed_up_to);
+            self.nal_cursor = i;
             Ok(ParseResult::Nothing)
         }
     }
 
     fn reset(&mut self) {
-        eprintln!("[parser] reset() called, clearing processed_up_to={}", self.processed_up_to);
         self.sps_cache.clear();
         self.pps_cache.clear();
         self.active_sps = None;
@@ -1141,6 +1294,10 @@ impl VideoParser for H264Parser {
         self.prev_pic_order_cnt_msb = 0;
         self.processed_up_to = 0;
         self.current_frame_num = None;
+        self.cached_nals.clear();
+        self.cached_payload_len = 0;
+        self.nal_cursor = 0;
+        self.current_poc_lsb = None;
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {

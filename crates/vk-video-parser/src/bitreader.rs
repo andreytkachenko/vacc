@@ -103,10 +103,13 @@ impl<'a> BitReader<'a> {
     /// H.264 spec maps: even ue → positive, odd ue → negative.
     pub fn read_se(&mut self) -> Result<i32, ParserError> {
         let code = self.read_ue()? as i32;
-        if code % 2 == 0 {
-            Ok(code / 2)
+        // se(v) per H.264/H.265 spec 9.1:
+        //   codeNum odd  -> value = (codeNum + 1) / 2   (positive)
+        //   codeNum even -> value = -(codeNum / 2)      (negative)
+        if code % 2 == 1 {
+            Ok((code + 1) / 2)
         } else {
-            Ok(-(code / 2 + 1))
+            Ok(-(code / 2))
         }
     }
 
@@ -159,21 +162,14 @@ impl<'a> BitReader<'a> {
     }
 
     /// Get current bit position in the stream.
+    ///
+    /// `curr_byte` holds `data[pos-1]` (load_byte advances `pos` after reading),
+    /// so the fully-consumed bytes are `pos-1` and the bits consumed within the
+    /// current byte are `8 - bits_left`. Total bits consumed:
+    ///   (pos-1)*8 + (8 - bits_left) == pos*8 - bits_left
+    /// (for pos==0, bits_left==0 this yields 0, i.e. no byte loaded yet).
     pub fn position(&self) -> u64 {
-        if self.bits_left == 0 && self.pos == 0 {
-            // No byte loaded yet
-            return 0;
-        }
-        // bits_left is in range 0..=8
-        // When bits_left == 0, we've consumed all bits of current byte, so we're at pos*8
-        // When bits_left == 8, we haven't consumed any bits of current byte, so we're at (pos-1)*8
-        // The formula: pos*8 - (8 - bits_left) works for bits_left > 0
-        // For bits_left == 0, we need special handling: we're at pos*8
-        if self.bits_left == 0 {
-            (self.pos as u64) * 8
-        } else {
-            (self.pos as u64) * 8 - (8 - self.bits_left) as u64
-        }
+        (self.pos as u64) * 8 - self.bits_left as u64
     }
 
     /// Check if there is more data to read.

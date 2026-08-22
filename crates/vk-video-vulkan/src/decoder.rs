@@ -285,12 +285,30 @@ impl VideoDecoder {
 
     /// Reorder frames from decoding order to presentation order (by POC).
     ///
-    /// H.264/H.265 use B-frames which are decoded out of order. This method
-    /// sorts frames by their picture order count (POC) for correct display.
+    /// H.264/H.265 use B-frames which are decoded out of order. Frames are
+    /// sorted by their picture order count (POC) for correct display.
+    ///
+    /// POC is only unique *within* a GOP: it resets to 0 at each IDR. A naive
+    /// global POC sort therefore interleaves frames from different GOPs and
+    /// scrambles the output on multi-IDR streams. We split the stream into
+    /// GOPs (each starting at an IDR), sort each GOP by POC independently, and
+    /// concatenate them in decode order. For a single-GOP (or no-B-frame)
+    /// stream this is identical to a plain POC sort.
     pub fn reorder_to_presentation(frames: Vec<DecodedFrame>) -> Vec<DecodedFrame> {
-        let mut sorted = frames;
-        sorted.sort_by_key(|f| f.poc);
-        sorted
+        let mut result: Vec<DecodedFrame> = Vec::with_capacity(frames.len());
+        let mut gop: Vec<DecodedFrame> = Vec::new();
+        for frame in frames {
+            if frame.is_idr && !gop.is_empty() {
+                gop.sort_by_key(|f| f.poc);
+                result.append(&mut gop);
+            }
+            gop.push(frame);
+        }
+        if !gop.is_empty() {
+            gop.sort_by_key(|f| f.poc);
+            result.append(&mut gop);
+        }
+        result
     }
 
     fn decode_all_h26x(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
