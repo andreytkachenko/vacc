@@ -154,6 +154,7 @@
 //! - [`vp9`] — VP9 decoder (`NvdecVp9Decoder`), DPB state, and
 //!   `CUVIDPICPARAMS` construction
 
+pub mod av1;
 pub mod decoder;
 pub mod device;
 pub mod dpb;
@@ -164,6 +165,7 @@ pub mod picparams;
 pub mod poc;
 pub mod vp9;
 
+pub use av1::{build_cuvid_av1_picparams, NvdecAv1Decoder, Av1DpbState};
 pub use decoder::NvdecH264Decoder;
 pub use device::{
     cu_memcpy_2d, init_nvdec, is_available, is_codec_supported, query_decoder_caps, CUDA_MEMCPY2D,

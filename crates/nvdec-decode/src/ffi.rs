@@ -742,7 +742,13 @@ impl Default for CUVIDVP9PICPARAMS {
     }
 }
 
-/// AV1 picture parameters
+/// AV1 picture parameters.
+///
+/// Layout matches the NVIDIA Video Codec SDK `cuviddec.h` exactly
+/// (verified against a C compile of the SDK header on x86-64: total size
+/// 1024 bytes). C bitfields are packed LSB-first into their allocation
+/// units, so each bitfield group is modeled here as a single packed word
+/// with accessor helpers (same pattern as [`CUVIDVP9PICPARAMS`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDAV1PICPARAMS {
@@ -750,137 +756,288 @@ pub struct CUVIDAV1PICPARAMS {
     pub height: c_uint,
     pub frame_offset: c_uint,
     pub decodePicIdx: c_int,
-    // sequence header
-    pub profile: c_uint,
-    pub use_128x128_superblock: c_uint,
-    pub subsampling_x: c_uint,
-    pub subsampling_y: c_uint,
-    pub mono_chrome: c_uint,
-    pub bit_depth_minus8: c_uint,
-    pub enable_filter_intra: c_uint,
-    pub enable_intra_edge_filter: c_uint,
-    pub enable_interintra_compound: c_uint,
-    pub enable_masked_compound: c_uint,
-    pub enable_dual_filter: c_uint,
-    pub enable_order_hint: c_uint,
-    pub order_hint_bits_minus1: c_uint,
-    pub enable_jnt_comp: c_uint,
-    pub enable_superres: c_uint,
-    pub enable_cdef: c_uint,
-    pub enable_restoration: c_uint,
-    pub enable_fgs: c_uint,
-    pub reserved0_7bits: c_uint,
-    // frame header
-    pub frame_type: c_uint,
-    pub show_frame: c_uint,
-    pub disable_cdf_update: c_uint,
-    pub allow_screen_content_tools: c_uint,
-    pub force_integer_mv: c_uint,
-    pub coded_denom: c_uint,
-    pub allow_intrabc: c_uint,
-    pub allow_high_precision_mv: c_uint,
-    pub interp_filter: c_uint,
-    pub switchable_motion_mode: c_uint,
-    pub use_ref_frame_mvs: c_uint,
-    pub disable_frame_end_update_cdf: c_uint,
-    pub delta_q_present: c_uint,
-    pub delta_q_res: c_uint,
-    pub using_qmatrix: c_uint,
-    pub coded_lossless: c_uint,
-    pub use_superres: c_uint,
-    pub tx_mode: c_uint,
-    pub reference_mode: c_uint,
-    pub allow_warped_motion: c_uint,
-    pub reduced_tx_set: c_uint,
-    pub skip_mode: c_uint,
-    pub reserved1_3bits: c_uint,
-    // tiling info
-    pub num_tile_cols: c_uint,
-    pub num_tile_rows: c_uint,
-    pub context_update_tile_id: c_uint,
-    pub tile_widths: [c_uint; 64],
-    pub tile_heights: [c_uint; 64],
-    // CDEF
-    pub cdef_damping_minus_3: c_uint,
-    pub cdef_bits: c_uint,
-    pub reserved2_4bits: c_uint,
-    pub cdef_y_strength: [c_uchar; 8],
-    pub cdef_uv_strength: [c_uchar; 8],
-    // SkipModeFrames
-    pub SkipModeFrame0: c_uchar,
-    pub SkipModeFrame1: c_uchar,
-    // qp information
-    pub base_qindex: c_uchar,
-    pub qp_y_dc_delta_q: c_char,
-    pub qp_u_dc_delta_q: c_char,
-    pub qp_v_dc_delta_q: c_char,
-    pub qp_u_ac_delta_q: c_char,
-    pub qp_v_ac_delta_q: c_char,
-    pub qm_y: c_uchar,
-    pub qm_u: c_uchar,
-    pub qm_v: c_uchar,
-    // segmentation
-    pub segmentation_enabled: c_uint,
-    pub segmentation_update_map: c_uint,
-    pub segmentation_update_data: c_uint,
-    pub segmentation_temporal_update: c_uint,
-    pub reserved3_4bits: c_uint,
-    pub segmentation_feature_data: [[c_int; 8]; 8],
-    pub segmentation_feature_mask: [c_uchar; 8],
-    // loopfilter
-    pub loop_filter_level: [c_uchar; 2],
-    pub loop_filter_level_u: c_uchar,
-    pub loop_filter_level_v: c_uchar,
-    pub loop_filter_sharpness: c_uchar,
-    pub loop_filter_ref_deltas: [c_char; 8],
-    pub loop_filter_mode_deltas: [c_char; 2],
-    pub loop_filter_delta_enabled: c_uint,
-    pub loop_filter_delta_update: c_uint,
-    pub delta_lf_present: c_uint,
-    pub delta_lf_res: c_uint,
-    pub delta_lf_multi: c_uint,
-    pub reserved4_2bits: c_uint,
-    // restoration
-    pub lr_unit_size: [c_uchar; 3],
-    pub lr_type: [c_uchar; 3],
-    // reference frames
-    pub primary_ref_frame: c_uchar,
-    pub ref_frame_map: [c_uchar; 8],
-    pub temporal_layer_id: c_uint,
-    pub spatial_layer_id: c_uint,
-    pub reserved5_32bits: [c_uchar; 4],
-    // ref frame list
+    /// Sequence header bitfields (LSB-first): profile:3 |
+    /// use_128x128_superblock:1 | subsampling_x:1 | subsampling_y:1 |
+    /// mono_chrome:1 | bit_depth_minus8:4 | enable_filter_intra:1 |
+    /// enable_intra_edge_filter:1 | enable_interintra_compound:1 |
+    /// enable_masked_compound:1 | enable_dual_filter:1 | enable_order_hint:1 |
+    /// order_hint_bits_minus1:3 | enable_jnt_comp:1 | enable_superres:1 |
+    /// enable_cdef:1 | enable_restoration:1 | enable_fgs:1 | reserved0_7bits:7
+    pub seq_flags: u32,
+    /// Frame header bitfields (LSB-first): frame_type:2 | show_frame:1 |
+    /// disable_cdf_update:1 | allow_screen_content_tools:1 | force_integer_mv:1 |
+    /// coded_denom:3 | allow_intrabc:1 | allow_high_precision_mv:1 |
+    /// interp_filter:3 | switchable_motion_mode:1 | use_ref_frame_mvs:1 |
+    /// disable_frame_end_update_cdf:1 | delta_q_present:1 | delta_q_res:2 |
+    /// using_qmatrix:1 | coded_lossless:1 | use_superres:1 | tx_mode:2 |
+    /// reference_mode:1 | allow_warped_motion:1 | reduced_tx_set:1 |
+    /// skip_mode:1 | reserved1_3bits:3
+    pub frame_flags: u32,
+    /// Tiling bitfields (LSB-first): num_tile_cols:8 | num_tile_rows:8 |
+    /// context_update_tile_id:16
+    pub tile_info: u32,
+    /// Width of each tile column in superblocks (128 bytes).
+    pub tile_widths: [u16; 64],
+    /// Height of each tile row in superblocks (128 bytes).
+    pub tile_heights: [u16; 64],
+    /// CDEF bitfields: cdef_damping_minus_3:2 | cdef_bits:2 | reserved2_4bits:4
+    pub cdef_flags: u8,
+    /// 0-3 bits: y_pri_strength, 4-7 bits: y_sec_strength (per CDEF unit).
+    pub cdef_y_strength: [u8; 8],
+    /// 0-3 bits: uv_pri_strength, 4-7 bits: uv_sec_strength (per CDEF unit).
+    pub cdef_uv_strength: [u8; 8],
+    /// SkipModeFrames: SkipModeFrame0:4 | SkipModeFrame1:4
+    pub skip_mode_frames: u8,
+    /// Base frame qindex (AV1 base_q_idx).
+    pub base_qindex: u8,
+    pub qp_y_dc_delta_q: i8,
+    pub qp_u_dc_delta_q: i8,
+    pub qp_v_dc_delta_q: i8,
+    pub qp_u_ac_delta_q: i8,
+    pub qp_v_ac_delta_q: i8,
+    pub qm_y: u8,
+    pub qm_u: u8,
+    pub qm_v: u8,
+    /// Segmentation bitfields: segmentation_enabled:1 | segmentation_update_map:1 |
+    /// segmentation_update_data:1 | segmentation_temporal_update:1 | reserved3_4bits:4
+    pub segmentation_flags: u8,
+    /// Feature data for each segment/feature (8x8, 128 bytes).
+    pub segmentation_feature_data: [i16; 64],
+    /// Indicates that the corresponding feature is unused or feature value is coded.
+    pub segmentation_feature_mask: [u8; 8],
+    /// Loop filter strength values for Y (2 planes).
+    pub loop_filter_level: [u8; 2],
+    pub loop_filter_level_u: u8,
+    pub loop_filter_level_v: u8,
+    pub loop_filter_sharpness: u8,
+    pub loop_filter_ref_deltas: [i8; 8],
+    pub loop_filter_mode_deltas: [i8; 2],
+    /// Loop filter bitfields: loop_filter_delta_enabled:1 |
+    /// loop_filter_delta_update:1 | delta_lf_present:1 | delta_lf_res:2 |
+    /// delta_lf_multi:1 | reserved4_2bits:2
+    pub loop_filter_flags: u8,
+    /// Loop restoration unit sizes: 0: 32, 1: 64, 2: 128, 3: 256.
+    pub lr_unit_size: [u8; 3],
+    /// Used to compute FrameRestorationType.
+    pub lr_type: [u8; 3],
+    /// Reference frame containing the CDF values and other state.
+    pub primary_ref_frame: u8,
+    /// Frames in DPB that can be used as reference for current/future frames.
+    pub ref_frame_map: [u8; 8],
+    /// Layer ids: temporal_layer_id:4 | spatial_layer_id:4
+    pub layer_ids: u8,
+    pub reserved5_32bits: [u8; 4],
+    /// Reference frames used for the current frame (7 slots).
     pub ref_frame: [CUVIDAV1REFFRAME; 7],
-    // global motion
+    /// Global motion params for reference frames (7 slots).
     pub global_motion: [CUVIDAV1GLOBALMOTION; 7],
-    // film grain params
-    pub apply_grain: c_uint,
-    pub overlap_flag: c_uint,
-    pub scaling_shift_minus8: c_uint,
-    pub chroma_scaling_from_luma: c_uint,
-    pub ar_coeff_lag: c_uint,
-    pub ar_coeff_shift_minus6: c_uint,
-    pub grain_scale_shift: c_uint,
-    pub clip_to_restricted_range: c_uint,
-    pub reserved6_4bits: c_uint,
-    pub num_y_points: c_uchar,
-    pub scaling_points_y: [[c_uchar; 2]; 14],
-    pub num_cb_points: c_uchar,
-    pub scaling_points_cb: [[c_uchar; 2]; 10],
-    pub num_cr_points: c_uchar,
-    pub scaling_points_cr: [[c_uchar; 2]; 10],
-    pub reserved7_8bits: c_uchar,
-    pub random_seed: c_uint,
-    pub ar_coeffs_y: [c_int; 24],
-    pub ar_coeffs_cb: [c_int; 25],
-    pub ar_coeffs_cr: [c_int; 25],
-    pub cb_mult: c_uchar,
-    pub cb_luma_mult: c_uchar,
-    pub cb_offset: c_int,
-    pub cr_mult: c_uchar,
-    pub cr_luma_mult: c_uchar,
-    pub cr_offset: c_int,
+    /// Film grain bitfields (LSB-first u16): apply_grain:1 | overlap_flag:1 |
+    /// scaling_shift_minus8:2 | chroma_scaling_from_luma:1 | ar_coeff_lag:2 |
+    /// ar_coeff_shift_minus6:2 | grain_scale_shift:2 | clip_to_restricted_range:1 |
+    /// reserved6_4bits:4
+    pub film_grain_flags: u16,
+    pub num_y_points: u8,
+    pub scaling_points_y: [[u8; 2]; 14],
+    pub num_cb_points: u8,
+    pub scaling_points_cb: [[u8; 2]; 10],
+    pub num_cr_points: u8,
+    pub scaling_points_cr: [[u8; 2]; 10],
+    pub reserved7_8bits: u8,
+    pub random_seed: u16,
+    pub ar_coeffs_y: [i16; 24],
+    pub ar_coeffs_cb: [i16; 25],
+    pub ar_coeffs_cr: [i16; 25],
+    pub cb_mult: u8,
+    pub cb_luma_mult: u8,
+    pub cb_offset: i16,
+    pub cr_mult: u8,
+    pub cr_luma_mult: u8,
+    pub cr_offset: i16,
     pub reserved: [c_int; 7],
+}
+
+impl CUVIDAV1PICPARAMS {
+    /// Extract a bitfield from `word` starting at `shift` with `width` bits.
+    pub fn bits(word: u32, shift: u32, width: u32) -> u32 {
+        (word >> shift) & ((1u32 << width) - 1)
+    }
+    pub fn profile(&self) -> u32 {
+        Self::bits(self.seq_flags, 0, 3)
+    }
+    pub fn use_128x128_superblock(&self) -> u32 {
+        Self::bits(self.seq_flags, 3, 1)
+    }
+    pub fn subsampling_x(&self) -> u32 {
+        Self::bits(self.seq_flags, 4, 1)
+    }
+    pub fn subsampling_y(&self) -> u32 {
+        Self::bits(self.seq_flags, 5, 1)
+    }
+    pub fn mono_chrome(&self) -> u32 {
+        Self::bits(self.seq_flags, 6, 1)
+    }
+    pub fn bit_depth_minus8(&self) -> u32 {
+        Self::bits(self.seq_flags, 7, 4)
+    }
+    pub fn enable_filter_intra(&self) -> u32 {
+        Self::bits(self.seq_flags, 11, 1)
+    }
+    pub fn enable_intra_edge_filter(&self) -> u32 {
+        Self::bits(self.seq_flags, 12, 1)
+    }
+    pub fn enable_interintra_compound(&self) -> u32 {
+        Self::bits(self.seq_flags, 13, 1)
+    }
+    pub fn enable_masked_compound(&self) -> u32 {
+        Self::bits(self.seq_flags, 14, 1)
+    }
+    pub fn enable_dual_filter(&self) -> u32 {
+        Self::bits(self.seq_flags, 15, 1)
+    }
+    pub fn enable_order_hint(&self) -> u32 {
+        Self::bits(self.seq_flags, 16, 1)
+    }
+    pub fn order_hint_bits_minus1(&self) -> u32 {
+        Self::bits(self.seq_flags, 17, 3)
+    }
+    pub fn enable_jnt_comp(&self) -> u32 {
+        Self::bits(self.seq_flags, 20, 1)
+    }
+    pub fn enable_superres(&self) -> u32 {
+        Self::bits(self.seq_flags, 21, 1)
+    }
+    pub fn enable_cdef(&self) -> u32 {
+        Self::bits(self.seq_flags, 22, 1)
+    }
+    pub fn enable_restoration(&self) -> u32 {
+        Self::bits(self.seq_flags, 23, 1)
+    }
+    pub fn enable_fgs(&self) -> u32 {
+        Self::bits(self.seq_flags, 24, 1)
+    }
+    pub fn frame_type(&self) -> u32 {
+        Self::bits(self.frame_flags, 0, 2)
+    }
+    pub fn show_frame(&self) -> u32 {
+        Self::bits(self.frame_flags, 2, 1)
+    }
+    pub fn disable_cdf_update(&self) -> u32 {
+        Self::bits(self.frame_flags, 3, 1)
+    }
+    pub fn allow_screen_content_tools(&self) -> u32 {
+        Self::bits(self.frame_flags, 4, 1)
+    }
+    pub fn force_integer_mv(&self) -> u32 {
+        Self::bits(self.frame_flags, 5, 1)
+    }
+    pub fn coded_denom(&self) -> u32 {
+        Self::bits(self.frame_flags, 6, 3)
+    }
+    pub fn allow_intrabc(&self) -> u32 {
+        Self::bits(self.frame_flags, 9, 1)
+    }
+    pub fn allow_high_precision_mv(&self) -> u32 {
+        Self::bits(self.frame_flags, 10, 1)
+    }
+    pub fn interp_filter(&self) -> u32 {
+        Self::bits(self.frame_flags, 11, 3)
+    }
+    pub fn switchable_motion_mode(&self) -> u32 {
+        Self::bits(self.frame_flags, 14, 1)
+    }
+    pub fn use_ref_frame_mvs(&self) -> u32 {
+        Self::bits(self.frame_flags, 15, 1)
+    }
+    pub fn disable_frame_end_update_cdf(&self) -> u32 {
+        Self::bits(self.frame_flags, 16, 1)
+    }
+    pub fn delta_q_present(&self) -> u32 {
+        Self::bits(self.frame_flags, 17, 1)
+    }
+    pub fn delta_q_res(&self) -> u32 {
+        Self::bits(self.frame_flags, 18, 2)
+    }
+    pub fn using_qmatrix(&self) -> u32 {
+        Self::bits(self.frame_flags, 20, 1)
+    }
+    pub fn coded_lossless(&self) -> u32 {
+        Self::bits(self.frame_flags, 21, 1)
+    }
+    pub fn use_superres(&self) -> u32 {
+        Self::bits(self.frame_flags, 22, 1)
+    }
+    pub fn tx_mode(&self) -> u32 {
+        Self::bits(self.frame_flags, 23, 2)
+    }
+    pub fn reference_mode(&self) -> u32 {
+        Self::bits(self.frame_flags, 25, 1)
+    }
+    pub fn allow_warped_motion(&self) -> u32 {
+        Self::bits(self.frame_flags, 26, 1)
+    }
+    pub fn reduced_tx_set(&self) -> u32 {
+        Self::bits(self.frame_flags, 27, 1)
+    }
+    pub fn skip_mode(&self) -> u32 {
+        Self::bits(self.frame_flags, 28, 1)
+    }
+    pub fn num_tile_cols(&self) -> u32 {
+        Self::bits(self.tile_info, 0, 8)
+    }
+    pub fn num_tile_rows(&self) -> u32 {
+        Self::bits(self.tile_info, 8, 8)
+    }
+    pub fn context_update_tile_id(&self) -> u32 {
+        Self::bits(self.tile_info, 16, 16)
+    }
+    pub fn cdef_damping_minus_3(&self) -> u32 {
+        Self::bits(self.cdef_flags as u32, 0, 2)
+    }
+    pub fn cdef_bits(&self) -> u32 {
+        Self::bits(self.cdef_flags as u32, 2, 2)
+    }
+    pub fn skip_mode_frame0(&self) -> u32 {
+        Self::bits(self.skip_mode_frames as u32, 0, 4)
+    }
+    pub fn skip_mode_frame1(&self) -> u32 {
+        Self::bits(self.skip_mode_frames as u32, 4, 4)
+    }
+    pub fn segmentation_enabled(&self) -> u32 {
+        Self::bits(self.segmentation_flags as u32, 0, 1)
+    }
+    pub fn segmentation_update_map(&self) -> u32 {
+        Self::bits(self.segmentation_flags as u32, 1, 1)
+    }
+    pub fn segmentation_update_data(&self) -> u32 {
+        Self::bits(self.segmentation_flags as u32, 2, 1)
+    }
+    pub fn segmentation_temporal_update(&self) -> u32 {
+        Self::bits(self.segmentation_flags as u32, 3, 1)
+    }
+    pub fn loop_filter_delta_enabled(&self) -> u32 {
+        Self::bits(self.loop_filter_flags as u32, 0, 1)
+    }
+    pub fn loop_filter_delta_update(&self) -> u32 {
+        Self::bits(self.loop_filter_flags as u32, 1, 1)
+    }
+    pub fn delta_lf_present(&self) -> u32 {
+        Self::bits(self.loop_filter_flags as u32, 2, 1)
+    }
+    pub fn delta_lf_res(&self) -> u32 {
+        Self::bits(self.loop_filter_flags as u32, 3, 2)
+    }
+    pub fn delta_lf_multi(&self) -> u32 {
+        Self::bits(self.loop_filter_flags as u32, 5, 1)
+    }
+    pub fn temporal_layer_id(&self) -> u32 {
+        Self::bits(self.layer_ids as u32, 0, 4)
+    }
+    pub fn spatial_layer_id(&self) -> u32 {
+        Self::bits(self.layer_ids as u32, 4, 4)
+    }
+    pub fn apply_grain(&self) -> u32 {
+        Self::bits(self.film_grain_flags as u32, 0, 1)
+    }
 }
 
 /// AV1 reference frame structure
@@ -893,15 +1050,25 @@ pub struct CUVIDAV1REFFRAME {
     pub reserved24Bits: [c_uchar; 3],
 }
 
-/// AV1 global motion structure
+/// AV1 global motion structure (28 bytes: 1 bitfield byte + 3 reserved +
+/// 6 x i32 matrix).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CUVIDAV1GLOBALMOTION {
-    pub invalid: c_uint,
-    pub wmtype: c_uint,
-    pub reserved5Bits: c_uint,
+    /// Bitfields: invalid:1 | wmtype:2 | reserved5Bits:5
+    pub flags: u8,
     pub reserved24Bits: [c_char; 3],
+    /// gm_params[6] from the AV1 specification.
     pub wmmat: [c_int; 6],
+}
+
+impl CUVIDAV1GLOBALMOTION {
+    pub fn invalid(&self) -> u32 {
+        (self.flags as u32 >> 0) & 1
+    }
+    pub fn wmtype(&self) -> u32 {
+        (self.flags as u32 >> 1) & 0b11
+    }
 }
 
 /// Picture parameters for decoding.
@@ -1381,11 +1548,22 @@ mod struct_size_tests {
     fn test_cuvid_av1_picparams_size() {
         let size = std::mem::size_of::<CUVIDAV1PICPARAMS>();
         println!("CUVIDAV1PICPARAMS size: {}", size);
-        // NVIDIA SDK: 1916 bytes on 64-bit (with film grain params)
+        // NVIDIA SDK (cuviddec.h, x86-64): 1024 bytes (verified via C compile
+        // of the SDK header: sizeof(CUVIDAV1PICPARAMS) == 1024).
         assert_eq!(
-            size, 1916,
-            "CUVIDAV1PICPARAMS size mismatch: expected 1916, got {}",
+            size, 1024,
+            "CUVIDAV1PICPARAMS size mismatch: expected 1024, got {}",
             size
+        );
+        assert_eq!(
+            std::mem::size_of::<CUVIDAV1REFFRAME>(),
+            12,
+            "CUVIDAV1REFFRAME size mismatch: expected 12"
+        );
+        assert_eq!(
+            std::mem::size_of::<CUVIDAV1GLOBALMOTION>(),
+            28,
+            "CUVIDAV1GLOBALMOTION size mismatch: expected 28"
         );
     }
 

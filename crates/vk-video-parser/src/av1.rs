@@ -589,7 +589,7 @@ impl Av1Parser {
     }
 
     /// Parse the Sequence Header OBU and populate Av1Sps.
-    fn parse_sequence_header_obu(
+    pub fn parse_sequence_header_obu(
         &mut self,
         obu_data: &[u8],
     ) -> ParserResult<vk_video_core::picture::Av1Sps> {

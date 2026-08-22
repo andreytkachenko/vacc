@@ -19,6 +19,18 @@ name = "decode_nvdec_vp9_cuvid"
 path = "src/decode_nvdec_vp9_cuvid.rs"
 
 [[example]]
+name = "decode_nvdec_av1_cuvid"
+path = "src/decode_nvdec_av1_cuvid.rs"
+
+[[example]]
+name = "decode_nvdec_av1"
+path = "src/decode_nvdec_av1.rs"
+
+[[example]]
+name = "diag_av1_obu"
+path = "src/diag_av1_obu.rs"
+
+[[example]]
 name = "decode_nvdec_vp9"
 path = "src/decode_nvdec_vp9.rs"
 
