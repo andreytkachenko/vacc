@@ -13,7 +13,7 @@ use libva::{
     Picture, PictureNew, PictureEnd, PictureRender, PictureSync, Surface, Image,
 };
 use libva::VAProfile::Type as VAProfileType;
-use libva::constants::{
+use libva::{
     VA_INVALID_ID, VA_SLICE_DATA_FLAG_ALL,
     VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE,
     VA_PICTURE_H264_LONG_TERM_REFERENCE, VA_PICTURE_H264_TOP_FIELD,
@@ -2024,7 +2024,7 @@ fn read_from_image(
 
     // Determine format from fourcc
     let fourcc = va_image.format.fourcc;
-    let is_nv12 = fourcc == libva::constants::VA_FOURCC_NV12;
+    let is_nv12 = fourcc == libva::VA_FOURCC_NV12;
     let format_str = if is_nv12 {
         "NV12".to_string()
     } else if fourcc == u32::from_ne_bytes(*b"YV12") {
@@ -2094,118 +2094,6 @@ fn read_from_image(
     }))
 }
 
-/// Read pixel data from a VA surface using DMA-BUF export (export_prime).
-///
-/// This is the preferred method for NVIDIA GPUs where derive_from doesn't work.
-/// Exports the surface as a DRM PRIME handle, mmaps it, and reads the pixel data.
-///
-/// Uses `export_prime_separate()` because the NVIDIA NVDEC VA-API driver only
-/// implements the `VA_EXPORT_SURFACE_SEPARATE_LAYERS` export form (it returns
-/// `VA_STATUS_ERROR_INVALID_SURFACE` for the composed-layers form). In the
-/// separate-layers form each plane is its own layer (num_planes == 1) and its
-/// own DMA-BUF object, ordered luma-first: for NV12 layer 0 is Y and layer 1
-/// is the interleaved UV.
-fn read_surface_from_export_prime(
-    surface: &Surface<DmaBufSurfaceDescriptor>,
-    _width: u32,
-    _height: u32,
-) -> Result<Option<PixelData>> {
-    // Export the surface as DRM PRIME handle (separate layers form).
-    let desc = surface
-        .export_prime_separate()
-        .map_err(|e| Error::VaApi(format!("export_prime_separate failed: {}", e)))?;
-
-    // DRM format NV12 = 0x3231564E ("NV12")
-    let drm_fourcc_nv12 = u32::from_le_bytes(*b"NV12");
-    let drm_fourcc_nv21 = u32::from_le_bytes(*b"NV21");
-
-    if desc.fourcc != drm_fourcc_nv12 && desc.fourcc != drm_fourcc_nv21 {
-        return Ok(None);
-    }
-
-    if desc.objects.is_empty() || desc.layers.len() < 2 {
-        return Ok(None);
-    }
-
-    // Mmap every exported object (one per plane for the separate-layers form).
-    let mut mmaps = Vec::new();
-    for obj in desc.objects.iter() {
-        let mmap = unsafe {
-            memmap2::MmapOptions::new()
-                .map_copy(&obj.fd)
-                .map_err(|e| Error::VaApi(format!("mmap failed: {}", e)))?
-        };
-        mmaps.push(mmap);
-    }
-
-    let width = desc.width as usize;
-    let height = desc.height as usize;
-    let uv_height = (height + 1) / 2;
-
-    // Helper to copy a single plane described by (layer, plane_idx) into a fresh vec.
-    let copy_plane = |layer: &libva::DrmPrimeSurfaceDescriptorLayer,
-                      plane_idx: usize,
-                      rows: usize,
-                       _label: &str|
-        -> Option<(Vec<u8>, usize)> {
-        let obj_idx = layer.object_index[plane_idx] as usize;
-        let offset = layer.offset[plane_idx] as usize;
-        let pitch = layer.pitch[plane_idx] as usize;
-        let size = pitch * rows;
-        if obj_idx >= mmaps.len() {
-            return None;
-        }
-        if offset + size > mmaps[obj_idx].len() {
-            return None;
-        }
-        let mut data = vec![0u8; size];
-        data.copy_from_slice(&mmaps[obj_idx][offset..offset + size]);
-        Some((data, pitch))
-    };
-
-    // Layer 0 = Y (luma), layer 1 = UV (interleaved) for NV12/NV21.
-    let (y_data, y_pitch) = match copy_plane(&desc.layers[0], 0, height, "Y") {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let (uv_data, uv_pitch) = match copy_plane(&desc.layers[1], 0, uv_height, "UV") {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    let y_size = y_data.len();
-    let uv_size = uv_data.len();
-
-    // Combine into a single buffer: [Y plane][UV plane]
-    let mut buffer = Vec::with_capacity(y_size + uv_size);
-    buffer.extend_from_slice(&y_data);
-    buffer.extend_from_slice(&uv_data);
-
-    let y_offset = 0usize;
-    let uv_offset = y_size;
-
-    let is_nv21 = desc.fourcc == drm_fourcc_nv21;
-    let format_str = if is_nv21 { "NV21" } else { "NV12" }.to_string();
-
-    Ok(Some(PixelData {
-        format: format_str,
-        y: PixelPlane {
-            data: unsafe { buffer.as_ptr().add(y_offset) },
-            pitch: y_pitch,
-            width,
-            height,
-        },
-        u: PixelPlane {
-            data: unsafe { buffer.as_ptr().add(uv_offset) },
-            pitch: uv_pitch,
-            width,
-            height: uv_height,
-        },
-        v: None, // NV12/NV21 are semi-planar, UV is interleaved
-        buffer,
-    }))
-}
-
 /// Read pixel data from a VA surface after decode.
 ///
 /// Strategy (in order):
@@ -2229,7 +2117,7 @@ fn read_surface_pixels(
 
     // Primary: vaCreateImage + vaGetImage (driver-supported CPU read).
     let format = libva::VAImageFormat {
-        fourcc: libva::constants::VA_FOURCC_NV12,
+        fourcc: libva::VA_FOURCC_NV12,
         ..Default::default()
     };
     match Image::create_from(surface, format, (width, height), (width, height)) {
@@ -2241,7 +2129,7 @@ fn read_surface_pixels(
     match Image::derive_from(surface, (width, height)) {
         Ok(img) => {
             let fourcc = img.image().format.fourcc;
-            if fourcc == libva::constants::VA_FOURCC_NV12
+            if fourcc == libva::VA_FOURCC_NV12
                 || fourcc == u32::from_ne_bytes(*b"YV12")
                 || fourcc == u32::from_ne_bytes(*b"I420")
             {
@@ -2418,19 +2306,19 @@ fn parse_h264_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
         let chroma_fmt = sps.chroma_format_idc;
 
         match (bit_depth, chroma_fmt) {
-            (8, 0) | (8, 1) => libva::constants::VA_RT_FORMAT_YUV420,
-            (8, 2) => libva::constants::VA_RT_FORMAT_YUV422,
-            (8, 3) => libva::constants::VA_RT_FORMAT_YUV444,
-            (10, 0) | (10, 1) => libva::constants::VA_RT_FORMAT_YUV420_10,
-            (10, 2) => libva::constants::VA_RT_FORMAT_YUV422_10,
-            (10, 3) => libva::constants::VA_RT_FORMAT_YUV444_10,
-            (12, 0) | (12, 1) => libva::constants::VA_RT_FORMAT_YUV420_12,
-            (12, 2) => libva::constants::VA_RT_FORMAT_YUV422_12,
-            (12, 3) => libva::constants::VA_RT_FORMAT_YUV444_12,
-            _ => libva::constants::VA_RT_FORMAT_YUV420,
+            (8, 0) | (8, 1) => libva::VA_RT_FORMAT_YUV420,
+            (8, 2) => libva::VA_RT_FORMAT_YUV422,
+            (8, 3) => libva::VA_RT_FORMAT_YUV444,
+            (10, 0) | (10, 1) => libva::VA_RT_FORMAT_YUV420_10,
+            (10, 2) => libva::VA_RT_FORMAT_YUV422_10,
+            (10, 3) => libva::VA_RT_FORMAT_YUV444_10,
+            (12, 0) | (12, 1) => libva::VA_RT_FORMAT_YUV420_12,
+            (12, 2) => libva::VA_RT_FORMAT_YUV422_12,
+            (12, 3) => libva::VA_RT_FORMAT_YUV444_12,
+            _ => libva::VA_RT_FORMAT_YUV420,
         }
     } else {
-        libva::constants::VA_RT_FORMAT_YUV420
+        libva::VA_RT_FORMAT_YUV420
     };
 
     Ok(StreamInfo {
@@ -2480,7 +2368,7 @@ fn parse_h265_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
         display_width: width,
         display_height: height,
         max_dpb: max_dpb.min(16).max(1),
-        rt_format: libva::constants::VA_RT_FORMAT_YUV420,
+        rt_format: libva::VA_RT_FORMAT_YUV420,
         sps: None,
         pps: None,
     })
@@ -2526,7 +2414,7 @@ fn parse_vp9_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
         display_width: width,
         display_height: height,
         max_dpb: 8,
-        rt_format: libva::constants::VA_RT_FORMAT_YUV420,
+        rt_format: libva::VA_RT_FORMAT_YUV420,
         sps: None,
         pps: None,
     })
