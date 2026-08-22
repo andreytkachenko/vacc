@@ -398,8 +398,17 @@ impl VideoDeviceBuilder {
             ));
         }
 
+        // NVD_GPU (0-based index) selects the GPU from the enumerated device list.
+        let mut candidates: Vec<vk::PhysicalDevice> = physical_devices;
+        if let Some(idx) = std::env::var("NVD_GPU").ok().and_then(|v| v.parse::<usize>().ok()) {
+            if idx < candidates.len() {
+                let pd = candidates.remove(idx);
+                candidates.insert(0, pd);
+            }
+        }
+
         // Find a physical device with video decode support
-        for &pd in &physical_devices {
+        for &pd in &candidates {
             let queue_families_list =
                 unsafe { instance.get_physical_device_queue_family_properties(pd) };
 

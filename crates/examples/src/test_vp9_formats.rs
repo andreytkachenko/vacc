@@ -78,7 +78,10 @@ fn main() {
 
         // Get function pointer
         let get_format_props_fn = unsafe {
-            device.get_physical_device_video_format_properties_fn()
+            device.entry.get_instance_proc_addr(
+                device.instance.handle(),
+                c"vkGetPhysicalDeviceVideoFormatPropertiesKHR".as_ptr(),
+            )
         };
 
         let Some(fn_ptr_raw) = get_format_props_fn else {
@@ -98,7 +101,7 @@ fn main() {
             // First call to get count
             let mut count: u32 = 0;
             let result = fn_ptr(
-                device.physical_device(),
+                device.physical_device,
                 &format_info,
                 &mut count,
                 std::ptr::null_mut(),
@@ -124,7 +127,7 @@ fn main() {
             }
 
             let result = fn_ptr(
-                device.physical_device(),
+                device.physical_device,
                 &format_info,
                 &mut count,
                 props.as_mut_ptr(),

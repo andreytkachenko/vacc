@@ -15,6 +15,14 @@ name = "vulkan_decode_vp9"
 path = "src/vulkan_decode_vp9.rs"
 
 [[example]]
+name = "decode"
+path = "src/decode.rs"
+
+[[example]]
+name = "decode_vaapi"
+path = "src/decode_vaapi.rs"
+
+[[example]]
 name = "decode_nvdec_vp9_cuvid"
 path = "src/decode_nvdec_vp9_cuvid.rs"
 
@@ -34,12 +42,6 @@ path = "src/diag_av1_obu.rs"
 name = "decode_nvdec_vp9"
 path = "src/decode_nvdec_vp9.rs"
 
-[dependencies]
-vk-video-core = { workspace = true }
-vk-video-parser = { workspace = true }
-vk-video-vulkan = { workspace = true }
-nvdec-decode = { workspace = true }
-ash = { workspace = true }
 [[example]]
 name = "decode_nvdec"
 path = "src/decode_nvdec.rs"
@@ -81,6 +83,10 @@ name = "test_caps"
 path = "src/test_caps.rs"
 
 [[example]]
+name = "test_vp9_formats"
+path = "src/test_vp9_formats.rs"
+
+[[example]]
 name = "mmco_debug"
 path = "src/mmco_debug.rs"
 
@@ -95,3 +101,12 @@ path = "src/mmco_bits.rs"
 [[example]]
 name = "mmco_trace"
 path = "src/mmco_trace.rs"
+
+[dependencies]
+vk-video-core = { workspace = true }
+vk-video-parser = { workspace = true }
+vk-video-vulkan = { workspace = true }
+nvdec-decode = { workspace = true }
+vaapi-decode = { workspace = true }
+vulkan-decode = { workspace = true }
+ ash = { workspace = true }

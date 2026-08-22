@@ -21,6 +21,7 @@
 
 pub mod codec;
 pub mod decoder;
+pub mod device;
 pub mod error;
 pub mod format;
 pub mod frame;
@@ -29,9 +30,10 @@ pub mod session;
 
 pub use codec::{VideoCodec, VideoCodecFlagBits, VideoCodecOperation};
 pub use decoder::{Decoder, DecoderInfo};
+pub use device::{DecodeCapabilities, DecoderDevice};
 pub use error::{VideoError, VideoResult};
 pub use format::{ChromaSubsampling, ComponentBitDepth, VideoFormat, VideoProfile};
-pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo};
+pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo, PixelData, PixelPlane};
 pub use picture::{ParameterType, PictureParametersSet, StdType};
 pub use session::{PictureResourceInfo, VideoDecodeInfo, VideoSessionParams};
 
