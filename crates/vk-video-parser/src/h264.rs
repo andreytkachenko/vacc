@@ -83,6 +83,20 @@ impl H264Parser {
         self.active_pps.as_ref()
     }
 
+    /// Set the active SPS (e.g. from an out-of-band parse) so that
+    /// `parse_slice_header` can use it.
+    pub fn set_sps(&mut self, sps: vk_video_core::picture::H264Sps) {
+        self.sps_cache.insert(sps.seq_parameter_set_id, sps.clone());
+        self.active_sps = Some(sps);
+    }
+
+    /// Set the active PPS (e.g. from an out-of-band parse) so that
+    /// `parse_slice_header` can use it.
+    pub fn set_pps(&mut self, pps: vk_video_core::picture::H264Pps) {
+        self.pps_cache.insert(pps.pic_parameter_set_id, pps.clone());
+        self.active_pps = Some(pps);
+    }
+
     /// Parse VUI parameters from the bitstream.
     /// Returns H264SpsVui with parsed values when vui_parameters_present_flag is set.
     fn parse_vui_parameters(r: &mut BitReader) -> ParserResult<vk_video_core::picture::H264SpsVui> {
@@ -1063,11 +1077,26 @@ impl H264Parser {
                     if memory_management_control_operation == 0 {
                         break;
                     }
+                    // H.264 spec 7.4.5: each op has a specific number of ue(v) values.
+                    // Reading the wrong count desyncs the bit reader for the rest of
+                    // the slice header (and subsequent slices). We store the primary
+                    // value in `value`; op 3's second value (long_term_pic_num) is
+                    // read for bit-reader sync but not stored (DecRefPicMarkingEntry
+                    // has a single value field).
                     let value = match memory_management_control_operation {
-                        1 | 4 | 6 => r.read_ue()?,     // difference_of_pic_nums_minus1
-                        2 | 5 | 7 | 9 => r.read_ue()?, // long_term_pic_num
-                        3 => r.read_ue()?,             // max_long_term_frame_idx_plus1
-                        8 => 0,                        // unmark_all_short_term: no value
+                        1 => r.read_ue()?, // difference_of_pic_nums_minus1
+                        2 => r.read_ue()?, // long_term_pic_num
+                        3 => {
+                            let diff = r.read_ue()?; // difference_of_pic_nums_minus1
+                            let _lt = r.read_ue()?;  // long_term_pic_num (sync only)
+                            diff
+                        }
+                        4 => r.read_ue()?, // max_long_term_frame_idx_plus1
+                        5 => 0,            // no value
+                        6 => r.read_ue()?, // long_term_pic_num
+                        7 => r.read_ue()?, // long_term_pic_num
+                        8 => 0,            // no value
+                        9 => r.read_ue()?, // long_term_pic_num
                         _ => 0,
                     };
                     marking.push(DecRefPicMarkingEntry {

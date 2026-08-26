@@ -2499,6 +2499,15 @@ impl VideoDecoder {
             },
         });
 
+        if std::env::var("VACC_DBG_SPS").is_ok() {
+            let bs_head: Vec<String> = au.data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+            eprintln!(
+                "[RUST-AU] slice_type={} frame_num={} is_idr={} is_ref={} poc=[{} {}] au_len={} au_head=[{}]",
+                au.slice_type, au.frame_num, au.is_idr, au.is_reference,
+                au.pic_order_cnt[0], au.pic_order_cnt[1],
+                au.data.len(), bs_head.join(" ")
+            );
+        }
         h264_decoder.record_decode_command(
             cmd_buffer,
             self.session.handle(),
@@ -2517,7 +2526,16 @@ impl VideoDecoder {
             &au.slice_offsets,
             Some(au.frame_num),
             Some(au.pic_order_cnt),
-            Some(matches!(au.slice_type, 0 | 4 | 8)), // I or SI slices are intra
+            // Decode slice_type per H.264 8.2.1: slice_type = raw % 5, but raw 5/6 -> 1 (B).
+            // au.slice_type holds the raw value from the slice header.
+            {
+                let st = if au.slice_type == 5 || au.slice_type == 6 {
+                    1
+                } else {
+                    au.slice_type % 5
+                };
+                Some(matches!(st, 2 | 4)) // I (2) or SI (4) slices are intra
+            },
             Some(au.is_reference),
             Some(au.is_idr),
             is_first_frame,
@@ -2819,6 +2837,30 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
             }
         })
         .unwrap_or(0);
+
+    // Compute crop offsets from SPS conformance window (H.264 A.11)
+    let (display_width, display_height, crop_left, crop_top) = sps.as_ref().map(|s| {
+        let crop_left = s.frame_crop_left_offset as i32 * 2;
+        let crop_right = s.frame_crop_right_offset as i32 * 2;
+        let crop_top = if s.frame_mbs_only_flag {
+            s.frame_crop_top_offset as i32 * 2
+        } else {
+            s.frame_crop_top_offset as i32 * 4
+        };
+        let crop_bottom = if s.frame_mbs_only_flag {
+            s.frame_crop_bottom_offset as i32 * 2
+        } else {
+            s.frame_crop_bottom_offset as i32 * 4
+        };
+        let disp_w = coded_width as i32 - crop_left - crop_right;
+        let disp_h = coded_height as i32 - crop_top - crop_bottom;
+        (
+            disp_w.max(0) as u32,
+            disp_h.max(0) as u32,
+            crop_left.max(0) as u32,
+            crop_top.max(0) as u32,
+        )
+    }).unwrap_or((coded_width, coded_height, 0, 0));
     let raw_profile_idc = sps.as_ref().map(|s| s.profile_idc as u32).unwrap_or(100);
     let profile_idc = match raw_profile_idc {
         41 => 66,
@@ -2855,10 +2897,10 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
         pps: pps.map(H264OrH265Pps::H264),
         coded_width,
         coded_height,
-        display_width: coded_width,
-        display_height: coded_height,
-        crop_left: 0,
-        crop_top: 0,
+        display_width,
+        display_height,
+        crop_left,
+        crop_top,
         profile_idc,
         max_dpb_slots,
         chroma_subsampling,

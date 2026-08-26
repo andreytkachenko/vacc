@@ -237,23 +237,9 @@ impl H264Decoder {
         let all_begin_slots: Vec<vk::VideoReferenceSlotInfoKHR>;
 
         if is_first_frame {
-            // RESET frame: activate ALL DPB slots
-
-            // Build picture resources for all slots
-            let all_picture_resources: Vec<vk::VideoPictureResourceInfoKHR> = (0..dpb_views.len()
-                as u32)
-                .map(|slot_idx| vk::VideoPictureResourceInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    coded_offset: vk::Offset2D::default(),
-                    coded_extent,
-                    base_array_layer: 0,
-                    image_view_binding: dpb_views[slot_idx as usize],
-                    _marker: Default::default(),
-                })
-                .collect();
-
-            // Build setup slot with DPB info
+            // RESET frame: activate ONLY the setup slot (matches C++ oracle, which
+            // activates a single slot for the IDR frame). Activating all DPB slots
+            // with null DPB slot info confuses the driver.
             let setup_slot_idx = dpb_setup_picture
                 .as_ref()
                 .map_or(0, |s| s.slot_index as usize);
@@ -268,26 +254,23 @@ impl H264Decoder {
             let setup_dpb_slot_info =
                 vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info);
 
-            // Build all slots
-            all_begin_slots = (0..dpb_views.len() as u32)
-                .map(|slot_idx| {
-                    let is_setup = slot_idx as usize == setup_slot_idx;
-                    let pr = &all_picture_resources[slot_idx as usize];
-                    let p_next = if is_setup {
-                        &setup_dpb_slot_info as *const _ as *const _
-                    } else {
-                        // Non-setup slots on RESET: no DPB slot info needed for H.264
-                        std::ptr::null()
-                    };
-                    vk::VideoReferenceSlotInfoKHR {
-                        s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                        p_next,
-                        slot_index: slot_idx as i32,
-                        p_picture_resource: pr,
-                        _marker: Default::default(),
-                    }
-                })
-                .collect();
+            let setup_pr = vk::VideoPictureResourceInfoKHR {
+                s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
+                p_next: std::ptr::null(),
+                coded_offset: vk::Offset2D::default(),
+                coded_extent,
+                base_array_layer: 0,
+                image_view_binding: dpb_views[setup_slot_idx],
+                _marker: Default::default(),
+            };
+
+            all_begin_slots = vec![vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: &setup_dpb_slot_info as *const _ as *const _,
+                slot_index: setup_slot_idx as i32,
+                p_picture_resource: &setup_pr as *const _,
+                _marker: Default::default(),
+            }];
 
             let begin_coding_info = vk::VideoBeginCodingInfoKHR {
                 s_type: vk::StructureType::VIDEO_BEGIN_CODING_INFO_KHR,
@@ -530,6 +513,17 @@ impl H264Decoder {
 
         let pic_ptr = &pic_info as *const StdVideoDecodeH264PictureInfo;
 
+        if std::env::var("VACC_DBG_SPS").is_ok() {
+            eprintln!(
+                "[RUST-DECODE] bs_range={} slice_count={} slice_offsets={:?} ref_slots={} setup_slot={}",
+                bitstream_range,
+                slice_offsets.len(),
+                slice_offsets,
+                dpb_ref_pictures.len(),
+                dpb_setup_picture.as_ref().map(|s| s.slot_index).unwrap_or(u32::MAX)
+            );
+        }
+
         let h264_decode_info = vk::VideoDecodeH264PictureInfoKHR {
             s_type: vk::StructureType::VIDEO_DECODE_H264_PICTURE_INFO_KHR,
             p_next: std::ptr::null(),
@@ -661,9 +655,20 @@ impl H264Decoder {
             .flags
             .set_is_reference(if is_reference { 1 } else { 0 });
         pic_info.flags.set_field_pic_flag(0);
-        pic_info.flags.set_IdrPicFlag(if is_idr { 1 } else { 0 });
+        // TEST HYPOTHESIS 1: C++ oracle never sets IdrPicFlag for H.264 (stays 0).
+        let _ = is_idr;
+        pic_info.flags.set_IdrPicFlag(0);
         pic_info.flags.set_bottom_field_flag(0);
         pic_info.flags.set_complementary_field_pair(0);
+
+        if std::env::var("VACC_DBG_SPS").is_ok() {
+            eprintln!(
+                "[RUST-PIC] frame_num={} poc=[{} {}] is_intra={} is_ref={} idr={} sps_id={} pps_id={}",
+                pic_info.frame_num, pic_order_cnt[0], pic_order_cnt[1],
+                is_intra, is_reference, is_idr,
+                pic_info.seq_parameter_set_id, pic_info.pic_parameter_set_id
+            );
+        }
 
         pic_info
     }
@@ -776,6 +781,47 @@ impl H264Decoder {
     }
 }
 
+/// Convert raw H.264 level_idc to Vulkan StdVideoH264LevelIdc enum.
+///
+/// Matches C++ reference VulkanH264Parser.cpp:levelIdcToVulkanLevelIdcEnum().
+/// Note: the driver's ABI uses 0-based enum values (level 3.0 -> 7), NOT the
+/// raw H.264 level_idc (30).
+fn h264_level_idc_to_vulkan(raw_level_idc: u8, constraint_set3_flag: bool) -> StdVideoH264LevelIdc {
+    // Level 1b (level_idc 9, or 11 with constraint_set3) has no Vulkan enum;
+    // the C++ oracle maps it to 1.1.
+    if raw_level_idc == 9 || (raw_level_idc == 11 && constraint_set3_flag) {
+        return StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_1;
+    }
+    match raw_level_idc {
+        10 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_0,
+        11 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_1,
+        12 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_2,
+        13 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_3,
+        20 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_2_0,
+        21 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_2_1,
+        22 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_2_2,
+        30 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_0,
+        31 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_1,
+        32 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_2,
+        40 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_0,
+        41 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_1,
+        42 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_2,
+        50 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_0,
+        51 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1,
+        52 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2,
+        60 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_0,
+        61 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_1,
+        62 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2,
+        _ => {
+            eprintln!(
+                "[H264] WARNING: Unknown level_idc={}, defaulting to 6.2",
+                raw_level_idc
+            );
+            StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2
+        }
+    }
+}
+
 /// Convert our H264Sps to StdVideoH264SequenceParameterSet.
 pub fn convert_h264_sps(sps: &vk_video_core::picture::H264Sps) -> StdVideoH264SequenceParameterSet {
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH264SpsFlags>() };
@@ -867,10 +913,17 @@ pub fn convert_h264_sps(sps: &vk_video_core::picture::H264Sps) -> StdVideoH264Se
     // Leak the Box to get a &'static pointer. Vulkan copies the data, so this is safe.
     let vui_ptr = Box::leak(Box::new(vui_data)) as *const StdVideoH264SequenceParameterSetVui;
 
-    StdVideoH264SequenceParameterSet {
+    // TEST HYPOTHESIS 3: C++ oracle always passes a non-null (zeroed) pOffsetForRefFrame.
+    // Some drivers may read it unconditionally even when pic_order_cnt_type != 1.
+    let offset_for_ref_frame: [i32; 255] = [0i32; 255];
+    let offset_ptr = Box::leak(Box::new(offset_for_ref_frame)) as *const i32;
+
+    let level_idc = h264_level_idc_to_vulkan(sps.level_idc, sps.constraint_set3_flag);
+
+    let out = StdVideoH264SequenceParameterSet {
         flags,
         profile_idc: sps.profile_idc as u32,
-        level_idc: sps.level_idc as u32,
+        level_idc,
         chroma_format_idc: sps.chroma_format_idc as u32,
         seq_parameter_set_id: sps.seq_parameter_set_id as u8,
         bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
@@ -890,10 +943,52 @@ pub fn convert_h264_sps(sps: &vk_video_core::picture::H264Sps) -> StdVideoH264Se
         frame_crop_top_offset: sps.frame_crop_top_offset,
         frame_crop_bottom_offset: sps.frame_crop_bottom_offset,
         reserved2: 0,
-        pOffsetForRefFrame: std::ptr::null(),
+        pOffsetForRefFrame: offset_ptr,
         pScalingLists: std::ptr::null(),
         pSequenceParameterSetVui: vui_ptr,
+    };
+
+    if std::env::var("VACC_DEBUG").is_ok() {
+        eprintln!("[H264-SESS-DUMP] ===== StdVideoH264SequenceParameterSet =====");
+        eprintln!(
+            "[H264-SESS-DUMP] flags: sep_colour={} qpprime_bypass={} frame_mbs_only={} direct_8x8={} crop={} vui={}",
+            out.flags.separate_colour_plane_flag(),
+            out.flags.qpprime_y_zero_transform_bypass_flag(),
+            out.flags.frame_mbs_only_flag(),
+            out.flags.direct_8x8_inference_flag(),
+            out.flags.frame_cropping_flag(),
+            out.flags.vui_parameters_present_flag()
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] profile_idc={} level_idc={} chroma_format_idc={} sps_id={}",
+            out.profile_idc, out.level_idc, out.chroma_format_idc, out.seq_parameter_set_id
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] bit_depth_luma_minus8={} bit_depth_chroma_minus8={} log2_max_frame_num_minus4={} poc_type={}",
+            out.bit_depth_luma_minus8, out.bit_depth_chroma_minus8,
+            out.log2_max_frame_num_minus4, out.pic_order_cnt_type
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] offset_non_ref={} offset_top_bottom={} log2_max_poc_lsb={} num_ref_frames_in_cycle={} max_num_ref_frames={}",
+            out.offset_for_non_ref_pic, out.offset_for_top_to_bottom_field,
+            out.log2_max_pic_order_cnt_lsb_minus4, out.num_ref_frames_in_pic_order_cnt_cycle,
+            out.max_num_ref_frames
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] w_mbs_minus1={} h_map_units_minus1={} crop=(L={},R={},T={},B={})",
+            out.pic_width_in_mbs_minus1, out.pic_height_in_map_units_minus1,
+            out.frame_crop_left_offset, out.frame_crop_right_offset,
+            out.frame_crop_top_offset, out.frame_crop_bottom_offset
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] pOffsetForRefFrame={:?} pScalingLists={:?} pVui={:?}",
+            out.pOffsetForRefFrame.is_null(),
+            out.pScalingLists.is_null(),
+            out.pSequenceParameterSetVui.is_null()
+        );
     }
+
+    out
 }
 
 /// Convert our H264Pps to StdVideoH264PictureParameterSet.
@@ -918,8 +1013,19 @@ pub fn convert_h264_pps(pps: &vk_video_core::picture::H264Pps) -> StdVideoH264Pi
     } else {
         0
     });
+    // The driver parses slice data with this flag (CABAC vs CAVLC); it is NOT
+    // in the slice header, so it must come from the session PPS. The C++
+    // oracle sets it (VulkanH264Parser.cpp pps->flags.entropy_coding_mode_flag).
+    flags.set_entropy_coding_mode_flag(if pps.entropy_coding_mode_flag { 1 } else { 0 });
+    flags.set_bottom_field_pic_order_in_frame_present_flag(
+        if pps.bottom_field_pic_order_in_frame_present_flag {
+            1
+        } else {
+            0
+        },
+    );
 
-    StdVideoH264PictureParameterSet {
+    let out = StdVideoH264PictureParameterSet {
         flags,
         seq_parameter_set_id: pps.seq_parameter_set_id as u8,
         pic_parameter_set_id: pps.pic_parameter_set_id as u8,
@@ -931,5 +1037,33 @@ pub fn convert_h264_pps(pps: &vk_video_core::picture::H264Pps) -> StdVideoH264Pi
         chroma_qp_index_offset: pps.chroma_qp_index_offset as i8,
         second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset as i8,
         pScalingLists: std::ptr::null(),
+    };
+
+    if std::env::var("VACC_DEBUG").is_ok() {
+        eprintln!("[H264-SESS-DUMP] ===== StdVideoH264PictureParameterSet =====");
+        eprintln!(
+            "[H264-SESS-DUMP] flags: entropy_coding_mode={} weighted_pred={} bottom_field_poc={} deblock_present={} constrained_intra={} redundant_pic_cnt={} transform_8x8={} pic_scaling_matrix={}",
+            out.flags.entropy_coding_mode_flag(),
+            out.flags.weighted_pred_flag(),
+            out.flags.bottom_field_pic_order_in_frame_present_flag(),
+            out.flags.deblocking_filter_control_present_flag(),
+            out.flags.constrained_intra_pred_flag(),
+            out.flags.redundant_pic_cnt_present_flag(),
+            out.flags.transform_8x8_mode_flag(),
+            out.flags.pic_scaling_matrix_present_flag()
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] pps_id={} sps_id={} nrl0={} nrl1={} weighted_bipred_idc={} pic_init_qp={} pic_init_qs={}",
+            out.pic_parameter_set_id, out.seq_parameter_set_id,
+            out.num_ref_idx_l0_default_active_minus1, out.num_ref_idx_l1_default_active_minus1,
+            out.weighted_bipred_idc, out.pic_init_qp_minus26, out.pic_init_qs_minus26
+        );
+        eprintln!(
+            "[H264-SESS-DUMP] chroma_qp_index_offset={} second_chroma_qp_index_offset={} pScalingLists={:?}",
+            out.chroma_qp_index_offset, out.second_chroma_qp_index_offset,
+            out.pScalingLists.is_null()
+        );
     }
+
+    out
 }

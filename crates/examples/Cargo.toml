@@ -19,10 +19,6 @@ name = "decode"
 path = "src/decode.rs"
 
 [[example]]
-name = "decode_vaapi"
-path = "src/decode_vaapi.rs"
-
-[[example]]
 name = "decode_nvdec_vp9_cuvid"
 path = "src/decode_nvdec_vp9_cuvid.rs"
 
@@ -107,6 +103,6 @@ vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
 vk-video-vulkan = { workspace = true }
 nvdec-decode = { workspace = true }
-vaapi-decode = { workspace = true }
+# vaapi-decode = { workspace = true }  # excluded: cros-libva build failure
 vulkan-decode = { workspace = true }
  ash = { workspace = true }

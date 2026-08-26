@@ -15,12 +15,83 @@ fn main() {
     let format = DetectedVideoFormat::new(VideoCodec::DecodeH264);
     parser.init(&format).expect("Failed to init parser");
 
-    // Parse the entire file as one packet
-    let packet = BitstreamPacket::new(data);
+    // Truncate at the first slice NAL so parse() returns ParameterSet (with PPS).
+    // Slice NAL types are 1-5. Scan for 00 00 01; NAL header is always at pos+3.
+    let mut cut = data.len();
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let hdr = i + 3;
+            if hdr < data.len() {
+                let t = data[hdr] & 0x1F;
+                if (1..=5).contains(&t) {
+                    cut = if i >= 1 && data[i - 1] == 0 { i - 1 } else { i };
+                    break;
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let data = &data[..cut];
+
+    // Parse the parameter-set portion as one packet
+    let packet = BitstreamPacket::new(data.to_vec());
     let result = parser.parse(&packet).expect("Failed to parse");
 
     // Get the active SPS
     let sps = parser.active_sps().expect("No SPS found in the bitstream");
+
+    // Dump PPS fields (for debugging PPS conversion) — from ParseResult
+    let pps_ref: Option<&vk_video_core::picture::H264Pps> = match &result {
+        vk_video_parser::ParseResult::ParameterSet { pps, .. } => pps
+            .as_ref()
+            .and_then(|p| p.downcast_ref::<vk_video_core::picture::H264Pps>()),
+        _ => None,
+    };
+    if let Some(pps) = pps_ref {
+        println!("=== H.264 PPS Fields ===\n");
+        println!("pic_parameter_set_id               = {}", pps.pic_parameter_set_id);
+        println!("seq_parameter_set_id               = {}", pps.seq_parameter_set_id);
+        println!("entropy_coding_mode_flag           = {}", pps.entropy_coding_mode_flag);
+        println!(
+            "bottom_field_pic_order_in_frame_pres = {}",
+            pps.bottom_field_pic_order_in_frame_present_flag
+        );
+        println!("num_slice_groups_minus1            = {}", pps.num_slice_groups_minus1);
+        println!(
+            "num_ref_idx_l0_default_active_minus1 = {}",
+            pps.num_ref_idx_l0_default_active_minus1
+        );
+        println!(
+            "num_ref_idx_l1_default_active_minus1 = {}",
+            pps.num_ref_idx_l1_default_active_minus1
+        );
+        println!("weighted_pred_flag                 = {}", pps.weighted_pred_flag);
+        println!("weighted_bipred_idc                = {}", pps.weighted_bipred_idc);
+        println!("pic_init_qp_minus26                = {}", pps.pic_init_qp_minus26);
+        println!("pic_init_qs_minus26                = {}", pps.pic_init_qs_minus26);
+        println!("chroma_qp_index_offset             = {}", pps.chroma_qp_index_offset);
+        println!(
+            "deblocking_filter_control_present    = {}",
+            pps.deblocking_filter_control_present_flag
+        );
+        println!(
+            "redundant_pic_cnt_present_flag       = {}",
+            pps.redundant_pic_cnt_present_flag
+        );
+        println!("transform_8x8_mode_flag            = {}", pps.transform_8x8_mode_flag);
+        println!(
+            "constrained_intra_pred_flag          = {}",
+            pps.constrained_intra_pred_flag
+        );
+        println!(
+            "second_chroma_qp_index_offset        = {}",
+            pps.second_chroma_qp_index_offset
+        );
+        println!();
+    }
 
     println!("=== H.264 SPS Fields ===\n");
 

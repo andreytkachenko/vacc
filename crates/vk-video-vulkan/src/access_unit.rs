@@ -21,8 +21,13 @@ pub struct AccessUnit {
     pub is_idr: bool,
     /// Whether this is a reference frame
     pub is_reference: bool,
-    /// Slice type (0=I, 1=P, 2=B, 3=SI, 4=SP for H.264)
+    /// H.264: slice type from the common parser (0=P, 1=B, 2=I, 3=SP, 4=SI).
+    /// H.265: raw slice type.
     pub slice_type: u32,
+    /// H.264: full slice header from the common parser (None for other codecs).
+    /// Carries POC fields, num_ref_idx, and ref_pic_list_modification needed by
+    /// the common PocCalculator / H264Dpb / ref-list builder.
+    pub h264_slice: Option<vk_video_parser::h264::SliceHeader>,
     /// H.265: NumBitsForShortTermRPSInSlice from slice header
     pub num_bits_for_st_ref_pic_set_in_slice: i32,
     /// H.265: NumDeltaPocsOfRefRpsIdx from slice header
@@ -39,26 +44,10 @@ pub struct AccessUnit {
     pub no_output_of_prior_pics_flag: bool,
 }
 
-/// H.264 Memory Management Control Operation (MMCO) command.
-/// See H.264 spec 8.2.5.4 for details.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H264MmcoCommand {
-    /// MMCO 1: Unmark short-term reference with difference_of_pic_nums_minus1
-    UnmarkShortTerm { difference_of_pic_nums_minus1: u32 },
-    /// MMCO 2: Unmark long-term reference with long_term_frame_idx
-    UnmarkLongTerm { long_term_frame_idx: u32 },
-    /// MMCO 3: Assign LongTermFrameIdx to short-term reference
-    AssignLongTerm {
-        difference_of_pic_nums_minus1: u32,
-        long_term_frame_idx: u32,
-    },
-    /// MMCO 4: Set MaxLongTermFrameIdx
-    SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: u32 },
-    /// MMCO 5: Unmark all references
-    UnmarkAll,
-    /// MMCO 6: Assign LongTermFrameIdx to current picture
-    AssignLongTermToCurrent { long_term_frame_idx: u32 },
-}
+// H.264 MMCO command type is shared across all backends via the common parser
+// crate. Re-exported here to keep the existing `crate::access_unit::H264MmcoCommand`
+// path compiling.
+pub use vk_video_parser::h264_dpb::H264MmcoCommand;
 
 /// Enum to hold either H.264 or H.265 SPS.
 #[derive(Debug, Clone)]
@@ -198,27 +187,55 @@ fn parse_h264_slice_header(
         let _idr_pic_id = r.read_ue().unwrap_or(0);
     }
 
-    let pic_order_cnt_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
-    let pic_order_cnt_lsb = r.read_bits(pic_order_cnt_lsb_bits)? as i32;
+    // POC calculation per H.264 spec 8.2.1
+    // Different POC types have different bitstream syntax
+    let (pic_order_cnt_lsb, pic_order_cnt_msb, pic_order_cnt) = match sps.pic_order_cnt_type {
+        0 => {
+            // Type 0: explicit POC with pic_order_cnt_lsb
+            let pic_order_cnt_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
+            let poc_lsb = r.read_bits(pic_order_cnt_lsb_bits)? as i32;
 
-    let pic_order_cnt_msb = if is_idr {
-        0
-    } else if pic_order_cnt_lsb < prev_pic_order_cnt_lsb
-        && (prev_pic_order_cnt_lsb - pic_order_cnt_lsb) >= (max_pic_order_cnt_lsb as i32 / 2)
-    {
-        prev_pic_order_cnt_msb + max_pic_order_cnt_lsb as i32
-    } else if pic_order_cnt_lsb > prev_pic_order_cnt_lsb
-        && (pic_order_cnt_lsb - prev_pic_order_cnt_lsb) > (max_pic_order_cnt_lsb as i32 / 2)
-    {
-        prev_pic_order_cnt_msb - max_pic_order_cnt_lsb as i32
-    } else {
-        prev_pic_order_cnt_msb
+            let poc_msb = if is_idr {
+                0
+            } else if poc_lsb < prev_pic_order_cnt_lsb
+                && (prev_pic_order_cnt_lsb - poc_lsb) >= (max_pic_order_cnt_lsb as i32 / 2)
+            {
+                prev_pic_order_cnt_msb + max_pic_order_cnt_lsb as i32
+            } else if poc_lsb > prev_pic_order_cnt_lsb
+                && (poc_lsb - prev_pic_order_cnt_lsb) > (max_pic_order_cnt_lsb as i32 / 2)
+            {
+                prev_pic_order_cnt_msb - max_pic_order_cnt_lsb as i32
+            } else {
+                prev_pic_order_cnt_msb
+            };
+
+            let poc = poc_msb + poc_lsb;
+            (poc_lsb, poc_msb, [poc, poc])
+        }
+        1 => {
+            // Type 1: implicit POC with delta values
+            let delta_poc_bottom = 0; // simplified for frame pictures
+            if !sps.delta_pic_order_always_zero_flag {
+                let _delta_poc_bottom = r.read_se().unwrap_or(0);
+            }
+            // For type 1, POC is computed from frame_num and offsets
+            // Simplified: use frame_num * 2 as approximation
+            let poc = frame_num as i32 * 2;
+            (0, 0, [poc, poc + delta_poc_bottom])
+        }
+        2 => {
+            // Type 2: implicit POC, no bits in bitstream
+            // POC = FrameNum * 2 for reference, FrameNum * 2 + 1 for non-reference
+            let is_reference = nal_ref_idc != 0;
+            let poc = if is_reference {
+                frame_num as i32 * 2
+            } else {
+                frame_num as i32 * 2 + 1
+            };
+            (0, 0, [poc, poc])
+        }
+        _ => (0, 0, [0, 0]),
     };
-
-    let pic_order_cnt = [
-        pic_order_cnt_msb + pic_order_cnt_lsb,
-        pic_order_cnt_msb + pic_order_cnt_lsb,
-    ];
 
     // adaptive_ref_pic_marking_mode_flag appears after pic_order_cnt for reference frames
     let adaptive_ref_pic_marking_mode_flag = if nal_ref_idc > 0 {
@@ -672,12 +689,17 @@ pub fn extract_all_access_units(
     let mut current_adaptive_ref_pic_marking_mode_flag: bool = false;
     let mut current_mmco_commands: Vec<H264MmcoCommand> = Vec::new();
     let mut current_no_output_of_prior_pics_flag: bool = false;
+    let mut current_h264_slice: Option<vk_video_parser::h264::SliceHeader> = None;
     let mut in_frame = false;
 
+    let mut prev_frame_num: u32 = 0;
+    // H.265 POC state (H.264 POC is tracked by the common PocCalculator).
     let mut prev_pic_order_cnt_lsb: i32 = 0;
     let mut prev_pic_order_cnt_msb: i32 = 0;
-    let mut max_pic_order_cnt_lsb: u32 = 256;
-    let mut prev_frame_num: u32 = 0;
+
+    // Common H.264 parser + POC calculator (ONE common parser/POC across backends).
+    let mut h264_parser = vk_video_parser::h264::H264Parser::new();
+    let mut poc_calc = vk_video_parser::h264_poc::PocCalculator::new();
 
     // Track seen parameter set IDs to detect in-band updates
     let mut seen_h264_sps_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -707,10 +729,11 @@ pub fn extract_all_access_units(
     // Initialize seen IDs from initial parameter sets
     if let Some(sps) = h264_sps {
         seen_h264_sps_ids.insert(sps.seq_parameter_set_id);
-        max_pic_order_cnt_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+        h264_parser.set_sps(sps.clone());
     }
     if let Some(pps) = h264_pps {
         seen_h264_pps_ids.insert(pps.pic_parameter_set_id);
+        h264_parser.set_pps(pps.clone());
     }
     if let Some(sps) = h265_sps {
         seen_h265_sps_ids.insert(sps.sps_seq_parameter_set_id);
@@ -740,6 +763,18 @@ pub fn extract_all_access_units(
                     let is_aud = t == 9;
                     let is_slice_type = matches!(t, 1..=5);
                     let is_params_type = t == 7 || t == 8;
+                    if std::env::var("VACC_DBG_AU").is_ok() {
+                        eprintln!(
+                            "[AU-DBG] off={} hdr={:#04x} type={} slice={} idr={} params={} aud={}",
+                            start,
+                            nal_data[0],
+                            t,
+                            is_slice_type,
+                            is_idr,
+                            is_params_type,
+                            is_aud
+                        );
+                    }
                     (t as usize, is_idr, is_aud, is_slice_type, is_params_type)
                 } else {
                     (0, false, false, false, false)
