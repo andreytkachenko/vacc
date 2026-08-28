@@ -392,14 +392,18 @@ impl NvdecH264Decoder {
                         break;
                     };
 
-                    // Get active SPS/PPS from parser
+                    // Get active SPS/PPS from parser. Cloned so that the
+                    // immutable borrow of `self.parser` does not conflict with
+                    // the `&mut self` calls below (drain_reorder, create_decoder).
                     let sps = self
                         .parser
                         .active_sps()
+                        .cloned()
                         .ok_or_else(|| NvdecError::DecodeFailed("No active SPS".into()))?;
                     let pps = self
                         .parser
                         .active_pps()
+                        .cloned()
                         .ok_or_else(|| NvdecError::DecodeFailed("No active PPS".into()))?;
 
                     // Determine if this is an IDR picture
@@ -407,6 +411,18 @@ impl NvdecH264Decoder {
 
                     // Reset POC calculator for IDR pictures
                     if is_idr {
+                        // A new GOP starts here: POC restarts from 0, so the
+                        // wrap tracker must restart with it, and everything
+                        // still held for reordering belongs to an earlier GOP
+                        // and has to be presented first (H.264 8.2.5.2 outputs
+                        // all needed-for-output pictures at an IDR unless
+                        // no_output_of_prior_pics_flag is set).
+                        let drained = self.drain_reorder();
+                        if !drained.is_empty() {
+                            self.pending_frames.lock().unwrap().extend(drained);
+                        }
+                        self.poc_cycle = 0;
+                        self.prev_decoded_poc = None;
                         let mut poc_calc = self.poc_calculator.lock().unwrap();
                         poc_calc.reset();
                     }
@@ -415,7 +431,7 @@ impl NvdecH264Decoder {
                     let poc = {
                         let mut poc_calc = self.poc_calculator.lock().unwrap();
                         let is_reference = slh.nal_ref_idc > 0;
-                        poc_calc.calculate(sps, slh, is_reference)
+                        poc_calc.calculate(&sps, slh, is_reference)
                     };
 
                     // Apply the IDR reset BEFORE the picture is added, so old
@@ -477,8 +493,8 @@ impl NvdecH264Decoder {
                     }
 
                     let picparams = build_cuvid_picparams(
-                        sps,
-                        pps,
+                        &sps,
+                        &pps,
                         slh,
                         slh.frame_num,
                         poc,
@@ -588,7 +604,7 @@ impl NvdecH264Decoder {
                     }
 
                     // Extract ready frames in display (POC) order
-                    self.extract_ready_frames();
+                    self.extract_ready_frames(unwrapped);
                 }
                 Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => {
                     break;
@@ -682,11 +698,14 @@ impl NvdecH264Decoder {
             ulMaxWidth: coded_width as _,
             ulMaxHeight: coded_height as _,
             Reserved1: 0,
+            // The decoder's display_area must match ulTargetWidth/Height (the
+            // coded size) or cuvid scales the output. The actual picture crop
+            // is applied during readback via `self.display_area` (set below).
             display_area: CUVIDRECT {
-                left: display_left as _,
-                top: display_top as _,
-                right: display_right as _,
-                bottom: display_bottom as _,
+                left: 0,
+                top: 0,
+                right: coded_width as _,
+                bottom: coded_height as _,
             },
             OutputFormat: output_format,
             DeinterlaceMode: if sps.frame_mbs_only_flag {
@@ -890,23 +909,31 @@ impl NvdecH264Decoder {
 
     /// Extract ready frames in DISPLAY (ascending POC) order.
     ///
-    /// After each decode, presents the lowest-POC decoded frame while it is
-    /// safe to do so: a frame is presentable once a HIGHER-POC frame has
-    /// been decoded (so no lower-POC frame can still arrive), or it is the
-    /// first frame.
-    fn extract_ready_frames(&mut self) {
+    /// `current_uw_poc` is the unwrapped POC of the picture that was just
+    /// decoded (it is already in `self.reorder`).
+    ///
+    /// Output rule (H.264 8.2.5.2, same shape as the common DPB's display
+    /// bumping): present the lowest pending POC only once the *current*
+    /// picture has a strictly greater POC. The current picture is the only
+    /// evidence available — a higher-POC picture merely sitting in the reorder
+    /// buffer proves nothing, because with hierarchical B-frames (b-pyramid)
+    /// pictures with a POC *below* the current one are still to be decoded
+    /// (e.g. decode order ... POC 14, POC 10, POC 8: after POC 10 the pending
+    /// set {10, 14} would release POC 10 even though POC 8 has not been
+    /// decoded yet, swapping two adjacent display frames).
+    ///
+    /// Pictures still held back when the stream ends are drained by
+    /// [`flush`](Self::flush) in ascending POC order.
+    fn extract_ready_frames(&mut self, current_uw_poc: i32) {
         loop {
             let (&key, &(min_idx, min_seq)) = match self.reorder.iter().next() {
                 Some(x) => x,
                 None => break,
             };
-            let max_uw = match self.reorder.iter().next_back() {
-                Some((k, _)) => k.0,
-                None => break,
-            };
 
-            // Hold back while no higher-POC frame has been decoded yet.
-            if self.presented_count > 0 && max_uw <= key.0 {
+            // Hold back until the just-decoded picture overtakes the oldest
+            // pending one; until then a lower-POC picture may still arrive.
+            if key.0 >= current_uw_poc {
                 break;
             }
 
@@ -1327,6 +1354,28 @@ impl NvdecH264Decoder {
         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
     }
 
+    /// Present every picture still held in the reorder buffer, in ascending
+    /// (unwrapped) POC order, and leave the buffer empty.
+    ///
+    /// Used at end of stream and at IDR boundaries, where no later picture can
+    /// still reorder in front of them.
+    fn drain_reorder(&mut self) -> Vec<DecodedFrame> {
+        let remaining: Vec<((i32, i32), (i32, i32))> =
+            self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut frames = Vec::with_capacity(remaining.len());
+        for (key, (pic_index, seq)) in remaining {
+            if let Some(frame) = self.extract_frame(pic_index, seq) {
+                let mut dpb = self.dpb_manager.lock().unwrap();
+                dpb.mark_extracted(seq);
+                self.last_presented_unwrapped = Some(key.0);
+                self.presented_count += 1;
+                frames.push(frame);
+            }
+        }
+        self.reorder.clear();
+        frames
+    }
+
     /// Get the next decoded frame if available.
     fn get_decoded_frame(&self) -> Option<DecodedFrame> {
         let frame = {
@@ -1395,18 +1444,7 @@ impl Decoder for NvdecH264Decoder {
         // Extract remaining frames from the reorder buffer in ascending
         // POC (display) order. BTreeMap iteration is already sorted by
         // (unwrapped_poc, seq).
-        let remaining: Vec<((i32, i32), (i32, i32))> =
-            self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
-
-        for (key, (pic_index, seq)) in remaining {
-            if let Some(frame) = self.extract_frame(pic_index, seq) {
-                let mut dpb = self.dpb_manager.lock().unwrap();
-                dpb.mark_extracted(seq);
-                self.last_presented_unwrapped = Some(key.0);
-                frames.push(frame);
-            }
-        }
-        self.reorder.clear();
+        frames.append(&mut self.drain_reorder());
 
         Ok(frames)
     }

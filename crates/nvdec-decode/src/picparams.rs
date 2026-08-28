@@ -89,7 +89,9 @@ pub fn build_cuvid_h264_picparams(
 
         // PPS fields
         entropy_coding_mode_flag: pps.entropy_coding_mode_flag as c_int,
-        pic_order_present_flag: 0, // EXPERIMENT: match GT (was: poc_type != 2 ? 1 : 0)
+        // EXPERIMENT: PPS field, verbatim.
+        pic_order_present_flag: pps.bottom_field_pic_order_in_frame_present_flag as c_int,
+        // EXPERIMENT 2: PPS defaults, not slice-resolved values.
         num_ref_idx_l0_active_minus1: pps.num_ref_idx_l0_default_active_minus1 as c_int,
         num_ref_idx_l1_active_minus1: pps.num_ref_idx_l1_default_active_minus1 as c_int,
         weighted_pred_flag: pps.weighted_pred_flag as c_int,

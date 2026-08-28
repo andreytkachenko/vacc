@@ -719,6 +719,8 @@ impl H264Parser {
             num_ref_idx_active_override_flag: false,
             cabac_init_idc: 0,
             slice_qp_delta: 0,
+            sp_for_switch_flag: false,
+            slice_qs_delta: 0,
             disable_deblocking_filter_idc: 0,
             slice_alpha_c0_offset_div2: 0,
             slice_beta_offset_div2: 0,
@@ -787,20 +789,14 @@ impl H264Parser {
         let is_sp = slice_type == 3;
         let is_si = slice_type == 4;
 
-        // Decoded reference picture marking (H.264 spec 7.3.2.1.1). This comes
-        // BEFORE num_ref_idx_active_override_flag / ref_pic_list_modification.
-        //   IDR (nal_unit_type == 5): no_output_of_prior_pics_flag + long_term_reference_flag
-        //   non-IDR reference (nal_ref_idc > 0): adaptive_ref_pic_marking_mode_flag + MMCO ops
-        if nal_ref_idc > 0 {
-            let (marking, no_output, lt_ref) =
-                Self::parse_dec_ref_pic_marking(&mut r, nal_unit_type == 5)?;
-            slh.dec_ref_pic_marking = marking;
-            slh.no_output_of_prior_pics_flag = no_output;
-            slh.long_term_reference_flag = lt_ref;
+        // direct_spatial_mv_pred_flag (B slices only, H.264 spec 7.4.3)
+        if is_b {
+            slh.direct_spatial_mv_pred_flag = r.read_bit()?;
         }
 
-        // P/SP/B slice: num_ref_idx_active_override_flag
-        if is_p || is_sp || is_b {
+        // num_ref_idx_active_override_flag: present for P and B slices
+        // (H.264 spec 7.4.3; matches x264/ffmpeg read order).
+        if is_p || is_b {
             slh.num_ref_idx_active_override_flag = r.read_bit()?;
             if slh.num_ref_idx_active_override_flag {
                 slh.num_ref_idx_l0_active_minus1 = r.read_ue()?;
@@ -810,38 +806,19 @@ impl H264Parser {
             }
         }
 
-        // Reference picture list modification (for P/SP/B slices, H.264 spec 7.3.6).
-        // Only index [0] of each list is ever modified (single flag per list).
+        // Reference picture list modification (H.264 spec 7.3.6): L0 present when
+        // slice_type != I && slice_type != SI (P/SP/B), L1 only for B slices.
         if is_p || is_sp || is_b {
             let (mod_l0, mod_l1) = Self::parse_ref_pic_list_modification(&mut r, is_b)?;
             slh.ref_pic_list_modification_l0 = mod_l0;
             slh.ref_pic_list_modification_l1 = mod_l1;
         }
 
-        // CABAC init IDC (not for I/SI slices)
-        if pps.entropy_coding_mode_flag && !is_i && !is_si {
-            slh.cabac_init_idc = r.read_ue()? as u8;
-        }
-
-        // Slice QP delta
-        slh.slice_qp_delta = r.read_se()?;
-
-        // Deblocking filter parameters: present in the slice header only when
-        // deblocking_filter_control_present_flag == 0 (H.264 spec 7.4.3). When the
-        // flag is 1 the control lives in the PPS and nothing is read here.
-        if !pps.deblocking_filter_control_present_flag {
-            slh.disable_deblocking_filter_idc = r.read_ue()? as i8;
-            if slh.disable_deblocking_filter_idc != 1 {
-                slh.slice_alpha_c0_offset_div2 = r.read_se()?;
-                slh.slice_beta_offset_div2 = r.read_se()?;
-            }
-        }
-
-        // Pred weight table: present LAST in the slice header (H.264 spec 7.4.3),
-        // when pps_weighted_pred_flag == 1 and slice_type != B (covers P, SP, I,
-        // SI), OR when pps_weighted_bipred_idc == 1 and slice_type == B.
+        // Pred weight table (H.264 spec 7.4.3): present when weighted_pred_flag &&
+        // slice_type == P, or weighted_bipred_idc == 1 && slice_type == B. Comes
+        // AFTER ref list modification and BEFORE dec_ref_pic_marking.
         let has_pred_weight_table =
-            (pps.weighted_pred_flag && !is_b) || (pps.weighted_bipred_idc == 1 && is_b);
+            (pps.weighted_pred_flag && is_p) || (pps.weighted_bipred_idc == 1 && is_b);
         if has_pred_weight_table {
             let (
                 luma_log2_weight_denom,
@@ -881,30 +858,82 @@ impl H264Parser {
             slh.chroma_offset_l1 = chroma_offset_l1;
         }
 
+        // Decoded reference picture marking (H.264 spec 7.4.3): present when
+        // nal_ref_idc > 0, AFTER pred_weight_table and BEFORE cabac_init_idc.
+        //   IDR (nal_unit_type == 5): no_output_of_prior_pics_flag u(1) +
+        //       long_term_reference_flag u(1) (two fixed 1-bit fields)
+        //   non-IDR reference: adaptive_ref_pic_marking_mode_flag u(1) + MMCO ops
+        if nal_ref_idc > 0 {
+            let (marking, no_output, lt_ref) =
+                Self::parse_dec_ref_pic_marking(&mut r, nal_unit_type == 5)?;
+            slh.dec_ref_pic_marking = marking;
+            slh.no_output_of_prior_pics_flag = no_output;
+            slh.long_term_reference_flag = lt_ref;
+        }
+
+        // CABAC init IDC (not for I/SI slices)
+        if pps.entropy_coding_mode_flag && !is_i && !is_si {
+            slh.cabac_init_idc = r.read_ue()? as u8;
+        }
+
+        // Slice QP delta
+        slh.slice_qp_delta = r.read_se()?;
+
+        // SP/SI slice extras (H.264 spec 7.4.3)
+        if is_sp {
+            slh.sp_for_switch_flag = r.read_bit()?;
+        }
+        if is_sp || is_si {
+            slh.slice_qs_delta = r.read_se()?;
+        }
+
+        // Deblocking filter parameters (H.264 spec 7.4.3): present for ALL slice
+        // types (including I) when deblocking_filter_control_present_flag == 1.
+        // disable_deblocking_filter_idc is ue(v); alpha/beta offsets follow when
+        // idc != 1. Verified against x264, ffmpeg and the NVIDIA C++ oracle —
+        // skipping or mis-reading these desynchronizes header_bit_size (which
+        // corrupts VAAPI slice_data_bit_offset).
+        if pps.deblocking_filter_control_present_flag {
+            slh.disable_deblocking_filter_idc = r.read_ue()? as i8;
+            if slh.disable_deblocking_filter_idc != 1 {
+                slh.slice_alpha_c0_offset_div2 = r.read_se()?;
+                slh.slice_beta_offset_div2 = r.read_se()?;
+            }
+        }
+
         // Calculate header bit size (bits consumed from slice header start)
         slh.header_bit_size = (r.position() - header_start_pos) as u16;
+
+        if std::env::var("DBG_H264").is_ok() {
+            eprintln!("[DBG-PARSER] fn={} st={} hbs={} sep_colour={} redpic={} deblock_flag={} wpred={} entropy={} qp_delta={} dis_db={}",
+                slh.frame_num, slh.slice_type, slh.header_bit_size,
+                sps.separate_colour_plane_flag, pps.redundant_pic_cnt_present_flag,
+                pps.deblocking_filter_control_present_flag, pps.weighted_pred_flag,
+                pps.entropy_coding_mode_flag, slh.slice_qp_delta, slh.disable_deblocking_filter_idc);
+        }
 
         Ok(slh)
     }
 
-    /// Parse reference picture list modification (H.264 spec 7.3.6).
+    /// Parse reference picture list modification (H.264 spec 7.4.3).
     ///
     /// H.264 only ever modifies reference-list index [0] of each list — there is
     /// a single `ref_pic_list_modification_flag_lX[0]` per list, NOT a per-index
     /// loop over `numRefIdx` (that is the HEVC model). Syntax:
     ///   ref_pic_list_modification_flag_l0[0]  u(1)
     ///   if( ref_pic_list_modification_flag_l0[0] ) {
-    ///       modification_of_pic_nums_idc  ue(v)
-    ///       if( modification_of_pic_nums_idc == 0 )
-    ///           abs_diff_pic_num_minus1   ue(v)
-    ///       else if( modification_of_pic_nums_idc == 1 || == 2 )
-    ///           long_term_pic_num         ue(v)
+    ///       loop: {
+    ///           modification_of_pic_nums_idc  ue(v)
+    ///           if( idc == 0 || idc == 1 || idc == 2 )
+    ///               abs_diff_pic_num_minus1 / long_term_pic_num  ue(v)
+    ///           loop--
+    ///       } while( modification_of_pic_nums_idc != 3 && loop )
     ///   }
-    ///   if( slice_type == B ) {
-    ///       ref_pic_list_modification_flag_l1[0]  u(1)
-    ///       ... same ...
-    ///   }
-    /// A `ue(v)` value is always present when the flag is set (op 0, 1, or 2).
+    ///   if( slice_type == B ) { ... same for l1 ... }
+    /// Multiple entries per list are allowed; the sequence terminates with
+    /// idc == 3, which carries NO ue(v) value. Real x264 streams emit multi-entry
+    /// sequences (e.g. [(0,0),(0,15),(0,0)] on P slices). Verified against
+    /// FFmpeg ff_h264_decode_ref_pic_list_reordering and the NVIDIA C++ oracle.
     fn parse_ref_pic_list_modification(
         r: &mut BitReader,
         is_b: bool,
@@ -912,37 +941,32 @@ impl H264Parser {
         Vec<RefPicListModificationEntry>,
         Vec<RefPicListModificationEntry>,
     )> {
-        let mut mod_l0 = Vec::new();
-        let mut mod_l1 = Vec::new();
-
-        // Ref pic list 0 modification (for P/SP/B slices): index [0] only.
-        if r.read_bit()? {
-            // ref_pic_list_modification_flag_l0[0]
-            let op = r.read_ue()?; // modification_of_pic_nums_idc
-                                   // value: abs_diff_pic_num_minus1 (op 0) or long_term_pic_num (op 1/2), always ue(v).
-            let value = r.read_ue()?;
-            mod_l0.push(RefPicListModificationEntry {
-                index: 0,
-                length: 0,
-                op,
-                difference: value as i32,
-            });
-        }
-
-        // Ref pic list 1 modification (for B slices only): index [0] only.
-        if is_b {
+        let parse_list = |r: &mut BitReader| -> ParserResult<Vec<RefPicListModificationEntry>> {
+            let mut mods = Vec::new();
             if r.read_bit()? {
-                // ref_pic_list_modification_flag_l1[0]
-                let op = r.read_ue()?; // modification_of_pic_nums_idc
-                let value = r.read_ue()?;
-                mod_l1.push(RefPicListModificationEntry {
-                    index: 0,
-                    length: 0,
-                    op,
-                    difference: value as i32,
-                });
+                // ref_pic_list_modification_flag_lX[0]
+                loop {
+                    let op = r.read_ue()?; // modification_of_pic_nums_idc
+                    if op == 3 {
+                        break; // terminator: no value follows
+                    }
+                    // op 0: abs_diff_pic_num_minus1; op 1/2: long_term_pic_num.
+                    let value = r.read_ue()?;
+                    mods.push(RefPicListModificationEntry {
+                        index: 0,
+                        length: 0,
+                        op,
+                        difference: value as i32,
+                    });
+                }
             }
-        }
+            Ok(mods)
+        };
+
+        // Ref pic list 0 modification (for P/SP/B slices).
+        let mod_l0 = parse_list(r)?;
+        // Ref pic list 1 modification (for B slices only).
+        let mod_l1 = if is_b { parse_list(r)? } else { Vec::new() };
 
         Ok((mod_l0, mod_l1))
     }
@@ -1064,7 +1088,9 @@ impl H264Parser {
         let mut long_term_reference_flag = false;
 
         if is_idr {
-            // IDR picture marking: both flags ALWAYS present per H.264 spec 7.4.5
+            // IDR picture marking: two fixed 1-bit fields (H.264 spec 7.4.3):
+            // no_output_of_prior_pics_flag u(1) + long_term_reference_flag u(1).
+            // Verified against x264, ffmpeg and the NVIDIA C++ oracle.
             no_output_of_prior_pics_flag = r.read_bit()?;
             long_term_reference_flag = r.read_bit()?;
         } else {
@@ -1366,13 +1392,24 @@ impl VideoParser for H264Parser {
             })
         } else if !slices.is_empty() {
             self.nal_cursor = i;
-            // Calculate bytes consumed: from first slice start to last slice end
-            let bytes_consumed =
-                if let (Some(first), Some(last)) = (first_slice_offset, last_slice_end) {
-                    last - first
-                } else {
-                    0
-                };
+            // Bytes consumed measured from the START of the payload (not from
+            // the first slice): advance to the beginning of the next start
+            // code's zero run so an incremental consumer (VAAPI) re-anchors on
+            // a clean NAL boundary. The last slice's data may include one
+            // leading 0x00 of a 4-byte start code (cuvid convention, see
+            // extract_nal_units), so back up over trailing zeros. Emulation
+            // prevention guarantees no in-RBSP start-code lookalikes, and any
+            // pre-start-code bytes left in the next payload are skipped by the
+            // following extract_nal_units pass.
+            let bytes_consumed = if let Some(last) = last_slice_end {
+                let mut consumed = last;
+                while consumed > 0 && packet.payload[consumed - 1] == 0 {
+                    consumed -= 1;
+                }
+                consumed
+            } else {
+                0
+            };
             // Update processed_up_to to the end of the last slice in this frame
             if let Some(last) = last_slice_end {
                 self.processed_up_to = last;
@@ -1463,6 +1500,8 @@ pub struct SliceHeader {
     pub num_ref_idx_active_override_flag: bool,
     pub cabac_init_idc: u8,
     pub slice_qp_delta: i32,
+    pub sp_for_switch_flag: bool,
+    pub slice_qs_delta: i32,
     pub disable_deblocking_filter_idc: i8,
     pub slice_alpha_c0_offset_div2: i32,
     pub slice_beta_offset_div2: i32,

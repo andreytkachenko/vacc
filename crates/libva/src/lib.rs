@@ -19,6 +19,7 @@ mod surface;
 mod usage_hint;
 
 pub use bindings::constants;
+pub use bindings::constants::*;
 pub use bindings::VAConfigAttrib;
 pub use bindings::VAConfigAttribType;
 pub use bindings::VADRMPRIMESurfaceDescriptor;

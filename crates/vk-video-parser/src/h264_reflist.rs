@@ -18,14 +18,20 @@
 //!   Lists are truncated to `num_ref_idx_lN_active_minus1 + 1`.
 //! - **8.2.3.2 (reordering)**: each `ref_pic_list_modification` entry is
 //!   applied in order:
-//!   - idc 0: `RefPicListX[PicNumIdx] = RefPicListX[abs_diff_pic_num_minus1 + 1]`
-//!     (the entry at position `abs_diff_pic_num_minus1 + 1` moves to
-//!     `PicNumIdx`; entries in between shift down by one).
-//!   - idc 1: `RefPicListX[PicNumIdx]` = the long-term reference picture with
-//!     `LongTermFrameIdx == long_term_pic_num`.
-//!   - idc 2: `RefPicListX[PicNumIdx]` = the long-term reference picture with
-//!     `LongTermFrameIdx == 0`.
+//!   - idc 0/1: short-term reference with `FrameNum == picNumLX`, where
+//!     picNumLX walks from the current FrameNum by -(v+1) / +(v+1) modulo
+//!     maxPicNum (FFmpeg matches on absolute frame_num, h264_refs.c:331).
+//!   - idc 2: long-term reference with `LongTermFrameIdx == long_term_pic_num`.
 //!   - idc 3: end of reordering (stop).
+//!
+//!   Placement mirrors FFmpeg `ff_h264_build_ref_list` exactly: the list is a
+//!   fixed-size array of exactly `num_ref_idx_lN_active` entries (initial list
+//!   truncated if longer, zero-padded with empty refs if shorter). Each op
+//!   scans `[index, active)` for an existing occurrence of the target and
+//!   shifts right; if absent from the window the tail entry is dropped; if
+//!   the target picture is missing entirely the position is cleared. After all
+//!   ops, any still-empty slot is filled with the default reference (first
+//!   initial-list entry, h264_refs.c:212 / 391-404).
 //!
 //! Note: this is the H.264 bitstream syntax/semantics (7.3.6 / 8.2.3.2), which
 //! differs from the HEVC-style "move-to-end / swap" operations.
@@ -200,13 +206,22 @@ pub fn build_ref_pic_lists(
         eprintln!("REFLIST-DBG slice={} l0={} l1={} currpoc={} in=[{}] init_l0=[{}] init_l1=[{}]", slice_type, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, curr_poc, inp.join(","), i0.join(","), i1.join(","));
     }
 
-    l0.truncate((num_ref_idx_l0_active_minus1 as usize).saturating_add(1));
-    l1.truncate((num_ref_idx_l1_active_minus1 as usize).saturating_add(1));
-
-    // 8.2.3.2: reordering (spec arithmetic + insert-with-dedup, matching the
-    // C++ oracle VkEncoderDpbH264::RefPicListReorderingLX).
-    apply_reordering(&mut l0, slots, mod_l0, curr_frame_num, max_frame_num);
-    apply_reordering(&mut l1, slots, mod_l1, curr_frame_num, max_frame_num);
+    // 8.2.3.2: reordering on a fixed-size array of exactly `active` entries
+    // (see module docs / ff_h264_build_ref_list): truncate excess, pad the
+    // shortfall with empty refs, reorder, then backfill empties with the
+    // default ref (first initial-list entry).
+    let active0 = (num_ref_idx_l0_active_minus1 as usize).saturating_add(1);
+    let active1 = (num_ref_idx_l1_active_minus1 as usize).saturating_add(1);
+    let default0 = l0.first().copied();
+    let default1 = l1.first().copied();
+    for (list, active) in [(&mut l0, active0), (&mut l1, active1)] {
+        list.truncate(active);
+        list.resize_with(active, empty_ref);
+    }
+    apply_reordering(&mut l0, slots, mod_l0, curr_frame_num, max_frame_num, active0);
+    apply_reordering(&mut l1, slots, mod_l1, curr_frame_num, max_frame_num, active1);
+    backfill_default(&mut l0, default0);
+    backfill_default(&mut l1, default1);
 
     if std::env::var("VACC_DBG_H264").is_ok() {
         let f0: Vec<String> = l0.iter().map(|r| format!("s{}/f{}/p{}", r.slot, r.frame_num, r.poc)).collect();
@@ -221,90 +236,123 @@ pub fn build_ref_pic_lists(
 
 /// Apply the 8.2.3.2 reference picture list reordering process to one list.
 ///
-/// Mirrors the C++ oracle `VkEncDpbH264::RefPicListReorderingLX`:
+/// Mirrors FFmpeg `ff_h264_build_ref_list` exactly:
 /// - `picNumLXPred` starts at the current picture's FrameNum and is updated
-///   cumulatively (spec 8-35/8-36) with wraparound over `max_frame_num`.
-/// - Each short-term modification places the reference whose PicNum equals the
-///   running value at the next list position, using insert-with-dedup (spec 8-38):
-///   the reference is removed from its current position (if present) and inserted
-///   at the target position.
+///   cumulatively with wraparound over `max_pic_num` (modulo).
+/// - idc 0: short-term, picNumLX = (picNumLXPred - (v+1)) mod maxPicNum.
+/// - idc 1: short-term, picNumLX = (picNumLXPred + (v+1)) mod maxPicNum.
+/// - idc 2: long-term with LongTermFrameIdx == v.
+/// - idc 3: end of reordering.
+/// - The target is the marked reference with absolute `frame_num == picNumLX`
+///   (FFmpeg h264_refs.c:331-338; NOT a wrapped/PicNum comparison).
+/// - Placement: scan [index, len) for an existing occurrence of the target;
+///   if found at j, shift list[index..j] right and write at index; otherwise
+///   shift the tail right (dropping its last entry) and write at index. If the
+///   target picture is missing entirely, position `index` is cleared (empty
+///   ref) without shifting; `backfill_default` restores it afterwards.
+///
+/// `list` must be exactly `window`-sized (see `build_ref_pic_lists`).
 fn apply_reordering(
     list: &mut Vec<RefPic>,
     slots: &[DpbRefState],
     mods: &[RefPicListModificationEntry],
     curr_frame_num: u32,
     max_frame_num: u32,
+    window: usize,
 ) {
     let max_pic_num = max_frame_num.max(1) as i32;
-    let curr_pic_num = curr_frame_num as i32;
-    let mut pic_num_pred = curr_pic_num;
-    let mut ref_idx = 0usize;
-    for m in mods {
-        match m.op {
-            // idc 0: short-term subtract (spec 8-35).
+    let mut pic_num_pred = curr_frame_num as i32;
+    for (ref_idx, m) in mods.iter().enumerate() {
+        if ref_idx >= window {
+            break; // beyond the active window (FFmpeg flags this as an error)
+        }
+        let target: Option<usize> = match m.op {
+            // idc 0: short-term subtract.
             0 => {
-                let diff = m.difference.max(0) as i32 + 1;
-                let mut pic_num_no_wrap = pic_num_pred - diff;
-                if pic_num_no_wrap < 0 {
-                    pic_num_no_wrap += max_pic_num;
-                }
-                pic_num_pred = pic_num_no_wrap;
-                let pic_num_lx = if pic_num_no_wrap > curr_pic_num {
-                    pic_num_no_wrap - max_pic_num
-                } else {
-                    pic_num_no_wrap
-                };
-                if let Some(slot) = slots
-                    .iter()
-                    .position(|s| s.marking == MARKING_SHORT && s.frame_num_wrap == pic_num_lx)
-                {
-                    insert_with_dedup(list, slot, ref_idx, slots);
-                }
-                ref_idx += 1;
+                pic_num_pred =
+                    (pic_num_pred - (m.difference.max(0) as i32 + 1)).rem_euclid(max_pic_num);
+                slots.iter().position(|s| {
+                    s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32
+                })
             }
-            // idc 1: long-term with LongTermFrameIdx == long_term_pic_num.
+            // idc 1: short-term add (forward reference).
             1 => {
-                let lt_idx = m.difference.max(0) as u32;
-                if let Some(slot) = slots
-                    .iter()
-                    .position(|s| s.marking == MARKING_LONG && s.long_term_frame_idx == lt_idx)
-                {
-                    insert_with_dedup(list, slot, ref_idx, slots);
-                }
-                ref_idx += 1;
+                pic_num_pred =
+                    (pic_num_pred + (m.difference.max(0) as i32 + 1)).rem_euclid(max_pic_num);
+                slots.iter().position(|s| {
+                    s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32
+                })
             }
-            // idc 2: long-term with LongTermFrameIdx == 0.
+            // idc 2: long-term with LongTermFrameIdx == long_term_pic_num.
             2 => {
-                if let Some(slot) = slots
-                    .iter()
-                    .position(|s| s.marking == MARKING_LONG && s.long_term_frame_idx == 0)
-                {
-                    insert_with_dedup(list, slot, ref_idx, slots);
-                }
-                ref_idx += 1;
+                let lt_idx = m.difference.max(0) as u32;
+                slots.iter().position(|s| {
+                    s.marking == MARKING_LONG && s.long_term_frame_idx == lt_idx
+                })
             }
-            // idc 3: end of reordering.
-            3 => break,
-            // idc 4/5: invalid per spec; stop processing.
-            _ => break,
+            // idc 3: end of reordering; 4/5 invalid per spec.
+            _ => return,
+        };
+        match target {
+            Some(slot) => window_insert(list, slot, ref_idx, slots),
+            // FFmpeg: "reference picture missing during reorder" -> clear the
+            // position (no shift); backfill_default restores default_ref.
+            None => list[ref_idx] = empty_ref(),
         }
     }
 }
 
-/// Insert the reference in `slot` at position `ref_idx`, removing any existing
-/// occurrence of the same slot first (spec 8-38 insert-with-dedup).
-fn insert_with_dedup(list: &mut Vec<RefPic>, slot: usize, ref_idx: usize, slots: &[DpbRefState]) {
+/// Sentinel slot index for an empty reference-list entry (FFmpeg's
+/// zero-filled `H264Ref`); replaced by the default ref after reordering.
+const EMPTY_SLOT: usize = usize::MAX;
+
+fn empty_ref() -> RefPic {
+    RefPic {
+        slot: EMPTY_SLOT,
+        poc: 0,
+        frame_num: 0,
+        is_long_term: false,
+    }
+}
+
+/// FFmpeg final pass (h264_refs.c:391-404): any still-empty list slot is
+/// filled with the default reference (first initial-list entry). Without a
+/// default (no marked refs at all — invalid stream) empty slots are dropped.
+fn backfill_default(list: &mut Vec<RefPic>, default_ref: Option<RefPic>) {
+    match default_ref {
+        Some(d) => {
+            for r in list.iter_mut() {
+                if r.slot == EMPTY_SLOT {
+                    *r = d;
+                }
+            }
+        }
+        None => list.retain(|r| r.slot != EMPTY_SLOT),
+    }
+}
+
+/// FFmpeg-style in-window placement (see `apply_reordering`). The list is
+/// exactly window-sized; when the target is absent from [index, len) the tail
+/// entry is dropped (shift right) before writing at index.
+fn window_insert(list: &mut Vec<RefPic>, slot: usize, index: usize, slots: &[DpbRefState]) {
+    if index >= list.len() {
+        return;
+    }
     let new_ref = RefPic {
         slot,
         poc: slots[slot].poc,
         frame_num: slots[slot].frame_num,
         is_long_term: slots[slot].marking == MARKING_LONG,
     };
-    if let Some(pos) = list.iter().position(|r| r.slot == slot) {
-        list.remove(pos);
+    let mut j = index;
+    while j < list.len() && list[j].slot != slot {
+        j += 1;
     }
-    let idx = ref_idx.min(list.len());
-    list.insert(idx, new_ref);
+    let shift_end = if j < list.len() { j } else { list.len() - 1 };
+    for i in (index + 1..=shift_end).rev() {
+        list[i] = list[i - 1];
+    }
+    list[index] = new_ref;
 }
 
 #[cfg(test)]
@@ -373,26 +421,67 @@ mod tests {
         );
     }
 
-    /// (c) op=1: the entry at PicNumIdx is replaced by the long-term reference
-    /// picture with LongTermFrameIdx == long_term_pic_num (spec: pure
-    /// assignment — other entries are untouched, list length unchanged).
+    /// (c) op=1: SHORT-TERM forward — picNumLX = (picNumLXPred + (v+1)) mod
+    /// maxPicNum (spec 8.2.3.2 / FFmpeg ff_h264_build_ref_list case 1).
     #[test]
-    fn reorder_op1_long_term() {
+    fn reorder_op1_short_term_add() {
         let slots = [
             st(1, 1, 0, MARKING_SHORT, 0),
-            st(5, 5, 10, MARKING_LONG, 2), // long-term, LongTermFrameIdx = 2
-            st(2, 2, 2, MARKING_SHORT, 0),
+            st(5, 5, 4, MARKING_SHORT, 0),
+            st(6, 6, 6, MARKING_SHORT, 0),
         ];
-        // Initial L0 = [fn2, fn1, LT2] (descending PicNum, then long-term);
-        // op=1, long_term_pic_num=2 -> insert LT2 at 0. Insert-with-dedup:
-        // [LT2, fn2, fn1].
-        let mods = vec![entry(0, 1, 2)];
-        let lists = build_ref_pic_lists(&slots, 0, 2, 0, &mods, &[], 6, 0, 16);
+        // Initial L0 = [fn6, fn5, fn1] (descending PicNum); curr=4;
+        // op=1, v=0 -> picNumLX = 4+1 = 5 (fn5 at pos 1) -> move to pos 0:
+        // [fn5, fn6, fn1].
+        let mods = vec![entry(0, 1, 0)];
+        let lists = build_ref_pic_lists(&slots, 0, 2, 0, &mods, &[], 4, 0, 16);
+        assert_eq!(
+            lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
+            vec![5, 6, 1]
+        );
+    }
+
+    /// (c2) op=2: long-term with LongTermFrameIdx == v (the value IS the
+    /// LongTermFrameIdx; FFmpeg case 2 uses `val` directly).
+    #[test]
+    fn reorder_op2_long_term_by_idx() {
+        let slots = [
+            st(1, 1, 0, MARKING_SHORT, 0),
+            st(7, 7, 8, MARKING_LONG, 0), // LT FrameIdx 0
+            st(8, 8, 10, MARKING_LONG, 1), // LT FrameIdx 1
+        ];
+        // Initial L0 = [fn1, LT0(fn7), LT1(fn8)] (short desc, then LT asc by idx);
+        // op=2, v=1 -> target LT1 (fn8) at pos 2 -> move to pos 0:
+        // [LT1(fn8), fn1, LT0(fn7)].
+        let mods = vec![entry(0, 2, 1)];
+        let lists = build_ref_pic_lists(&slots, 0, 2, 0, &mods, &[], 4, 0, 16);
         assert_eq!(lists.l0.len(), 3);
+        assert_eq!(lists.l0[0].frame_num, 8);
         assert!(lists.l0[0].is_long_term);
-        assert_eq!(lists.l0[0].slot, 1);
-        assert_eq!(lists.l0[1].frame_num, 2);
-        assert_eq!(lists.l0[2].frame_num, 1);
+        assert_eq!(lists.l0[1].frame_num, 1);
+        assert_eq!(lists.l0[2].frame_num, 7);
+    }
+
+    /// (c3) reordering operates on the full initial list and truncates AFTER:
+    /// a target beyond the active window (initially truncated away) is still
+    /// found and placed; the window tail is dropped (FFmpeg semantics).
+    #[test]
+    fn reorder_truncates_after() {
+        let slots = [
+            st(1, 1, 0, MARKING_SHORT, 0),
+            st(2, 2, 2, MARKING_SHORT, 0),
+            st(3, 3, 4, MARKING_SHORT, 0),
+            st(4, 4, 6, MARKING_SHORT, 0),
+        ];
+        // P slice, 3 active: initial full L0 = [fn4, fn3, fn2, fn1].
+        // op=0, v=3 -> picNumLX = 5-4 = 1 (fn1, beyond the 3-entry window)
+        // -> place at pos 0, drop window tail: [fn1, fn4, fn3].
+        let mods = vec![entry(0, 0, 3)];
+        let lists = build_ref_pic_lists(&slots, 0, 2, 0, &mods, &[], 5, 0, 16);
+        assert_eq!(
+            lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
+            vec![1, 4, 3]
+        );
     }
 
     /// (d) B slice: L0/L1 are initialized by POC relative to currPOC (8.2.4.2.3):
@@ -465,6 +554,49 @@ mod tests {
         assert_eq!(
             lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
             vec![3, 2, 1]
+        );
+    }
+
+    /// The list is padded to the active count with empty refs and the tail is
+    /// backfilled with the default ref (first initial entry) — FFmpeg
+    /// h264_refs.c:181-182 / 391-404. Two marked refs, active=3, no RPLM:
+    /// initial [fn2, fn1] + empty -> [fn2, fn1, fn2].
+    #[test]
+    fn pads_to_active_with_default_backfill() {
+        let slots = [
+            st(1, 1, 0, MARKING_SHORT, 0),
+            st(2, 2, 2, MARKING_SHORT, 0),
+        ];
+        let lists = build_ref_pic_lists(&slots, 0, 2, 0, &[], &[], 3, 4, 16);
+        assert_eq!(
+            lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
+            vec![2, 1, 2]
+        );
+    }
+
+    /// FrameNum-wrap scenario (regression for the 8 genuine GT mismatches at
+    /// every 32-picture wrap): curr_fn=1, marked refs {fn13, fn15, fn0} with
+    /// signed wraps {-3, -1, 0}. Targets must match on ABSOLUTE frame_num
+    /// (FFmpeg h264_refs.c:331), the list grows via padding, and tail-drop
+    /// inserts fill the padded slot. Expected final L0 (verified against
+    /// instrumented FFmpeg GT-REFLST): [fn15, fn15, fn0, fn13].
+    #[test]
+    fn reorder_wrap_absolute_frame_num_target() {
+        let slots = [
+            st(13, -3, 118, MARKING_SHORT, 0),
+            st(15, -1, 126, MARKING_SHORT, 0),
+            st(0, 0, 122, MARKING_SHORT, 0),
+        ];
+        // RPLM as in the main-stream P-slices at fn=1:
+        // i=0: idc0 d=1 -> pred=(1-2)%16=15 -> fn15 @0
+        // i=1: idc0 d=15 -> pred=(15-16)%16=15 -> fn15 @1 (dup, tail drop)
+        // i=2: idc1 d=0 -> pred=(15+1)%16=0  -> fn0 @2
+        // i=3: idc0 d=2 -> pred=(0-3)%16=13  -> fn13 @3
+        let mods = vec![entry(0, 0, 1), entry(1, 0, 15), entry(2, 1, 0), entry(3, 0, 2)];
+        let lists = build_ref_pic_lists(&slots, 0, 3, 0, &mods, &[], 1, 134, 16);
+        assert_eq!(
+            lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
+            vec![15, 15, 0, 13]
         );
     }
 }

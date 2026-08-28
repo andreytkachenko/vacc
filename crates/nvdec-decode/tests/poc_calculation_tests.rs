@@ -3,7 +3,8 @@
 //! These tests verify that our POC calculation matches what cuvid's parser
 //! would compute based on the H.264 specification (Annex B, D.3.3).
 //!
-//! The `PocCalculator` in nvdec-decode/src/poc.rs implements
+//! The `PocCalculator` (re-exported from the common
+//! `vk_video_parser::h264_poc` module in `nvdec_decode::poc`) implements
 //! the same algorithm as cuvid's parser callbacks.
 //!
 //! Reference: H.264/AVC specification, section D.3.3 "Decoding process for
@@ -726,10 +727,14 @@ fn test_poc_type2_implicit_from_frame_num() {
 
 /// Test 11: POC type 2 with frame_num wraparound.
 ///
-/// When frame_num wraps (decreases), POC still follows the formula:
-/// - ref: frame_num * 2
-/// - non-ref: frame_num * 2 + 1
-/// The actual display order is tracked by the decoder's frame buffer.
+/// The common [`PocCalculator`] (vk_video_parser::h264_poc) tracks FrameNum
+/// wrap cycles so that type-2 POCs remain MONOTONIC across wraps:
+/// - ref: (cycle * MaxFrameNum + frame_num) * 2
+/// - non-ref: (cycle * MaxFrameNum + frame_num) * 2 + 1
+///
+/// Monotonic POCs are required for correct presentation-order sorting in the
+/// decoder's reorder buffer (raw spec POCs wrap with FrameNum and would
+/// misorder frames after a wrap).
 #[test]
 fn test_poc_type2_frame_num_wrap() {
     let sps = create_sps_poc_type_2(256);
@@ -742,20 +747,20 @@ fn test_poc_type2_frame_num_wrap() {
     let slh254 = create_slice_header(254, 0, [0, 0], 1, 3);
     assert_eq!(calc.calculate(&sps, &slh254, true), 508); // 254*2=508
 
-    // Wrap around: frame_num=5 (was 254, wrapped past 256)
+    // Wrap around: frame_num=5 (was 254, wrapped past 256) → cycle=1
     let slh_wrap = create_slice_header(5, 0, [0, 0], 1, 3);
     assert_eq!(
         calc.calculate(&sps, &slh_wrap, true),
-        10,
-        "POC should be 10 after frame_num wrap (5*2=10)"
+        (256 + 5) * 2,
+        "POC should be 522 after frame_num wrap (cycle=1: (256+5)*2)"
     );
 
     // Continue after wrap
     let slh_after = create_slice_header(10, 0, [0, 0], 1, 3);
     assert_eq!(
         calc.calculate(&sps, &slh_after, true),
-        20,
-        "POC should be 20 after wrap (10*2=20)"
+        (256 + 10) * 2,
+        "POC should be 532 after wrap (cycle=1: (256+10)*2)"
     );
 }
 

@@ -360,13 +360,15 @@ impl H264Dpb {
             }
         }
 
-        // Count existing DPB refs, then add the current picture if it's a reference.
-        // The C++ oracle (Vulkan-Video-Samples) counts refs AFTER marking the current
-        // picture, so its total = existing_refs + current_ref. We replicate that by
-        // adding 1 for the current picture here, since it hasn't been allocated a slot yet.
+        // Count existing DPB refs (NOT including the current picture, which has
+        // no slot yet). Spec 8.2.5.3 evicts only when the DPB already holds
+        // `max_num_ref_frames` references; FFmpeg matches this exactly
+        // (generate_sliding_window_mmcos: `short_ref_count >= ref_frame_count`
+        // before the current picture is added to the list). Verified against
+        // `ffmpeg -debug mmco` on h264_baseline: refs grow to max_num_ref_frames
+        // (3) before the oldest is evicted.
         let num_refs = self.slots.iter().filter(|s| s.is_ref()).count();
-        let total_with_current = num_refs + if cur.is_ref { 1 } else { 0 };
-        if (total_with_current as u32) >= self.num_ref_frames {
+        if (num_refs as u32) >= self.num_ref_frames {
             let mut imin = 0usize;
             let mut min_wrap = i32::MAX;
             for (i, s) in self.slots.iter().enumerate() {
@@ -376,8 +378,8 @@ impl H264Dpb {
                 }
             }
             if std::env::var("VACC_DBG_H264").is_ok() {
-                eprintln!("RUST-SLIDE cur_fn={} cur_poc={} nrefs={} +cur={} total={} num_ref_frames={} evict=s{}/p{}/f{}/w{}",
-                    cur.frame_num, cur.poc, num_refs, if cur.is_ref { 1 } else { 0 }, total_with_current, self.num_ref_frames, imin, self.slots[imin].poc, self.slots[imin].frame_num, min_wrap);
+                eprintln!("RUST-SLIDE cur_fn={} cur_poc={} nrefs={} num_ref_frames={} evict=s{}/p{}/f{}/w{}",
+                    cur.frame_num, cur.poc, num_refs, self.num_ref_frames, imin, self.slots[imin].poc, self.slots[imin].frame_num, min_wrap);
             }
             self.slots[imin].marking = MARKING_UNUSED;
         }

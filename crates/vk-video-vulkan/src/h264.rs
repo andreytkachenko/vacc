@@ -12,6 +12,10 @@ pub struct H264DpbRefPicture<'a> {
     pub slot_index: u32,
     pub picture_resource: vk::VideoPictureResourceInfoKHR<'a>,
     pub image: vk::Image,
+    /// Absolute array layer of `image` holding this slot. In image-array DPB
+    /// mode (single shared image, one layer per slot) this is the slot index;
+    /// in separate-image mode it is 0. Used for barriers on the raw image.
+    pub base_array_layer: u32,
     pub frame_num: u32,
     pub pic_order_cnt: [i32; 2],
     pub current_layout: vk::ImageLayout,
@@ -152,6 +156,12 @@ impl H264Decoder {
         bitstream_range: u64,
         output_image_view: vk::ImageView,
         output_image: vk::Image,
+        // Absolute array layer of `output_image` holding the output slot
+        // (slot index in image-array DPB mode, 0 in separate-image mode).
+        output_base_layer: u32,
+        // Current layout of the output slot's subresource before this decode
+        // (UNDEFINED on first use, VIDEO_DECODE_DPB_KHR when reused).
+        output_old_layout: vk::ImageLayout,
         coded_extent: vk::Extent2D,
         dpb_setup_picture: Option<H264SetupPictureInfo<'static>>,
         dpb_ref_pictures: &[H264DpbRefPicture<'_>],
@@ -248,9 +258,10 @@ impl H264Decoder {
                 unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
             setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
             setup_ref_info.PicOrderCnt = effective_poc;
-            // For progressive frames: both fields are available for prediction
-            setup_ref_info.flags.set_top_field_flag(1);
-            setup_ref_info.flags.set_bottom_field_flag(1);
+            // Vulkan: top_field_flag/bottom_field_flag mark a FIELD reference.
+            // A frame (progressive) reference must have BOTH flags clear.
+            // (Setting them makes the driver treat the slot as field refs,
+            // which is invalid for a progressive frame and drops the picture.)
             let setup_dpb_slot_info =
                 vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info);
 
@@ -294,9 +305,7 @@ impl H264Decoder {
                 let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                 ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
                 ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
-                // For progressive frames: both fields are available for prediction
-                ref_info.flags.set_top_field_flag(1);
-                ref_info.flags.set_bottom_field_flag(1);
+                // Frame reference: both field flags must be clear (see above).
                 ref_infos.push(ref_info);
             }
             let ref_dpb_slot_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_infos
@@ -332,8 +341,7 @@ impl H264Decoder {
                     let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
                     info.FrameNum = (effective_frame_num % max_frame_num) as u16;
                     info.PicOrderCnt = effective_poc;
-                    info.flags.set_top_field_flag(1);
-                    info.flags.set_bottom_field_flag(1);
+                    // Frame reference: both field flags must be clear.
                     Box::leak(Box::new(info))
                 } else {
                     std::ptr::null()
@@ -429,11 +437,15 @@ impl H264Decoder {
         // Use COLOR aspect (matches C++ reference VkVideoDecoder.cpp:857)
         // When dpb_setup_picture points to the same image as dstPictureResource,
         // use VIDEO_DECODE_DPB_KHR layout (per Vulkan spec).
-        let subresource_range = vk::ImageSubresourceRange {
+        // NOTE: these barriers operate on the raw IMAGE, so in image-array
+        // DPB mode (one shared image, one layer per slot) the subresource
+        // range must select the slot's own array layer. base_array_layer in
+        // VkVideoPictureResourceInfoKHR is view-relative and stays 0.
+        let output_subresource_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
-            base_array_layer: 0,
+            base_array_layer: output_base_layer,
             layer_count: 1,
         };
 
@@ -454,9 +466,9 @@ impl H264Decoder {
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image: output_image,
-            old_layout: vk::ImageLayout::UNDEFINED,
+            old_layout: output_old_layout,
             new_layout,
-            subresource_range,
+            subresource_range: output_subresource_range,
             _marker: Default::default(),
         };
 
@@ -479,7 +491,13 @@ impl H264Decoder {
                     image: ref_pic.image,
                     old_layout: ref_pic.current_layout,
                     new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                    subresource_range,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: ref_pic.base_array_layer,
+                        layer_count: 1,
+                    },
                     _marker: Default::default(),
                 });
             }
@@ -546,9 +564,7 @@ impl H264Decoder {
         let mut setup_ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
         setup_ref_info.FrameNum = (effective_frame_num % max_frame_num) as u16;
         setup_ref_info.PicOrderCnt = effective_poc;
-        // For progressive frames: both fields are available for prediction
-        setup_ref_info.flags.set_top_field_flag(1);
-        setup_ref_info.flags.set_bottom_field_flag(1);
+        // Frame reference: both field flags must be clear (see above).
         let setup_dpb_slot_info = dpb_setup_picture.as_ref().map(|_| {
             vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_ref_info)
         });
@@ -572,9 +588,7 @@ impl H264Decoder {
             let mut ref_info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
             ref_info.FrameNum = (ref_pic.frame_num % max_frame_num) as u16;
             ref_info.PicOrderCnt = ref_pic.pic_order_cnt;
-            // For progressive frames: both fields are available for prediction
-            ref_info.flags.set_top_field_flag(1);
-            ref_info.flags.set_bottom_field_flag(1);
+            // Frame reference: both field flags must be clear (see above).
             ref_infos.push(ref_info);
         }
 

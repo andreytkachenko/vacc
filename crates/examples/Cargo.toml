@@ -71,6 +71,10 @@ name = "parse_sps"
 path = "src/parse_sps.rs"
 
 [[example]]
+name = "parse_h264_cuvid"
+path = "src/parse_h264_cuvid.rs"
+
+[[example]]
 name = "dump_slices"
 path = "src/dump_slices.rs"
 
@@ -98,11 +102,15 @@ path = "src/mmco_bits.rs"
 name = "mmco_trace"
 path = "src/mmco_trace.rs"
 
+[[example]]
+name = "decode_vaapi"
+path = "src/decode_vaapi.rs"
+
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
 vk-video-vulkan = { workspace = true }
 nvdec-decode = { workspace = true }
-# vaapi-decode = { workspace = true }  # excluded: cros-libva build failure
+vaapi-decode = { workspace = true }
 vulkan-decode = { workspace = true }
  ash = { workspace = true }

@@ -298,19 +298,24 @@ impl DpbManager {
     }
 
     /// Mark all entries as invalid (for IDR frames).
+    ///
+    /// NOTE: `current_layout` is intentionally NOT reset here. It tracks the
+    /// ACTUAL GPU layout of the slot's subresource, which stays
+    /// VIDEO_DECODE_DPB_KHR after decode/readback even when the entry is no
+    /// longer a valid reference. Barriers must use the real layout as
+    /// old_layout (UNDEFINED is only correct for never-used subresources).
     pub fn invalidate_all(&mut self) {
         for entry in &mut self.entries {
             entry.is_valid = false;
-            entry.current_layout = vk::ImageLayout::UNDEFINED;
             entry.last_access = LastAccessType::None;
         }
     }
 
     /// Mark a single slot as invalid (when recycling).
+    /// `current_layout` is preserved (see invalidate_all).
     pub fn invalidate_slot(&mut self, slot_index: u32) {
         if (slot_index as usize) < self.entries.len() {
             self.entries[slot_index as usize].is_valid = false;
-            self.entries[slot_index as usize].current_layout = vk::ImageLayout::UNDEFINED;
             self.entries[slot_index as usize].last_access = LastAccessType::None;
         }
     }

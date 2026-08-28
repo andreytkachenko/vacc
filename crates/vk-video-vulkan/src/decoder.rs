@@ -22,6 +22,8 @@ use super::{
     vp9::{convert_vp9_picture_info, VideoDecodeVP9PictureInfoKHR, Vp9Decoder},
     VideoError, VideoResult,
 };
+use vk_video_parser::h264_dpb::MARKING_SHORT;
+use vk_video_parser::h264_reflist::{build_ref_pic_lists, DpbRefState};
 
 /// Decoded frame with metadata for presentation ordering.
 #[derive(Debug, Clone)]
@@ -2462,27 +2464,136 @@ impl VideoDecoder {
         h264_decoder.set_sps(sps.clone());
         h264_decoder.set_pps(pps.clone());
 
-        let dpb_ref_pictures: Vec<H264DpbRefPicture<'_>> = self
+        // Collect valid reference entries (excluding the output slot).
+        let dpb_entries: Vec<DpbEntry> = self
             .dpb_manager
             .get_references()
-            .iter()
+            .into_iter()
             .filter(|e| e.slot_index != _output_slot)
-            .map(|entry| H264DpbRefPicture {
-                slot_index: entry.slot_index,
-                picture_resource: vk::VideoPictureResourceInfoKHR {
-                    s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    coded_offset: vk::Offset2D::default(),
-                    coded_extent: self.coded_extent,
-                    base_array_layer: 0,
-                    image_view_binding: entry.image_view,
-                    _marker: Default::default(),
-                },
-                image: entry.image,
-                frame_num: entry.frame_num,
-                pic_order_cnt: entry.pic_order_cnt,
-                current_layout: entry.current_layout,
-                last_access: entry.last_access,
+            .cloned()
+            .collect();
+
+        // Build common DpbRefState per reference so we can order them with the
+        // shared build_ref_pic_lists (L0 then L1, PicNum/POC order) instead of
+        // the generic DpbManager slot order.
+        let max_frame_num = self.dpb_manager.max_frame_num();
+        let dpb_states: Vec<DpbRefState> = dpb_entries
+            .iter()
+            .map(|e| {
+                let frame_num_wrap = if e.frame_num > au.frame_num {
+                    e.frame_num as i32 - max_frame_num as i32
+                } else {
+                    e.frame_num as i32
+                };
+                DpbRefState {
+                    frame_num: e.frame_num,
+                    frame_num_wrap,
+                    poc: e.pic_order_cnt[0],
+                    marking: MARKING_SHORT,
+                    long_term_frame_idx: 0,
+                }
+            })
+            .collect();
+
+        // Order references via the common build_ref_pic_lists (L0 then L1).
+        let ordered_slots: Vec<usize> = if let Some(slh) = &au.h264_slice {
+            let lists = build_ref_pic_lists(
+                &dpb_states,
+                slh.slice_type,
+                slh.num_ref_idx_l0_active_minus1,
+                slh.num_ref_idx_l1_active_minus1,
+                &slh.ref_pic_list_modification_l0,
+                &slh.ref_pic_list_modification_l1,
+                au.frame_num,
+                au.pic_order_cnt[0],
+                max_frame_num,
+            );
+            // VACC_H264_GT: emit FFmpeg-compatible ground-truth dump lines
+            // (same format as the instrumented ffmpeg_g build) for diffing.
+            if std::env::var("VACC_H264_GT").is_ok() {
+                let mut line = format!(
+                    "GT-SLICE fn={} poc_lsb={} st={} nrid={} refc0={} refc1={} rplm0=[",
+                    au.frame_num,
+                    slh.pic_order_cnt_lsb,
+                    slh.slice_type,
+                    slh.nal_ref_idc,
+                    slh.num_ref_idx_l0_active_minus1 + 1,
+                    slh.num_ref_idx_l1_active_minus1 + 1,
+                );
+                for m in &slh.ref_pic_list_modification_l0 {
+                    line.push_str(&format!("{}:{} ", m.op, m.difference));
+                }
+                line.push_str("] rplm1=[");
+                for m in &slh.ref_pic_list_modification_l1 {
+                    line.push_str(&format!("{}:{} ", m.op, m.difference));
+                }
+                line.push_str(&format!("] mmco_n={}", slh.dec_ref_pic_marking.len()));
+                for m in &slh.dec_ref_pic_marking {
+                    line.push_str(&format!(" {}:{}/-", m.memory_management_control_operation, m.value));
+                }
+                let db = if slh.disable_deblocking_filter_idc == 1 { 0 } else { 1 };
+                line.push_str(&format!(
+                    "] cabac={} qp_delta={} db={} alpha={} beta={} hbs={}",
+                    slh.cabac_init_idc,
+                    slh.slice_qp_delta,
+                    db,
+                    slh.slice_alpha_c0_offset_div2 * 2,
+                    slh.slice_beta_offset_div2 * 2,
+                    slh.header_bit_size,
+                ));
+                eprintln!("{}
+", line.trim_end());
+                for (name, refs) in [("l0", &lists.l0), ("l1", &lists.l1)] {
+                    let mut rl = format!(
+                        "GT-REFLST fn={} poc={} {}=[",
+                        au.frame_num, au.pic_order_cnt[0], name
+                    );
+                    for r in refs {
+                        rl.push_str(&format!(
+                            "fn{}/p{}/ltd {} ",
+                            r.frame_num,
+                            r.poc,
+                            if r.is_long_term { "Y" } else { "N" }
+                        ));
+                    }
+                    eprintln!("{}]", rl);
+                }
+            }
+            lists
+                .l0
+                .iter()
+                .map(|r| r.slot)
+                .chain(lists.l1.iter().map(|r| r.slot))
+                .collect()
+        } else {
+            // Fallback: slot order when no slice header is available.
+            (0..dpb_entries.len()).collect()
+        };
+
+        let dpb_ref_pictures: Vec<H264DpbRefPicture<'_>> = ordered_slots
+            .iter()
+            .copied()
+            .filter(|slot_idx| *slot_idx < dpb_entries.len())
+            .map(|slot_idx| {
+                let entry = &dpb_entries[slot_idx];
+                H264DpbRefPicture {
+                    slot_index: entry.slot_index,
+                    base_array_layer: self.dpb_base_layer(entry.slot_index),
+                    picture_resource: vk::VideoPictureResourceInfoKHR {
+                        s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
+                        p_next: std::ptr::null(),
+                        coded_offset: vk::Offset2D::default(),
+                        coded_extent: self.coded_extent,
+                        base_array_layer: 0,
+                        image_view_binding: entry.image_view,
+                        _marker: Default::default(),
+                    },
+                    image: entry.image,
+                    frame_num: entry.frame_num,
+                    pic_order_cnt: entry.pic_order_cnt,
+                    current_layout: entry.current_layout,
+                    last_access: entry.last_access,
+                }
             })
             .collect();
 
@@ -2501,11 +2612,15 @@ impl VideoDecoder {
 
         if std::env::var("VACC_DBG_SPS").is_ok() {
             let bs_head: Vec<String> = au.data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+            let refs: Vec<String> = dpb_ref_pictures
+                .iter()
+                .map(|r| format!("s{}/f{}/p{}", r.slot_index, r.frame_num, r.pic_order_cnt[0]))
+                .collect();
             eprintln!(
-                "[RUST-AU] slice_type={} frame_num={} is_idr={} is_ref={} poc=[{} {}] au_len={} au_head=[{}]",
+                "[RUST-AU] slice_type={} frame_num={} is_idr={} is_ref={} poc=[{} {}] nref={} refs=[{}] au_head=[{}]",
                 au.slice_type, au.frame_num, au.is_idr, au.is_reference,
                 au.pic_order_cnt[0], au.pic_order_cnt[1],
-                au.data.len(), bs_head.join(" ")
+                dpb_ref_pictures.len(), refs.join(","), bs_head.join(" ")
             );
         }
         h264_decoder.record_decode_command(
@@ -2520,6 +2635,10 @@ impl VideoDecoder {
             bs_size,
             output_view,
             output_img,
+            self.dpb_base_layer(_output_slot),
+            // Pre-decode layout of the output slot's subresource (UNDEFINED on
+            // first use, DPB when the slot is recycled).
+            self.dpb_manager.get_slot_layout(_output_slot),
             self.coded_extent,
             setup_picture,
             &dpb_ref_pictures,
