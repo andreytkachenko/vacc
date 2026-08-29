@@ -174,6 +174,8 @@ fn create_slice_header(
         dec_ref_pic_marking: Vec::new(),
         no_output_of_prior_pics_flag: false,
         long_term_reference_flag: false,
+        sp_for_switch_flag: false,
+        slice_qs_delta: 0,
         header_bit_size: 0,
         luma_log2_weight_denom: 0,
         chroma_log2_weight_denom: 0,

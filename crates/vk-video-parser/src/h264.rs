@@ -814,11 +814,14 @@ impl H264Parser {
             slh.ref_pic_list_modification_l1 = mod_l1;
         }
 
-        // Pred weight table (H.264 spec 7.4.3): present when weighted_pred_flag &&
-        // slice_type == P, or weighted_bipred_idc == 1 && slice_type == B. Comes
-        // AFTER ref list modification and BEFORE dec_ref_pic_marking.
+        // Pred weight table (H.264 spec 7.3.3.2): present when
+        // (slice_type P|SP && weighted_pred_flag) ||
+        // (slice_type B && weighted_bipred_idc == 1). Note: idc==2 means
+        // IMPLICIT weights (computed from POC distances, no table in the
+        // bitstream); only idc==1 carries an explicit pred_weight_table.
+        // Comes AFTER ref list modification and BEFORE dec_ref_pic_marking.
         let has_pred_weight_table =
-            (pps.weighted_pred_flag && is_p) || (pps.weighted_bipred_idc == 1 && is_b);
+            (pps.weighted_pred_flag && (is_p || is_sp)) || (pps.weighted_bipred_idc == 1 && is_b);
         if has_pred_weight_table {
             let (
                 luma_log2_weight_denom,
@@ -1003,8 +1006,23 @@ impl H264Parser {
             0
         };
 
-        // L0 weights: loop count based on actual num_ref_idx_l0_active_minus1
-        // Per H.264 spec 7.4.4
+        // L0 weights (H.264 spec 7.4.3). The weight/offset arrays hold the
+        // FINAL per-reference values: explicit entries from the bitstream,
+        // or the inferred defaults (weight = 1 << log2_weight_denom, offset 0)
+        // where the bitstream carries no explicit weight. HW decode APIs (e.g.
+        // VA-API VASliceParameterBufferH264) expose a single scalar
+        // luma_weight_l0_flag plus complete per-reference arrays, so refs
+        // without explicit weights must be filled with the inferred defaults
+        // rather than left zero (matches FFmpeg
+        // fill_vaapi_plain_pred_weight_table). The scalar flag is set only
+        // when some explicit weight differs from its inferred default.
+        let luma_def = 1i16 << luma_log2_weight_denom;
+        let chroma_def = if sps.chroma_format_idc != 0 {
+            1i16 << chroma_log2_weight_denom
+        } else {
+            0
+        };
+
         let mut luma_weight_l0_flag: u8 = 0;
         let mut luma_weight_l0 = [0i16; 32];
         let mut luma_offset_l0 = [0i16; 32];
@@ -1015,23 +1033,39 @@ impl H264Parser {
         for i in 0..=(num_ref_idx_l0_active_minus1 as usize) {
             let lw_flag = r.read_bit()?;
             if lw_flag {
-                luma_weight_l0_flag |= 1 << i;
-                luma_weight_l0[i] = r.read_se()? as i16;
-                luma_offset_l0[i] = r.read_se()? as i16;
+                let w = r.read_se()? as i16;
+                let o = r.read_se()? as i16;
+                luma_weight_l0[i] = w;
+                luma_offset_l0[i] = o;
+                if w != luma_def || o != 0 {
+                    luma_weight_l0_flag = 1;
+                }
+            } else {
+                luma_weight_l0[i] = luma_def;
+                luma_offset_l0[i] = 0;
             }
             if sps.chroma_format_idc != 0 {
                 let cw_flag = r.read_bit()?;
                 if cw_flag {
-                    chroma_weight_l0_flag |= 1 << i;
-                    chroma_weight_l0[i][0] = r.read_se()? as i16;
-                    chroma_offset_l0[i][0] = r.read_se()? as i16;
-                    chroma_weight_l0[i][1] = r.read_se()? as i16;
-                    chroma_offset_l0[i][1] = r.read_se()? as i16;
+                    for j in 0..2 {
+                        let w = r.read_se()? as i16;
+                        let o = r.read_se()? as i16;
+                        chroma_weight_l0[i][j] = w;
+                        chroma_offset_l0[i][j] = o;
+                        if w != chroma_def || o != 0 {
+                            chroma_weight_l0_flag = 1;
+                        }
+                    }
+                } else {
+                    chroma_weight_l0[i][0] = chroma_def;
+                    chroma_offset_l0[i][0] = 0;
+                    chroma_weight_l0[i][1] = chroma_def;
+                    chroma_offset_l0[i][1] = 0;
                 }
             }
         }
 
-        // L1 weights (B slices only)
+        // L1 weights (B slices only), same semantics as L0.
         let mut luma_weight_l1_flag: u8 = 0;
         let mut luma_weight_l1 = [0i16; 32];
         let mut luma_offset_l1 = [0i16; 32];
@@ -1043,18 +1077,34 @@ impl H264Parser {
             for i in 0..=(num_ref_idx_l1_active_minus1 as usize) {
                 let lw_flag = r.read_bit()?;
                 if lw_flag {
-                    luma_weight_l1_flag |= 1 << i;
-                    luma_weight_l1[i] = r.read_se()? as i16;
-                    luma_offset_l1[i] = r.read_se()? as i16;
+                    let w = r.read_se()? as i16;
+                    let o = r.read_se()? as i16;
+                    luma_weight_l1[i] = w;
+                    luma_offset_l1[i] = o;
+                    if w != luma_def || o != 0 {
+                        luma_weight_l1_flag = 1;
+                    }
+                } else {
+                    luma_weight_l1[i] = luma_def;
+                    luma_offset_l1[i] = 0;
                 }
                 if sps.chroma_format_idc != 0 {
                     let cw_flag = r.read_bit()?;
                     if cw_flag {
-                        chroma_weight_l1_flag |= 1 << i;
-                        chroma_weight_l1[i][0] = r.read_se()? as i16;
-                        chroma_offset_l1[i][0] = r.read_se()? as i16;
-                        chroma_weight_l1[i][1] = r.read_se()? as i16;
-                        chroma_offset_l1[i][1] = r.read_se()? as i16;
+                        for j in 0..2 {
+                            let w = r.read_se()? as i16;
+                            let o = r.read_se()? as i16;
+                            chroma_weight_l1[i][j] = w;
+                            chroma_offset_l1[i][j] = o;
+                            if w != chroma_def || o != 0 {
+                                chroma_weight_l1_flag = 1;
+                            }
+                        }
+                    } else {
+                        chroma_weight_l1[i][0] = chroma_def;
+                        chroma_offset_l1[i][0] = 0;
+                        chroma_weight_l1[i][1] = chroma_def;
+                        chroma_offset_l1[i][1] = 0;
                     }
                 }
             }
