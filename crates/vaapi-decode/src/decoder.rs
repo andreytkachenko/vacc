@@ -453,19 +453,22 @@ impl VaapiDecoder {
         // decode_h264_pending). Derive the per-field POCs for the VA picture.
         let poc = ctx.curr_poc;
         // FFmpeg's fill_vaapi_pic: TopFieldOrderCnt = field_poc[0],
-        // BottomFieldOrderCnt = field_poc[1], each 0 when the field is not
-        // present. For a progressive frame only the top field count is set.
+        // BottomFieldOrderCnt = field_poc[1]. For a frame picture
+        // field_poc[1] == field_poc[0] (H.264 8.2: both field order counts
+        // equal for frame pictures), so BottomFieldOrderCnt must equal the
+        // top POC — iHD stores it in the DDI field-order table used for
+        // direct-mode and implicit-weight POC math (a zero there corrupts
+        // B-frame prediction).
         let (top_field_order_cnt, bottom_field_order_cnt) = if field_pic_flag {
             if bottom_field { (0, poc) } else { (poc, 0) }
         } else {
-            (poc, 0)
+            (poc, poc)
         };
 
-        // Build the current picture's VA flags.
-        let mut flags = 0u32;
-        if is_ref {
-            flags |= VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-        }
+        // Build the current picture's VA flags. FFmpeg's fill_vaapi_pic sets
+        // SHORT_TERM_REFERENCE for every non-droppable picture (pic->reference
+        // = picture_structure, h264_slice.c), regardless of nal_ref_idc.
+        let mut flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
         if field_pic_flag {
             if bottom_field {
                 flags |= VA_PICTURE_H264_BOTTOM_FIELD;
@@ -519,13 +522,13 @@ impl VaapiDecoder {
 
         let make_pic = |info: &(Option<libva::VASurfaceID>, u32, i32, u8)| -> PictureH264 {
             match (info.0, info.3) {
-                // FFmpeg's fill_vaapi_pic: BottomFieldOrderCnt is 0 for a
-                // progressive reference (only field_poc[0] is set).
+                // Frame references: BottomFieldOrderCnt == TopFieldOrderCnt
+                // (H.264 8.2; FFmpeg writes field_poc[1] == field_poc[0]).
                 (Some(sid), MARKING_SHORT) => {
-                    PictureH264::new(sid, info.1, VA_PICTURE_H264_SHORT_TERM_REFERENCE, info.2, 0)
+                    PictureH264::new(sid, info.1, VA_PICTURE_H264_SHORT_TERM_REFERENCE, info.2, info.2)
                 }
                 (Some(sid), MARKING_LONG) => {
-                    PictureH264::new(sid, info.1, VA_PICTURE_H264_LONG_TERM_REFERENCE, info.2, 0)
+                    PictureH264::new(sid, info.1, VA_PICTURE_H264_LONG_TERM_REFERENCE, info.2, info.2)
                 }
                 // No surface, or the DPB slot is not marked as a reference:
                 // must be INVALID, else the driver may treat the surface
@@ -623,6 +626,9 @@ impl VaapiDecoder {
             pps.transform_8x8_mode_flag as u32,
             field_pic_flag as u32,
             pps.constrained_intra_pred_flag as u32,
+            // libva 1.23 renamed this bit to
+            // bottom_field_pic_order_in_frame_present_flag; FFmpeg writes the
+            // PPS value (not a derivation from SPS pic_order_cnt_type).
             pps.bottom_field_pic_order_in_frame_present_flag as u32,
             pps.deblocking_filter_control_present_flag as u32,
             pps.redundant_pic_cnt_present_flag as u32,
@@ -712,6 +718,15 @@ impl VaapiDecoder {
             // an IDR slice with a 22-bit header decodes pixel-perfect only at
             // offset 30; offsets 26-29/31-32 all corrupt the output).
             let mut slice_data: Vec<u8> = slice_info.nal_data.clone();
+            // The common parser extends a NAL with the leading 0x00 of a
+            // following 4-byte start code (needed by NVDEC/cuvid). VAAPI
+            // expects the exact NAL bytes (FFmpeg sends slice_data_size
+            // without that byte). A valid H.264 NAL never ends in 0x00
+            // (rbsp_stop_one_bit), so a trailing zero is always the extra
+            // byte — strip it.
+            if slice_data.last() == Some(&0) {
+                slice_data.pop();
+            }
             // TEMP EXPERIMENT: zero out slice data to test if driver reads it
             if std::env::var("EXP_ZERO_SLICE").is_ok() {
                 for b in slice_data.iter_mut() { *b = 0; }
@@ -760,6 +775,61 @@ impl VaapiDecoder {
              let eff_ref_l0 = if eff_slice_type == 2 { 0 } else { num_ref_idx_l0_active_minus1 };
              let eff_ref_l1 = if eff_slice_type == 2 { 0 } else { num_ref_idx_l1_active_minus1 };
 
+             // Replicate FFmpeg's pwt state (h264_slice.c / h264_parse.c):
+             // - I slices: pwt stays at its initial values (denom 0, empty
+             //   tables — ref_count is 0).
+             // - P/SP with weighted_pred_flag, or B with
+             //   weighted_bipred_idc==1: explicit pred_weight_table from the
+             //   bitstream (our parser already fills inferred defaults per
+             //   FF convention; note the denoms hold the raw minus1 value,
+             //   same as FF's pwt).
+             // - B without an explicit table (implicit, idc==2): FF sets the
+             //   denoms to 5 and the tables to 1 << 5 = 32.
+             // - P/SP without a table: denoms stay 0, tables filled with
+             //   1 << 0 = 1. (iHD ignores the arrays while the per-list flag
+             //   is 0, but match FF anyway.)
+             // slice_type after %5: 0=P, 1=B, 2=I, 3=SP, 4=SI.
+             let st_va = slice_header_opt
+                 .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_type % 5), _ => None })
+                 .unwrap_or(2);
+             let has_pw_table = slice_header_opt
+                 .and_then(|sh| match sh {
+                     SliceHeader::H264(h) => Some(
+                         ((h.slice_type % 5 == 0 || h.slice_type % 5 == 3) && pps.weighted_pred_flag)
+                             || (h.slice_type % 5 == 1 && pps.weighted_bipred_idc == 1),
+                     ),
+                     _ => None,
+                 })
+                 .unwrap_or(false);
+             let implicit_b = st_va == 1 && !has_pw_table;
+             let n_refs0 = if st_va == 2 { 0 } else { eff_ref_l0 as usize + 1 };
+             let n_refs1 = if st_va != 1 { 0 } else { eff_ref_l1 as usize + 1 };
+             let (luma_log2_weight_denom, chroma_log2_weight_denom, luma_weight_l0_flag, luma_weight_l0, luma_offset_l0, chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0, luma_weight_l1_flag, luma_weight_l1, luma_offset_l1, chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1) = if has_pw_table {
+                 let h = match slice_header_opt { Some(SliceHeader::H264(h)) => h, _ => unreachable!() };
+                 (h.luma_log2_weight_denom, h.chroma_log2_weight_denom, h.luma_weight_l0_flag, h.luma_weight_l0, h.luma_offset_l0, h.chroma_weight_l0_flag, h.chroma_weight_l0, h.chroma_offset_l0, h.luma_weight_l1_flag, h.luma_weight_l1, h.luma_offset_l1, h.chroma_weight_l1_flag, h.chroma_weight_l1, h.chroma_offset_l1)
+             } else if st_va == 2 {
+                 (0, 0, 0, [0i16; 32], [0i16; 32], 0, [[0i16; 2]; 32], [[0i16; 2]; 32], 0, [0i16; 32], [0i16; 32], 0, [[0i16; 2]; 32], [[0i16; 2]; 32])
+             } else {
+                 let denom = if implicit_b { 5 } else { 0 };
+                 let luma_def = 1i16 << denom;
+                 let chroma_def = if sps.chroma_format_idc != 0 { 1i16 << denom } else { 0 };
+                 let mut luma_weight_l0 = [0i16; 32];
+                 let mut chroma_weight_l0 = [[0i16; 2]; 32];
+                 let mut luma_weight_l1 = [0i16; 32];
+                 let mut chroma_weight_l1 = [[0i16; 2]; 32];
+                 for i in 0..n_refs0 {
+                     luma_weight_l0[i] = luma_def;
+                     chroma_weight_l0[i][0] = chroma_def;
+                     chroma_weight_l0[i][1] = chroma_def;
+                 }
+                 for i in 0..n_refs1 {
+                     luma_weight_l1[i] = luma_def;
+                     chroma_weight_l1[i][0] = chroma_def;
+                     chroma_weight_l1[i][1] = chroma_def;
+                 }
+                 (denom, denom, 0, luma_weight_l0, [0i16; 32], 0, chroma_weight_l0, [[0i16; 2]; 32], 0, luma_weight_l1, [0i16; 32], 0, chroma_weight_l1, [[0i16; 2]; 32])
+             };
+
              let slice_param = SliceParameterBufferH264::new(
                   slice_data.len() as u32,
                   0,
@@ -793,48 +863,20 @@ impl VaapiDecoder {
                     .unwrap_or(0),
                 ref_pic_list_0,
                 ref_pic_list_1,
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_log2_weight_denom), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_log2_weight_denom), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_weight_l0_flag as u8), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_weight_l0), _ => None })
-                    .unwrap_or([0i16; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_offset_l0), _ => None })
-                    .unwrap_or([0i16; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_weight_l0_flag as u8), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_weight_l0), _ => None })
-                    .unwrap_or([[0i16; 2]; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_offset_l0), _ => None })
-                    .unwrap_or([[0i16; 2]; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_weight_l1_flag as u8), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_weight_l1), _ => None })
-                    .unwrap_or([0i16; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.luma_offset_l1), _ => None })
-                    .unwrap_or([0i16; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_weight_l1_flag as u8), _ => None })
-                    .unwrap_or(0),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_weight_l1), _ => None })
-                    .unwrap_or([[0i16; 2]; 32]),
-                slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.chroma_offset_l1), _ => None })
-                    .unwrap_or([[0i16; 2]; 32]),
+                luma_log2_weight_denom,
+                chroma_log2_weight_denom,
+                luma_weight_l0_flag,
+                luma_weight_l0,
+                luma_offset_l0,
+                chroma_weight_l0_flag,
+                chroma_weight_l0,
+                chroma_offset_l0,
+                luma_weight_l1_flag,
+                luma_weight_l1,
+                luma_offset_l1,
+                chroma_weight_l1_flag,
+                chroma_weight_l1,
+                chroma_offset_l1,
             );
 
             if std::env::var("VACC_VA_DUMP").is_ok() {
@@ -1241,6 +1283,15 @@ impl VaapiDecoder {
                         eprintln!("[DBG] fn={} poc={} st={} mmco={:?} dpb_refs={}",
                             frame_num, ctx.curr_poc, st, mmco,
                             ctx.dpb.get_references().len());
+                        for (si, se) in parser_slices.iter().enumerate() {
+                            if let Some(SliceHeader::H264(h)) = &se.slice_header {
+                                eprintln!("[DBG-SL] pic={si} fn={} poc_lsb={} hbs={} mmco={:?} rplm0={:?} nal0={:02x} len={}",
+                                    h.frame_num, h.pic_order_cnt_lsb, h.header_bit_size,
+                                    h.dec_ref_pic_marking.iter().map(|e| (e.memory_management_control_operation, e.value)).collect::<Vec<_>>(),
+                                    h.ref_pic_list_modification_l0.iter().map(|e| (e.op, e.difference)).collect::<Vec<_>>(),
+                                    se.nal_data.first().copied().unwrap_or(0), se.nal_data.len());
+                            }
+                        }
                     }
 
                     // Convert parser's SliceEntry to our H264SliceInfo
