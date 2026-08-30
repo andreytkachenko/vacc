@@ -445,6 +445,7 @@ pub fn build_cuvid_av1_picparams(
     dpb: &mut Av1DpbState,
     bitstream_ptr: *const u8,
     bitstream_len: u32,
+    ts_90k: u64,
 ) -> CUVIDPICPARAMS {
     let is_key = fh.frame_type == 0;
     let is_intra_only = fh.frame_type == 2;
@@ -727,7 +728,13 @@ pub fn build_cuvid_av1_picparams(
     params.pSliceDataOffsets = SLICE_DATA_OFFSETS.as_ptr();
     params.ref_pic_flag = (fh.refresh_frame_flags != 0) as c_int;
     params.intra_pic_flag = (is_key || is_intra_only) as c_int;
-    params.Reserved = [0; 30];
+    // Display timestamp on the 90 kHz clock in Reserved[0]: NVIDIA's own
+    // cuvid parser sets it from the packet timestamp, and the NVDEC AV1
+    // decoder consumes it. Leaving it zero makes inter-frame reconstruction
+    // diverge (small error that propagates through the reference chain).
+    let mut reserved = [0u32; 30];
+    reserved[0] = (ts_90k & 0xFFFF_FFFF) as u32;
+    params.Reserved = reserved;
     params.CodecSpecific.av1 = av1;
 
     params
@@ -783,6 +790,9 @@ pub struct NvdecAv1Decoder {
     /// submitted for each picture (DECODE order) to this path.
     dump_params_path: Option<std::path::PathBuf>,
     dump_params_count: u32,
+    /// IVF timebase (rate_num, rate_den); converts packet pts to the 90 kHz
+    /// clock NVDEC expects in `CUVIDPICPARAMS.Reserved[0]`.
+    ivf_timebase: (u32, u32),
 }
 
 impl NvdecAv1Decoder {
@@ -794,6 +804,16 @@ impl NvdecAv1Decoder {
         init_nvdec()?;
 
         let is_ivf = data.len() >= IVF_HEADER_SIZE && &data[0..4] == b"DKIF";
+        // IVF header (FFmpeg/canonical layout): fourcc @8, width @12, height
+        // @14, time_base.den @16, time_base.num @20. There is no reserved
+        // field before the fourcc.
+        let ivf_timebase = if is_ivf && data.len() >= 24 {
+            let rate_den = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            let rate_num = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+            (rate_num, rate_den)
+        } else {
+            (0, 1)
+        };
 
         let mut decoder = Self {
             parser: Av1Parser::new(),
@@ -826,6 +846,7 @@ impl NvdecAv1Decoder {
             pending_data: data,
             parsed_offset: if is_ivf { IVF_HEADER_SIZE } else { 0 },
             is_ivf,
+            ivf_timebase,
             pinned_cache: Mutex::new(None),
             bitstream_cache: Mutex::new(None),
             dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
@@ -870,6 +891,11 @@ impl NvdecAv1Decoder {
                 if size == 0 || self.parsed_offset + 12 + size > self.pending_data.len() {
                     break;
                 }
+                let pts = u64::from_le_bytes(
+                    self.pending_data[self.parsed_offset + 4..self.parsed_offset + 12]
+                        .try_into()
+                        .unwrap(),
+                );
                 let payload =
                     &self.pending_data[self.parsed_offset + 12..self.parsed_offset + 12 + size];
                 // Parse the SPS (type 1 OBU) once, from whichever packet carries it.
@@ -897,7 +923,7 @@ impl NvdecAv1Decoder {
                     }
                 }
                 for obu in extract_frame_obus(payload) {
-                    self.process_frame(&obu.payload)?;
+                    self.process_frame(&obu.payload, pts)?;
                 }
                 self.parsed_offset += 12 + size;
             }
@@ -905,7 +931,7 @@ impl NvdecAv1Decoder {
             // Raw single-frame: process the whole buffer once, then mark consumed.
             if self.parsed_offset == 0 && !self.pending_data.is_empty() {
                 let data = self.pending_data.clone();
-                self.process_frame(&data)?;
+                self.process_frame(&data, 0)?;
                 self.parsed_offset = self.pending_data.len();
             }
         }
@@ -944,8 +970,9 @@ impl NvdecAv1Decoder {
         Ok(p as *const u8)
     }
 
-    /// Parse and decode one AV1 frame OBU payload.
-    fn process_frame(&mut self, payload: &[u8]) -> NvdecResult<()> {
+    /// Parse and decode one AV1 frame OBU payload. `packet_pts` is the IVF
+    /// packet timestamp (in IVF timebase ticks) carrying this frame.
+    fn process_frame(&mut self, payload: &[u8], packet_pts: u64) -> NvdecResult<()> {
         let sps = match self.sps.lock().unwrap().clone() {
             Some(s) => s,
             // No SPS yet (e.g. first packet had no type-1 OBU); skip this OBU.
@@ -993,11 +1020,23 @@ impl NvdecAv1Decoder {
         let tile_len = payload.len() - hdr;
         let tile_ptr = self.bitstream_buffer(&payload[hdr..])?;
 
+        // Convert the packet pts to the 90 kHz clock (same result as the
+        // NVIDIA cuvid-parser baseline: raw ticks scaled by the IVF timebase
+        // num/den onto the 90 kHz clock).
+        let (rate_num, rate_den) = self.ivf_timebase;
+        let ts_90k = if rate_den > 0 {
+            packet_pts
+                .saturating_mul(90_000u64 * rate_num as u64)
+                / rate_den as u64
+        } else {
+            0
+        };
+
         // Build the picparams (allocates the output slot; references from the
         // pre-decode DPB state).
         let params = {
             let mut dpb = self.dpb.lock().unwrap();
-            build_cuvid_av1_picparams(&fh, &sps, &mut dpb, tile_ptr, tile_len as u32)
+            build_cuvid_av1_picparams(&fh, &sps, &mut dpb, tile_ptr, tile_len as u32, ts_90k)
         };
 
         if let Some(dump_path) = &self.dump_params_path {
@@ -1029,8 +1068,13 @@ impl NvdecAv1Decoder {
 
         let cuda_log = std::env::var("NVDEC_CUDA_LOG").is_ok();
         let t0 = std::time::Instant::now();
+        let procparams = crate::ffi::default_procparams();
         let result = unsafe {
-            (funcs.decode_picture)(decoder_handle as *mut std::ffi::c_void, &params)
+            (funcs.decode_picture)(
+                decoder_handle as *mut std::ffi::c_void,
+                &params,
+                &procparams,
+            )
         };
         if cuda_log {
             eprintln!(

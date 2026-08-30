@@ -601,7 +601,8 @@ unsafe extern "C" fn decode_callback(
             return 0;
         }
     };
-    let res = unsafe { (funcs.decode_picture)(decoder, pPicParams) };
+    let procparams = nvdec_decode::ffi::default_procparams();
+    let res = unsafe { (funcs.decode_picture)(decoder, pPicParams, &procparams) };
     if res == CUDA_SUCCESS {
         state.decode_picture_ok += 1;
         state.decoded_surfaces.push(pp.CurrPicIdx as u32);

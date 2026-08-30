@@ -309,11 +309,17 @@ impl VideoDecoder {
         eprintln!("[Decoder] Video session created successfully");
 
         let max_frame_size = extract_max_frame_size(&data, decoded_codec, max_frames);
+        // The driver may read srcBufferRange rounded up to
+        // minBitstreamBufferSizeAlignment, so the allocation must cover the
+        // aligned size of the largest access unit (VUID-07139).
+        let bs_align = bs_buffer_size_alignment.max(1);
+        let bs_buffer_size =
+            ((max_frame_size as u64 + bs_align - 1) & !(bs_align - 1)).max(bs_align);
 
         let bs_buffer = create_bitstream_buffer_with_profile(
             &vulkan.device,
             &vulkan.memory_properties,
-            max_frame_size as u64,
+            bs_buffer_size,
             codec,
             parsed.profile_idc,
             parsed.chroma_subsampling,
@@ -2346,7 +2352,7 @@ impl VideoDecoder {
                 sess_params_handle,
                 self.bs_buffer.buffer(),
                 0,
-                actual_size,
+                aligned_size,
                 output_view,
                 output_img,
                 frame_coded_extent,
@@ -3837,6 +3843,12 @@ fn create_video_session(
         chroma_subsampling: parsed.chroma_subsampling,
         luma_bit_depth: parsed.luma_bit_depth,
         chroma_bit_depth: parsed.chroma_bit_depth,
+        // H264/H265 use a real result-status query pool per frame; AV1/VP9 use
+        // no queries (see VideoSessionParams::inline_queries).
+        inline_queries: matches!(
+            codec,
+            VideoCodec::DecodeH264 | VideoCodec::DecodeH265
+        ),
     };
 
     let std_header_version = build_std_header_version(std_header_name);

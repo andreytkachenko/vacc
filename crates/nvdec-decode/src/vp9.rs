@@ -631,8 +631,13 @@ impl NvdecVp9Decoder {
         let funcs = get_funcs()?;
         let _ = cu_ctx_set_current();
 
+        let procparams = crate::ffi::default_procparams();
         let result = unsafe {
-            (funcs.decode_picture)(decoder_handle as *mut std::ffi::c_void, &params)
+            (funcs.decode_picture)(
+                decoder_handle as *mut std::ffi::c_void,
+                &params,
+                &procparams,
+            )
         };
         if result != CUDA_SUCCESS {
             return Err(NvdecError::DecodeFailed(format!(

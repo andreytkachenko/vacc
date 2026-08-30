@@ -256,7 +256,15 @@ impl Vp9Decoder {
         // Heap-allocate to ensure pointers stay valid
         let mut all_slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> = Vec::new();
         if has_setup_slot {
-            all_slots.push(unsafe { *setup_slot_ptr });
+            // CRITICAL (same fix as H264/H265, VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239):
+            // BeginVideoCoding declares the output slot with slot_index=-1 — at Begin
+            // execution time the slot is INACTIVE; the decode's pSetupReferenceSlot
+            // (setup_slot_ptr, real index) then associates it. Declaring the actual
+            // (inactive) index makes the NVIDIA driver trap in vkCmdDecodeVideoKHR.
+            let mut setup_for_begin: vk::VideoReferenceSlotInfoKHR<'static> =
+                unsafe { *setup_slot_ptr };
+            setup_for_begin.slot_index = -1;
+            all_slots.push(setup_for_begin);
         }
         if !ref_slots_ptr.is_null() {
             let ref_slice =
@@ -436,16 +444,14 @@ impl Vp9Decoder {
                 _marker: Default::default(),
             };
 
-            // The session is created with VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR,
-            // so the spec requires this structure in the pNext chain; the NVIDIA driver
-            // dereferences it unconditionally and crashes without it.
-            let inline_queries = super::inline_queries::empty_inline_queries(
-                vp9_decode_info as *const _ as *const std::ffi::c_void,
-            );
-
+            // No inline queries for VP9: the session is created WITHOUT the
+            // INLINE_QUERIES flag (see session.rs) — with the flag set the
+            // NVIDIA driver unconditionally dereferences an empty
+            // VkVideoInlineQueryInfoKHR and segfaults here. pNext chain is
+            // just the VP9 picture info (matches FFmpeg).
             let decode_info = vk::VideoDecodeInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: &inline_queries as *const _ as *const _,
+                p_next: vp9_decode_info as *const _ as *const _,
                 flags: vk::VideoDecodeFlagsKHR::empty(),
                 src_buffer: bitstream_buffer,
                 src_buffer_offset: bitstream_offset,

@@ -95,6 +95,11 @@ fn rt_format_to_fourcc(rt_format: u32) -> Option<u32> {
 const FOURCC_YV12: u32 = u32::from_ne_bytes(*b"YV12");
 const FOURCC_I420: u32 = u32::from_ne_bytes(*b"I420");
 const FOURCC_XYUV: u32 = u32::from_ne_bytes(*b"XYUV");
+// Y410: 32-bit packed 10-bit 4:4:4. iHD's image format for 10-bit 4:4:4
+// surfaces (HEVC Main444_10) — this is what FFmpeg's vaapi hwaccel requests
+// for the same content. iHD's field order is U | Y<<10 | V<<20 (verified
+// byte-for-byte against FF output).
+const FOURCC_Y410: u32 = u32::from_ne_bytes(*b"Y410");
 
 /// Candidate image fourccs to probe via `vaGetImage` for a render format:
 /// the driver may expose a semi-planar or planar variant of the same format
@@ -106,6 +111,8 @@ fn rt_format_candidates(rt_format: u32) -> &'static [u32] {
         // XYUV first: iHD stores Main444 surfaces in packed XYUV and derives
         // images in that layout; 444P is kept as a fallback for other drivers.
         libva::VA_RT_FORMAT_YUV444 => &[FOURCC_XYUV, libva::VA_FOURCC_444P],
+        // 10-bit 4:4:4: iHD derives Y410 images (no 16-bit 444P/XYUV variant).
+        libva::VA_RT_FORMAT_YUV444_10 => &[FOURCC_Y410],
         _ => &[libva::VA_FOURCC_NV12],
     }
 }
@@ -2047,6 +2054,56 @@ fn read_from_image(
 ) -> Result<Option<PixelData>> {
     let va_image = image.image();
     let data = image.as_ref();
+
+    // Packed Y410: 4 bytes per pixel, word = U | Y<<10 | V<<20 (10 bits each,
+    // top 2 bits padding). This is iHD's actual layout for 10-bit 4:4:4
+    // surfaces (HEVC Main444_10) — verified byte-for-byte against FFmpeg's
+    // vaapi hwaccel output, which requests Y410 for the same content. Unpack
+    // to planar u16 with bottom-justified 10-bit values (yuv444p10le).
+    if va_image.format.fourcc == FOURCC_Y410 && va_image.num_planes == 1 {
+        let out_width = display_width.min(va_image.width as u32) as usize;
+        let out_height = display_height.min(va_image.height as u32) as usize;
+        let pitch = va_image.pitches[0] as usize;
+        let off = va_image.offsets[0] as usize;
+        let plane_size = out_width * out_height;
+        let mut buffer = vec![0u8; 3 * plane_size * 2];
+        let src = data.as_ptr();
+        for row in 0..out_height {
+            let row_off = off + row * pitch;
+            for col in 0..out_width {
+                let p = unsafe { src.add(row_off + col * 4) };
+                let word = u32::from_ne_bytes([
+                    unsafe { *p },
+                    unsafe { *p.add(1) },
+                    unsafe { *p.add(2) },
+                    unsafe { *p.add(3) },
+                ]);
+                let y = ((word >> 10) & 0x3FF) as u16;
+                let u = (word & 0x3FF) as u16;
+                let v = ((word >> 20) & 0x3FF) as u16;
+                unsafe {
+                    buffer[(row * out_width + col) * 2..(row * out_width + col) * 2 + 2]
+                        .copy_from_slice(&y.to_ne_bytes());
+                    buffer[(plane_size + row * out_width + col) * 2..(plane_size + row * out_width + col) * 2 + 2]
+                        .copy_from_slice(&u.to_ne_bytes());
+                    buffer[(2 * plane_size + row * out_width + col) * 2..(2 * plane_size + row * out_width + col) * 2 + 2]
+                        .copy_from_slice(&v.to_ne_bytes());
+                }
+            }
+        }
+        drop(image);
+        let y_ptr = buffer.as_ptr();
+        let u_ptr = unsafe { y_ptr.add(plane_size * 2) };
+        let v_ptr = unsafe { y_ptr.add(2 * plane_size * 2) };
+        return Ok(Some(PixelData {
+            // "16" => bps=2 in the consumer; not "P016" => no top-justification shift.
+            format: "Y410P16".to_string(),
+            y: PixelPlane { data: y_ptr, pitch: out_width * 2, width: out_width, height: out_height },
+            u: PixelPlane { data: u_ptr, pitch: out_width * 2, width: out_width, height: out_height },
+            v: Some(PixelPlane { data: v_ptr, pitch: out_width * 2, width: out_width, height: out_height }),
+            buffer,
+        }));
+    }
 
     // Packed XYUV (DRM 'XYUV' == FFmpeg VUYX): 4 bytes per pixel in V,U,Y,X
     // order. iHD derives Main444 surfaces in this layout; unpack to planar.

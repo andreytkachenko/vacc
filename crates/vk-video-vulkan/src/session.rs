@@ -39,6 +39,14 @@ pub struct VideoSessionParams {
     pub chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
     pub luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
     pub chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    /// Whether to create the session with
+    /// VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR. H264/H265 use real
+    /// inline queries (result-status pool per frame). AV1/VP9 pass no
+    /// queries at all — with the flag set the NVIDIA driver
+    /// unconditionally dereferences the (empty) VkVideoInlineQueryInfoKHR
+    /// and segfaults in vkCmdDecodeVideoKHR, so those sessions are created
+    /// without the flag (matches FFmpeg: flags=0x20 only).
+    pub inline_queries: bool,
 }
 
 /// A Vulkan video session.
@@ -276,7 +284,18 @@ impl VideoSession {
         // non-zero session flag (FFmpeg: INLINE_SESSION_PARAMETERS 0x20; C++ ref:
         // INLINE_QUERIES 0x4); with empty() flags the NVIDIA driver traps in
         // vkCmdDecodeVideoKHR on frame 0. ash 0.38 lacks the constant, so use raw bits.
-        let session_flags = vk::VideoSessionCreateFlagsKHR::from_raw(0x4);
+        //
+        // AV1/VP9 sessions must NOT set this flag: they pass no inline queries,
+        // and with the flag set the NVIDIA driver unconditionally dereferences
+        // the (empty) VkVideoInlineQueryInfoKHR and segfaults in
+        // vkCmdDecodeVideoKHR. (The "traps with empty flags" note above applies
+        // to H264/H265 sessions that DO carry a real query pool; for AV1/VP9
+        // empty flags + no query struct is the FFmpeg pattern and works.)
+        let session_flags = if params.inline_queries {
+            vk::VideoSessionCreateFlagsKHR::from_raw(0x4)
+        } else {
+            vk::VideoSessionCreateFlagsKHR::empty()
+        };
 
         let session_create_info = vk::VideoSessionCreateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_CREATE_INFO_KHR,

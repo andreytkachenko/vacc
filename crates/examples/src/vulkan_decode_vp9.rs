@@ -277,6 +277,7 @@ by Vulkan Video decode (4:2:0 only).",
         chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
         luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
         chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        inline_queries: false,
     };
 
     let std_header_version = build_std_header_version("VK_STD_vulkan_video_codec_vp9_decode");

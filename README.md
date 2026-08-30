@@ -2,7 +2,7 @@
 
 A Rust library for Vulkan hardware-accelerated video decoding, based on the [Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
 
-Supports **H.264/AVC**, **H.265/HEVC**, and **AV1** decoding using Vulkan's video decode extensions.
+Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding (Vulkan Video, NVIDIA NVDEC, and VAAPI backends — see [Decode Support Matrix](#decode-support-matrix)).
 
 ## Architecture
 
@@ -132,39 +132,46 @@ Bitstream ──► BitstreamBuffer ──────────┤
 | `BitstreamBuffer` | `VkBuffer` | Compressed video data |
 | `DpbImage` | `VkImage` | Decoded Picture Buffer |
 
-## Supported Codecs
+## Decode Support Matrix
 
-| Codec | Parser | Vulkan Decoder | NVDEC Decoder | Profile Support |
-|-------|--------|---------------|---------------|-----------------|
-| H.264/AVC | ✅ | ✅ | ✅ | Baseline, Main, High |
-| H.265/HEVC | ✅ | ✅ | ❌ | Main, Main10 |
-| AV1 | ✅ | ✅ | ❌ | Main, High, Professional |
-| VP9 | 🔄 | 🔄 | ❌ | Profile 0-3 |
+Verified 2026-08-30: Big Buck Bunny 640x360 @ 30 fps, **300 frames** per sample; output compared
+**byte-exact** against FFmpeg (software-decode reference). Environment: NVIDIA GeForce **RTX 3060**,
+driver 610.43.02 (Vulkan Video + NVDEC); Intel iHD driver (VA API 1.22) for VAAPI.
 
-✅ = Implemented | 🔄 = Planned | ❌ = Not yet implemented
+Legend: ✅ = 300/300 byte-exact | ❌ = fails (reason noted) | — = not implemented
 
-### NVDEC Decoder (`nvdec-decode`)
+| Codec / Profile (chroma, depth) | Vulkan Video | NVDEC | VAAPI |
+|---|---|---|---|
+| H.264 Baseline (4:2:0 8b) | ✅ | ✅ | ✅ |
+| H.264 Main (4:2:0 8b) | ✅ | ✅ | ✅ |
+| H.264 High (4:2:0 8b) | ✅ | ✅ | ✅ |
+| H.264 High 10 (4:2:0 10b) | ❌ driver: `ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED` (FF Vulkan fails identically) | ❌ hardware: GeForce NVDEC has no 10-bit H.264 (cuvid 801; FF CUDA fails identically) | ❌ driver: iHD has no 10-bit H.264 render target (FF VAAPI fails identically) |
+| H.264 High 4:4:4 (4:4:4 8b) | ❌ driver (FF Vulkan fails identically) | ❌ hardware: cuvid 801 (FF CUDA fails identically) | ⚠️ our gap: FF VAAPI decodes this stream, we fail at render-target format negotiation |
+| H.265 Main (4:2:0 8b) | ✅ | ✅ | ✅ |
+| H.265 Main 10 (4:2:0 10b) | ✅ | ✅ | ✅ |
+| H.265 Rext 4:4:4 (4:4:4 8b) | ✅ | ✅ | ✅ |
+| H.265 Rext 4:4:4 Main 10 (4:4:4 10b) | ✅ | ❌ wrong pixels (0/300, maxdiff 64449; output size/layout correct) | ✅ |
+| VP9 Profile 0 (4:2:0 8b) | ✅ * | ✅ | ✅ |
+| VP9 Profile 2 (4:2:0 10b) | ❌ emits 8-bit format for 10-bit stream (G8 instead of G10X6) | ❌ same as Vulkan | ✅ † |
+| VP9 Profile 2 (4:2:0 12b) | ❌ emits 8-bit format (G8 instead of G12X4) | ❌ same as Vulkan | ✅ † |
+| AV1 Main (4:2:0 8b) | ✅ | ❌ 11/300 frames match — fix in progress | — no AV1 path |
+| AV1 Main 10 (4:2:0 10b) | ✅ | ❌ emits 8-bit-sized buffer for 10-bit stream — fix in progress | — no AV1 path |
+| AV1 High (4:2:0 12b) | ❌ driver (FF Vulkan fails identically) | ❌ hardware: GeForce NVDEC has no 12-bit AV1 (FF CUDA decodes 8/10-bit, fails at 12-bit) | — no AV1 path |
+| AV1 Main 4:4:4 (4:4:4 8b) | ❌ driver: NVIDIA Vulkan Video has no AV1 4:4:4 decode (FF Vulkan fails identically) | ❌ our gap: AV1 chroma hardcoded to 4:2:0 | — no AV1 path |
+| AV1 High 4:4:4 (4:4:4 10b) | ❌ driver (FF Vulkan fails identically) | ❌ same as Main 4:4:4 | — no AV1 path |
 
-Hardware-accelerated H.264 decoding via NVIDIA CUVID/NVDEC API.
+\* byte-exact on clean runs (re-verified 300/300 twice); one flake (6/300) observed under sustained
+back-to-back decode load.
+† VAAPI decodes at native depth on the GPU, but the example readback down-converts P010/P012 to
+8-bit (rounded), so comparison is against the down-converted reference.
 
-**What works:**
-- H.264 Main, High, and Baseline profiles (8-bit, progressive)
-- Various resolutions and frame rates (tested: 1920x1080, 640x480, 320x240)
-- Multi-segment streams with resolution changes mid-stream
-- B-frame reordering (NVDEC parser handles DPB and display order)
-- Proper drain/flush at end-of-stream (2136 frames, byte-perfect vs ffmpeg)
-- Decoder reset/reconfiguration mid-stream
-- Multi-GPU support (select specific CUDA device)
-- Concurrent thread safety (decoder instances per thread)
-
-**What doesn't work on V100:**
-- 10-bit H.264 (V100 NVDEC hardware limitation)
-- High 4:4:4 Intra profile (V100 NVDEC hardware limitation)
-
-**Known limitations:**
-- Interlaced content: field ordering differs from ffmpeg (NVDEC uses top-field-first convention)
-- H.264 only — HEVC and AV1 NVDEC support not yet implemented
-- Requires NVIDIA GPU with NVDEC hardware (tested on Tesla V100, Driver 580.159.04)
+Notes:
+- "driver/hardware" failures = the same stream fails identically through FFmpeg's own hwaccel path,
+  i.e. not a bug in our code.
+- NVDEC H.264: interlaced content decodes but field ordering differs from FFmpeg (top-field-first
+  convention); progressive-only parity.
+- NVDEC features verified separately: B-frame reordering/flush (byte-perfect vs ffmpeg), decoder
+  reset/reconfiguration mid-stream, multi-GPU selection, concurrent decoder instances.
 
 ## Vulkan Extensions Required
 
