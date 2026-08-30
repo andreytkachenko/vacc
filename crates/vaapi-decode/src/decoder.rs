@@ -11,6 +11,8 @@ use libva::{
     PictureParameter, PictureParameterBufferH264, PictureH264, H264SeqFields,
     H264PicFields, SliceParameter, SliceParameterBufferH264,
     Picture, PictureNew, PictureEnd, PictureRender, PictureSync, Surface, Image,
+    PictureParameterBufferVP9, SegmentParameterVP9, SliceParameterBufferVP9,
+    VP9PicFields, VP9SegmentFlags,
 };
 use libva::VAProfile::Type as VAProfileType;
 use libva::{
@@ -26,16 +28,19 @@ use vk_video_core::{
     frame::{DecodedFrame, PixelData, PixelPlane},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     session::Extent2D,
-    picture::{H264Sps, H264Pps},
+    picture::{H264Sps, H264Pps, Vp9FrameData},
 };
 use vk_video_parser::{
     bitstream::BitstreamPacket, h264::H264Parser,
     h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG},
     h264_poc::PocCalculator,
+    vp9::Vp9Parser, vp9_dpb::Vp9Dpb,
     DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
 };
 
 use super::{Error, Result};
+
+use crate::vp9_qlookup::{VP9_AC_QLOOKUP, VP9_DC_QLOOKUP};
 
 /// Custom surface memory descriptor that requests DRM_PRIME_2 memory type.
 /// This is required for export_prime to work on NVIDIA GPUs.
@@ -49,6 +54,21 @@ impl libva::SurfaceMemoryDescriptor for DmaBufSurfaceDescriptor {
         // VA_ERROR_INVALID_SURFACE ("invalid VASurfaceID") on export.
         attrs.push(libva::VASurfaceAttrib::new_memory_type(libva::MemoryType::DrmPrime2));
         None
+    }
+}
+
+/// Map a VA runtime format to the DRM fourcc of the surface pixel format.
+///
+/// Only 8-bit 4:4:4 (profile 1) needs an explicit pixel-format attribute on
+/// iHD: without it the driver allocates a surface its VP9 profile-1 decoder
+/// rejects with VA_STATUS_INVALID_PARAM, and XYUV is the format FFmpeg's
+/// VAAPI wrapper requests. For 4:2:0 (NV12/P010/P012) leaving the attribute
+/// unset keeps the driver's default allocation, which decodes byte-exact;
+/// forcing NV12 measurably changes the decoded output.
+fn rt_format_to_fourcc(rt_format: u32) -> Option<u32> {
+    match rt_format {
+        libva::VA_RT_FORMAT_YUV444 => Some(0x56555958), // XYUV
+        _ => None,
     }
 }
 
@@ -275,9 +295,24 @@ struct StreamInfo {
     display_height: u32,
     max_dpb: u32,
     rt_format: u32,
+    /// VP9 bitstream profile (0/1/2); 0 for other codecs.
+    vp9_profile: u8,
+    /// Luma/chroma bit depth from the first VP9 frame; 8 for other codecs.
+    vp9_bit_depth: u8,
     /// H.264 specific
     sps: Option<H264Sps>,
     pps: Option<H264Pps>,
+}
+
+/// VP9 decode context.
+///
+/// Uses the common decode-state foundation from `vk-video-parser`:
+/// - `dpb`: the common `Vp9Dpb` manager (ONE DPB manager across backends).
+/// - `slot_surfaces`: maps a common-DPB slot index to a VA surface-pool index.
+struct Vp9Context {
+    dpb: Vp9Dpb,
+    /// DPB slot index -> surface pool index (None if the slot has no surface).
+    slot_surfaces: Vec<Option<usize>>,
 }
 
 /// H.264 decode context.
@@ -323,7 +358,11 @@ pub struct VaapiDecoder {
     pending_key: i64,
     /// Codec-specific context
     h264_ctx: Option<H264Context>,
+    vp9_ctx: Option<Vp9Context>,
     parser: Option<H264Parser>,
+    vp9_parser: Option<Vp9Parser>,
+    /// True if the input is an IVF container (packets start at offset 32).
+    input_is_ivf: bool,
 }
 
 impl VaapiDecoder {
@@ -334,6 +373,9 @@ impl VaapiDecoder {
 
         // Parse stream to get codec and dimensions
         let stream = parse_stream_info(&display, &data)?;
+
+        // IVF containers carry a 32-byte header before the first packet.
+        let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
 
         // Create config with RT format attribute (like cros-codecs does)
         let config = display.create_config(
@@ -353,7 +395,7 @@ impl VaapiDecoder {
 
          let surfaces = display.create_surfaces::<DmaBufSurfaceDescriptor>(
             stream.rt_format,
-            None,
+            rt_format_to_fourcc(stream.rt_format),
             stream.width,
             stream.height,
             None,
@@ -399,6 +441,25 @@ impl VaapiDecoder {
             None
         };
 
+        // VP9 uses the common parser + DPB (ONE implementation across
+        // backends). One slot per surface so a surface can always be mapped
+        // to a slot.
+        let (vp9_ctx, vp9_parser) = if stream.codec == CoreVideoCodec::DecodeVp9 {
+            let num_slots = num_surfaces;
+            let mut p = Vp9Parser::new();
+            p.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeVp9))
+                .map_err(|e| Error::Parser(e.to_string()))?;
+            (
+                Some(Vp9Context {
+                    dpb: Vp9Dpb::new(num_slots as u32),
+                    slot_surfaces: vec![None; num_slots],
+                }),
+                Some(p),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             _display: display,
             _config: config,
@@ -406,14 +467,17 @@ impl VaapiDecoder {
             surface_pool,
             stream,
             pending_data: data,
-            parse_offset: 0,
+            parse_offset: if is_ivf { 32 } else { 0 },
             frame_count: 0,
             pending_frames: VecDeque::new(),
             reorder_watermark: i64::MIN,
             gop_count: 0,
             pending_key: 0,
             h264_ctx,
+            vp9_ctx,
             parser,
+            vp9_parser,
+            input_is_ivf: is_ivf,
         })
     }
 
@@ -928,6 +992,7 @@ impl VaapiDecoder {
             self.stream.height,
             self.stream.display_width,
             self.stream.display_height,
+            libva::VA_FOURCC_NV12,
         )?;
 
         // Commit the current picture to the common DPB. The reference marking
@@ -993,9 +1058,22 @@ impl Decoder for VaapiDecoder {
     }
 
     fn info(&self) -> DecoderInfo {
-        // Derive bit depth, chroma subsampling, and profile from SPS when available
+        // Derive bit depth, chroma subsampling, and profile from the stream
+        // metadata (VP9 frame header / H.264 SPS) when available.
         let (chroma_subsampling, luma_bit_depth, chroma_bit_depth, profile_idc) =
-            if let Some(ref sps) = self.stream.sps {
+            if self.stream.codec == CoreVideoCodec::DecodeVp9 {
+                let chroma = if self.stream.vp9_profile == 1 {
+                    ChromaSubsampling::_444
+                } else {
+                    ChromaSubsampling::_420
+                };
+                let bd = match self.stream.vp9_bit_depth {
+                    10 => ComponentBitDepth::Bit10,
+                    12 => ComponentBitDepth::Bit12,
+                    _ => ComponentBitDepth::Bit8,
+                };
+                (chroma, bd, bd, Some(self.stream.vp9_profile as u32))
+            } else if let Some(ref sps) = self.stream.sps {
                 let chroma_subsampling = match sps.chroma_format_idc {
                     0 => ChromaSubsampling::Monochrome,
                     1 => ChromaSubsampling::_420,
@@ -1099,6 +1177,22 @@ impl Decoder for VaapiDecoder {
                 }
             }
 
+            if self.stream.codec == CoreVideoCodec::DecodeVp9 {
+                // VP9 has no B-frames: display order equals decode order
+                // (show-existing commands re-display in place), so frames are
+                // emitted directly without a reorder buffer.
+                let offset_before = self.parse_offset;
+                match self.decode_vp9_pending()? {
+                    Some(frame) => return Ok(Some(frame)),
+                    None => {
+                        if self.parse_offset == offset_before {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // Fallback: return placeholder frame for other codecs (no reordering).
             let frame = DecodedFrame::new(
                 self.frame_count,
@@ -1136,6 +1230,12 @@ impl Decoder for VaapiDecoder {
                 *s = None;
             }
         }
+        if let Some(ctx) = self.vp9_ctx.as_mut() {
+            ctx.dpb.reset();
+            for s in ctx.slot_surfaces.iter_mut() {
+                *s = None;
+            }
+        }
 
         // Clear pending data
         self.pending_data.clear();
@@ -1168,9 +1268,18 @@ impl Decoder for VaapiDecoder {
                 *s = None;
             }
         }
+        if let Some(ctx) = self.vp9_ctx.as_mut() {
+            ctx.dpb.reset();
+            for s in ctx.slot_surfaces.iter_mut() {
+                *s = None;
+            }
+        }
 
         // Reset parser state
         if let Some(ref mut parser) = self.parser {
+            parser.reset();
+        }
+        if let Some(ref mut parser) = self.vp9_parser {
             parser.reset();
         }
 
@@ -1336,11 +1445,28 @@ fn read_from_image(
     let va_image = image.image();
     let data = image.as_ref();
 
-    // Determine format from fourcc
+    // Determine format from fourcc. P010/P012 carry full-precision samples
+    // (left-aligned in u16) and are scaled to 8-bit below.
     let fourcc = va_image.format.fourcc;
     let is_nv12 = fourcc == libva::VA_FOURCC_NV12;
-    let format_str = if is_nv12 {
+    // XYUV (defensive): the driver's native 4:4:4 layout (Y, X-unused, U, V);
+    // its 444P image view over an XYUV surface returns broken chroma on iHD.
+    let is_xyuv = fourcc == libva::VA_FOURCC_XYUV;
+    // AYUV: single interleaved plane, 4 bytes/pixel. iHD stores it as
+    // [V, U, Y, A] in memory (see the de-interleave below).
+    let is_ayuv = fourcc == libva::VA_FOURCC_AYUV;
+    let is_444 = fourcc == libva::VA_FOURCC_444P || is_xyuv || is_ayuv;
+    let p016_shift = if fourcc == libva::VA_FOURCC_P010 {
+        Some(6u32)
+    } else if fourcc == libva::VA_FOURCC_P012 {
+        Some(4u32)
+    } else {
+        None
+    };
+    let format_str = if is_nv12 || p016_shift.is_some() {
         "NV12".to_string()
+    } else if is_444 || is_ayuv {
+        "YUV444P".to_string()
     } else if fourcc == u32::from_ne_bytes(*b"YV12") {
         "YV12".to_string()
     } else if fourcc == u32::from_ne_bytes(*b"I420") {
@@ -1350,15 +1476,10 @@ fn read_from_image(
     };
 
     // Validate num_planes
-    if va_image.num_planes < 2 {
+    let min_planes = if is_ayuv { 1 } else if is_xyuv { 4 } else if is_nv12 || p016_shift.is_some() { 2 } else { 3 };
+    if va_image.num_planes < min_planes {
         return Err(Error::VaApi(format!(
-            "Unexpected num_planes={} for semi-planar format",
-            va_image.num_planes
-        )));
-    }
-    if !is_nv12 && va_image.num_planes < 3 {
-        return Err(Error::VaApi(format!(
-            "Unexpected num_planes={} for planar format {}",
+            "Unexpected num_planes={} for format {}",
             va_image.num_planes, format_str
         )));
     }
@@ -1370,12 +1491,114 @@ fn read_from_image(
     // the display size due to frame cropping / padding.
     let out_width = display_width.min(va_image.width as u32) as usize;
     let out_height = display_height.min(va_image.height as u32) as usize;
-    let uv_width = (out_width + 1) / 2;
-    let uv_height = (out_height + 1) / 2;
+    // 4:4:4 keeps full-resolution chroma; 4:2:0 downsamples by 2.
+    let uv_width = if is_444 || is_ayuv { out_width } else { (out_width + 1) / 2 };
+    let uv_height = if is_444 || is_ayuv { out_height } else { (out_height + 1) / 2 };
 
-    // Build plane descriptors from the copied buffer
+    // AYUV: de-interleave the single [A,Y,U,V] plane into planar Y/U/V.
+    if is_ayuv {
+        let y_pitch = va_image.pitches[0] as usize; // bytes per row (width*4)
+        let base = va_image.offsets[0] as usize;
+        let mut out = vec![0u8; out_width * 3 * out_height];
+        for y in 0..out_height {
+            let row = unsafe { buffer.as_ptr().add(base + y * y_pitch) };
+            for x in 0..out_width {
+                let p = unsafe { row.add(x * 4) };
+                // iHD stores the AYUV view as [V, U, Y, A] in memory.
+                out[y * out_width + x] = unsafe { *p.add(2) }; // Y
+                out[out_width * out_height + y * out_width + x] = unsafe { *p.add(1) }; // U
+                out[2 * out_width * out_height + y * out_width + x] = unsafe { *p.add(0) }; // V
+            }
+        }
+        drop(image);
+        return Ok(Some(PixelData {
+            format: format_str,
+            y: PixelPlane {
+                data: unsafe { out.as_ptr() },
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            },
+            u: PixelPlane {
+                data: unsafe { out.as_ptr().add(out_width * out_height) },
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            },
+            v: Some(PixelPlane {
+                data: unsafe { out.as_ptr().add(2 * out_width * out_height) },
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            }),
+            buffer: out,
+        }));
+    }
+
+    // P010/P012: scale the left-aligned 16-bit samples to 8-bit with
+    // round-to-nearest and saturation (matches the NVDEC P016 and Vulkan
+    // G10X6/G12X4 readbacks). Output keeps the semi-planar NV12 layout.
+    if let Some(shift) = p016_shift {
+        let bits = 16u32 - shift;
+        let half = 1u32 << (bits - 1);
+        let scale = |v: u16| -> u8 {
+            let x = (v >> shift) as u32;
+            (((x * 256 + half) >> bits).min(255)) as u8
+        };
+        let read_u16 = |base: *const u8, off: usize| -> u16 {
+            unsafe { u16::from_ne_bytes([*base.add(off), *base.add(off + 1)]) }
+        };
+
+        let y_offset = va_image.offsets[0] as usize;
+        let u_offset = va_image.offsets[1] as usize;
+        let y_pitch = va_image.pitches[0] as usize / 2; // u16 samples per row
+        let uv_pitch = va_image.pitches[1] as usize / 2;
+
+        let mut out = vec![0u8; out_width * out_height + uv_width * 2 * uv_height];
+        for y in 0..out_height {
+            let row = unsafe { buffer.as_ptr().add(y_offset) };
+            for x in 0..out_width {
+                out[y * out_width + x] = scale(read_u16(row, y * y_pitch * 2 + x * 2));
+            }
+        }
+        let uv_row = unsafe { buffer.as_ptr().add(u_offset) };
+        for y in 0..uv_height {
+            for x in 0..uv_width {
+                let base = y * uv_pitch * 2 + x * 4;
+                out[out_width * out_height + y * (uv_width * 2) + x * 2] =
+                    scale(read_u16(uv_row, base));
+                out[out_width * out_height + y * (uv_width * 2) + x * 2 + 1] =
+                    scale(read_u16(uv_row, base + 2));
+            }
+        }
+
+        // Image is dropped here, unmapping the surface
+        drop(image);
+
+        return Ok(Some(PixelData {
+            format: format_str,
+            y: PixelPlane {
+                data: out.as_ptr(),
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            },
+            u: PixelPlane {
+                data: unsafe { out.as_ptr().add(out_width * out_height) },
+                pitch: uv_width * 2,
+                width: uv_width,
+                height: uv_height,
+            },
+            v: None,
+            buffer: out,
+        }))
+    }
+
+    // Build plane descriptors from the copied buffer. XYUV stores an unused
+    // X plane at index 1, so chroma starts at index 2.
     let y_offset = va_image.offsets[0] as usize;
-    let u_offset = va_image.offsets[1] as usize;
+    let uv_base = if is_xyuv { 2 } else { 1 };
+    let u_offset = va_image.offsets[uv_base] as usize;
 
     let y_plane = PixelPlane {
         data: unsafe { buffer.as_ptr().add(y_offset) },
@@ -1391,8 +1614,8 @@ fn read_from_image(
         height: uv_height,
     };
 
-    let v_plane = if !is_nv12 {
-        let v_offset = va_image.offsets[2] as usize;
+    let v_plane = if !is_nv12 && !p016_shift.is_some() {
+        let v_offset = va_image.offsets[uv_base + 1] as usize;
         Some(PixelPlane {
             data: unsafe { buffer.as_ptr().add(v_offset) },
             pitch: va_image.pitches[2] as usize,
@@ -1436,12 +1659,13 @@ fn read_surface_pixels(
     height: u32,
     display_width: u32,
     display_height: u32,
+    fourcc: u32,
 ) -> Result<Option<PixelData>> {
 
     // Primary: vaCreateImage + vaGetImage (driver-supported CPU read).
     // Read the full coded size, then crop to the display size in read_from_image.
     let format = libva::VAImageFormat {
-        fourcc: libva::VA_FOURCC_NV12,
+        fourcc,
         ..Default::default()
     };
     match Image::create_from(surface, format, (width, height), (width, height)) {
@@ -1673,6 +1897,8 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         display_height,
         max_dpb: max_dpb.min(16).max(1),
         rt_format,
+        vp9_profile: 0,
+        vp9_bit_depth: 8,
         sps: sps_opt,
         pps: pps_opt,
     })
@@ -1712,26 +1938,33 @@ fn parse_h265_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
         display_height: height,
         max_dpb: max_dpb.min(16).max(1),
         rt_format: libva::VA_RT_FORMAT_YUV420,
+        vp9_profile: 0,
+        vp9_bit_depth: 8,
         sps: None,
         pps: None,
     })
 }
 
-/// Parse VP9 stream info.
-fn parse_vp9_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
-    use vk_video_parser::{vp9::Vp9Parser, DetectedVideoFormat, VideoParser};
-
-    let raw_frames = if data.len() >= 32 && data[0..4] == *b"DKIF" {
-        if data.len() > 128 {
-            vec![data[128..].to_vec()]
-        } else {
-            vec![data.to_vec()]
+/// Parse VP9 stream info from the first frame header.
+fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
+    // Extract the first frame payload. IVF containers have a 32-byte header
+    // followed by per-packet headers (4-byte payload size + 8-byte pts).
+    let first_payload: Vec<u8> = if data.len() >= 32 && data[0..4] == *b"DKIF" {
+        if data.len() < 32 + 12 {
+            return Err(Error::DecoderInit("IVF too short for a packet".to_string()));
         }
+        let size = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
+        if data.len() < 32 + 12 + size {
+            return Err(Error::DecoderInit("IVF packet truncated".to_string()));
+        }
+        data[32 + 12..32 + 12 + size].to_vec()
     } else {
-        vec![data.to_vec()]
+        data.to_vec()
     };
 
-    if raw_frames.is_empty() {
+    // A single IVF packet may hold a superframe; parse its first subframe.
+    let frames = expand_superframes(&first_payload);
+    if frames.is_empty() {
         return Err(Error::DecoderInit("No VP9 frames found".to_string()));
     }
 
@@ -1739,26 +1972,559 @@ fn parse_vp9_info(_display: &Display, data: &[u8]) -> Result<StreamInfo> {
     parser.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeVp9))
         .map_err(|e| Error::Parser(e.to_string()))?;
 
-    let parsed = parser.parse_frame(&raw_frames[0])
+    let parsed = parser
+        .parse_frame_with_offset(&frames[0].data, frames[0].superframe_frame_offset)
         .map_err(|e| Error::Parser(e.to_string()))?;
 
     let width = parsed.frame_width;
     let height = parsed.frame_height;
-
     if width == 0 || height == 0 {
         return Err(Error::DecoderInit("Failed to parse VP9 dimensions".to_string()));
     }
+    let display_width = if parsed.render_width > 0 { parsed.render_width } else { width };
+    let display_height = if parsed.render_height > 0 { parsed.render_height } else { height };
+
+    let profile_num = parsed.picture_info.profile as u8;
+    let bit_depth = parsed.color_config.bit_depth;
+
+    let profile = match profile_num {
+        0 => libva::VAProfile::VAProfileVP9Profile0,
+        1 => libva::VAProfile::VAProfileVP9Profile1,
+        _ => libva::VAProfile::VAProfileVP9Profile2,
+    };
+    if !display
+        .query_config_entrypoints(profile)
+        .map(|e| e.contains(&libva::VAEntrypoint::VAEntrypointVLD))
+        .unwrap_or(false)
+    {
+        return Err(Error::DecoderInit(format!(
+            "VA driver lacks VP9 profile {profile_num} decode"
+        )));
+    }
+
+    // Surface (rt) format per bit depth. 10/12-bit content decodes into P010/
+    // P012 surfaces so readback preserves full precision (the driver's 8-bit
+    // down-convert dithers and is not reproducible sample-wise).
+    let rt_format = match (bit_depth, profile_num) {
+        (8, 1) => libva::VA_RT_FORMAT_YUV444,
+        (8, _) => libva::VA_RT_FORMAT_YUV420,
+        (10, _) => libva::VA_RT_FORMAT_YUV420_10,
+        (12, _) => libva::VA_RT_FORMAT_YUV420_12,
+        _ => {
+            return Err(Error::DecoderInit(format!(
+                "Unsupported VP9 bit depth {bit_depth}"
+            )))
+        }
+    };
 
     Ok(StreamInfo {
         codec: CoreVideoCodec::DecodeVp9,
-        profile: libva::VAProfile::VAProfileVP9Profile0,
+        profile,
         width,
         height,
-        display_width: width,
-        display_height: height,
+        display_width,
+        display_height,
         max_dpb: 8,
-        rt_format: libva::VA_RT_FORMAT_YUV420,
+        rt_format,
+        vp9_profile: profile_num,
+        vp9_bit_depth: bit_depth,
         sps: None,
         pps: None,
     })
 }
+
+/// One subframe extracted from an IVF packet payload (possibly a superframe).
+#[derive(Debug, Clone)]
+struct ExpandedVp9Frame {
+    data: Vec<u8>,
+    /// Offset of this frame within the original superframe payload (0 if the
+    /// payload is not a superframe).
+    superframe_frame_offset: u32,
+}
+
+/// Split an IVF packet payload into its subframes. A VP9 superframe carries a
+/// start code (0x543210FE LE) and a per-frame size index at the tail; each
+/// subframe is decoded separately. Same logic as the NVDEC path.
+fn expand_superframes(payload: &[u8]) -> Vec<ExpandedVp9Frame> {
+    let mut out = Vec::new();
+    let data_len = payload.len();
+    if data_len < 2 {
+        out.push(ExpandedVp9Frame {
+            data: payload.to_vec(),
+            superframe_frame_offset: 0,
+        });
+        return out;
+    }
+
+    let final_byte = payload[data_len - 1];
+    if (final_byte & 0xE0) != 0xC0 {
+        // Not a superframe.
+        out.push(ExpandedVp9Frame {
+            data: payload.to_vec(),
+            superframe_frame_offset: 0,
+        });
+        return out;
+    }
+
+    let num_frames = (final_byte & 0x07) as usize + 1;
+    if num_frames <= 1 {
+        out.push(ExpandedVp9Frame {
+            data: payload.to_vec(),
+            superframe_frame_offset: 0,
+        });
+        return out;
+    }
+
+    let mag = (((final_byte >> 3) & 0x03) as usize) + 1;
+    let index_size = 2 + mag * num_frames;
+    if data_len < index_size {
+        out.push(ExpandedVp9Frame {
+            data: payload.to_vec(),
+            superframe_frame_offset: 0,
+        });
+        return out;
+    }
+
+    let index_start = data_len - index_size;
+    if payload[index_start] != final_byte {
+        out.push(ExpandedVp9Frame {
+            data: payload.to_vec(),
+            superframe_frame_offset: 0,
+        });
+        return out;
+    }
+
+    let frame_data_size = data_len - index_size;
+    let mut offset = 0usize;
+    let mut x = index_start + 1;
+    for _ in 0..num_frames {
+        let mut this_sz = 0usize;
+        for j in 0..mag {
+            this_sz |= (payload[x + j] as usize) << (j * 8);
+        }
+        x += mag;
+        if offset + this_sz <= frame_data_size {
+            out.push(ExpandedVp9Frame {
+                data: payload[offset..offset + this_sz].to_vec(),
+                superframe_frame_offset: offset as u32,
+            });
+        }
+        offset += this_sz;
+    }
+    out
+}
+
+impl VaapiDecoder {
+    /// FOURCC to request from `vaGetImage` for the current VP9 surface format.
+    fn vp9_image_fourcc(&self) -> u32 {
+        match (self.stream.vp9_profile, self.stream.vp9_bit_depth) {
+            // Profile 1 is 8-bit 4:4:4. The driver allocates XYUV surfaces,
+            // but its XYUV/444P image views over them return broken chroma;
+            // the AYUV view (single interleaved [A,Y,U,V] plane) works.
+            (1, _) => libva::VA_FOURCC_AYUV,
+            (_, 10) => libva::VA_FOURCC_P010,
+            (_, 12) => libva::VA_FOURCC_P012,
+            _ => libva::VA_FOURCC_NV12,
+        }
+    }
+
+    /// Parse and decode pending VP9 data (IVF packets or a raw frame).
+    ///
+    /// VP9 has no B-frames: display order equals decode order, with
+    /// `show_existing_frame` commands re-displaying an earlier picture in
+    /// place. Frames are therefore emitted directly (no reorder buffer).
+    fn decode_vp9_pending(&mut self) -> Result<Option<DecodedFrame>> {
+        if self.parse_offset >= self.pending_data.len() {
+            return Ok(None);
+        }
+
+        if !self.input_is_ivf {
+            // Raw single frame: the whole remaining buffer is one frame.
+            let data = self.pending_data[self.parse_offset..].to_vec();
+            self.parse_offset = self.pending_data.len();
+            for f in expand_superframes(&data) {
+                if let Some(frame) = self.decode_vp9_frame(&f.data, f.superframe_frame_offset, 0)? {
+                    return Ok(Some(frame));
+                }
+            }
+            return Ok(None);
+        }
+
+        // IVF: 12-byte packet header (4-byte payload size + 8-byte pts).
+        loop {
+            if self.parse_offset + 12 > self.pending_data.len() {
+                return Ok(None);
+            }
+            let size = u32::from_le_bytes(
+                self.pending_data[self.parse_offset..self.parse_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if size == 0 || self.parse_offset + 12 + size > self.pending_data.len() {
+                return Ok(None);
+            }
+            let pts = u64::from_le_bytes(
+                self.pending_data[self.parse_offset + 4..self.parse_offset + 12]
+                    .try_into()
+                    .unwrap(),
+            );
+            let payload = self.pending_data
+                [self.parse_offset + 12..self.parse_offset + 12 + size]
+                .to_vec();
+            self.parse_offset += 12 + size;
+            for f in expand_superframes(&payload) {
+                if let Some(frame) =
+                    self.decode_vp9_frame(&f.data, f.superframe_frame_offset, pts)?
+                {
+                    return Ok(Some(frame));
+                }
+            }
+        }
+    }
+
+    /// Decode one (superframe-expanded) VP9 frame and, if it is displayed,
+    /// return the decoded picture.
+    fn decode_vp9_frame(
+        &mut self,
+        data: &[u8],
+        superframe_offset: u32,
+        timestamp: u64,
+    ) -> Result<Option<DecodedFrame>> {
+        let parser = self.vp9_parser.as_mut()
+            .ok_or_else(|| Error::InvalidState("VP9 parser not initialized".to_string()))?;
+
+        let parsed = parser
+            .parse_frame_with_offset(data, superframe_offset)
+            .map_err(|e| Error::Parser(e.to_string()))?;
+
+        // show_existing_frame: no decode, no DPB change — re-display an
+        // already-decoded surface (FFmpeg re-outputs refs[frame_to_show_map_idx]).
+        if parsed.show_existing_frame {
+            let slot = self.vp9_ctx.as_ref()
+                .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?
+                .dpb
+                .slot_of_frame_buffer(parsed.frame_to_show_map_idx as usize);
+            if slot < 0 {
+                return Err(Error::InvalidState(format!(
+                    "show-existing-frame: frame buffer {} is empty",
+                    parsed.frame_to_show_map_idx
+                )));
+            }
+            let pool_idx = self.vp9_ctx.as_ref().unwrap().slot_surfaces[slot as usize]
+                .ok_or_else(|| Error::InvalidState("show-existing-frame: slot has no surface".to_string()))?;
+            let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
+            self.surface_pool.sync_surface(pool_idx)?;
+            let pixel_data = read_surface_pixels(
+                &surface,
+                self.stream.width,
+                self.stream.height,
+                self.stream.display_width,
+                self.stream.display_height,
+                self.vp9_image_fourcc(),
+            )?;
+            let mut frame = DecodedFrame::new(
+                self.frame_count,
+                timestamp as i64,
+                self.stream.display_width,
+                self.stream.display_height,
+                false,
+            );
+            frame.pixel_data = pixel_data;
+            self.frame_count += 1;
+            return Ok(Some(frame));
+        }
+
+        let pi = &parsed.picture_info;
+        let is_key = parsed.frame_is_intra;
+
+        // 1. Resolve references and choose the output slot from the common
+        //    DPB (pre-decode state; the frame's refresh is committed below,
+        //    after the decode, so subsequent frames see the updated frame
+        //    buffers). Slots no longer referenced by any frame buffer release
+        //    their surface first.
+        let (ref_pool_idxs, out_slot, used_pool) = {
+            let ctx = self.vp9_ctx.as_mut()
+                .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?;
+
+            let live: std::collections::HashSet<usize> = ctx.dpb.frame_buffer_slots()
+                .iter()
+                .filter(|s| **s >= 0)
+                .map(|s| *s as usize)
+                .collect();
+            for (s, entry) in ctx.slot_surfaces.iter_mut().enumerate() {
+                if !live.contains(&s) {
+                    *entry = None;
+                }
+            }
+
+            let mut ref_pool_idxs = [None; 8];
+            for (i, &slot) in ctx.dpb.frame_buffer_slots().iter().enumerate() {
+                if slot >= 0 {
+                    ref_pool_idxs[i] = ctx.slot_surfaces[slot as usize];
+                }
+            }
+
+            let out_slot = ctx.dpb.choose_output_slot() as usize;
+            let used_pool: std::collections::HashSet<usize> =
+                ctx.slot_surfaces.iter().flatten().copied().collect();
+            (ref_pool_idxs, out_slot, used_pool)
+        };
+
+        let mut ref_surfaces = [libva::VA_INVALID_ID; 8];
+        for (i, pool_idx) in ref_pool_idxs.iter().enumerate() {
+            if let Some(pool_idx) = pool_idx {
+                ref_surfaces[i] = self.surface_pool.entries[*pool_idx].surface.id();
+            }
+        }
+
+        // 2. Allocate a surface that is not currently referenced by any frame
+        //    buffer (the output slot itself was just released above).
+        let (pool_idx, surface) = self
+            .surface_pool
+            .alloc_excluding(&used_pool)
+            .ok_or_else(|| Error::DecoderInit("No free VA surface for VP9 frame".to_string()))?;
+
+        // 3. Build the VA parameter buffers (FFmpeg vaapi_vp9.c mapping).
+        let (pic_type, slice_type) = build_vp9_va_buffers(&parsed, ref_surfaces, data.len() as u32);
+        let pic_buf = self.context.create_buffer(pic_type)
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+        let slice_buf = self.context.create_buffer(slice_type)
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+
+        // 4. Decode: picture parameters + slice parameters + whole frame as
+        //    slice data (offset 0, like FFmpeg passes the full packet).
+        let mut picture = Picture::<PictureNew, Rc<Surface<DmaBufSurfaceDescriptor>>>::new(
+            timestamp,
+            Rc::clone(&self.context),
+            surface.clone(),
+        );
+        picture.add_buffer(pic_buf);
+        picture.add_buffer(slice_buf);
+        let slice_data_buf = self
+            .context
+            .create_buffer(BufferType::SliceData(data.to_vec()))
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+        picture.add_buffer(slice_data_buf);
+
+        let picture = picture.begin().map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture = picture.render().map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture = picture.end().map_err(|e| Error::VaApi(e.to_string()))?;
+        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
+            .sync()
+            .map_err(|e| Error::VaApi(e.0.to_string()))?;
+
+        self.surface_pool.mark_ready(pool_idx);
+
+        // 5. Commit the frame's refresh into the common DPB and track the
+        //    surface for the slot.
+        {
+            let ctx = self.vp9_ctx.as_mut()
+                .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?;
+            ctx.dpb.commit_frame(pi.refresh_frame_flags, out_slot as i32);
+            ctx.slot_surfaces[out_slot] = Some(pool_idx);
+        }
+
+        // 6. Display if requested; otherwise the frame was decoded for
+        //    references only.
+        if pi.flags.show_frame == 0 {
+            return Ok(None);
+        }
+
+        self.surface_pool.sync_surface(pool_idx)?;
+        let pixel_data = read_surface_pixels(
+            &surface,
+            self.stream.width,
+            self.stream.height,
+            self.stream.display_width,
+            self.stream.display_height,
+            self.vp9_image_fourcc(),
+        )?;
+
+        let mut frame = DecodedFrame::new(
+            self.frame_count,
+            timestamp as i64,
+            self.stream.display_width,
+            self.stream.display_height,
+            is_key,
+        );
+        frame.pixel_data = pixel_data;
+        self.frame_count += 1;
+        Ok(Some(frame))
+    }
+}
+
+/// Build the VA picture- and slice-parameter buffers for one VP9 frame.
+///
+/// Field mapping follows FFmpeg's `vaapi_vp9.c` (the old-style
+/// `VADecPictureParameterBufferVP9` this driver implements). The whole
+/// superframe-expanded frame payload is passed as slice data with offset 0.
+fn build_vp9_va_buffers(
+    fd: &Vp9FrameData,
+    ref_surfaces: [libva::VASurfaceID; 8],
+    slice_data_size: u32,
+) -> (BufferType, BufferType) {
+    let pi = &fd.picture_info;
+    let cc = &fd.color_config;
+    let lf = &fd.loop_filter;
+    let sg = &fd.segmentation;
+    let is_key = fd.frame_is_intra;
+
+    let pic_fields = VP9PicFields::new(
+        cc.subsampling_x as u32,
+        cc.subsampling_y as u32,
+        // frame_type: 0 = key frame, 1 = inter frame (old VA spec).
+        if is_key { 0 } else { 1 },
+        pi.flags.show_frame as u32,
+        pi.flags.error_resilient_mode as u32,
+        pi.flags.intra_only as u32,
+        // Key frames never use high-precision MVs (FFmpeg forces 0).
+        if is_key { 0 } else { pi.flags.allow_high_precision_mv as u32 },
+        // The parser's enum values match the VA mcomp_filter_type values
+        // exactly (FFmpeg computes `literal ^ (literal <= 1)` from the raw
+        // bitstream literal, which reduces to this direct cast).
+        pi.interpolation_filter as u32,
+        pi.flags.frame_parallel_decoding_mode as u32,
+        pi.flags.reset_frame_context as u32,
+        pi.flags.refresh_frame_context as u32,
+        pi.frame_context_idx as u32,
+        pi.flags.segmentation_enabled as u32,
+        sg.flags.segmentation_temporal_update as u32,
+        sg.flags.segmentation_update_map as u32,
+        fd.ref_frame_idx[0] as u32, // last_ref_frame
+        ((pi.ref_frame_sign_bias_mask >> 1) & 1) as u32,
+        fd.ref_frame_idx[1] as u32, // golden_ref_frame
+        ((pi.ref_frame_sign_bias_mask >> 2) & 1) as u32,
+        fd.ref_frame_idx[2] as u32, // alt_ref_frame
+        ((pi.ref_frame_sign_bias_mask >> 3) & 1) as u32,
+        pi.lossless as u32,
+    );
+
+    let segment_pred_probs = if sg.flags.segmentation_temporal_update != 0 {
+        [sg.segmentation_pred_prob[0], sg.segmentation_pred_prob[1], sg.segmentation_pred_prob[2]]
+    } else {
+        [255, 255, 255]
+    };
+
+    let pic_param = PictureParameterBufferVP9::new(
+        fd.frame_width as u16,
+        fd.frame_height as u16,
+        ref_surfaces,
+        &pic_fields,
+        lf.loop_filter_level,
+        // sharpness_level uses the raw bitstream values (0=SHARP, 1=SHARP_5TAP,
+        // 2=BICUBIC) — no remap for this buffer layout.
+        lf.loop_filter_sharpness,
+        pi.tile_rows_log2,
+        pi.tile_cols_log2,
+        // The common parser leaves `uncompressed_header_size` unset; the
+        // uncompressed header length is exactly `compressed_header_offset`
+        // (bytes from frame start to the first partition, like cuvid's
+        // frameTagSize).
+        fd.compressed_header_offset.min(255) as u8, // frame_header_length_in_bytes
+        fd.compressed_header_size.min(u16::MAX as u32) as u16, // first_partition_size
+        sg.segmentation_tree_probs[..7].try_into().unwrap(),
+        segment_pred_probs,
+        pi.profile as u8,
+        cc.bit_depth,
+    );
+
+    let seg_param = vp9_segment_params(fd);
+    let slice_param = SliceParameterBufferVP9::new(slice_data_size, 0, VA_SLICE_DATA_FLAG_ALL, seg_param);
+
+    (
+        BufferType::PictureParameter(PictureParameter::VP9(pic_param)),
+        BufferType::SliceParameter(SliceParameter::VP9(slice_param)),
+    )
+}
+
+/// Clamp to an n-bit unsigned range.
+fn clip_uint(v: i32, bits: u32) -> usize {
+    v.clamp(0, (1i32 << bits) - 1) as usize
+}
+
+/// Build the per-segment VA parameters (quantization scales + loop filter
+/// levels) following FFmpeg's `vp9.c` qmul/lflvl computation.
+///
+/// Parser feature order per segment: [0]=delta Q (s8), [1]=delta LF level
+/// (s6), [2]=reference frame index (u2), [3]=skip flag — matching FFmpeg's
+/// `q_enabled/lf_enabled/ref_enabled/skip_enabled` read order.
+fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
+    let pi = &fd.picture_info;
+    let sg = &fd.segmentation;
+    let lf = &fd.loop_filter;
+
+    let enabled = pi.flags.segmentation_enabled != 0;
+    let abs_or_delta = sg.flags.segmentation_abs_or_delta_update != 0;
+    let bpp_index = match fd.color_config.bit_depth {
+        10 => 1,
+        12 => 2,
+        _ => 0,
+    };
+
+    let yac_qi = pi.base_q_idx as i32;
+    let sh = if lf.loop_filter_level >= 32 { 1 } else { 0 };
+    let lf_delta_enabled = lf.flags.loop_filter_delta_enabled != 0;
+    let ref_delta = &lf.loop_filter_ref_deltas;
+    let mode_delta = &lf.loop_filter_mode_deltas;
+
+    let mut out: [SegmentParameterVP9; 8] = unsafe { std::mem::zeroed() };
+    // FFmpeg fills only seg[0] when segmentation is disabled ("some hwaccels
+    // don't ignore these fields if segmentation is disabled" — iHD included).
+    for i in 0..(if enabled { 8 } else { 1 }) {
+        let fe = sg.feature_enabled[i];
+        let q_enabled = enabled && (fe & 1) != 0;
+        let lf_enabled = enabled && (fe & 2) != 0;
+        let ref_enabled = enabled && (fe & 4) != 0;
+        let skip_enabled = (fe & 8) != 0;
+
+        // Quantization scales (FFmpeg: qmul[Y/UV][DC/AC]).
+        let mut qyac: i32 = if q_enabled {
+            let qv = sg.feature_data[i][0] as i32;
+            if abs_or_delta { qv } else { yac_qi + qv }
+        } else {
+            yac_qi
+        };
+        let qydc = clip_uint(qyac + pi.delta_q_y_dc as i32, 8);
+        let quvdc = clip_uint(qyac + pi.delta_q_uv_dc as i32, 8);
+        let quvac = clip_uint(qyac + pi.delta_q_uv_ac as i32, 8);
+        qyac = clip_uint(qyac, 8) as i32;
+
+        // Loop filter level per reference/mode (FFmpeg: feat[i].lflvl[4][2]).
+        let lflvl: i32 = if lf_enabled {
+            let lv = sg.feature_data[i][1] as i32;
+            if abs_or_delta { lv } else { lf.loop_filter_level as i32 + lv }
+        } else {
+            lf.loop_filter_level as i32
+        };
+        let mut flvl = [[0u8; 2]; 4];
+        if lf_delta_enabled {
+            flvl[0][0] = clip_uint(lflvl + ref_delta[0] as i32 * (1 << sh), 6) as u8;
+            flvl[0][1] = flvl[0][0];
+            for j in 1..4 {
+                flvl[j][0] = clip_uint(lflvl + (ref_delta[j] as i32 + mode_delta[0] as i32) * (1 << sh), 6) as u8;
+                flvl[j][1] = clip_uint(lflvl + (ref_delta[j] as i32 + mode_delta[1] as i32) * (1 << sh), 6) as u8;
+            }
+        } else {
+            for j in 0..4 {
+                flvl[j][0] = clip_uint(lflvl, 6) as u8;
+                flvl[j][1] = flvl[j][0];
+            }
+        }
+
+        out[i] = SegmentParameterVP9::new(
+            &VP9SegmentFlags::new(
+                if ref_enabled { 1 } else { 0 },
+                sg.feature_data[i][2] as u16,
+                if skip_enabled { 1 } else { 0 },
+            ),
+            flvl,
+            VP9_AC_QLOOKUP[bpp_index][qyac as usize] as i16, // luma_ac_quant_scale
+            VP9_DC_QLOOKUP[bpp_index][qydc] as i16, // luma_dc_quant_scale
+            VP9_AC_QLOOKUP[bpp_index][quvac] as i16, // chroma_ac_quant_scale
+            VP9_DC_QLOOKUP[bpp_index][quvdc] as i16, // chroma_dc_quant_scale
+        );
+    }
+    out
+}
+
+

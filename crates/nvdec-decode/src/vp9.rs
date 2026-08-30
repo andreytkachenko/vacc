@@ -20,16 +20,13 @@
 //! with 16 surfaces, frames 0-15 use surfaces 0-15, and frame 16 reuses
 //! surface 1 (surface 0 is still live as ALTREF and must be skipped).
 //!
-//! ## Refresh timing (important)
+//! ## Refresh timing
 //!
 //! A frame's `refresh_frame_flags` (which frame buffers the frame becomes) is
-//! applied by the cuvid parser **when the next frame's picparams are built**,
-//! and **only if that next frame is an inter frame**. Key frames do not
-//! consume references, so a pending refresh is *discarded* when the next frame
-//! is a key frame (the key frame's own `0xFF` refresh overwrites everything
-//! anyway). This deferred timing is what makes frame 250 (a key frame) report
-//! the pre-frame-249 reference surfaces in the dump. See
-//! [`Vp9DpbState::flush_pending_refresh`].
+//! committed to the common DPB **after** the frame is decoded
+//! (`Vp9Dpb::commit_frame`). Spec-correct; for pure inter stretches this is
+//! equivalent to the cuvid parser's deferred timing, and for key frames it
+//! only changes *which* free surface is picked (content identical).
 
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_uchar, c_uint};
@@ -40,7 +37,7 @@ use vk_video_core::{
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
-    picture::{Vp9FrameData, Vp9FrameType},
+    picture::Vp9FrameData,
     session::Extent2D,
 };
 use vk_video_parser::vp9::Vp9Parser;
@@ -70,161 +67,16 @@ const VP9_NUM_FRAME_BUFFERS: usize = 8;
 /// `static` is both safe and the simplest correct choice.
 static SLICE_DATA_OFFSETS: [c_uint; 1] = [0];
 
-/// VP9 DPB state for NVDEC surface management. Mirrors the cuvid parser's
-/// behavior.
-#[derive(Debug)]
-pub struct Vp9DpbState {
-    /// Number of decode surfaces (e.g. 16).
-    pub num_surfaces: u32,
-    /// Frame buffer 0-7 -> surface index, `-1` = invalid.
-    fb_to_surface: [i32; VP9_NUM_FRAME_BUFFERS],
-    /// Per surface: frame index last assigned as `CurrPicIdx` (`-1` = never).
-    surface_last_used: Vec<i32>,
-    /// Internal bookkeeping: last chosen surface (scan-start hint).
-    next_surface_hint: u32,
-    /// `mcomp_filter_type` carried across key/intra-only frames.
-    last_mcomp_filter: u32,
-    /// Number of frames processed (used as the frame index for `surface_last_used`).
-    decoded_frames: u32,
-    /// Previous frame's refresh, not yet applied (see module docs).
-    pending_refresh: Option<(u8, i32)>,
-}
+/// Common VP9 DPB manager shared by ALL backends (Vulkan / NVDEC / VAAPI).
+/// For NVDEC, a DPB slot IS a cuvid surface index (`PicIdx`), so the common
+/// slot indices can be used directly as `CurrPicIdx` / `*RefIdx` values.
+pub use vk_video_parser::vp9_dpb::Vp9Dpb as Vp9DpbState;
 
-impl Vp9DpbState {
-    /// Create a fresh DPB with `num_surfaces` decode surfaces.
-    pub fn new(num_surfaces: u32) -> Self {
-        Self {
-            num_surfaces,
-            fb_to_surface: [-1; VP9_NUM_FRAME_BUFFERS],
-            surface_last_used: vec![-1; num_surfaces as usize],
-            next_surface_hint: 0,
-            last_mcomp_filter: 0,
-            decoded_frames: 0,
-            pending_refresh: None,
-        }
-    }
-
-    /// Choose the surface to decode the next frame into.
-    ///
-    /// Returns the surface with the **oldest** `surface_last_used` that is NOT
-    /// in the live set. The live set is all surfaces currently pointed to by
-    /// any of the 8 frame buffers, computed from the **pre-decode**
-    /// `fb_to_surface` state (before any frame buffer is overwritten). For the
-    /// first frame (no valid frame buffer) this returns surface 0.
-    ///
-    /// The chosen surface is marked as used with the current frame index.
-    ///
-    /// `ref_frame_idx` and `is_key` are accepted for API completeness; the
-    /// live set is derived from all 8 frame buffers regardless.
-    pub fn choose_output_surface(&mut self, ref_frame_idx: &[u8; 3], is_key: bool) -> i32 {
-        let _ = (ref_frame_idx, is_key);
-        let n = self.num_surfaces as usize;
-        if n == 0 {
-            return 0;
-        }
-
-        // Live set (pre-decode): surfaces pointed to by any frame buffer.
-        let mut live = vec![false; n];
-        for &s in &self.fb_to_surface {
-            if s >= 0 && (s as usize) < n {
-                live[s as usize] = true;
-            }
-        }
-
-        // Scan all surfaces (starting at the hint) for the oldest non-live one.
-        let start = (self.next_surface_hint as usize) % n;
-        let mut best: Option<usize> = None;
-        for k in 0..n {
-            let s = (start + k) % n;
-            if live[s] {
-                continue;
-            }
-            best = match best {
-                None => Some(s),
-                Some(b) => {
-                    if self.surface_last_used[s] < self.surface_last_used[b]
-                        || (self.surface_last_used[s] == self.surface_last_used[b] && s < b)
-                    {
-                        Some(s)
-                    } else {
-                        Some(b)
-                    }
-                }
-            };
-        }
-
-        let chosen = match best {
-            Some(s) => s,
-            // Degenerate (all surfaces live — cannot happen with the recommended
-            // >= 9 surfaces): overwrite the surface used longest ago.
-            None => {
-                let mut oldest = 0usize;
-                for s in 1..n {
-                    if self.surface_last_used[s] < self.surface_last_used[oldest] {
-                        oldest = s;
-                    }
-                }
-                oldest
-            }
-        };
-
-        self.surface_last_used[chosen] = self.decoded_frames as i32;
-        self.next_surface_hint = chosen as u32;
-        self.decoded_frames += 1;
-        chosen as i32
-    }
-
-    /// Apply a refresh mask directly: for each bit `i` set in
-    /// `refresh_frame_flags`, frame buffer `i` now points at `curr_pic_idx`.
-    ///
-    /// Key frames pass `0xFF` (all 8 frame buffers refreshed).
-    pub fn apply_refresh(&mut self, refresh_frame_flags: u8, curr_pic_idx: i32) {
-        for i in 0..VP9_NUM_FRAME_BUFFERS {
-            if refresh_frame_flags >> i & 1 != 0 {
-                self.fb_to_surface[i] = curr_pic_idx;
-            }
-        }
-    }
-
-    /// Apply the previous frame's deferred refresh, if any.
-    ///
-    /// The cuvid parser applies frame N's `refresh_frame_flags` when building
-    /// frame N+1's picparams — and **only if N+1 is an inter frame**. Key
-    /// frames do not consume references, so a pending refresh is discarded
-    /// when `is_key` is true. Verified against the 300-frame dump (frame 250).
-    pub fn flush_pending_refresh(&mut self, is_key: bool) {
-        if let Some((flags, idx)) = self.pending_refresh.take() {
-            if !is_key {
-                self.apply_refresh(flags, idx);
-            }
-        }
-    }
-
-    /// Defer this frame's refresh; it is applied by
-    /// [`flush_pending_refresh`](Self::flush_pending_refresh) when the next
-    /// frame's picparams are built.
-    pub fn defer_refresh(&mut self, refresh_frame_flags: u8, curr_pic_idx: i32) {
-        self.pending_refresh = Some((refresh_frame_flags, curr_pic_idx));
-    }
-
-    /// Surface index for a frame buffer, or 255 if the buffer is invalid.
-    pub fn surface_of_frame_buffer(&self, fb: usize) -> i32 {
-        match self.fb_to_surface.get(fb) {
-            Some(&s) if s >= 0 => s,
-            _ => 255,
-        }
-    }
-
-    /// Reset all DPB state (new stream / reconfigure).
-    pub fn reset(&mut self) {
-        self.fb_to_surface = [-1; VP9_NUM_FRAME_BUFFERS];
-        for s in &mut self.surface_last_used {
-            *s = -1;
-        }
-        self.next_surface_hint = 0;
-        self.last_mcomp_filter = 0;
-        self.decoded_frames = 0;
-        self.pending_refresh = None;
+/// cuvid `PicIdx` for frame buffer `fb`: the DPB slot, or 255 if empty.
+fn surface_of_frame_buffer(dpb: &Vp9DpbState, fb: usize) -> i32 {
+    match dpb.slot_of_frame_buffer(fb) {
+        s @ 0..=255 => s,
+        _ => 255,
     }
 }
 
@@ -237,9 +89,10 @@ impl Vp9DpbState {
 /// stay valid for the duration of the subsequent `cuvidDecodePicture` call.
 ///
 /// The field mapping reproduces the cuvid parser's output exactly (verified
-/// against the 300-frame dump). After building, the frame's refresh is
-/// *deferred* on the DPB (see [`Vp9DpbState::defer_refresh`]) so the state is
-/// ready for the next frame.
+/// against the 300-frame dump). The DPB state (common [`Vp9DpbState`]) is read
+/// for references and the output surface; the caller MUST call
+/// `dpb.commit_frame(refresh_frame_flags, params.CurrPicIdx)` after decoding
+/// so the frame buffers point at this frame for subsequent frames.
 ///
 /// Callers should not invoke this for `show_existing_frame` commands (they
 /// carry no bitstream data); handle those separately.
@@ -251,49 +104,46 @@ pub fn build_cuvid_vp9_picparams(
 ) -> CUVIDPICPARAMS {
     let is_key = fd.frame_is_intra;
 
-    // 1. Apply the previous frame's deferred refresh (inter frames only).
-    dpb.flush_pending_refresh(is_key);
-
-    // 2. Reference frame-buffer lookup. Inter frames use `ref_frame_idx`;
-    //    key frames have no `ref_frame_idx` in the bitstream and the cuvid
-    //    parser reports frame buffers 0, 1, 2 directly.
+    // 1. Reference frame-buffer lookup. Inter frames use `ref_frame_idx`;
+    //    key frames take no references.
     let ref_lookup = if is_key {
         [0u8, 1, 2]
     } else {
         [fd.ref_frame_idx[0], fd.ref_frame_idx[1], fd.ref_frame_idx[2]]
     };
 
-    let last_ref = dpb.surface_of_frame_buffer(ref_lookup[0] as usize);
-    let golden_ref = dpb.surface_of_frame_buffer(ref_lookup[1] as usize);
-    let alt_ref = dpb.surface_of_frame_buffer(ref_lookup[2] as usize);
+    let mut last_ref = 255i32;
+    let mut golden_ref = 255i32;
+    let mut alt_ref = 255i32;
+    if !is_key {
+        let slots = dpb.reference_slots(false, &ref_lookup);
+        last_ref = slots[0].max(0) as i32;
+        golden_ref = slots[1].max(0) as i32;
+        alt_ref = slots[2].max(0) as i32;
+    }
 
-    // 3. Output surface (live set computed from the pre-decode fb state).
-    let curr_pic_idx = dpb.choose_output_surface(&ref_lookup, is_key);
+    // 2. Output surface (live set computed from the pre-decode fb state).
+    let curr_pic_idx = dpb.choose_output_slot();
 
     let pi = &fd.picture_info;
     let cc = &fd.color_config;
     let lf = &fd.loop_filter;
     let sg = &fd.segmentation;
 
-    // mcomp_filter_type: inter (and not intra-only) -> interpolation_filter
-    // (and remember it); otherwise carry over the last value (init 0).
-    let mcomp = if pi.frame_type == Vp9FrameType::Inter && pi.flags.intra_only == 0 {
-        let m = pi.interpolation_filter as u32;
-        dpb.last_mcomp_filter = m;
-        m
-    } else {
-        dpb.last_mcomp_filter
-    };
+    // mcomp_filter_type: the parser carries the last-seen filter over to
+    // key/intra-only frames (FFmpeg `h->filtermode` / cuvid convention).
+    let mcomp = pi.interpolation_filter as u32;
 
-    // 4. VP9-specific parameters.
+    // 3. VP9-specific parameters.
     let mut vp9 = CUVIDVP9PICPARAMS::new();
     vp9.width = fd.frame_width;
     vp9.height = fd.frame_height;
     vp9.LastRefIdx = last_ref as c_uchar;
     vp9.GoldenRefIdx = golden_ref as c_uchar;
     vp9.AltRefIdx = alt_ref as c_uchar;
-    // Profile 0 only (known gap: profiles 1-3 need the real color space).
-    vp9.colorSpace = 0;
+    // VP9 color space (0=unknown, 1=bt601, 2=bt709, ...). The parser persists
+    // the key frame's color config across inter frames.
+    vp9.colorSpace = cc.color_space as u32 as c_uchar;
 
     vp9.set_profile(pi.profile as u32);
     vp9.set_frame_context_idx(pi.frame_context_idx as u32);
@@ -372,10 +222,8 @@ pub fn build_cuvid_vp9_picparams(
     vp9.offsetToDctParts = fd.compressed_header_size;
     vp9.reserved128Bits = [0; 4];
 
-    // 5. Defer this frame's refresh for the next frame.
-    dpb.defer_refresh(pi.refresh_frame_flags, curr_pic_idx);
-
-    // 6. Common CUVIDPICPARAMS.
+    // 4. Common CUVIDPICPARAMS. (The frame's refresh is committed by the
+    // caller after cuvidDecodePicture: dpb.commit_frame(pi.refresh_frame_flags, curr_pic_idx).)
     let mut params = unsafe { std::mem::zeroed::<CUVIDPICPARAMS>() };
     params.PicWidthInMbs = (fd.frame_width / 16) as c_int;
     params.FrameHeightInMbs = (fd.frame_height / 16) as c_int;
@@ -493,6 +341,13 @@ fn expand_superframes(payload: &[u8]) -> Vec<ExpandedVp9Frame> {
 }
 
 /// Map a full bit depth (e.g. 8, 10, 12) to a [`ComponentBitDepth`].
+/// Scale a 16-bit P016 sample (left-aligned, low bits zero) to 8-bit with
+/// round-to-nearest and saturation, matching the Vulkan G10X6/G12X4 readback.
+fn scale_p016_to_8(v: u16, bits: u32) -> u8 {
+    let x = (v as u32) >> (16 - bits);
+    (((x << 8) + (1u32 << (bits - 1))) >> bits).min(255) as u8
+}
+
 fn bit_depth_component(bit_depth: u8) -> ComponentBitDepth {
     match bit_depth {
         8 => ComponentBitDepth::Bit8,
@@ -740,7 +595,7 @@ impl NvdecVp9Decoder {
             // already-decoded surface (always displayed).
             let surface = {
                 let dpb = self.dpb.lock().unwrap();
-                dpb.surface_of_frame_buffer(parsed.frame_to_show_map_idx as usize)
+                surface_of_frame_buffer(&dpb, parsed.frame_to_show_map_idx as usize)
             };
             if surface < 255 {
                 if let Some(frame) = self.extract_frame(surface) {
@@ -751,8 +606,9 @@ impl NvdecVp9Decoder {
             return Ok(());
         }
 
-        // Build the picparams (advances the DPB: applies the previous frame's
-        // deferred refresh, chooses the output surface, defers this frame's).
+        // Build the picparams (reads the common DPB for references and picks
+        // the output surface; the frame's refresh is committed below, after
+        // the decode, so subsequent frames see the updated frame buffers).
         let params = {
             let mut dpb = self.dpb.lock().unwrap();
             build_cuvid_vp9_picparams(&parsed, &mut dpb, data.as_ptr(), data.len() as u32)
@@ -788,6 +644,14 @@ impl NvdecVp9Decoder {
         // Decode is async; extraction must wait for completion.
         let _ = cu_ctx_synchronize();
 
+        // Commit this frame's refresh into the common DPB so that the next
+        // frame's references resolve to it. Key frames pass 0xFF (all 8
+        // frame buffers refreshed).
+        {
+            let mut dpb = self.dpb.lock().unwrap();
+            dpb.commit_frame(parsed.picture_info.refresh_frame_flags, params.CurrPicIdx);
+        }
+
         if parsed.picture_info.flags.show_frame != 0 {
             if let Some(frame) = self.extract_frame(params.CurrPicIdx) {
                 self.pending_frames.lock().unwrap().push_back(frame);
@@ -813,6 +677,21 @@ impl NvdecVp9Decoder {
         let h = first.frame_height;
         let cc = &first.color_config;
 
+        // cuvid VP9 decode only supports 4:2:0. Reject 4:4:4/4:2:2 (and RGB)
+        // streams up front instead of failing mid-decode in cuvidDecodePicture.
+        if cc.subsampling_x != 1 || cc.subsampling_y != 1 {
+            return Err(NvdecError::DecoderCreationFailed(format!(
+                "VP9 chroma subsampling {}x{} not supported by NVDEC decode (4:2:0 only)",
+                cc.subsampling_x, cc.subsampling_y
+            )));
+        }
+
+        // 8-bit content: NV12. 10/12-bit content: P016, which preserves the
+        // full-precision samples (10-bit left-aligned in 16 bits with 6 LSBs
+        // zero; 12-bit with 4 LSBs zero). The readback scales them to 8-bit
+        // with round+clamp, matching the Vulkan G10X6/G12X4 path. cuvid's
+        // NV12 output for 10/12-bit is a dithered down-convert (maxdiff 1 vs
+        // full precision), so P016 is required for pixel-perfect verification.
         let output_format = if cc.bit_depth > 8 {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_P016
         } else {
@@ -862,8 +741,10 @@ impl NvdecVp9Decoder {
         let result = unsafe { (funcs.create_decoder)(&mut ph_decoder, &create_info) };
         if result != CUDA_SUCCESS || ph_decoder.is_null() {
             return Err(NvdecError::DecoderCreationFailed(format!(
-                "cuvidCreateDecoder failed with error {}",
-                result
+                "cuvidCreateDecoder failed with error {} (VP9 {}x{} bit_depth={}; \
+                 NVIDIA NVDEC supports VP9 up to 10-bit — 12-bit streams are not \
+                 decodable on any NVIDIA GPU)",
+                result, w, h, cc.bit_depth
             )));
         }
         {
@@ -1081,8 +962,14 @@ impl NvdecVp9Decoder {
         };
         let (crop_left, crop_top, _, _) = display_area;
 
-        let y_size = display_width * display_height;
-        let interleaved_uv_size = display_width * (display_height / 2);
+        // P016 output holds 16-bit samples (10/12-bit content); NV12 is 8-bit.
+        let luma_bd = info.luma_bit_depth.bit_depth();
+        let chroma_bd = info.chroma_bit_depth.bit_depth();
+        let bps = if luma_bd > 8 { 2 } else { 1 }; // bytes per sample on device
+        let row_bytes = display_width * bps;
+
+        let y_size = row_bytes * display_height;
+        let interleaved_uv_size = row_bytes * (display_height / 2);
         let total = y_size + interleaved_uv_size;
         let pinned_base = {
             let mut cache = self.pinned_cache.lock().unwrap();
@@ -1109,7 +996,7 @@ impl NvdecVp9Decoder {
         let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         let mut copy_y = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: (crop_left as u64) * bps as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1124,8 +1011,8 @@ impl NvdecVp9Decoder {
             dstHost: pinned_y,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: row_bytes as u64,
+            WidthInBytes: row_bytes as u64,
             Height: display_height as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_y) } {
@@ -1139,7 +1026,7 @@ impl NvdecVp9Decoder {
 
         let coded_height = info.coded_size.height as u64;
         let copy_uv = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: (crop_left as u64) * bps as u64,
             srcY: coded_height + (crop_top as u64) / 2,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1154,8 +1041,8 @@ impl NvdecVp9Decoder {
             dstHost: pinned_uv,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: row_bytes as u64,
+            WidthInBytes: row_bytes as u64,
             Height: (display_height / 2) as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_uv) } {
@@ -1169,38 +1056,64 @@ impl NvdecVp9Decoder {
 
         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
 
-        let mut y_plane = vec![0u8; y_size];
-        let mut interleaved_uv = vec![0u8; interleaved_uv_size];
+        let mut raw_y = vec![0u8; y_size];
+        let mut raw_uv = vec![0u8; interleaved_uv_size];
         unsafe {
-            std::ptr::copy_nonoverlapping(pinned_y as *const u8, y_plane.as_mut_ptr(), y_size);
+            std::ptr::copy_nonoverlapping(pinned_y as *const u8, raw_y.as_mut_ptr(), y_size);
             std::ptr::copy_nonoverlapping(
                 pinned_uv as *const u8,
-                interleaved_uv.as_mut_ptr(),
+                raw_uv.as_mut_ptr(),
                 interleaved_uv_size,
             );
         }
 
-        // De-interleave NV12 UV to planar U and V.
         let uv_size = (display_width / 2) * (display_height / 2);
+        let mut y_plane = vec![0u8; display_width * display_height];
         let mut u_plane = vec![0u8; uv_size];
         let mut v_plane = vec![0u8; uv_size];
-        for y in 0..(display_height / 2) {
-            for x in 0..(display_width / 2) {
-                let src_idx = y * display_width + x * 2;
-                let dst_idx = y * (display_width / 2) + x;
-                u_plane[dst_idx] = interleaved_uv[src_idx];
-                v_plane[dst_idx] = interleaved_uv[src_idx + 1];
+
+        if bps == 1 {
+            // NV12: samples are already 8-bit. De-interleave UV to planar.
+            y_plane.copy_from_slice(&raw_y);
+            for py in 0..(display_height / 2) {
+                for x in 0..(display_width / 2) {
+                    let src_idx = py * display_width + x * 2;
+                    let dst_idx = py * (display_width / 2) + x;
+                    u_plane[dst_idx] = raw_uv[src_idx];
+                    v_plane[dst_idx] = raw_uv[src_idx + 1];
+                }
+            }
+        } else {
+            // P016: 16-bit LE samples, left-aligned (10-bit: 6 LSBs zero,
+            // 12-bit: 4 LSBs zero). Scale to 8-bit with round + clamp.
+            for py in 0..display_height {
+                for x in 0..display_width {
+                    let off = (py * display_width + x) * 2;
+                    let v = u16::from_le_bytes([raw_y[off], raw_y[off + 1]]);
+                    y_plane[py * display_width + x] = scale_p016_to_8(v, luma_bd);
+                }
+            }
+            for py in 0..(display_height / 2) {
+                for x in 0..(display_width / 2) {
+                    let off = (py * display_width + x * 2) * 2;
+                    let u = u16::from_le_bytes([raw_uv[off], raw_uv[off + 1]]);
+                    let v = u16::from_le_bytes([raw_uv[off + 2], raw_uv[off + 3]]);
+                    let dst_idx = py * (display_width / 2) + x;
+                    u_plane[dst_idx] = scale_p016_to_8(u, chroma_bd);
+                    v_plane[dst_idx] = scale_p016_to_8(v, chroma_bd);
+                }
             }
         }
 
-        let mut buffer = Vec::with_capacity(y_size + uv_size * 2);
+        let out_y_size = display_width * display_height;
+        let mut buffer = Vec::with_capacity(out_y_size + uv_size * 2);
         buffer.extend_from_slice(&y_plane);
         buffer.extend_from_slice(&u_plane);
         buffer.extend_from_slice(&v_plane);
 
         let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-        let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
+        let u_ptr = unsafe { buffer.as_ptr().add(out_y_size) };
+        let v_ptr = unsafe { buffer.as_ptr().add(out_y_size + uv_size) };
 
         let pixel_data = Some(PixelData {
             format: "I420".to_string(),
@@ -1491,6 +1404,9 @@ mod tests {
                 .expect("failed to parse frame");
             let params =
                 build_cuvid_vp9_picparams(&fd, &mut dpb, f.data.as_ptr(), f.data.len() as u32);
+            // Mirror NvdecVp9Decoder::process_frame: commit the refresh after
+            // the (simulated) decode.
+            dpb.commit_frame(fd.picture_info.refresh_frame_flags, params.CurrPicIdx);
             out.push(params);
         }
         out
@@ -1651,32 +1567,31 @@ mod tests {
     #[test]
     fn dpb_first_frame_is_surface_0() {
         let mut dpb = Vp9DpbState::new(16);
-        assert_eq!(dpb.choose_output_surface(&[0, 0, 0], true), 0);
+        assert_eq!(dpb.choose_output_slot(), 0);
         // Second frame: surface 0 is now live (all fb -> 0 after key refresh),
         // so the next non-live surface is 1.
-        dpb.apply_refresh(0xFF, 0);
-        assert_eq!(dpb.choose_output_surface(&[0, 1, 2], false), 1);
+        dpb.commit_frame(0xFF, 0);
+        assert_eq!(dpb.choose_output_slot(), 1);
     }
 
     #[test]
     fn dpb_surface_of_frame_buffer_invalid_is_255() {
         let dpb = Vp9DpbState::new(16);
-        assert_eq!(dpb.surface_of_frame_buffer(0), 255);
-        assert_eq!(dpb.surface_of_frame_buffer(7), 255);
+        assert_eq!(surface_of_frame_buffer(&dpb, 0), 255);
+        assert_eq!(surface_of_frame_buffer(&dpb, 7), 255);
         let mut dpb = dpb;
-        dpb.apply_refresh(0b001, 5);
-        assert_eq!(dpb.surface_of_frame_buffer(0), 5);
-        assert_eq!(dpb.surface_of_frame_buffer(1), 255);
+        dpb.commit_frame(0b001, 5);
+        assert_eq!(surface_of_frame_buffer(&dpb, 0), 5);
+        assert_eq!(surface_of_frame_buffer(&dpb, 1), 255);
     }
 
     #[test]
     fn dpb_reset_clears_state() {
         let mut dpb = Vp9DpbState::new(16);
-        dpb.apply_refresh(0xFF, 3);
-        dpb.defer_refresh(1, 4);
-        dpb.choose_output_surface(&[0, 1, 2], false);
+        dpb.commit_frame(0xFF, 3);
+        dpb.choose_output_slot();
         dpb.reset();
-        assert_eq!(dpb.surface_of_frame_buffer(0), 255);
-        assert_eq!(dpb.choose_output_surface(&[0, 0, 0], true), 0);
+        assert_eq!(surface_of_frame_buffer(&dpb, 0), 255);
+        assert_eq!(dpb.choose_output_slot(), 0);
     }
 }

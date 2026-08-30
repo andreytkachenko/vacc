@@ -98,7 +98,7 @@ fn main() {
 
     for (i, frame) in frames.iter().enumerate() {
         let output_path = format!("{}_frame_{}.yuv", stem, i);
-        let yuv_data = frame_to_yuv420p(frame);
+        let yuv_data = frame_to_yuv(frame);
         match std::fs::write(&output_path, yuv_data) {
             Ok(()) => println!("  Saved frame {} to {}", i, output_path),
             Err(e) => eprintln!("  Failed to save frame {}: {}", i, e),
@@ -135,70 +135,53 @@ fn detect_codec(path: &str) -> &'static str {
     }
 }
 
-/// Convert decoded frame to yuv420p planar format.
-fn frame_to_yuv420p(frame: &vk_video_core::frame::DecodedFrame) -> Vec<u8> {
-    if let Some(ref pixel_data) = frame.pixel_data {
-        let disp_w = frame.width as usize;
-        let disp_h = frame.height as usize;
-        let uv_disp_w = disp_w / 2;
-        let uv_disp_h = disp_h / 2;
+/// Convert a decoded frame to planar YUV in its native chroma layout
+/// (yuv420p for 4:2:0, yuv444p for 4:4:4). NV12 input is deinterleaved.
+fn frame_to_yuv(frame: &vk_video_core::frame::DecodedFrame) -> Vec<u8> {
+    if let Some(ref pd) = frame.pixel_data {
+        let yw = pd.y.width as usize;
+        let yh = pd.y.height as usize;
+        let uw = pd.u.width as usize;
+        let uh = pd.u.height as usize;
 
-        let mut yuv_data = Vec::with_capacity(disp_w * disp_h + uv_disp_w * uv_disp_h * 2);
+        let mut out = Vec::with_capacity(yw * yh + uw * uh * 2);
 
-        // Copy Y plane
-        let y_pitch = pixel_data.y.pitch;
-        let y_width = pixel_data.y.width;
-        for y in 0..disp_h {
-            let src_start = y * y_pitch;
-            yuv_data.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(pixel_data.y.data.add(src_start), disp_w.min(y_width))
+        for y in 0..yh {
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(pd.y.data.add(y * pd.y.pitch), yw)
             });
         }
 
-        // Copy U plane (handle NV12 vs planar)
-        let u_pitch = pixel_data.u.pitch;
-        let u_width = pixel_data.u.width;
-        if pixel_data.v.is_none() {
-            // NV12: U and V are interleaved. Deinterleave U (even bytes).
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                for x in 0..uv_disp_w {
-                    let u_byte = unsafe { *pixel_data.u.data.add(src_start + x * 2) };
-                    yuv_data.push(u_byte);
+        if pd.v.is_none() {
+            // NV12: U and V interleaved in the u plane; deinterleave into
+            // planar U then planar V.
+            for y in 0..uh {
+                let row = unsafe { pd.u.data.add(y * pd.u.pitch) };
+                for x in 0..uw {
+                    out.push(unsafe { *row.add(x * 2) });
+                }
+            }
+            for y in 0..uh {
+                let row = unsafe { pd.u.data.add(y * pd.u.pitch) };
+                for x in 0..uw {
+                    out.push(unsafe { *row.add(x * 2 + 1) });
                 }
             }
         } else {
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                yuv_data.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(pixel_data.u.data.add(src_start), uv_disp_w.min(u_width))
+            for y in 0..uh {
+                out.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(pd.u.data.add(y * pd.u.pitch), uw)
+                });
+            }
+            let v = pd.v.as_ref().unwrap();
+            for y in 0..uh {
+                out.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(v.data.add(y * v.pitch), uw)
                 });
             }
         }
 
-        // Copy V plane (handle NV12 vs planar)
-        if let Some(ref v_plane) = pixel_data.v {
-            let v_pitch = v_plane.pitch;
-            let v_width = v_plane.width;
-            for y in 0..uv_disp_h {
-                let src_start = y * v_pitch;
-                yuv_data.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(v_plane.data.add(src_start), uv_disp_w.min(v_width))
-                });
-            }
-        } else {
-            // NV12: V is interleaved with U, copy every other byte starting at offset 1
-            let u_pitch = pixel_data.u.pitch;
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                for x in 0..uv_disp_w {
-                    let v_byte = unsafe { *pixel_data.u.data.add(src_start + x * 2 + 1) };
-                    yuv_data.push(v_byte);
-                }
-            }
-        }
-
-        yuv_data
+        out
     } else {
         Vec::new()
     }

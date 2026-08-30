@@ -11,7 +11,7 @@ pub struct DecodedPixels {
     pub v_plane: Vec<u8>,
 }
 
-/// Readback decoded image pixels from GPU to CPU.
+/// Readback decoded image pixels from GPU to CPU (8-bit NV12 source).
 pub fn readback_decoded_image(
     instance: &ash::Instance,
     device: &ash::Device,
@@ -25,10 +25,76 @@ pub fn readback_decoded_image(
     height: u32,
     old_layout: vk::ImageLayout,
 ) -> Result<DecodedPixels, VideoError> {
-    let y_size = (width * height) as usize;
+    readback_decoded_image_format(
+        instance,
+        device,
+        memory_properties,
+        queue_family,
+        command_pool,
+        fence,
+        image,
+        base_array_layer,
+        width,
+        height,
+        old_layout,
+        vk::Format::G8_B8R8_2PLANE_420_UNORM,
+    )
+}
+
+/// Source format descriptor for readback.
+#[derive(Clone, Copy)]
+enum HdrSource {
+    /// 8-bit NV12: plane0 = 1 byte/px, plane1 = interleaved 1 byte U/V.
+    B8,
+    /// G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 (or the 12-bit equivalent):
+    /// plane0 = 2 bytes/px, plane1 = 4 bytes per (U,V) pair. Each sample is a
+    /// u16 with the `bits`-bit value in the HIGH bits (`value << (16 - bits)`,
+    /// i.e. G10X6 = 10 bits + 6 pad, G12X4 = 12 bits + 4 pad).
+    B16 { bits: u32 },
+}
+
+fn hdr_source_for_format(format: vk::Format) -> Option<HdrSource> {
+    match format {
+        vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16_KHR => Some(HdrSource::B16 { bits: 10 }),
+        vk::Format::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16_KHR => Some(HdrSource::B16 { bits: 12 }),
+        _ => None,
+    }
+}
+
+/// Readback decoded image pixels from GPU to CPU.
+///
+/// `source_format` must match the format of `image`. 8-bit NV12 is returned
+/// as-is; 10/12-bit sources are down-converted to 8-bit (rounded).
+pub fn readback_decoded_image_format(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue_family: u32,
+    command_pool: vk::CommandPool,
+    fence: vk::Fence,
+    image: vk::Image,
+    base_array_layer: u32,
+    width: u32,
+    height: u32,
+    old_layout: vk::ImageLayout,
+    source_format: vk::Format,
+) -> Result<DecodedPixels, VideoError> {
     let uv_width = width.div_ceil(2);
     let uv_height = height.div_ceil(2);
-    let uv_size = (uv_width * uv_height * 2) as usize;
+
+    // Plane sizes in bytes depend on the source format.
+    let (y_size, uv_size) = match hdr_source_for_format(source_format) {
+        Some(HdrSource::B16 { .. }) => {
+            let y = (width * height * 2) as usize;
+            let uv = (uv_width * uv_height * 4) as usize;
+            (y, uv)
+        }
+        _ => {
+            let y = (width * height) as usize;
+            let uv = (uv_width * uv_height * 2) as usize;
+            (y, uv)
+        }
+    };
     let total_size = (y_size + uv_size) as u64;
 
     let buffer_create_info = vk::BufferCreateInfo::default()
@@ -305,22 +371,44 @@ pub fn readback_decoded_image(
             return Err(VideoError::FenceWait(e.to_string()));
         }
 
-        let mut y_plane = vec![0u8; y_size];
-        let mut uv_plane = vec![0u8; uv_size];
-
-        std::ptr::copy_nonoverlapping(mapped_ptr as *const u8, y_plane.as_mut_ptr(), y_size);
-        std::ptr::copy_nonoverlapping(
-            mapped_ptr.add(y_size) as *const u8,
-            uv_plane.as_mut_ptr(),
-            uv_size,
-        );
-
+        let mut y_plane = vec![0u8; (width * height) as usize];
         let uv_plane_size = (uv_width * uv_height) as usize;
         let mut u_plane = vec![0u8; uv_plane_size];
         let mut v_plane = vec![0u8; uv_plane_size];
-        for i in 0..uv_plane_size {
-            u_plane[i] = uv_plane[i * 2];
-            v_plane[i] = uv_plane[i * 2 + 1];
+
+        match hdr_source_for_format(source_format) {
+            Some(HdrSource::B16 { bits }) => {
+                // Plane 0: one u16 per luma sample (value in low `bits` bits).
+                let src = mapped_ptr as *const u16;
+                for i in 0..(width * height) as usize {
+                    let v = unsafe { *src.add(i) };
+                    y_plane[i] = scale_to_8(v, bits);
+                }
+                // Plane 1: interleaved u16 U, u16 V pairs.
+                let src = (mapped_ptr.add(y_size as usize)) as *const u16;
+                for i in 0..uv_plane_size {
+                    u_plane[i] = scale_to_8(unsafe { *src.add(i * 2) }, bits);
+                    v_plane[i] = scale_to_8(unsafe { *src.add(i * 2 + 1) }, bits);
+                }
+            }
+            _ => {
+                // 8-bit NV12: copy, then deinterleave UV.
+                std::ptr::copy_nonoverlapping(
+                    mapped_ptr as *const u8,
+                    y_plane.as_mut_ptr(),
+                    y_size,
+                );
+                let mut uv_plane = vec![0u8; uv_size];
+                std::ptr::copy_nonoverlapping(
+                    mapped_ptr.add(y_size) as *const u8,
+                    uv_plane.as_mut_ptr(),
+                    uv_size,
+                );
+                for i in 0..uv_plane_size {
+                    u_plane[i] = uv_plane[i * 2];
+                    v_plane[i] = uv_plane[i * 2 + 1];
+                }
+            }
         }
 
         device.unmap_memory(memory);
@@ -333,6 +421,16 @@ pub fn readback_decoded_image(
             v_plane,
         })
     }
+}
+
+/// Scale a `bits`-bit sample stored in the HIGH bits of a u16 (G10X6/G12X4
+/// packing: `value << (16 - bits)`) to 8-bit, rounded.
+#[inline]
+fn scale_to_8(v: u16, bits: u32) -> u8 {
+    let x = (v as u32) >> (16 - bits);
+    // For the max sample value the rounded result is 256; saturate instead of
+    // wrapping to 0 via the u8 cast.
+    (((x << 8) + (1u32 << (bits - 1))) >> bits).min(255) as u8
 }
 
 fn find_memory_type(

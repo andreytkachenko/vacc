@@ -146,7 +146,7 @@ impl VideoDecoder {
                         ));
                     }
                     let vulkan = super::VideoDeviceBuilder::new()
-                        .with_validation(false)
+                        .with_validation(std::env::var("VACC_VP9_VALIDATE").is_ok())
                         .build()?;
                     let coded_extent = vk::Extent2D {
                         width: parsed.coded_width,
@@ -173,7 +173,7 @@ impl VideoDecoder {
                         ));
                     }
                     let vulkan = super::VideoDeviceBuilder::new()
-                        .with_validation(false)
+                        .with_validation(std::env::var("VACC_VP9_VALIDATE").is_ok())
                         .build()?;
                     let coded_extent = vk::Extent2D {
                         width: parsed.coded_width,
@@ -275,7 +275,9 @@ impl VideoDecoder {
         )?;
         eprintln!("[Decoder] Video session created successfully");
 
-        let output_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+        // DPB image format must match the session bit depth (an 8-bit image
+        // under a 10/12-bit session crashes the driver: "device lost").
+        let output_format = decode_output_format(parsed.luma_bit_depth);
 
         let max_frame_size = extract_max_frame_size(&data, decoded_codec, max_frames);
 
@@ -765,6 +767,11 @@ impl VideoDecoder {
         vp9_decoder.set_session(&self.session);
         vp9_decoder.set_max_dpb_slots(self.parsed.max_dpb_slots);
 
+        // Common VP9 DPB shared by all backends: frame-buffer -> slot mapping,
+        // refresh application, reference list, and output-slot selection.
+        let mut vp9_dpb = vk_video_parser::vp9_dpb::Vp9Dpb::new(self.dpb_images.len() as u32);
+        let output_format = decode_output_format(self.parsed.luma_bit_depth);
+
         let mut decoded_frames = Vec::new();
         let mut is_first_frame = true;
         let mut frame_count: u32 = 0;
@@ -790,14 +797,13 @@ impl VideoDecoder {
                 height: parsed.frame_height,
             };
 
-            // Handle show_existing_frame
+            // Handle show_existing_frame: re-display a frame buffer, no decode.
             if parsed.show_existing_frame {
-                let frame_buffer_idx = parsed.frame_to_show_map_idx as usize;
-                let pic_idx = vp9_decoder.get_pic_idx_for_frame_buffer(frame_buffer_idx);
-                if pic_idx >= 0 {
-                    let slot = pic_idx as usize;
+                let slot = vp9_dpb.slot_of_frame_buffer(parsed.frame_to_show_map_idx as usize);
+                if slot >= 0 {
+                    let slot = slot as usize;
                     let img = self.dpb_images[slot];
-                    let pixels = super::readback::readback_decoded_image(
+                    let pixels = super::readback::readback_decoded_image_format(
                         &self.vulkan.instance,
                         &self.vulkan.device,
                         &self.vulkan.memory_properties,
@@ -809,6 +815,7 @@ impl VideoDecoder {
                         frame_coded_extent.width,
                         frame_coded_extent.height,
                         vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                        output_format,
                     )?;
                     decoded_frames.push(DecodedFrame {
                         poc: frame_count as i32,
@@ -823,12 +830,45 @@ impl VideoDecoder {
                         crop_left: self.parsed.crop_left,
                         crop_top: self.parsed.crop_top,
                     });
+                    frame_count += 1;
                 }
                 continue;
             }
 
             let is_key_frame =
                 parsed.picture_info.frame_type == vk_video_core::picture::Vp9FrameType::Key;
+            // Intra frames (key OR intra-only) take no references.
+            let is_intra = parsed.frame_is_intra;
+
+            // Common DPB: reference list (LAST/GOLDEN/ALTREF -> slots) and
+            // output slot (oldest non-live). Replaces the old buggy
+            // slot==frame-buffer mapping.
+            let ref3 = [
+                parsed.ref_frame_idx[0],
+                parsed.ref_frame_idx[1],
+                parsed.ref_frame_idx[2],
+            ];
+            let reference_name_slot_indices: [i32; 3] = if is_intra {
+                [-1, -1, -1]
+            } else {
+                vp9_dpb.reference_slots(false, &ref3)
+            };
+            let output_slot = vp9_dpb.choose_output_slot();
+
+            if super::vacc_debug() {
+                eprintln!(
+                    "[VP9-DBG] f{} key={} intra={} show={} refresh={:02x} ref_fb={:?} ref_slots={:?} out_slot={}",
+                    frame_idx,
+                    is_key_frame,
+                    is_intra,
+                    parsed.picture_info.flags.show_frame,
+                    parsed.picture_info.refresh_frame_flags,
+                    &parsed.ref_frame_idx[..3],
+                    reference_name_slot_indices,
+                    output_slot,
+                );
+            }
+            let output_slot_u = output_slot as u32;
 
             // Write bitstream data
             let bs_align = self.bs_buffer_size_alignment.max(1);
@@ -838,30 +878,8 @@ impl VideoDecoder {
             self.bs_buffer.write(&vp9_frame.data)?;
             self.bs_buffer.flush_range(0, aligned_size).ok();
 
-            // Compute reference name slot indices
-            let reference_name_slot_indices = vp9_decoder
-                .compute_reference_name_slot_indices(is_key_frame, &parsed.ref_frame_idx);
-
-            // Select DPB slot
-            let output_slot = if is_key_frame || is_first_frame {
-                if is_key_frame {
-                    self.dpb_manager.invalidate_all();
-                    vp9_decoder.reset_dpb();
-                }
-                0
-            } else {
-                let exclude_slots: Vec<i32> = reference_name_slot_indices
-                    .iter()
-                    .filter(|&&s| s >= 0)
-                    .copied()
-                    .collect();
-                self.dpb_manager
-                    .find_or_recycle_slot_excluding(&exclude_slots)
-                    .unwrap_or(0)
-            };
-
-            let output_view = self.dpb_views[output_slot as usize];
-            let output_img = self.dpb_images[output_slot as usize];
+            let output_view = self.dpb_views[output_slot_u as usize];
+            let output_img = self.dpb_images[output_slot_u as usize];
 
             // Build DPB picture resources
             let (dpb_setup_picture, dpb_ref_pictures, dpb_ref_slot_indices) =
@@ -869,7 +887,7 @@ impl VideoDecoder {
                     &self.dpb_manager,
                     &self.dpb_views,
                     frame_coded_extent,
-                    output_slot,
+                    output_slot_u,
                     is_key_frame,
                     &reference_name_slot_indices,
                 );
@@ -903,18 +921,11 @@ impl VideoDecoder {
                 parsed.tiles_offset,
             ));
 
-            // Record decode command
+            // Record decode command (record_decode_command begins/ends the
+            // command buffer internally, matching the AV1 path).
             let cmd_buffer = allocate_command_buffer(&self.vulkan.device, self.command_pool)?;
-            unsafe {
-                let begin_info = vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                self.vulkan
-                    .device
-                    .begin_command_buffer(cmd_buffer, &begin_info)
-                    .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
-            }
 
-            let output_slot_old_layout = self.dpb_manager.get_slot_layout(output_slot);
+            let output_slot_old_layout = self.dpb_manager.get_slot_layout(output_slot_u);
             let result = vp9_decoder.record_decode_command(
                 cmd_buffer,
                 self.session.handle(),
@@ -938,6 +949,7 @@ impl VideoDecoder {
                 is_first_frame,
                 output_slot as i32,
                 output_slot_old_layout,
+                self.dpb_use_image_array,
             );
 
             let _picture_info_guard = picture_info_container;
@@ -949,12 +961,8 @@ impl VideoDecoder {
 
             result.map_err(|e| VideoError::DecoderInit(format!("VP9 decode failed: {}", e)))?;
 
-            // Submit
+            // Submit (record_decode_command already ended the command buffer)
             unsafe {
-                self.vulkan
-                    .device
-                    .end_command_buffer(cmd_buffer)
-                    .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
                 self.vulkan
                     .device
                     .reset_fences(&[self.fence])
@@ -977,45 +985,52 @@ impl VideoDecoder {
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
             }
 
-            // Record which DPB slot contains this frame buffer
-            let current_frame_buffer_idx = output_slot as i32;
-            vp9_decoder.set_frame_buffer_dpb_slot(output_slot as usize, current_frame_buffer_idx);
+            // Commit this frame into the common DPB: apply its
+            // refresh_frame_flags (key frames refresh all 8 frame buffers).
+            vp9_dpb.commit_frame(parsed.picture_info.refresh_frame_flags, output_slot);
 
-            self.dpb_manager.register_frame(output_slot, frame_count);
+            self.dpb_manager.register_frame(output_slot_u, frame_count);
             self.dpb_manager
-                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                .set_slot_layout(output_slot_u, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
-            // Readback
-            let pixels = super::readback::readback_decoded_image(
-                &self.vulkan.instance,
-                &self.vulkan.device,
-                &self.vulkan.memory_properties,
-                self.decode_queue_family,
-                self.command_pool,
-                self.fence,
-                output_img,
-                self.dpb_base_layer(output_slot as u32),
-                frame_coded_extent.width,
-                frame_coded_extent.height,
-                self.dpb_manager.get_slot_layout(output_slot),
-            )?;
+            // Readback (only frames that are displayed).
+            if parsed.picture_info.flags.show_frame != 0 {
+                let pixels = super::readback::readback_decoded_image_format(
+                    &self.vulkan.instance,
+                    &self.vulkan.device,
+                    &self.vulkan.memory_properties,
+                    self.decode_queue_family,
+                    self.command_pool,
+                    self.fence,
+                    output_img,
+                    self.dpb_base_layer(output_slot_u),
+                    frame_coded_extent.width,
+                    frame_coded_extent.height,
+                    self.dpb_manager.get_slot_layout(output_slot_u),
+                    output_format,
+                )?;
 
-            self.dpb_manager
-                .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+                self.dpb_manager
+                    .set_slot_layout(output_slot_u, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
-            decoded_frames.push(DecodedFrame {
-                poc: frame_count as i32,
-                frame_num: frame_count,
-                is_idr: is_key_frame,
-                is_reference: true,
-                pixels,
-                coded_width: frame_coded_extent.width,
-                coded_height: frame_coded_extent.height,
-                display_width: self.parsed.display_width,
-                display_height: self.parsed.display_height,
-                crop_left: self.parsed.crop_left,
-                crop_top: self.parsed.crop_top,
-            });
+                decoded_frames.push(DecodedFrame {
+                    poc: frame_count as i32,
+                    frame_num: frame_count,
+                    is_idr: is_key_frame,
+                    is_reference: true,
+                    pixels,
+                    coded_width: frame_coded_extent.width,
+                    coded_height: frame_coded_extent.height,
+                    display_width: self.parsed.display_width,
+                    display_height: self.parsed.display_height,
+                    crop_left: self.parsed.crop_left,
+                    crop_top: self.parsed.crop_top,
+                });
+            } else {
+                // Decoded for references only; keep the DPB layout.
+                self.dpb_manager
+                    .set_slot_layout(output_slot_u, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
+            }
 
             frame_count += 1;
         }
@@ -3175,7 +3190,12 @@ fn create_video_session(
     Option<VideoSessionParameters>,
     Vec<vk::DeviceMemory>,
 )> {
-    let output_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+    // The session picture/reference format must match the DPB image bit depth
+    // (DPB images use `decode_output_format(parsed.luma_bit_depth)`). Hardcoding
+    // G8B8R8 here made 10/12-bit VP9 sessions 8-bit while the DPB images were
+    // G10X6/G12X4 -> the driver decoded into mismatched surfaces (garbage even
+    // on key frames).
+    let output_format = decode_output_format(parsed.luma_bit_depth);
 
     let (codec_profile_info, std_header_name) = match codec {
         VideoCodec::DecodeH264 => (
@@ -3446,6 +3466,17 @@ fn extract_max_frame_size(data: &[u8], codec: AccessUnitCodec, max_frames: usize
 // VP9-specific helpers
 // ============================================================================
 
+/// DPB image format for a decode session's luma bit depth (4:2:0).
+fn decode_output_format(luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR) -> vk::Format {
+    if luma_bit_depth.contains(vk::VideoComponentBitDepthFlagsKHR::TYPE_10) {
+        vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16_KHR
+    } else if luma_bit_depth.contains(vk::VideoComponentBitDepthFlagsKHR::TYPE_12) {
+        vk::Format::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16_KHR
+    } else {
+        vk::Format::G8_B8R8_2PLANE_420_UNORM
+    }
+}
+
 fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u32, vk::Extent2D)> {
     use vk_video_core::codec::VideoCodec as CoreCodec;
     use vk_video_parser::vp9::Vp9Parser;
@@ -3482,6 +3513,17 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
     let display_height = parsed.render_height;
     let profile = parsed.picture_info.profile as u32;
     let bit_depth = parsed.color_config.bit_depth;
+    let subsampling_x = parsed.color_config.subsampling_x;
+    let subsampling_y = parsed.color_config.subsampling_y;
+
+    // The Vulkan VP9 decode profile only supports Y'CbCr 4:2:0. Reject
+    // 4:4:4 / 4:2:2 (and RGB) streams instead of silently downconverting.
+    if subsampling_x != 1 || subsampling_y != 1 {
+        return Err(VideoError::DecoderInit(format!(
+            "VP9 chroma subsampling {}x{} not supported by Vulkan decode (4:2:0 only)",
+            subsampling_x, subsampling_y
+        )));
+    }
 
     if coded_width == 0 || coded_height == 0 {
         return Err(VideoError::DecoderInit(
@@ -3491,7 +3533,7 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
 
     // Initialize Vulkan with VP9 decode support
     let vulkan = super::VideoDeviceBuilder::new()
-        .with_validation(false)
+        .with_validation(std::env::var("VACC_VP9_VALIDATE").is_ok())
         .build()?;
 
     let luma_bit_depth = match bit_depth {
@@ -3613,7 +3655,7 @@ fn parse_av1_init(
 
     // Initialize Vulkan with AV1 decode support
     let vulkan = super::VideoDeviceBuilder::new()
-        .with_validation(false)
+        .with_validation(std::env::var("VACC_VP9_VALIDATE").is_ok())
         .build()?;
 
     let luma_bit_depth = match bit_depth {

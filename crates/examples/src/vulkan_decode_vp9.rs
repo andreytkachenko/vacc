@@ -115,20 +115,18 @@ fn main() {
 
     // Vulkan Video VP9 decode only supports 4:2:0 output format (G8B8R8_2PLANE_420_UNORM).
     // VP9 Profile 1/3 with 4:4:4 chroma subsampling (subsampling_x=0, subsampling_y=0)
-    // cannot be correctly decoded - the driver cannot downsample 4:4:4 to 4:2:0.
+    // cannot be correctly decoded - decoding a 4:4:4 stream in a 4:2:0 session
+    // produces garbage output (verified: Y plane diverges from the start).
     let is_444 = first_parsed.color_config.subsampling_x == 0
         && first_parsed.color_config.subsampling_y == 0;
-    if is_444 && profile >= 1 {
+    if is_444 {
         eprintln!(
-            "Warning: VP9 Profile {} with 4:4:4 chroma subsampling detected.",
+            "Error: VP9 Profile {} with 4:4:4 chroma subsampling is not supported \
+by Vulkan Video decode (4:2:0 only).",
             profile
         );
-        eprintln!(
-            "  Vulkan Video VP9 decode only supports 4:2:0 output. Results may be incorrect."
-        );
-        eprintln!(
-            "  Consider re-encoding with Profile 0 (4:2:0) for hardware decode compatibility."
-        );
+        eprintln!("  Re-encode the stream as Profile 0 (4:2:0) or use a 4:4:4-capable backend.");
+        std::process::exit(1);
     }
 
     if coded_width == 0 || coded_height == 0 {
@@ -706,6 +704,7 @@ fn main() {
             is_first_frame,
             output_slot as i32,
             output_slot_old_layout,
+            false, // separate-image DPB mode (one image per slot)
         );
 
         // Keep container AND vp9_decode_info alive until after submit + wait

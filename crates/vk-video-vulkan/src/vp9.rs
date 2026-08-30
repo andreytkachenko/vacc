@@ -196,8 +196,18 @@ impl Vp9Decoder {
         is_first_frame: bool,
         output_slot_index: i32,
         output_slot_old_layout: vk::ImageLayout,
+        // Image-array DPB mode (one shared image, one layer per slot). When
+        // true the barriers below must select each slot's own array layer;
+        // in separate-image mode every image is its own and layer 0 is right.
+        dpb_use_image_array: bool,
     ) -> VideoResult<()> {
         let _picture_info_ptr = picture_info_container.std_picture_info();
+
+        // In image-array mode the DPB slot index IS the array layer of the
+        // shared image (the per-slot views are view-relative, layer 0).
+        fn base_layer(dpb_use_image_array: bool, slot: i32) -> u32 {
+            if dpb_use_image_array && slot >= 0 { slot as u32 } else { 0 }
+        }
 
         // Build reference slots for BeginVideoCoding (setup + references)
         // Per Vulkan spec: DPB slots become active when used in BeginVideoCodingKHR.
@@ -319,7 +329,9 @@ impl Vp9Decoder {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                // The barrier operates on the raw image; in image-array mode it
+                // must target the output slot's own layer (not always 0).
+                base_array_layer: base_layer(dpb_use_image_array, output_slot_index),
                 layer_count: 1,
             };
 
@@ -361,12 +373,15 @@ impl Vp9Decoder {
                 Vec::with_capacity(1 + dpb_ref_images.len());
             image_barriers.push(image_barrier);
 
-            for (&ref_image, &ref_layout) in dpb_ref_images.iter().zip(dpb_ref_slot_layouts.iter())
+            for ((ref_image, ref_layout), ref_slot) in dpb_ref_images
+                .iter()
+                .zip(dpb_ref_slot_layouts.iter())
+                .zip(dpb_ref_slot_indices.iter())
             {
                 // Only add barrier if reference image is valid and not already in correct layout.
                 // This matches C++ reference which checks currentImageLayout before adding barriers.
-                if ref_image == vk::Image::null()
-                    || ref_layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+                if *ref_image == vk::Image::null()
+                    || *ref_layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR
                 {
                     continue;
                 }
@@ -381,14 +396,14 @@ impl Vp9Decoder {
                     dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: ref_image,
-                    old_layout: ref_layout,
+                    image: *ref_image,
+                    old_layout: *ref_layout,
                     new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
                         level_count: 1,
-                        base_array_layer: 0,
+                        base_array_layer: base_layer(dpb_use_image_array, *ref_slot),
                         layer_count: 1,
                     },
                     _marker: Default::default(),

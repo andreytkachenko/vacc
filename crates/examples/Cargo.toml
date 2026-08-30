@@ -106,6 +106,10 @@ path = "src/mmco_trace.rs"
 name = "decode_vaapi"
 path = "src/decode_vaapi.rs"
 
+[[example]]
+name = "_probe_vp9"
+path = "src/_probe_vp9.rs"
+
 [dependencies]
 vk-video-core = { workspace = true }
 vk-video-parser = { workspace = true }
