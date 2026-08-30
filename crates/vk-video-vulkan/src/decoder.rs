@@ -24,6 +24,7 @@ use super::{
 };
 use vk_video_parser::h264_dpb::MARKING_SHORT;
 use vk_video_parser::h264_reflist::{build_ref_pic_lists, DpbRefState};
+use vk_video_parser::VideoParser;
 
 /// Decoded frame with metadata for presentation ordering.
 #[derive(Debug, Clone)]
@@ -74,6 +75,11 @@ pub struct VideoDecoder {
     fence: vk::Fence,
     bs_buffer: BitstreamBuffer,
     coded_extent: vk::Extent2D,
+    /// Coded extent aligned to pictureAccessGranularity. Every
+    /// VkVideoPictureResourceInfoKHR.codedExtent must be a multiple of the
+    /// granularity (VUID-VkVideoPictureResourceInfoKHR-codedExtent-07238);
+    /// the raw coded_extent is only used for readback/crop metadata.
+    picture_coded_extent: vk::Extent2D,
     dpb_manager: DpbManager,
     dpb_views: Vec<vk::ImageView>,
     dpb_images: Vec<vk::Image>,
@@ -179,9 +185,23 @@ impl VideoDecoder {
                         width: parsed.coded_width,
                         height: parsed.coded_height,
                     };
-                    let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
+                    // H.265 DPB size from SPS (top temporal layer):
+                    // MaxDecPicBuffering + MaxNumReorderPics reference slots.
+                    // Encoders (e.g. x265) under-signal MinDecPicBuffering
+                    // relative to the live reference+reorder set they actually
+                    // keep (big_buck: signals min 3, keeps 6 alive), so size
+                    // from the upper bound instead. +1 setup slot below.
+                    let h265_dpb_slots = match &parsed.sps {
+                        Some(H264OrH265Sps::H265(s)) => {
+                            let max_dec = (s.max_dec_pic_buffering_minus1[0] as u32 + 1).max(1);
+                            let reorder = s.max_num_reorder_pics[0] as u32;
+                            (max_dec + reorder).clamp(4, 16)
+                        }
+                        _ => 8,
+                    };
+                    let session_dpb_slots = h265_dpb_slots + 1;
                     let codec = VideoCodec::DecodeH265;
-                    let dpb_slots = parsed.max_dpb_slots.min(4);
+                    let dpb_slots = h265_dpb_slots;
                     (
                         parsed,
                         codec,
@@ -265,6 +285,18 @@ impl VideoDecoder {
             }
         };
 
+        // Pick the decode output picture format. For H.264/H.265, query the
+        // device for the formats it actually supports for this
+        // profile/chroma/bit-depth (e.g. NVIDIA exposes P010 for Main10, not
+        // P016) and prefer the most compact layout. Other codecs use the
+        // bit-depth-based format: 10/12-bit VP9/AV1 need a matching session
+        // format (an 8-bit session with G10X6/G12X4 DPB images decodes garbage).
+        let output_format = match codec {
+            VideoCodec::DecodeH265 => select_h265_picture_format(&vulkan, &parsed)?,
+            VideoCodec::DecodeH264 => select_h264_picture_format(&vulkan, &parsed)?,
+            _ => decode_output_format(parsed.luma_bit_depth),
+        };
+
         let (session, session_params, session_memories) = create_video_session(
             &vulkan,
             codec,
@@ -272,12 +304,9 @@ impl VideoDecoder {
             session_coded_extent,
             session_dpb_slots,
             av1_sps.as_ref(),
+            output_format,
         )?;
         eprintln!("[Decoder] Video session created successfully");
-
-        // DPB image format must match the session bit depth (an 8-bit image
-        // under a 10/12-bit session crashes the driver: "device lost").
-        let output_format = decode_output_format(parsed.luma_bit_depth);
 
         let max_frame_size = extract_max_frame_size(&data, decoded_codec, max_frames);
 
@@ -450,6 +479,7 @@ impl VideoDecoder {
             fence,
             bs_buffer,
             coded_extent,
+            picture_coded_extent: session_coded_extent,
             dpb_manager,
             dpb_views,
             dpb_images,
@@ -529,9 +559,120 @@ impl VideoDecoder {
 
         let items: Vec<_> = items.into_iter().take(max_frames * 2).collect();
 
-        let mut frames = Vec::new();
+        // H.265: common parser + common DPB — the single source of truth for
+        // POC, reference lists and DPB slot allocation/liveness (shared with
+        // the VAAPI/NVDEC backends). One parser pass over the whole bitstream;
+        // each ParseResult::Slice corresponds 1:1 with an extracted access unit.
+        struct H265FrameCtx {
+            info: vk_video_parser::h265::SliceHeaderInfo,
+            lists: vk_video_parser::h265_dpb::H265RefLists,
+            rps_slots: (Vec<i32>, Vec<i32>, Vec<i32>),
+            /// Every in-use RPS reference (slot, poc) — superset of the
+            /// final L0/L1 union; required so each RefPicSet* slot_index is
+            /// resolvable in pReferenceSlots.
+            in_use: Vec<(u32, i32)>,
+            slot: u32,
+        }
+
+        let mut h265_parser: Option<vk_video_parser::h265::H265Parser> = None;
+        let mut h265_dpb: Option<vk_video_parser::h265_dpb::H265Dpb> = None;
+        let mut h265_packet: Option<vk_video_parser::BitstreamPacket> = None;
+        if self.codec == VideoCodec::DecodeH265 {
+            let mut parser = vk_video_parser::h265::H265Parser::new();
+            parser
+                .init(&vk_video_parser::DetectedVideoFormat::new(
+                    vk_video_core::codec::VideoCodec::DecodeH265,
+                ))
+                .map_err(|e| VideoError::DecoderInit(format!("H265 parser init: {e}")))?;
+            let mut dpb =
+                vk_video_parser::h265_dpb::H265Dpb::new(self.dpb_manager.entries.len());
+            if let Some(H264OrH265Sps::H265(sps)) = &self.parsed.sps {
+                dpb.set_max_num_reorder_frames(sps.max_num_reorder_pics[0] as u32);
+            }
+            h265_parser = Some(parser);
+            h265_dpb = Some(dpb);
+            h265_packet = Some(vk_video_parser::BitstreamPacket::new(
+                self.bitstream_data().to_vec(),
+            ));
+        }
+
+        let mut frames: Vec<DecodedFrame> = Vec::new();
         let mut is_first_frame = true;
         let mut access_unit_count = 0;
+
+        // Video decode query pool for VkVideoInlineQueryInfoKHR, matching the C++
+        // reference (VulkanVideoFrameBuffer.cpp:305-310): one
+        // RESULT_STATUS_ONLY query per frame, pool created with the session's
+        // video profile in the pNext chain (VUID-vkCmdDecodeVideoKHR-queryPool-08368).
+        let mut query_pool = vk::QueryPool::null();
+        match self.codec {
+            VideoCodec::DecodeH265 => {
+                let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_H265_PROFILE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    std_profile_idc: self.parsed.profile_idc,
+                    _marker: Default::default(),
+                };
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &h265_profile as *const _ as *const _,
+                    video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+                    chroma_subsampling: self.parsed.chroma_subsampling,
+                    luma_bit_depth: self.parsed.luma_bit_depth,
+                    chroma_bit_depth: self.parsed.chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                query_pool = unsafe {
+                    self.vulkan.device.create_query_pool(
+                        &vk::QueryPoolCreateInfo {
+                            s_type: vk::StructureType::QUERY_POOL_CREATE_INFO,
+                            p_next: &profile_info as *const _ as *const _,
+                            flags: vk::QueryPoolCreateFlags::empty(),
+                            query_type: vk::QueryType::RESULT_STATUS_ONLY_KHR,
+                            query_count: (max_frames as u32).max(1),
+                            pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
+                            _marker: Default::default(),
+                        },
+                        None,
+                    )
+                }
+                .map_err(|e| VideoError::DecoderInit(format!("query pool: {e}")))?;
+            }
+            VideoCodec::DecodeH264 => {
+                let h264_profile = vk::VideoDecodeH264ProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    std_profile_idc: self.parsed.profile_idc,
+                    picture_layout: vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE,
+                    _marker: Default::default(),
+                };
+                let profile_info = vk::VideoProfileInfoKHR {
+                    s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+                    p_next: &h264_profile as *const _ as *const _,
+                    video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+                    chroma_subsampling: self.parsed.chroma_subsampling,
+                    luma_bit_depth: self.parsed.luma_bit_depth,
+                    chroma_bit_depth: self.parsed.chroma_bit_depth,
+                    _marker: Default::default(),
+                };
+                query_pool = unsafe {
+                    self.vulkan.device.create_query_pool(
+                        &vk::QueryPoolCreateInfo {
+                            s_type: vk::StructureType::QUERY_POOL_CREATE_INFO,
+                            p_next: &profile_info as *const _ as *const _,
+                            flags: vk::QueryPoolCreateFlags::empty(),
+                            query_type: vk::QueryType::RESULT_STATUS_ONLY_KHR,
+                            query_count: (max_frames as u32).max(1),
+                            pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
+                            _marker: Default::default(),
+                        },
+                        None,
+                    )
+                }
+                .map_err(|e| VideoError::DecoderInit(format!("query pool: {e}")))?;
+            }
+            _ => {}
+        }
 
         for (idx, item) in items.iter().enumerate() {
             match item {
@@ -557,40 +698,123 @@ impl VideoDecoder {
                     }
                     self.bs_buffer.flush_range(0, aligned_size).ok();
 
-                    let output_slot = if au.is_idr || au.no_output_of_prior_pics_flag {
+                    if super::vacc_debug() {
+                        eprintln!(
+                            "[AU-DIAG] au#{} data.len={} slice_offsets={:?} first4={:02x?}",
+                            access_unit_count - 1,
+                            au.data.len(),
+                            &au.slice_offsets[..au.slice_offsets.len().min(8)],
+                            &au.data[..au.data.len().min(4)]
+                        );
+                    }
+                    // --- H.265: common DPB owns slot allocation + ref lists ---
+                    let h265_ctx: Option<H265FrameCtx> = if self.codec == VideoCodec::DecodeH265 {
+                        let sps = match &self.parsed.sps {
+                            Some(H264OrH265Sps::H265(s)) => s,
+                            _ => {
+                                return Err(VideoError::DecoderInit(
+                                    "H265 SPS not found".to_string(),
+                                ))
+                            }
+                        };
+                        let parser = h265_parser.as_mut().expect("h265 parser initialized");
+                        let dpb = h265_dpb.as_mut().expect("h265 dpb initialized");
+                        let packet = h265_packet.as_ref().expect("h265 packet created");
+
+                        // Next picture from the common parser. Parameter-set
+                        // results roll the NAL cursor back to the first slice,
+                        // so keep parsing until a Slice arrives.
+                        let mut info = None;
+                        loop {
+                            match parser.parse(packet) {
+                                Ok(vk_video_parser::ParseResult::Slice { slices, .. }) => {
+                                    let vk_video_parser::SliceHeader::H265(i) = slices[0]
+                                        .slice_header
+                                        .clone()
+                                        .expect("slice header parsed")
+                                    else {
+                                        return Err(VideoError::DecoderInit(
+                                            "expected H265 slice header".to_string(),
+                                        ));
+                                    };
+                                    info = Some(i);
+                                    break;
+                                }
+                                Ok(vk_video_parser::ParseResult::ParameterSet { .. }) => continue,
+                                Ok(vk_video_parser::ParseResult::Nothing)
+                                | Ok(vk_video_parser::ParseResult::EndOfStream) => break,
+                                Err(e) => {
+                                    return Err(VideoError::DecoderInit(format!(
+                                        "H265 parse error: {e}"
+                                    )))
+                                }
+                            }
+                        }
+                        let info = info.ok_or_else(|| {
+                            VideoError::DecoderInit("H265 parser exhausted before AU".to_string())
+                        })?;
+
+                        if super::vacc_debug() && info.curr_pic_order_cnt_val != au.pic_order_cnt[0]
+                        {
+                            eprintln!(
+                                "[H265] au#{idx}: POC mismatch common={} au={}; using common parser value",
+                                info.curr_pic_order_cnt_val, au.pic_order_cnt[0]
+                            );
+                        }
+
+                        let slot = dpb.picture_start(sps, &info, info.is_reference);
+                        self.sync_h265_dpb_entries(dpb);
+                        let lists = dpb.build_ref_lists();
+                        let rps_slots = dpb.match_rps_slots();
+
+                        if super::vacc_debug() {
+                            eprintln!(
+                                "[H265] au#{} poc={} slot={} l0={:?} l1={:?} rps=({:?},{:?},{:?}) strps_bits={} slice_type={} nr0={} nr1={} mod0={:?} mod1={:?}",
+                                idx,
+                                info.curr_pic_order_cnt_val,
+                                slot,
+                                lists.l0.iter().map(|r| r.slot).collect::<Vec<_>>(),
+                                lists.l1.iter().map(|r| r.slot).collect::<Vec<_>>(),
+                                rps_slots.0, rps_slots.1, rps_slots.2,
+                                info.num_bits_for_strps_in_slice,
+                                info.slice_type,
+                                info.num_ref_idx_l0_active_minus1,
+                                info.num_ref_idx_l1_active_minus1,
+                                info.ref_pic_lists_modification_l0.iter().map(|m| (m.flag, m.ref_idx)).collect::<Vec<_>>(),
+                                info.ref_pic_lists_modification_l1.iter().map(|m| (m.flag, m.ref_idx)).collect::<Vec<_>>()
+                            );
+                        }
+
+                        let in_use = dpb
+                            .in_use_refs()
+                            .into_iter()
+                            .map(|(s, p)| (s as u32, p))
+                            .collect();
+                        Some(H265FrameCtx { info, lists, rps_slots, in_use, slot: slot as u32 })
+                    } else {
+                        None
+                    };
+
+                    let output_slot = if let Some(ctx) = &h265_ctx {
+                        ctx.slot
+                    } else if au.is_idr || au.no_output_of_prior_pics_flag {
                         self.dpb_manager.invalidate_all();
                         0
                     } else {
-                        // For H.264: ref_pocs from access_unit is empty (no RPS concept).
+                        // H.264: ref_pocs from access_unit is empty (no RPS concept).
                         // Use all valid DPB entries as protected references since any could be needed.
-                        // For H.265: collect ref_pocs from ALL remaining access units to protect
-                        // frames needed by future frames, not just the current one.
-                        let protected_pocs: Vec<i32> =
-                            if self.decoded_codec == AccessUnitCodec::H264 {
-                                self.dpb_manager
-                                    .entries
-                                    .iter()
-                                    .filter(|e| e.is_valid)
-                                    .flat_map(|e| {
-                                        if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
-                                            vec![e.pic_order_cnt[0]]
-                                        } else {
-                                            vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
-                                        }
-                                    })
-                                    .collect()
-                            } else {
-                                // Collect all POCs referenced by current and future access units
-                                let mut all_ref_pocs = std::collections::HashSet::new();
-                                for future_item in items[idx..].iter() {
-                                    if let ExtractedItem::AccessUnit(future_au) = future_item {
-                                        for poc in &future_au.ref_pocs {
-                                            all_ref_pocs.insert(*poc);
-                                        }
-                                    }
+                        let protected_pocs: Vec<i32> = self.dpb_manager
+                            .entries
+                            .iter()
+                            .filter(|e| e.is_valid)
+                            .flat_map(|e| {
+                                if e.pic_order_cnt[0] == e.pic_order_cnt[1] {
+                                    vec![e.pic_order_cnt[0]]
+                                } else {
+                                    vec![e.pic_order_cnt[0], e.pic_order_cnt[1]]
                                 }
-                                all_ref_pocs.into_iter().collect()
-                            };
+                            })
+                            .collect();
                         self.dpb_manager
                             .find_or_recycle_slot(&protected_pocs)
                             .unwrap_or(0)
@@ -599,15 +823,19 @@ impl VideoDecoder {
                     let output_view = self.dpb_views[output_slot as usize];
                     let output_img = self.dpb_images[output_slot as usize];
 
-                    let actual_bs_size = aligned_size;
-
                     self.record_decode_command(
                         au,
                         output_view,
                         output_img,
-                        actual_bs_size,
+                        aligned_size,
                         output_slot,
                         is_first_frame,
+                        h265_ctx.as_ref().map(|c| &c.info),
+                        h265_ctx.as_ref().map(|c| &c.lists),
+                        h265_ctx.as_ref().map(|c| &c.rps_slots),
+                        h265_ctx.as_ref().map(|c| c.in_use.as_slice()),
+                        query_pool,
+                        (access_unit_count - 1) as u32,
                     )?;
 
                     if is_first_frame {
@@ -620,11 +848,18 @@ impl VideoDecoder {
                     self.dpb_manager
                         .set_slot_last_access(output_slot, LastAccessType::DecodeWrite);
 
-                    // Always update DPB entry for reference frames, regardless of MMCO flag.
-                    // When adaptive_ref_pic_marking_mode_flag is true, MMCO commands are present
-                    // in the bitstream and take precedence over sliding window.
-                    // When false, sliding window handles cleanup.
-                    if au.is_reference {
+                    if h265_ctx.is_some() {
+                        // H.265: the common DPB owns reference marking, eviction
+                        // and NoRaslOutput handling (H.264 MMCO / sliding-window
+                        // concepts do not apply).
+                        let dpb = h265_dpb.as_mut().expect("h265 dpb initialized");
+                        dpb.commit_current(output_slot as usize);
+                        self.sync_h265_dpb_entries(dpb);
+                    } else if au.is_reference {
+                        // Always update DPB entry for reference frames, regardless of MMCO flag.
+                        // When adaptive_ref_pic_marking_mode_flag is true, MMCO commands are present
+                        // in the bitstream and take precedence over sliding window.
+                        // When false, sliding window handles cleanup.
                         self.dpb_manager.entries[output_slot as usize] = DpbEntry {
                             frame_num: au.frame_num,
                             pic_order_cnt: au.pic_order_cnt,
@@ -658,6 +893,7 @@ impl VideoDecoder {
                         self.command_pool,
                         self.fence,
                         output_img,
+                        self.output_format,
                         self.dpb_base_layer(output_slot as u32),
                         self.coded_extent.width,
                         self.coded_extent.height,
@@ -670,7 +906,12 @@ impl VideoDecoder {
                         .set_slot_last_access(output_slot, LastAccessType::TransferRead);
 
                     frames.push(DecodedFrame {
-                        poc: au.pic_order_cnt[0],
+                        // H.265: POC from the common parser (source of truth for
+                        // presentation reordering); H.264: access-unit POC.
+                        poc: h265_ctx
+                            .as_ref()
+                            .map(|c| c.info.curr_pic_order_cnt_val)
+                            .unwrap_or(au.pic_order_cnt[0]),
                         frame_num: au.frame_num,
                         is_idr: au.is_idr,
                         is_reference: au.is_reference,
@@ -686,10 +927,14 @@ impl VideoDecoder {
             }
         }
 
+        if !query_pool.is_null() {
+            unsafe {
+                self.vulkan.device.destroy_query_pool(query_pool, None);
+            }
+        }
+
         Ok(frames)
     }
-
-    /// Handle in-band parameter set updates.
     /// Updates cached parameter sets and calls vkUpdateVideoSessionParametersKHR.
     fn handle_inband_parameter_set(&mut self, ps: &InBandParameterSet) -> VideoResult<()> {
         if ps.vps.is_none() && ps.sps.is_none() && ps.pps.is_none() {
@@ -1149,6 +1394,7 @@ impl VideoDecoder {
                         self.command_pool,
                         self.fence,
                         img,
+                        self.output_format,
                         self.dpb_base_layer(slot as u32),
                         ref_width,
                         ref_height,
@@ -2060,6 +2306,7 @@ impl VideoDecoder {
                         self.command_pool,
                         self.fence,
                         self.dpb_images[slot],
+                        self.output_format,
                         self.dpb_base_layer(slot as u32),
                         frame_coded_extent.width,
                         frame_coded_extent.height,
@@ -2322,6 +2569,7 @@ impl VideoDecoder {
                 self.command_pool,
                 self.fence,
                 output_img,
+                self.output_format,
                 self.dpb_base_layer(output_slot as u32),
                 frame_coded_extent.width,
                 frame_coded_extent.height,
@@ -2376,6 +2624,24 @@ impl VideoDecoder {
         &self.bitstream_data
     }
 
+    /// Mirror the common H.265 DPB slot state into the Vulkan DpbManager
+    /// bookkeeping (surface liveness + POC). The common DPB is authoritative;
+    /// this only keeps the local entry table consistent for barriers/debug.
+    fn sync_h265_dpb_entries(&mut self, dpb: &vk_video_parser::h265_dpb::H265Dpb) {
+        for (i, s) in dpb.slots().iter().enumerate() {
+            if i >= self.dpb_manager.entries.len() {
+                break;
+            }
+            let e = &mut self.dpb_manager.entries[i];
+            e.is_valid = s.valid;
+            if s.valid {
+                e.pic_order_cnt = [s.poc, s.poc];
+                e.image_view = self.dpb_views[i];
+                e.image = self.dpb_images[i];
+            }
+        }
+    }
+
     fn record_decode_command(
         &mut self,
         au: &AccessUnit,
@@ -2384,6 +2650,12 @@ impl VideoDecoder {
         bs_size: u64,
         output_slot: u32,
         is_first_frame: bool,
+        h265_info: Option<&vk_video_parser::h265::SliceHeaderInfo>,
+        h265_lists: Option<&vk_video_parser::h265_dpb::H265RefLists>,
+        h265_rps_slots: Option<&(Vec<i32>, Vec<i32>, Vec<i32>)>,
+        h265_in_use: Option<&[(u32, i32)]>,
+        query_pool: vk::QueryPool,
+        frame_index: u32,
     ) -> VideoResult<()> {
         let cmd_buffer = allocate_command_buffer(&self.vulkan.device, self.command_pool)?;
 
@@ -2406,6 +2678,8 @@ impl VideoDecoder {
                     bs_size,
                     output_slot,
                     is_first_frame,
+                    query_pool,
+                    frame_index,
                 )?;
             }
             VideoCodec::DecodeH265 => {
@@ -2417,6 +2691,12 @@ impl VideoDecoder {
                     bs_size,
                     output_slot,
                     is_first_frame,
+                    h265_info.expect("H265 slice info for H265 decode"),
+                    h265_lists.expect("H265 ref lists for H265 decode"),
+                    h265_rps_slots.expect("H265 RPS slots for H265 decode"),
+                    h265_in_use.expect("H265 in-use refs for H265 decode"),
+                    query_pool,
+                    frame_index,
                 )?;
             }
             _ => {}
@@ -2464,6 +2744,8 @@ impl VideoDecoder {
         bs_size: u64,
         _output_slot: u32,
         is_first_frame: bool,
+        query_pool: vk::QueryPool,
+        frame_index: u32,
     ) -> VideoResult<()> {
         let sps = match &self.parsed.sps {
             Some(H264OrH265Sps::H264(s)) => s,
@@ -2598,7 +2880,7 @@ impl VideoDecoder {
                         s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                         p_next: std::ptr::null(),
                         coded_offset: vk::Offset2D::default(),
-                        coded_extent: self.coded_extent,
+                        coded_extent: self.picture_coded_extent,
                         base_array_layer: 0,
                         image_view_binding: entry.image_view,
                         _marker: Default::default(),
@@ -2618,26 +2900,13 @@ impl VideoDecoder {
                 s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                 p_next: std::ptr::null(),
                 coded_offset: vk::Offset2D::default(),
-                coded_extent: self.coded_extent,
+                coded_extent: self.picture_coded_extent,
                 base_array_layer: 0,
                 image_view_binding: output_view,
                 _marker: Default::default(),
             },
         });
 
-        if std::env::var("VACC_DBG_SPS").is_ok() {
-            let bs_head: Vec<String> = au.data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-            let refs: Vec<String> = dpb_ref_pictures
-                .iter()
-                .map(|r| format!("s{}/f{}/p{}", r.slot_index, r.frame_num, r.pic_order_cnt[0]))
-                .collect();
-            eprintln!(
-                "[RUST-AU] slice_type={} frame_num={} is_idr={} is_ref={} poc=[{} {}] nref={} refs=[{}] au_head=[{}]",
-                au.slice_type, au.frame_num, au.is_idr, au.is_reference,
-                au.pic_order_cnt[0], au.pic_order_cnt[1],
-                dpb_ref_pictures.len(), refs.join(","), bs_head.join(" ")
-            );
-        }
         h264_decoder.record_decode_command(
             cmd_buffer,
             self.session.handle(),
@@ -2654,7 +2923,7 @@ impl VideoDecoder {
             // Pre-decode layout of the output slot's subresource (UNDEFINED on
             // first use, DPB when the slot is recycled).
             self.dpb_manager.get_slot_layout(_output_slot),
-            self.coded_extent,
+            self.picture_coded_extent,
             setup_picture,
             &dpb_ref_pictures,
             &au.slice_offsets,
@@ -2676,6 +2945,8 @@ impl VideoDecoder {
             self.parsed.max_dpb_slots,
             &self.dpb_images,
             &self.dpb_views,
+            query_pool,
+            frame_index,
         )?;
 
         Ok(())
@@ -2690,6 +2961,12 @@ impl VideoDecoder {
         bs_size: u64,
         output_slot: u32,
         _is_first_frame: bool,
+        h265_info: &vk_video_parser::h265::SliceHeaderInfo,
+        h265_lists: &vk_video_parser::h265_dpb::H265RefLists,
+        h265_rps_slots: &(Vec<i32>, Vec<i32>, Vec<i32>),
+        h265_in_use: &[(u32, i32)],
+        query_pool: vk::QueryPool,
+        frame_index: u32,
     ) -> VideoResult<()> {
         let vps = &self.parsed.vps;
         let sps = match &self.parsed.sps {
@@ -2709,42 +2986,72 @@ impl VideoDecoder {
         h265_decoder.set_sps(sps.clone());
         h265_decoder.set_pps(pps.clone());
 
-        let dpb_ref_pictures: Vec<super::h265::H265RefPictureInfo> = self
-            .dpb_manager
-            .get_references()
+        // Reference slots = every in-use RPS reference (common DPB already
+        // matched them against live slots). This is a superset of the final
+        // RefPicList0/1 union: unused keep-alive RPS entries still appear in
+        // StdVideoDecodeH265PictureInfo::RefPicSet*, and each of those
+        // slot_index values MUST be resolvable in pReferenceSlots (video.xml).
+        let mut slot_poc: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
+        for &(slot, poc) in h265_in_use {
+            if slot != output_slot {
+                slot_poc.entry(slot as usize).or_insert(poc);
+            }
+        }
+        // Safety net: any final-list reference not covered by the RPS set
+        // (should be impossible — L0/L1 derive from used RPS entries).
+        for list in [&h265_lists.l0, &h265_lists.l1] {
+            for r in list {
+                if r.slot >= 0 && (r.slot as u32) != output_slot {
+                    slot_poc.entry(r.slot as usize).or_insert(r.poc);
+                }
+            }
+        }
+
+        let lt_slots: std::collections::HashSet<usize> = h265_rps_slots
+            .2
             .iter()
-            .filter(|e| e.slot_index != output_slot)
-            .map(|entry| super::h265::H265RefPictureInfo {
-                slot_index: entry.slot_index,
-                pic_order_cnt: entry.pic_order_cnt[0],
+            .filter(|&&s| s >= 0)
+            .map(|&s| s as usize)
+            .collect();
+
+        let mut dpb_ref_pictures: Vec<super::h265::H265RefPictureInfo> = slot_poc
+            .iter()
+            .map(|(&slot, &poc)| super::h265::H265RefPictureInfo {
+                slot_index: slot as u32,
+                pic_order_cnt: poc,
                 picture_resource: vk::VideoPictureResourceInfoKHR {
                     s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                     p_next: std::ptr::null(),
                     coded_offset: vk::Offset2D::default(),
-                    coded_extent: self.coded_extent,
+                    coded_extent: self.picture_coded_extent,
                     base_array_layer: 0,
-                    image_view_binding: entry.image_view,
+                    image_view_binding: self.dpb_views[slot],
                     _marker: Default::default(),
                 },
-                image: entry.image,
-                current_layout: entry.current_layout,
+                image: self.dpb_images[slot],
+                current_layout: self.dpb_manager.get_slot_layout(slot as u32),
+                image_base_layer: self.dpb_base_layer(slot as u32),
+                used_for_long_term_reference: lt_slots.contains(&slot),
             })
             .collect();
+        dpb_ref_pictures.sort_by_key(|r| r.slot_index);
 
         let setup_picture = super::h265::H265RefPictureInfo {
             slot_index: output_slot,
-            pic_order_cnt: au.pic_order_cnt[0],
+            pic_order_cnt: h265_info.curr_pic_order_cnt_val,
             picture_resource: vk::VideoPictureResourceInfoKHR {
                 s_type: vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR,
                 p_next: std::ptr::null(),
                 coded_offset: vk::Offset2D::default(),
-                coded_extent: self.coded_extent,
+                coded_extent: self.picture_coded_extent,
                 base_array_layer: 0,
                 image_view_binding: output_view,
                 _marker: Default::default(),
             },
             image: output_img,
             current_layout: vk::ImageLayout::UNDEFINED,
+            image_base_layer: self.dpb_base_layer(output_slot),
+            used_for_long_term_reference: false,
         };
 
         h265_decoder.record_decode_command(
@@ -2759,18 +3066,15 @@ impl VideoDecoder {
             bs_size,
             output_view,
             output_img,
-            self.coded_extent,
+            self.output_format,
+            self.picture_coded_extent,
             Some(setup_picture),
             &dpb_ref_pictures,
             &au.slice_offsets,
-            Some(au.pic_order_cnt[0]),
-            Some(au.is_idr || au.slice_type == 2),
-            Some(au.is_reference),
-            Some(au.is_idr),
-            au.num_bits_for_st_ref_pic_set_in_slice,
-            au.num_delta_pocs_of_ref_rps_idx,
-            &au.ref_pocs,
-            &self.dpb_manager.get_references(),
+            h265_info,
+            (&h265_rps_slots.0, &h265_rps_slots.1, &h265_rps_slots.2),
+            query_pool,
+            frame_index,
         )?;
 
         Ok(())
@@ -2893,13 +3197,19 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
         if start >= data.len() {
             continue;
         }
-        let nal_type = data[start] & 0x1F;
+        let b = data[start];
+        // H.265 NAL unit type is (byte >> 1) & 0x3F. H.264 SPS/PPS always have
+        // nal_ref_idc=3 (spec: shall be 3 for SPS/PPS), so the header bytes are
+        // exactly 0x67 (SPS) / 0x68 (PPS). The marker sets do not overlap, so
+        // either can be recognized unambiguously. NOTE: only trust a match at a
+        // genuine stream-head parameter set; the first real NAL wins.
+        let h265_type = (b >> 1) & 0x3F;
         // H.265 VPS/SPS/PPS are unambiguous
-        if nal_type == 32 || nal_type == 33 || nal_type == 34 {
+        if h265_type == 32 || h265_type == 33 || h265_type == 34 {
             return AccessUnitCodec::H265;
         }
-        // H.264 SPS/PPS are unambiguous
-        if nal_type == 7 || nal_type == 8 {
+        // H.264 SPS/PPS are unambiguous (0x67/0x68)
+        if b == 0x67 || b == 0x68 {
             return AccessUnitCodec::H264;
         }
     }
@@ -2998,7 +3308,7 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
     let raw_profile_idc = sps.as_ref().map(|s| s.profile_idc as u32).unwrap_or(100);
     let profile_idc = match raw_profile_idc {
         41 => 66,
-        66 | 77 | 88 | 100 | 110 | 122 | 244 => raw_profile_idc,
+        44 | 66 | 77 | 83 | 86 | 88 | 100 | 110 | 122 | 144 | 244 => raw_profile_idc,
         _ => 100,
     };
     let max_dpb_slots = 16;
@@ -3060,12 +3370,13 @@ fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
     let mut sps: Option<vk_video_core::picture::H265Sps> = None;
     let mut pps: Option<vk_video_core::picture::H265Pps> = None;
 
+    let parse_res = parser.parse(&packet);
     if let Ok(ParseResult::ParameterSet {
         vps: v,
         sps: s,
         pps: p,
         ..
-    }) = parser.parse(&packet)
+    }) = parse_res
     {
         if let Some(v) = v {
             vps = v.downcast_ref::<vk_video_core::picture::H265Vps>().cloned();
@@ -3131,7 +3442,11 @@ fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
         })
         .unwrap_or((coded_width, coded_height, 0, 0));
 
-    let profile_idc = 1;
+    let profile_idc = sps
+        .as_ref()
+        .map(|s| s.profile_idc as u32)
+        .filter(|&p| p != 0)
+        .unwrap_or(1);
     let max_dpb_slots = sps
         .as_ref()
         .map(|s| (s.max_num_ref_frames as u32).max(1))
@@ -3178,6 +3493,291 @@ fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
     })
 }
 
+/// Query the decode-output VkFormats supported by the device for an H.265
+/// profile/chroma/bit-depth combination (FFmpeg-style format probing via
+/// vkGetPhysicalDeviceVideoFormatPropertiesKHR).
+fn query_h265_decode_formats(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    std_profile_idc: u32,
+    chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+    luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+) -> VideoResult<Vec<vk::Format>> {
+    let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
+        s_type: vk::StructureType::VIDEO_DECODE_H265_PROFILE_INFO_KHR,
+        p_next: std::ptr::null(),
+        std_profile_idc,
+        _marker: Default::default(),
+    };
+    let profile_info = vk::VideoProfileInfoKHR {
+        s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+        p_next: &h265_profile as *const _ as *const _,
+        video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+        chroma_subsampling,
+        luma_bit_depth,
+        chroma_bit_depth,
+        _marker: Default::default(),
+    };
+    query_decode_formats_raw(entry, instance, physical_device, &profile_info)
+}
+
+/// H.264 variant of the decode-format query (progressive picture layout).
+fn query_h264_decode_formats(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    std_profile_idc: u32,
+    chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+    luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+) -> VideoResult<Vec<vk::Format>> {
+    let h264_profile = vk::VideoDecodeH264ProfileInfoKHR {
+        s_type: vk::StructureType::VIDEO_DECODE_H264_PROFILE_INFO_KHR,
+        p_next: std::ptr::null(),
+        std_profile_idc,
+        picture_layout: vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE,
+        _marker: Default::default(),
+    };
+    let profile_info = vk::VideoProfileInfoKHR {
+        s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+        p_next: &h264_profile as *const _ as *const _,
+        video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+        chroma_subsampling,
+        luma_bit_depth,
+        chroma_bit_depth,
+        _marker: Default::default(),
+    };
+    query_decode_formats_raw(entry, instance, physical_device, &profile_info)
+}
+
+fn query_decode_formats_raw(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    profile_info: &vk::VideoProfileInfoKHR<'_>,
+) -> VideoResult<Vec<vk::Format>> {
+    // The format-properties query takes the profile inside a
+    // VkVideoProfileListInfoKHR chain.
+    let profile_list = vk::VideoProfileListInfoKHR {
+        s_type: vk::StructureType::VIDEO_PROFILE_LIST_INFO_KHR,
+        p_next: std::ptr::null(),
+        profile_count: 1,
+        p_profiles: profile_info as *const _,
+        _marker: Default::default(),
+    };
+    let fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_VIDEO_FORMAT_INFO_KHR,
+        p_next: (&profile_list as *const vk::VideoProfileListInfoKHR) as *const std::ffi::c_void,
+        image_usage: vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
+        _marker: Default::default(),
+    };
+
+    let fn_ptr = unsafe {
+        entry.get_instance_proc_addr(
+            instance.handle(),
+            c"vkGetPhysicalDeviceVideoFormatPropertiesKHR".as_ptr(),
+        )
+    }
+    .ok_or_else(|| {
+        VideoError::CapabilityNotAvailable(
+            "vkGetPhysicalDeviceVideoFormatPropertiesKHR not found".to_string(),
+        )
+    })?;
+
+    type FnType = unsafe extern "system" fn(
+        vk::PhysicalDevice,
+        *const vk::PhysicalDeviceVideoFormatInfoKHR<'_>,
+        *mut u32,
+        *mut vk::VideoFormatPropertiesKHR<'_>,
+    ) -> vk::Result;
+    let f: FnType = unsafe { std::mem::transmute(fn_ptr) };
+
+    let mut count = 0u32;
+    let r = unsafe { f(physical_device, &fmt_info, &mut count, std::ptr::null_mut()) };
+    if r != vk::Result::SUCCESS {
+        return Err(VideoError::CapabilityNotAvailable(format!(
+            "vkGetPhysicalDeviceVideoFormatPropertiesKHR failed: {:?}",
+            r
+        )));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut props = vec![
+        vk::VideoFormatPropertiesKHR {
+            s_type: vk::StructureType::VIDEO_FORMAT_PROPERTIES_KHR,
+            p_next: std::ptr::null_mut(),
+            format: vk::Format::UNDEFINED,
+            component_mapping: vk::ComponentMapping::default(),
+            image_create_flags: vk::ImageCreateFlags::empty(),
+            image_type: vk::ImageType::TYPE_2D,
+            image_tiling: vk::ImageTiling::OPTIMAL,
+            image_usage_flags: vk::ImageUsageFlags::empty(),
+            _marker: Default::default(),
+        };
+        count as usize
+    ];
+    let r = unsafe { f(physical_device, &fmt_info, &mut count, props.as_mut_ptr()) };
+    if r != vk::Result::SUCCESS {
+        return Err(VideoError::CapabilityNotAvailable(format!(
+            "vkGetPhysicalDeviceVideoFormatPropertiesKHR (fetch) failed: {:?}",
+            r
+        )));
+    }
+    Ok(props.iter().map(|p| p.format).collect())
+}
+
+/// Choose the H.264 decode output picture format: query the device's supported
+/// formats for the stream's profile/chroma/bit-depth and prefer the most compact
+/// layout for that class.
+fn select_h264_picture_format(
+    vulkan: &VulkanDevice,
+    parsed: &ParsedInfo,
+) -> VideoResult<vk::Format> {
+    let supported = query_h264_decode_formats(
+        &vulkan.entry,
+        &vulkan.instance,
+        vulkan.physical_device,
+        parsed.profile_idc,
+        parsed.chroma_subsampling,
+        parsed.luma_bit_depth,
+        parsed.chroma_bit_depth,
+    )?;
+
+    let high_depth = parsed
+        .luma_bit_depth
+        .intersects(vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12);
+    let preferred: &[vk::Format] = match parsed.chroma_subsampling {
+        vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME if !high_depth => &[vk::Format::R8_UNORM],
+        vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME => &[vk::Format::R16_UNORM],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_420 if !high_depth => {
+            &[vk::Format::G8_B8R8_2PLANE_420_UNORM]
+        }
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_420 => &[
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            vk::Format::G16_B16R16_2PLANE_420_UNORM,
+            vk::Format::G16_B16_R16_3PLANE_420_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_422 if !high_depth => {
+            &[vk::Format::G8_B8R8_2PLANE_422_UNORM]
+        }
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_422 => &[
+            vk::Format::G16_B16R16_2PLANE_422_UNORM,
+            vk::Format::G16_B16_R16_3PLANE_422_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 if !high_depth => &[
+            vk::Format::G8_B8_R8_3PLANE_444_UNORM,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::G8_B8R8_2PLANE_444_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 => &[
+            vk::Format::G16_B16_R16_3PLANE_444_UNORM,
+            vk::Format::R16G16B16A16_UNORM,
+        ],
+        _ => &[vk::Format::G8_B8R8_2PLANE_420_UNORM],
+    };
+
+    let chosen = preferred
+        .iter()
+        .find(|f| supported.contains(f))
+        .copied()
+        .or_else(|| supported.first().copied())
+        .ok_or_else(|| {
+            VideoError::DecoderInit(format!(
+                "No H.264 decode output format supported for profile_idc={} chroma={:?} depth={:?}",
+                parsed.profile_idc, parsed.chroma_subsampling, parsed.luma_bit_depth
+            ))
+        })?;
+    if !preferred.contains(&chosen) {
+        eprintln!(
+            "[Decoder] NOTE: using non-preferred H264 decode format 0x{:x}",
+            chosen.as_raw()
+        );
+    }
+    eprintln!(
+        "[Decoder] H264 decode output format: {:?} (device supports {})",
+        chosen,
+        supported.len()
+    );
+    Ok(chosen)
+}
+
+/// Choose the H.265 decode output picture format: query the device's supported
+/// formats for the stream's profile/chroma/bit-depth and prefer the most compact
+/// layout for that class (e.g. P010 over P016 on NVIDIA).
+fn select_h265_picture_format(
+    vulkan: &VulkanDevice,
+    parsed: &ParsedInfo,
+) -> VideoResult<vk::Format> {
+    let supported = query_h265_decode_formats(
+        &vulkan.entry,
+        &vulkan.instance,
+        vulkan.physical_device,
+        parsed.profile_idc,
+        parsed.chroma_subsampling,
+        parsed.luma_bit_depth,
+        parsed.chroma_bit_depth,
+    )?;
+
+    let high_depth = parsed
+        .luma_bit_depth
+        .intersects(vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12);
+    let preferred: &[vk::Format] = match parsed.chroma_subsampling {
+        vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME if !high_depth => &[vk::Format::R8_UNORM],
+        vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME => &[vk::Format::R16_UNORM],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_420 if !high_depth => {
+            &[vk::Format::G8_B8R8_2PLANE_420_UNORM]
+        }
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_420 => &[
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            vk::Format::G16_B16R16_2PLANE_420_UNORM,
+            vk::Format::G16_B16_R16_3PLANE_420_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_422 if !high_depth => {
+            &[vk::Format::G8_B8R8_2PLANE_422_UNORM]
+        }
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_422 => &[
+            vk::Format::G16_B16R16_2PLANE_422_UNORM,
+            vk::Format::G16_B16_R16_3PLANE_422_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 if !high_depth => &[
+            vk::Format::G8_B8_R8_3PLANE_444_UNORM,
+            vk::Format::R8G8B8A8_UNORM,
+        ],
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 => &[
+            vk::Format::G16_B16_R16_3PLANE_444_UNORM,
+            vk::Format::R16G16B16A16_UNORM,
+        ],
+        _ => &[vk::Format::G8_B8R8_2PLANE_420_UNORM],
+    };
+
+    let chosen = preferred
+        .iter()
+        .find(|f| supported.contains(f))
+        .copied()
+        .or_else(|| supported.first().copied())
+        .ok_or_else(|| {
+            VideoError::DecoderInit(format!(
+                "No H.265 decode output format supported for profile_idc={} chroma={:?} depth={:?}",
+                parsed.profile_idc, parsed.chroma_subsampling, parsed.luma_bit_depth
+            ))
+        })?;
+    if !preferred.contains(&chosen) {
+        eprintln!(
+            "[Decoder] NOTE: using non-preferred H265 decode format 0x{:x}",
+            chosen.as_raw()
+        );
+    }
+    eprintln!(
+        "[Decoder] H265 decode output format: {:?} (device supports {})",
+        chosen,
+        supported.len()
+    );
+    Ok(chosen)
+}
+
 fn create_video_session(
     vulkan: &VulkanDevice,
     codec: VideoCodec,
@@ -3185,18 +3785,12 @@ fn create_video_session(
     coded_extent: vk::Extent2D,
     max_dpb_slots: u32,
     av1_sps: Option<&vk_video_core::picture::Av1Sps>,
+    output_format: vk::Format,
 ) -> VideoResult<(
     VideoSession,
     Option<VideoSessionParameters>,
     Vec<vk::DeviceMemory>,
 )> {
-    // The session picture/reference format must match the DPB image bit depth
-    // (DPB images use `decode_output_format(parsed.luma_bit_depth)`). Hardcoding
-    // G8B8R8 here made 10/12-bit VP9 sessions 8-bit while the DPB images were
-    // G10X6/G12X4 -> the driver decoded into mismatched surfaces (garbage even
-    // on key frames).
-    let output_format = decode_output_format(parsed.luma_bit_depth);
-
     let (codec_profile_info, std_header_name) = match codec {
         VideoCodec::DecodeH264 => (
             CodecProfileInfo::H264 {

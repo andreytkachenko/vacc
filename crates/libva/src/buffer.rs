@@ -36,6 +36,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Convenience function to return buffer's `VABufferID`.
+    pub fn id(&self) -> bindings::VABufferID {
+        self.id
+    }
+
     /// Creates a new buffer by wrapping a `vaCreateBuffer` call. This is just a helper for
     /// [`Context::create_buffer`].
     pub(crate) fn new(context: Rc<Context>, mut type_: BufferType) -> Result<Self, VaError> {
@@ -82,6 +87,10 @@ impl Buffer {
                     wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
                     std::mem::size_of_val(wrapper.inner_mut()),
                 ),
+                PictureParameter::HEVCExtension(ref mut wrapper) => (
+                    wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of_val(wrapper.inner_mut()),
+                ),
                 PictureParameter::AV1(ref mut wrapper) => (
                     wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
                     std::mem::size_of_val(wrapper.inner_mut()),
@@ -110,6 +119,10 @@ impl Buffer {
                     std::mem::size_of_val(wrapper.inner_mut()),
                 ),
                 SliceParameter::HEVCRext(ref mut wrapper) => (
+                    wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of_val(wrapper.inner_mut()),
+                ),
+                SliceParameter::HEVCExtension(ref mut wrapper) => (
                     wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
                     std::mem::size_of_val(wrapper.inner_mut()),
                 ),
@@ -370,6 +383,8 @@ pub enum PictureParameter {
     HEVCRext(hevc::PictureParameterBufferHEVCRext),
     /// Wrapper over VAPictureParameterBufferHEVCScc
     HEVCScc(hevc::PictureParameterBufferHEVCScc),
+    /// Wrapper over VAPictureParameterBufferHEVCExtension (REXT/SCC full-size buffer)
+    HEVCExtension(hevc::PictureParameterBufferHEVCExtension),
     /// Wrapper over VADecPictureParameterBufferAV1
     AV1(av1::PictureParameterBufferAV1),
 }
@@ -388,6 +403,8 @@ pub enum SliceParameter {
     HEVC(hevc::SliceParameterBufferHEVC),
     /// Wrapper over VASliceParameterBufferHEVCRext
     HEVCRext(hevc::SliceParameterBufferHEVCRext),
+    /// Wrapper over VASliceParameterBufferHEVCExtension (REXT/SCC full-size buffer)
+    HEVCExtension(hevc::SliceParameterBufferHEVCExtension),
     /// Wrapper over VASliceParameterBufferAV1
     AV1(av1::SliceParameterBufferAV1),
 }
@@ -551,3 +568,4 @@ pub enum EncMiscParameter {
     /// Wrapper over `VAEncMiscParameterBuffer` with `VAEncMiscParameterQuantization`.
     Quantization(EncMiscParameterQuantization),
 }
+

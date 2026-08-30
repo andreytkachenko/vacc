@@ -157,6 +157,8 @@ pub enum cudaVideoSurfaceFormat {
     cudaVideoSurfaceFormat_YUV444 = 2,
     /// 16 bit Planar YUV [Y plane followed by U and V planes]
     cudaVideoSurfaceFormat_YUV444_16Bit = 3,
+    /// Monochrome [Y plane only]
+    cudaVideoSurfaceFormat_YUV400 = 4,
 }
 
 /// Deinterlacing mode enums

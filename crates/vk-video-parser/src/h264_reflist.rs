@@ -195,17 +195,6 @@ pub fn build_ref_pic_lists(
             .collect();
     }
 
-    if std::env::var("VACC_DBG_H264").is_ok() {
-        let inp: Vec<String> = slots
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("s{}/f{}/w{}/m{}/p{}", i, s.frame_num, s.frame_num_wrap, s.marking, s.poc))
-            .collect();
-        let i0: Vec<String> = l0.iter().map(|r| format!("s{}/w{}/f{}/p{}", r.slot, slots[r.slot].frame_num_wrap, r.frame_num, r.poc)).collect();
-        let i1: Vec<String> = l1.iter().map(|r| format!("s{}/w{}/f{}/p{}", r.slot, slots[r.slot].frame_num_wrap, r.frame_num, r.poc)).collect();
-        eprintln!("REFLIST-DBG slice={} l0={} l1={} currpoc={} in=[{}] init_l0=[{}] init_l1=[{}]", slice_type, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, curr_poc, inp.join(","), i0.join(","), i1.join(","));
-    }
-
     // 8.2.3.2: reordering on a fixed-size array of exactly `active` entries
     // (see module docs / ff_h264_build_ref_list): truncate excess, pad the
     // shortfall with empty refs, reorder, then backfill empties with the
@@ -222,14 +211,6 @@ pub fn build_ref_pic_lists(
     apply_reordering(&mut l1, slots, mod_l1, curr_frame_num, max_frame_num, active1);
     backfill_default(&mut l0, default0);
     backfill_default(&mut l1, default1);
-
-    if std::env::var("VACC_DBG_H264").is_ok() {
-        let f0: Vec<String> = l0.iter().map(|r| format!("s{}/f{}/p{}", r.slot, r.frame_num, r.poc)).collect();
-        let f1: Vec<String> = l1.iter().map(|r| format!("s{}/f{}/p{}", r.slot, r.frame_num, r.poc)).collect();
-        let m0: Vec<String> = mod_l0.iter().map(|m| format!("op{}/idx{}/d{}", m.op, m.index, m.difference)).collect();
-        let m1: Vec<String> = mod_l1.iter().map(|m| format!("op{}/idx{}/d{}", m.op, m.index, m.difference)).collect();
-        eprintln!("REFLIST-FINAL slice={} currfn={} currpoc={} l0=[{}] l1=[{}] mod0=[{}] mod1=[{}]", slice_type, curr_frame_num, curr_poc, f0.join(","), f1.join(","), m0.join(","), m1.join(","));
-    }
 
     RefPicLists { l0, l1 }
 }

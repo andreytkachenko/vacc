@@ -1,6 +1,7 @@
 //! H.264/AVC Vulkan video decoder.
 
 use ash::vk;
+use ash::vk::Handle;
 use ash::vk::native::*;
 
 use super::dpb::LastAccessType;
@@ -175,7 +176,16 @@ impl H264Decoder {
         _max_dpb_slots: u32,
         _dpb_images: &[vk::Image],
         dpb_views: &[vk::ImageView],
+        query_pool: vk::QueryPool,
+        frame_index: u32,
     ) -> VideoResult<()> {
+        // Reset video result-status queries before use (VUID-08366), matching
+        // the H.265 path and C++ reference (right after BeginCommandBuffer,
+        // before CmdBeginVideoCodingKHR).
+        if query_pool != vk::QueryPool::null() {
+            self.cmd_reset_query_pool(cmd_buffer, query_pool, frame_index, 1);
+        }
+
         // Use provided values or compute from internal state
         let (
             effective_frame_num,
@@ -278,7 +288,11 @@ impl H264Decoder {
             all_begin_slots = vec![vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                 p_next: &setup_dpb_slot_info as *const _ as *const _,
-                slot_index: setup_slot_idx as i32,
+                // Declare the setup/output slot without an associated DPB slot
+                // (slot_index=-1): at execution time it is INACTIVE and a
+                // non-negative index would violate VUID-07239. The decode's
+                // pSetupReferenceSlot (real index) associates it.
+                slot_index: -1,
                 p_picture_resource: &setup_pr as *const _,
                 _marker: Default::default(),
             }];
@@ -361,9 +375,11 @@ impl H264Decoder {
                 Some(vk::VideoReferenceSlotInfoKHR {
                     s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                     p_next: setup_dpb_slot_info as *const _ as *const _,
-                    slot_index: dpb_setup_picture
-                        .as_ref()
-                        .map_or(0, |s| s.slot_index as i32),
+                    // Begin declares the setup/output slot with slot_index=-1
+                    // (bound without an associated DPB slot); the decode's
+                    // pSetupReferenceSlot carries the real index and
+                    // associates it. Reference slots above keep their indices.
+                    slot_index: -1,
                     p_picture_resource: dpb_setup_picture
                         .as_ref()
                         .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
@@ -531,17 +547,6 @@ impl H264Decoder {
 
         let pic_ptr = &pic_info as *const StdVideoDecodeH264PictureInfo;
 
-        if std::env::var("VACC_DBG_SPS").is_ok() {
-            eprintln!(
-                "[RUST-DECODE] bs_range={} slice_count={} slice_offsets={:?} ref_slots={} setup_slot={}",
-                bitstream_range,
-                slice_offsets.len(),
-                slice_offsets,
-                dpb_ref_pictures.len(),
-                dpb_setup_picture.as_ref().map(|s| s.slot_index).unwrap_or(u32::MAX)
-            );
-        }
-
         let h264_decode_info = vk::VideoDecodeH264PictureInfoKHR {
             s_type: vk::StructureType::VIDEO_DECODE_H264_PICTURE_INFO_KHR,
             p_next: std::ptr::null(),
@@ -612,9 +617,27 @@ impl H264Decoder {
             })
             .collect();
 
+        // The session is created with VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR,
+        // so the spec requires this structure in the pNext chain; the NVIDIA driver
+        // dereferences it unconditionally and crashes without it. Match the H.265
+        // path: one RESULT_STATUS_ONLY query per frame (first_query=frame_index).
+        let inline_queries = if query_pool != vk::QueryPool::null() {
+            super::inline_queries::VideoInlineQueryInfoKHR {
+                s_type: super::inline_queries::VIDEO_INLINE_QUERY_INFO_KHR,
+                p_next: &h264_decode_info as *const _ as *const _,
+                query_pool: query_pool.as_raw(),
+                first_query: frame_index,
+                query_count: 1,
+            }
+        } else {
+            super::inline_queries::empty_inline_queries(
+                &h264_decode_info as *const _ as *const _,
+            )
+        };
+
         let decode_info = vk::VideoDecodeInfoKHR {
             s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-            p_next: &h264_decode_info as *const _ as *const _,
+            p_next: &inline_queries as *const _ as *const _,
             flags: vk::VideoDecodeFlagsKHR::empty(),
             src_buffer: bitstream_buffer,
             src_buffer_offset: bitstream_offset,
@@ -669,20 +692,12 @@ impl H264Decoder {
             .flags
             .set_is_reference(if is_reference { 1 } else { 0 });
         pic_info.flags.set_field_pic_flag(0);
-        // TEST HYPOTHESIS 1: C++ oracle never sets IdrPicFlag for H.264 (stays 0).
+        // H.264 carries idr_pic_flag in the slice header (driver reads it from
+        // the bitstream); StdVideoDecodeH264PictureInfo has no IDR field to set.
         let _ = is_idr;
         pic_info.flags.set_IdrPicFlag(0);
         pic_info.flags.set_bottom_field_flag(0);
         pic_info.flags.set_complementary_field_pair(0);
-
-        if std::env::var("VACC_DBG_SPS").is_ok() {
-            eprintln!(
-                "[RUST-PIC] frame_num={} poc=[{} {}] is_intra={} is_ref={} idr={} sps_id={} pps_id={}",
-                pic_info.frame_num, pic_order_cnt[0], pic_order_cnt[1],
-                is_intra, is_reference, is_idr,
-                pic_info.seq_parameter_set_id, pic_info.pic_parameter_set_id
-            );
-        }
 
         pic_info
     }
@@ -767,6 +782,33 @@ impl H264Decoder {
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, &end_coding_info);
             }
+        }
+    }
+
+    // Helper: dispatch vkCmdResetQueryPool (video result-status queries must
+    // be reset after pool creation and between uses, VUID-08366)
+    fn cmd_reset_query_pool(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        first_query: u32,
+        query_count: u32,
+    ) {
+        let fn_ptr = unsafe {
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                c"vkCmdResetQueryPool".as_ptr(),
+            )
+        };
+        if let Some(ptr) = fn_ptr {
+            unsafe {
+                type FnType =
+                    unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
+                let f: FnType = std::mem::transmute(ptr);
+                f(cmd_buffer, query_pool, first_query, query_count);
+            }
+        } else {
+            eprintln!("[H264] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
         }
     }
 

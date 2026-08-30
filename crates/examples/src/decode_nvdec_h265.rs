@@ -115,10 +115,12 @@ fn main() {
 
     let frames_decoded = frames.len();
 
+    let bps = if info.luma_bit_depth.bit_depth() >= 10 { 2 } else { 1 };
+
     for (frame_idx, frame) in frames.iter().enumerate() {
         if let Some(ref pixel_data) = frame.pixel_data {
             let output_path = format!("{}_disp{}.yuv", out_prefix, frame_idx);
-            let nv12 = frame_to_nv12(pixel_data);
+            let nv12 = frame_to_nv12(pixel_data, bps);
             match std::fs::write(&output_path, &nv12) {
                 Ok(()) => {
                     if frames_decoded <= 8 || frame_idx % 50 == 0 {
@@ -151,32 +153,62 @@ fn main() {
     println!("\n=== Done ===");
 }
 
-/// Convert I420 [`PixelData`] to NV12 bytes (Y plane + interleaved UV).
-fn frame_to_nv12(pixel_data: &vk_video_core::frame::PixelData) -> Vec<u8> {
+/// Convert planar [`PixelData`] to raw bytes (`bps` = bytes per sample):
+/// - monochrome (u.width == 0): Y only
+/// - 4:4:4 (u.width == y.width): planar Y + U + V, full resolution
+/// - 4:2:0: Y plane + interleaved UV (NV12 layout)
+fn frame_to_nv12(pixel_data: &vk_video_core::frame::PixelData, bps: usize) -> Vec<u8> {
     let y = &pixel_data.y;
-    let u = &pixel_data.u;
-    let v = pixel_data.v.as_ref().expect("I420 must have a V plane");
 
-    let y_size = y.width as usize * y.height as usize;
+    // Monochrome: Y plane only.
+    if pixel_data.u.width == 0 {
+        let mut out = Vec::with_capacity(y.width as usize * y.height as usize * bps);
+        for row in 0..y.height as usize {
+            let src = unsafe { y.data.add(row * y.pitch as usize) };
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src, y.width as usize * bps)
+            });
+        }
+        return out;
+    }
+
+    let u = &pixel_data.u;
+    let v = pixel_data.v.as_ref().expect("planar format must have a V plane");
+
+    // 4:4:4: dump each plane at full resolution (matches FFmpeg gbrp raw layout).
+    if u.width as usize == y.width as usize {
+        let mut out = Vec::with_capacity(y.width as usize * y.height as usize * bps * 3);
+        for plane in [&y, &u, v] {
+            for row in 0..plane.height as usize {
+                let src = unsafe { plane.data.add(row * plane.pitch as usize) };
+                out.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(src, plane.width as usize * bps)
+                });
+            }
+        }
+        return out;
+    }
+
     let uv_w = u.width as usize;
     let uv_h = u.height as usize;
     let uv_size = uv_w * uv_h;
 
-    let mut out = Vec::with_capacity(y_size + uv_size * 2);
+    let y_bytes = y.width as usize * y.height as usize * bps;
+    let mut out = Vec::with_capacity(y_bytes + uv_size * 2 * bps);
 
     // Y plane (row by row, honoring pitch).
     for row in 0..y.height as usize {
         let src = unsafe { y.data.add(row * y.pitch as usize) };
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, y.width as usize) });
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, y.width as usize * bps) });
     }
 
-    // Interleaved UV: U[0] V[0] U[1] V[1] ...
+    // Interleaved UV: U[0] V[0] U[1] V[1] ... (each sample `bps` bytes).
     for row in 0..uv_h {
         let u_row = unsafe { u.data.add(row * u.pitch as usize) };
         let v_row = unsafe { v.data.add(row * v.pitch as usize) };
         for col in 0..uv_w {
-            out.push(unsafe { *u_row.add(col) });
-            out.push(unsafe { *v_row.add(col) });
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(u_row.add(col * bps), bps) });
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(v_row.add(col * bps), bps) });
         }
     }
 

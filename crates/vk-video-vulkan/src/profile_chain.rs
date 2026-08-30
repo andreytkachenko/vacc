@@ -64,7 +64,7 @@ pub fn create_output_image_with_profile(
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
         .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect_mask_for_format(format),
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
@@ -155,7 +155,7 @@ pub fn create_dpb_image_array_with_profile(
     let mut views = Vec::with_capacity(num_slots as usize);
     for slot in 0..num_slots {
         let subresource_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect_mask_for_format(format),
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: slot,
@@ -351,6 +351,19 @@ pub fn create_bitstream_buffer_with_profile(
         vk::BufferCreateFlags::VIDEO_PROFILE_INDEPENDENT_KHR,
         queue_family_index,
     )
+}
+
+/// Aspect mask for an image view over a decode output format.
+///
+/// Multi-planar DPB views/barriers MUST use the COLOR aspect: combining
+/// multiple multi-planar bits (PLANE_0|PLANE_1) in one view is forbidden by
+/// VUID-VkImageViewCreateInfo-subresourceRange-07818, and the NVIDIA driver
+/// traps at submit time on such views. FFmpeg and the C++ reference both use
+/// COLOR-aspect views for 2-plane/3-plane formats (the earlier "COLOR breaks
+/// P010" note was a misattribution — the real bugs were the missing
+/// query-pool reset and the Begin-slot state).
+pub fn aspect_mask_for_format(_format: vk::Format) -> vk::ImageAspectFlags {
+    vk::ImageAspectFlags::COLOR
 }
 
 fn find_memory_type(

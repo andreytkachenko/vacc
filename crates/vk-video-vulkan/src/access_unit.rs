@@ -591,18 +591,6 @@ pub fn extract_all_access_units(
                     let is_aud = t == 9;
                     let is_slice_type = matches!(t, 1..=5);
                     let is_params_type = t == 7 || t == 8;
-                    if std::env::var("VACC_DBG_AU").is_ok() {
-                        eprintln!(
-                            "[AU-DBG] off={} hdr={:#04x} type={} slice={} idr={} params={} aud={}",
-                            start,
-                            nal_data[0],
-                            t,
-                            is_slice_type,
-                            is_idr,
-                            is_params_type,
-                            is_aud
-                        );
-                    }
                     (t as usize, is_idr, is_aud, is_slice_type, is_params_type)
                 } else {
                     (0, false, false, false, false)

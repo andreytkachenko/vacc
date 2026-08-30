@@ -436,9 +436,16 @@ impl Vp9Decoder {
                 _marker: Default::default(),
             };
 
+            // The session is created with VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR,
+            // so the spec requires this structure in the pNext chain; the NVIDIA driver
+            // dereferences it unconditionally and crashes without it.
+            let inline_queries = super::inline_queries::empty_inline_queries(
+                vp9_decode_info as *const _ as *const std::ffi::c_void,
+            );
+
             let decode_info = vk::VideoDecodeInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-                p_next: vp9_decode_info as *const _ as *const _,
+                p_next: &inline_queries as *const _ as *const _,
                 flags: vk::VideoDecodeFlagsKHR::empty(),
                 src_buffer: bitstream_buffer,
                 src_buffer_offset: bitstream_offset,

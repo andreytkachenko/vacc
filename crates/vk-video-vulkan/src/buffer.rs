@@ -89,12 +89,33 @@ impl BitstreamBuffer {
 
         let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
+        // The GPU reads this buffer during decode, so it must be device-local.
+        // We also map it for host writes, so prefer HOST_VISIBLE|HOST_COHERENT.
+        // On NVIDIA the host-only (non-device-local) type makes the decode queue
+        // unable to read the bitstream -> driver traps in vkCmdDecodeVideoKHR.
         let mem_type_index = Self::find_memory_type(
             memory_properties,
             mem_requirements.memory_type_bits,
-            ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+            ash::vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | ash::vk::MemoryPropertyFlags::HOST_VISIBLE
                 | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
         )
+        .or_else(|| {
+            Self::find_memory_type(
+                memory_properties,
+                mem_requirements.memory_type_bits,
+                ash::vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | ash::vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )
+        })
+        .or_else(|| {
+            Self::find_memory_type(
+                memory_properties,
+                mem_requirements.memory_type_bits,
+                ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        })
         .ok_or_else(|| VideoError::MemoryAllocation("No suitable memory type found".to_string()))?;
 
         let alloc_info = ash::vk::MemoryAllocateInfo {

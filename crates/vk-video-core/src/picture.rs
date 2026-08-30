@@ -753,6 +753,10 @@ pub struct H265Pps {
     pub log2_sao_offset_scale_chroma_vui: u8,
 
     // ACT fields
+    /// pps_slice_act_qp_offsets_present_flag (from pps_scc_extension when
+    /// residual_adaptive_colour_transform_enabled; gates slice-level
+    /// slice_act_*_qp_offset in the slice header).
+    pub pps_slice_act_qp_offsets_present_flag: bool,
     pub pps_act_y_qp_offset_plus5: i8,
     pub pps_act_cb_qp_offset_plus5: i8,
     pub pps_act_cr_qp_offset_plus3: i8,
@@ -831,6 +835,7 @@ impl H265Pps {
             log2_sao_offset_scale_luma_vui: 0,
             log2_sao_offset_scale_chroma_vui: 0,
 
+            pps_slice_act_qp_offsets_present_flag: false,
             pps_act_y_qp_offset_plus5: 0,
             pps_act_cb_qp_offset_plus5: 0,
             pps_act_cr_qp_offset_plus3: 0,

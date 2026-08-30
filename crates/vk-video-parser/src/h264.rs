@@ -225,10 +225,14 @@ impl H264Parser {
 
         let seq_parameter_set_id = r.read_ue()?;
 
-        // Profile-dependent fields
+        // Profile-dependent fields. Per H.264 spec 7.3.2.1.1 (FFmpeg h264_ps.c),
+        // chroma_format_idc et al. are present for:
+        //   100 High, 110 High10, 122 High422, 244 High444 Predictive,
+        //   44 Cavlc444, 83/86 Scalable (SVC), 118 Stereo High (MVC),
+        //   128 Multiview High (MVC), 138 MVCD, 144 old High444.
         let is_high_profile = matches!(
             profile_idc,
-            100 | 110 | 122 | 244 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+            100 | 110 | 122 | 244 | 44 | 144 | 83 | 86 | 118 | 128 | 138
         );
 
         let (

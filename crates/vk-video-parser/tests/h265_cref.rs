@@ -17,28 +17,6 @@
 
 static GT: &str = include_str!("h265_cref_50.txt");
 
-/// PPS fields that the NVIDIA cuvid parser mis-parses for this stream, and are
-/// therefore excluded from the field-for-field comparison below.
-///
-/// Root cause (verified by bit-level decode of the PPS NAL `44 01 c1 72 b4 62 40`):
-/// HEVC spec 7.3.6 signals `pps_loop_filter_across_tiles_enabled_flag` when
-/// `tiles_enabled_flag || entropy_coding_sync_enabled_flag`. This stream has
-/// `tiles=0, entropy_sync=1`, so the flag IS present (bit 26 = 1). NVIDIA's
-/// parser only reads it when `tiles_enabled_flag=1`; with `tiles=0` it skips the
-/// bit and infers the flag as 1. That one skipped bit shifts every subsequent
-/// PPS field by one, so the GT's values for the three fields below are actually
-/// the *next* bit in the stream, not the real values:
-///
-///   field                spec-correct (Rust)   NVIDIA GT (shifted)
-///   lf_across_slices         0                      1
-///   lists_mod                1                      0
-///   log2_par_merge_minus2    3                      0
-///
-/// The Rust parser is spec-correct here. None of these three fields affect the
-/// decoded pixels (single-slice stream, empty ref-list-mod loop, merge-level is
-/// parse-only), which is why the C reference is still pixel-perfect. We keep the
-/// Rust parser spec-correct and skip these fields rather than replicate the bug.
-const NVIDIA_PPS_BUG_FIELDS: &[&str] = &["lf_across_slices", "lists_mod", "log2_par_merge_minus2"];
 
 use std::collections::HashMap;
 use vk_video_core::codec::VideoCodec;
@@ -176,19 +154,6 @@ fn parse_gt() -> Vec<GtPic> {
 }
 
 /// SPS/PPS values the parser must reproduce (GT key -> parser value).
-/// Spec-correct values for the fields in `NVIDIA_PPS_BUG_FIELDS`, obtained by
-/// a manual bit-level decode of the stream's PPS NAL (see that constant's
-/// comment). Used to assert the Rust parser stays spec-correct even though the
-/// GT's values for these fields are a 1-bit-shifted artifact.
-fn spec_correct_value(key: &str) -> i64 {
-    match key {
-        "lf_across_slices" => 0,
-        "lists_mod" => 1,
-        "log2_par_merge_minus2" => 3,
-        _ => unreachable!("spec_correct_value called for non-buggy field {key}"),
-    }
-}
-
 fn parser_params(sps: &H265Sps, pps: &H265Pps) -> HashMap<String, i64> {
     let mut m = HashMap::new();
     let b = |v: bool| v as i64;
@@ -508,18 +473,6 @@ fn h265_parser_matches_cuvid_ground_truth() {
                 );
                 let expected = parser_params(sps, pps);
                 for (k, v) in &expected {
-                    if NVIDIA_PPS_BUG_FIELDS.contains(&k.as_str()) {
-                        // GT value is a 1-bit-shifted artifact of NVIDIA's PPS
-                        // parser bug (see NVIDIA_PPS_BUG_FIELDS). Assert the
-                        // spec-correct value instead, so a regression in the
-                        // Rust parser still fails the test.
-                        assert_eq!(
-                            *v,
-                            spec_correct_value(k),
-                            "pic {pic}: param {k} deviated from spec-correct value (parser={v})"
-                        );
-                        continue;
-                    }
                     let gtv = g
                         .params
                         .get(k)
