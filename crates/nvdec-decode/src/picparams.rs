@@ -218,13 +218,14 @@ pub fn build_cuvid_picparams(
 /// HEVC DPB / reference-picture-set state for a single picture, computed by the
 /// decoder and fed into [`build_cuvid_hevc_picparams`].
 ///
-/// The arrays mirror the `CUVIDHEVCPICPARAMS` RefPicSets fields:
-/// - `pic_order_cnt_val[i]` / `is_long_term[i]` / `ref_pic_idx[i]` are indexed
-///   by **surface index** `i` (0–15). `ref_pic_idx` holds the surface index of
-///   the reference picture stored at that surface, or −1 if the surface is not
-///   used as a reference.
-/// - `st_curr_before` / `st_curr_after` / `lt_curr` hold **surface indices** of
-///   reference pictures in RPS order (8 entries each).
+/// The arrays mirror the `CUVIDHEVCPICPARAMS` RefPicSets fields (verified
+/// against a cuvid parser ground-truth dump):
+/// - `pic_order_cnt_val[i]` / `is_long_term[i]` / `ref_pic_idx[i]` describe
+///   the 16-entry DPB array: entry `i` holds the picture at surface
+///   `ref_pic_idx[i]` (−1 = empty slot) with POC `pic_order_cnt_val[i]`.
+/// - `st_curr_before` / `st_curr_after` / `lt_curr` hold **DPB entry indices**
+///   of the current picture's USED references in RPS order (8 entries each);
+///   the decoder resolves them to surfaces via `ref_pic_idx`.
 #[derive(Debug, Clone, Copy)]
 pub struct H265DpbState {
     pub pic_order_cnt_val: [i32; 16],

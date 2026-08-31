@@ -598,7 +598,8 @@ unsafe extern "C" fn decode_callback(
 
     let cuda_log = std::env::var("NVDEC_CUDA_LOG").is_ok();
     let t0 = std::time::Instant::now();
-    let res = unsafe { (funcs.decode_picture)(decoder, pPicParams) };
+    let procparams = nvdec_decode::ffi::default_procparams();
+    let res = unsafe { (funcs.decode_picture)(decoder, pPicParams, &procparams) };
     if cuda_log {
         eprintln!(
             "[CUDA-LOG] decode#{} CurrPicIdx={} nBitLen={} decode_picture={}us",

@@ -83,8 +83,14 @@ impl NvdecDpbManager {
     }
 
     /// Set max_dpb_size from SPS max_num_ref_frames.
+    ///
+    /// Clamped to >= 1: with max_num_ref_frames == 0 (all-intra streams where
+    /// the encoder still marks IDRs as references), the sliding-window loop in
+    /// [`add_frame`](Self::add_frame) (`while count_references() >= max_dpb_size`)
+    /// would never terminate. A 1-slot DPB is observationally equivalent for
+    /// such streams (I-slices carry no references).
     pub fn set_max_dpb_size(&mut self, max_dpb_size: usize) {
-        self.max_dpb_size = max_dpb_size;
+        self.max_dpb_size = std::cmp::max(1, max_dpb_size);
     }
 
     /// Add a frame to the DPB and return its NVDEC picture index.
@@ -550,6 +556,8 @@ mod tests {
             dec_ref_pic_marking: mmcos,
             no_output_of_prior_pics_flag: false,
             long_term_reference_flag: false,
+            sp_for_switch_flag: false,
+            slice_qs_delta: 0,
             header_bit_size: 0,
             luma_log2_weight_denom: 0,
             chroma_log2_weight_denom: 0,
@@ -889,6 +897,23 @@ mod tests {
         let mut dpb = NvdecDpbManager::new(4);
         dpb.set_max_dpb_size(8);
         assert_eq!(dpb.max_dpb_size, 8);
+    }
+
+    #[test]
+    fn test_max_dpb_size_zero_clamped_to_one() {
+        // max_num_ref_frames=0 (all-intra streams, e.g. x264 ref=1:bframes=0:keyint=1)
+        // must clamp to 1; otherwise the sliding-window loop in add_frame
+        // (`while count_references() >= max_dpb_size`) spins forever.
+        let mut dpb = NvdecDpbManager::new(16);
+        dpb.set_max_dpb_size(0);
+        assert_eq!(dpb.max_dpb_size, 1);
+
+        // Adding two reference frames must terminate and evict the oldest.
+        dpb.add_frame(0, 0, true);
+        dpb.add_frame(1, 2, true);
+        assert_eq!(dpb.count_references(), 1);
+        assert!(!dpb.entries[0].is_valid);
+        assert!(dpb.entries[1].is_valid);
     }
 
     #[test]

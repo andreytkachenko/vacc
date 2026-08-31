@@ -23,8 +23,10 @@ pub mod h264_dpb;
 pub mod h264_poc;
 pub mod h264_reflist;
 pub mod h265;
+pub mod h265_dpb;
 pub mod nal;
 pub mod vp9;
+pub mod vp9_dpb;
 
 pub use bitreader::BitReader;
 

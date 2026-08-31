@@ -36,6 +36,16 @@ pub struct Vp9Parser {
     loop_filter_mode_deltas: [i8; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
     /// Reference frame sizes indexed by DPB slot (for inter frame size inheritance).
     reference_frame_sz: [(u32, u32); VP9_NUM_REF_FRAMES as usize],
+    /// Color config carried across frames. Per the VP9 spec the color config is
+    /// only signaled on key frames and intra-only frames (profiles 1-3); a
+    /// decoder must keep using the last-seen values until refreshed. Without
+    /// this carry-over, inter frames of a 10/12-bit stream would report the
+    /// default 8-bit color config to the backends.
+    last_color_config: Vp9ColorConfig,
+    /// Interpolation filter carried across frames. It is only signaled on
+    /// non-intra inter frames; key/intra-only frames keep the last value
+    /// (FFmpeg `h->filtermode` and the cuvid parser both carry it over).
+    last_interpolation_filter: Vp9InterpolationFilter,
 }
 
 impl Default for Vp9Parser {
@@ -55,6 +65,8 @@ impl Vp9Parser {
             loop_filter_ref_deltas: [0; VP9_MAX_REF_FRAMES as usize],
             loop_filter_mode_deltas: [0; VP9_LOOP_FILTER_ADJUSTMENTS as usize],
             reference_frame_sz: [(0, 0); VP9_NUM_REF_FRAMES as usize],
+            last_color_config: Vp9ColorConfig::default(),
+            last_interpolation_filter: Vp9InterpolationFilter::default(),
         }
     }
 
@@ -141,6 +153,8 @@ impl Vp9Parser {
                 &mut frame_data.color_config,
                 frame_data.picture_info.profile,
             )?;
+            // Key frames refresh the carried color config.
+            self.last_color_config = frame_data.color_config;
 
             self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
 
@@ -187,6 +201,8 @@ impl Vp9Parser {
                     frame_data.color_config.subsampling_y = 1;
                     frame_data.color_config.bit_depth = 8;
                 }
+                // Intra-only frames refresh the carried color config.
+                self.last_color_config = frame_data.color_config;
 
                 // refresh_frame_flags comes AFTER color_config but BEFORE frame_size
                 // for intra-only frames (per VP9 spec section 7.2.4.1 and cros-codecs)
@@ -194,6 +210,10 @@ impl Vp9Parser {
 
                 self.parse_frame_and_render_size(&mut r, &mut frame_data)?;
             } else {
+                // Inter frames carry over the last-seen color config (bit depth,
+                // subsampling, color space) — it is not re-signaled here.
+                frame_data.color_config = self.last_color_config;
+
                 // Inter frame: refresh_frame_flags comes before ref_frame_idx
                 frame_data.picture_info.refresh_frame_flags = r.read_bits(8)? as u8;
 
@@ -225,7 +245,14 @@ impl Vp9Parser {
                         _ => Vp9InterpolationFilter::EightTapSmooth,
                     };
                 }
+                self.last_interpolation_filter = frame_data.picture_info.interpolation_filter;
             }
+        }
+
+        // Key/intra-only frames do not signal the interpolation filter; carry
+        // over the last value (FFmpeg `h->filtermode` / cuvid convention).
+        if frame_data.frame_is_intra {
+            frame_data.picture_info.interpolation_filter = self.last_interpolation_filter;
         }
 
         // refresh_frame_context and frame_parallel_decoding_mode
@@ -256,6 +283,13 @@ impl Vp9Parser {
 
         // Parse quantization parameters
         self.parse_quantization_params(&mut r, &mut frame_data)?;
+
+        // Lossless frame: all quantization values zero (FFmpeg convention).
+        frame_data.picture_info.lossless =
+            frame_data.picture_info.base_q_idx == 0
+                && frame_data.picture_info.delta_q_y_dc == 0
+                && frame_data.picture_info.delta_q_uv_dc == 0
+                && frame_data.picture_info.delta_q_uv_ac == 0;
 
         // Parse segmentation parameters
         self.parse_segmentation_params(&mut r, &mut frame_data)?;
@@ -777,6 +811,8 @@ impl VideoParser for Vp9Parser {
         self.loop_filter_ref_deltas.fill(0);
         self.loop_filter_mode_deltas.fill(0);
         self.reference_frame_sz.fill((0, 0));
+        self.last_color_config = Vp9ColorConfig::default();
+        self.last_interpolation_filter = Vp9InterpolationFilter::default();
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {
@@ -994,5 +1030,254 @@ mod tests {
         assert_eq!(VP9_SEG_LVL_MAX, 4);
         assert_eq!(VP9_MAX_SEGMENTATION_TREE_PROBS, 7);
         assert_eq!(VP9_MAX_SEGMENTATION_PRED_PROB, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Synthetic bitstream helpers (MSB-first, matching BitReader).
+    // ------------------------------------------------------------------
+
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bitpos: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self { bytes: Vec::new(), bitpos: 0 }
+        }
+
+        fn bits(&mut self, val: u32, n: u32) {
+            for i in (0..n).rev() {
+                if (val >> i) & 1 != 0 {
+                    let byte_idx = (self.bitpos / 8) as usize;
+                    while self.bytes.len() <= byte_idx {
+                        self.bytes.push(0);
+                    }
+                    self.bytes[byte_idx] |= 1 << (7 - (self.bitpos % 8));
+                }
+                self.bitpos += 1;
+            }
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    /// Profile-0 keyframe, all optional fields absent/zero.
+    fn keyframe_bytes(w: u32, h: u32, fps: u16) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.bits(0b10, 2); // marker
+        bw.bits(0, 2); // profile 0
+        bw.bits(0, 1); // show_existing_frame
+        bw.bits(0, 1); // frame_type: key
+        bw.bits(1, 1); // show_frame
+        bw.bits(0, 1); // error_resilient_mode
+        bw.bits(0x498342, 24); // sync code
+        bw.bits(1, 3); // color_space: Bt601
+        bw.bits(0, 1); // color_range
+        bw.bits(w - 1, 16);
+        bw.bits(h - 1, 16);
+        bw.bits(0, 1); // display size flag
+        bw.bits(0, 1); // refresh_frame_context
+        bw.bits(0, 1); // frame_parallel_decoding_mode
+        bw.bits(0, 2); // frame_context_idx
+        bw.bits(0, 6); // filter_level
+        bw.bits(0, 3); // sharpness_level
+        bw.bits(0, 1); // lf_delta_enabled
+        bw.bits(46, 8); // y_ac_qi
+        bw.bits(0, 1); // y_dc_delta flag
+        bw.bits(0, 1); // uv_dc_delta flag
+        bw.bits(0, 1); // uv_ac_delta flag
+        bw.bits(0, 1); // segmentation_enabled
+        bw.bits(0, 1); // log2_tile_rows (cols: 0 bits for sb_cols <= 7)
+        bw.bits(fps as u32, 16); // first_partition_size
+        bw.finish()
+    }
+
+    /// Profile-0 inter frame. `size_flags` bit i = frame_size_coding_flag[i]
+    /// (bit 0 = last, 1 = golden, 2 = alt); the chain stops at the first set
+    /// flag. `explicit_w/h` are only emitted when no flag is set.
+    fn inter_bytes(
+        refidx: [u32; 3],
+        size_flags: u8,
+        explicit_w: u32,
+        explicit_h: u32,
+        refresh_mask: u32,
+        fps: u16,
+    ) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.bits(0b10, 2); // marker
+        bw.bits(0, 2); // profile 0
+        bw.bits(0, 1); // show_existing_frame
+        bw.bits(1, 1); // frame_type: inter
+        bw.bits(1, 1); // show_frame (intra_only not present when shown)
+        bw.bits(0, 1); // error_resilient_mode
+        bw.bits(0, 2); // reset_frame_context
+        bw.bits(refresh_mask, 8);
+        for i in 0..3 {
+            bw.bits(refidx[i], 3);
+            bw.bits(0, 1); // sign bias
+        }
+        let mut inherited = false;
+        for i in 0..3u32 {
+            let flag = (size_flags >> i) & 1;
+            bw.bits(flag as u32, 1);
+            if flag != 0 {
+                inherited = true;
+                break;
+            }
+        }
+        if !inherited {
+            bw.bits(explicit_w - 1, 16);
+            bw.bits(explicit_h - 1, 16);
+        }
+        bw.bits(0, 1); // display size flag
+        bw.bits(0, 1); // allow_high_precision_mv
+        bw.bits(1, 1); // switchable filter (skips mcomp_filter_type)
+        bw.bits(0, 1); // refresh_frame_context
+        bw.bits(0, 1); // frame_parallel_decoding_mode
+        bw.bits(0, 2); // frame_context_idx
+        bw.bits(0, 6); // filter_level
+        bw.bits(0, 3); // sharpness_level
+        bw.bits(0, 1); // lf_delta_enabled
+        bw.bits(46, 8); // y_ac_qi
+        bw.bits(0, 1); // y_dc_delta flag
+        bw.bits(0, 1); // uv_dc_delta flag
+        bw.bits(0, 1); // uv_ac_delta flag
+        bw.bits(0, 1); // segmentation_enabled
+        bw.bits(0, 1); // log2_tile_rows (cols: 0 bits for sb_cols <= 7)
+        bw.bits(fps as u32, 16);
+        bw.finish()
+    }
+
+    /// Inter frames inherit their size from a reference slot. Set up distinct
+    /// per-slot sizes, then probe each size-inheritance branch.
+    #[test]
+    fn test_inter_size_inheritance() {
+        // Case (a): flag0 set -> inherit from refidx[0]'s slot.
+        let mut parser = Vp9Parser::new();
+        parser.parse_frame(&keyframe_bytes(64, 64, 100)).unwrap(); // all slots 64x64
+        parser
+            .parse_frame(&inter_bytes([0, 0, 0], 0b000, 32, 32, 0b010, 100))
+            .unwrap(); // slot 1 := 32x32
+        let f = parser
+            .parse_frame(&inter_bytes([1, 2, 0], 0b001, 0, 0, 0b000, 100))
+            .unwrap();
+        assert_eq!((f.frame_width, f.frame_height), (32, 32));
+        assert_eq!(f.compressed_header_size, 100);
+        assert_eq!(f.compressed_header_offset, 10);
+
+        // Case (b): flag0=0, flag1 set -> inherit from refidx[1]'s slot, and
+        // the flag chain must stop after 2 bits.
+        let mut parser = Vp9Parser::new();
+        parser.parse_frame(&keyframe_bytes(64, 64, 100)).unwrap();
+        parser
+            .parse_frame(&inter_bytes([0, 0, 0], 0b000, 32, 32, 0b010, 100))
+            .unwrap(); // slot 1 := 32x32
+        parser
+            .parse_frame(&inter_bytes([0, 0, 0], 0b000, 16, 16, 0b100, 100))
+            .unwrap(); // slot 2 := 16x16
+        let f = parser
+            .parse_frame(&inter_bytes([0, 2, 1], 0b010, 0, 0, 0b000, 100))
+            .unwrap();
+        assert_eq!((f.frame_width, f.frame_height), (16, 16));
+        assert_eq!(f.compressed_header_size, 100);
+        assert_eq!(f.compressed_header_offset, 10);
+
+        // Case (c): flags 0,0,1 -> inherit from refidx[2]'s slot.
+        let mut parser = Vp9Parser::new();
+        parser.parse_frame(&keyframe_bytes(64, 64, 100)).unwrap();
+        parser
+            .parse_frame(&inter_bytes([0, 0, 0], 0b000, 32, 32, 0b010, 100))
+            .unwrap();
+        let f = parser
+            .parse_frame(&inter_bytes([2, 1, 0], 0b100, 0, 0, 0b000, 100))
+            .unwrap();
+        assert_eq!((f.frame_width, f.frame_height), (64, 64)); // slot 0 unchanged
+        assert_eq!(f.compressed_header_size, 100);
+        assert_eq!(f.compressed_header_offset, 10);
+
+        // Case (d): no flags -> explicit size from bitstream.
+        let mut parser = Vp9Parser::new();
+        parser.parse_frame(&keyframe_bytes(64, 64, 100)).unwrap();
+        let f = parser
+            .parse_frame(&inter_bytes([0, 1, 2], 0b000, 96, 96, 0b000, 100))
+            .unwrap();
+        assert_eq!((f.frame_width, f.frame_height), (96, 96));
+        assert_eq!(f.compressed_header_size, 100);
+        assert_eq!(f.compressed_header_offset, 14);
+    }
+
+    // ------------------------------------------------------------------
+    // Golden header values (first_partition_size + frame_header_length,
+    // 30 frames each) for the bundled samples in assets/samples/.
+    // Regression anchors: regenerated against the committed IVF assets.
+    // ------------------------------------------------------------------
+
+    const VP9_PROFILE0_FPS: [u16; 30] = [148, 17, 3, 23, 31, 11, 6, 6, 6, 12, 71, 109, 34, 7, 13, 9, 23, 9, 13, 6, 8, 28, 5, 5, 6, 10, 9, 5, 3, 7];
+    const VP9_PROFILE0_HDR: [u8; 30] = [18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+    const VP9_PROFILE1_444_FPS: [u16; 30] = [193, 18, 3, 24, 34, 21, 7, 17, 12, 24, 93, 114, 35, 9, 9, 3, 11, 9, 5, 5, 8, 27, 13, 6, 9, 7, 11, 5, 12, 3];
+    const VP9_PROFILE1_444_HDR: [u8; 30] = [18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+    const VP9_PROFILE1_FPS: [u16; 30] = [147, 24, 6, 23, 20, 20, 9, 6, 6, 5, 65, 105, 25, 9, 10, 5, 12, 6, 11, 7, 6, 31, 13, 7, 5, 5, 7, 5, 7, 7];
+    const VP9_PROFILE1_HDR: [u8; 30] = [18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+    const VP9_PROFILE2_FPS: [u16; 30] = [157, 27, 6, 26, 28, 26, 3, 9, 6, 6, 83, 117, 27, 11, 14, 10, 15, 5, 3, 11, 6, 30, 9, 6, 7, 9, 14, 3, 9, 8];
+    const VP9_PROFILE2_HDR: [u8; 30] = [18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+
+    #[test]
+    fn test_golden_headers_bundled_samples() {
+        use std::path::Path;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+
+        let cases: [(&str, Vp9Profile, u8, &[u16; 30], &[u8; 30]); 4] = [
+            ("vp9_profile0.ivf", Vp9Profile::Profile0, 8, &VP9_PROFILE0_FPS, &VP9_PROFILE0_HDR),
+            (
+                "vp9_profile1_444.ivf",
+                Vp9Profile::Profile1,
+                8,
+                &VP9_PROFILE1_444_FPS,
+                &VP9_PROFILE1_444_HDR,
+            ),
+            ("vp9_profile1.ivf", Vp9Profile::Profile2, 10, &VP9_PROFILE1_FPS, &VP9_PROFILE1_HDR),
+            ("vp9_profile2.ivf", Vp9Profile::Profile2, 12, &VP9_PROFILE2_FPS, &VP9_PROFILE2_HDR),
+        ];
+
+        for (name, profile, bit_depth, fps_golden, hdr_golden) in cases {
+            let path = root.join("assets/samples").join(name);
+            if !path.exists() {
+                eprintln!("skipping {name}: sample not found");
+                continue;
+            }
+            let data = std::fs::read(&path).unwrap();
+            assert_eq!(&data[0..4], b"DKIF", "{name}: not an IVF file");
+            let hsz = u16::from_le_bytes([data[6], data[7]]) as usize;
+
+            let mut off = hsz;
+            let mut parser = Vp9Parser::new();
+            let mut i = 0u32;
+            while off + 12 <= data.len() && i < 30 {
+                let size = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+                off += 12;
+                let pkt = &data[off..off + size];
+                off += size;
+
+                let f = parser.parse_frame(pkt).unwrap_or_else(|e| panic!("{name} f{i}: {e:?}"));
+                assert_eq!(f.compressed_header_size, fps_golden[i as usize] as u32, "{name} f{i}: first_partition_size");
+                assert_eq!(
+                    f.compressed_header_offset as u8,
+                    hdr_golden[i as usize],
+                    "{name} f{i}: frame_header_length"
+                );
+                if i == 0 {
+                    assert_eq!(f.picture_info.profile, profile, "{name}: profile");
+                    assert_eq!(f.color_config.bit_depth, bit_depth, "{name}: bit depth");
+                }
+                i += 1;
+            }
+            assert_eq!(i, 30, "{name}: expected 30 frames");
+        }
     }
 }

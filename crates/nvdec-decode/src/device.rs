@@ -142,8 +142,11 @@ pub struct NvdecFuncs {
     /// Destroy a decoder (`cuvidDestroyDecoder`).
     pub destroy_decoder: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     /// Decode a picture (`cuvidDecodePicture`).
-    pub decode_picture:
-        unsafe extern "C" fn(*mut std::ffi::c_void, *const crate::ffi::CUVIDPICPARAMS) -> u32,
+    pub decode_picture: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *const crate::ffi::CUVIDPICPARAMS,
+        *const crate::ffi::CUVIDPROCPARAMS,
+    ) -> u32,
     /// Map a video frame for reading (`cuvidMapVideoFrame64`).
     pub map_video_frame64: unsafe extern "C" fn(
         *mut std::ffi::c_void,
@@ -469,6 +472,7 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
             *lib.get::<unsafe extern "C" fn(
                 *mut std::ffi::c_void,
                 *const crate::ffi::CUVIDPICPARAMS,
+                *const crate::ffi::CUVIDPROCPARAMS,
             ) -> u32>(b"cuvidDecodePicture\0")
                 .map_err(|e| {
                     NvdecError::LibLoadError(format!("Failed to resolve cuvidDecodePicture: {}", e))

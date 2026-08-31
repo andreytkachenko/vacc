@@ -39,6 +39,14 @@ pub struct VideoSessionParams {
     pub chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
     pub luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
     pub chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    /// Whether to create the session with
+    /// VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR. H264/H265 use real
+    /// inline queries (result-status pool per frame). AV1/VP9 pass no
+    /// queries at all — with the flag set the NVIDIA driver
+    /// unconditionally dereferences the (empty) VkVideoInlineQueryInfoKHR
+    /// and segfaults in vkCmdDecodeVideoKHR, so those sessions are created
+    /// without the flag (matches FFmpeg: flags=0x20 only).
+    pub inline_queries: bool,
 }
 
 /// A Vulkan video session.
@@ -268,18 +276,26 @@ impl VideoSession {
             _marker: Default::default(),
         };
 
-        // Session create info.
+        // Session create flags.
         //
-        // VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR (VK_KHR_video_maintenance1)
-        // is REQUIRED here: without it the session must be initialized with the
-        // session parameters via vkUpdateVideoSessionKHR before the first
-        // vkCmdBeginVideoCodingKHR (VUID-vkCmdBeginVideoCodingKHR-...-09237).
-        // On this NVIDIA driver vkUpdateVideoSessionKHR is not resolvable via
-        // vkGetDeviceProcAddr, so the session would otherwise never receive the
-        // AV1 SPS and the driver silently skips every decode (all-zero DPB).
-        // The C++ reference (Vulkan-Video-Samples) sets this same flag whenever
-        // VK_KHR_video_maintenance1 is supported.
-        let session_flags = vk::VideoSessionCreateFlagsKHR::INLINE_QUERIES;
+        // VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR (0x4, VK_KHR_video_maintenance1),
+        // matching the C++ reference (VkVideoDecoder.cpp:282-289, set whenever
+        // maintenance1 is supported). Both known-working NVIDIA H265 decoders use a
+        // non-zero session flag (FFmpeg: INLINE_SESSION_PARAMETERS 0x20; C++ ref:
+        // INLINE_QUERIES 0x4); with empty() flags the NVIDIA driver traps in
+        // vkCmdDecodeVideoKHR on frame 0. ash 0.38 lacks the constant, so use raw bits.
+        //
+        // AV1/VP9 sessions must NOT set this flag: they pass no inline queries,
+        // and with the flag set the NVIDIA driver unconditionally dereferences
+        // the (empty) VkVideoInlineQueryInfoKHR and segfaults in
+        // vkCmdDecodeVideoKHR. (The "traps with empty flags" note above applies
+        // to H264/H265 sessions that DO carry a real query pool; for AV1/VP9
+        // empty flags + no query struct is the FFmpeg pattern and works.)
+        let session_flags = if params.inline_queries {
+            vk::VideoSessionCreateFlagsKHR::from_raw(0x4)
+        } else {
+            vk::VideoSessionCreateFlagsKHR::empty()
+        };
 
         let session_create_info = vk::VideoSessionCreateInfoKHR {
             s_type: vk::StructureType::VIDEO_SESSION_CREATE_INFO_KHR,
@@ -745,6 +761,11 @@ impl VideoSessionParameters {
                 h264_params.p_parameters_add_info = &h264_add_info as *const _ as *const _;
             }
             VideoCodec::DecodeH265 => {
+                // Match the C++ reference (Vulkan-Video-Samples) exactly: create the
+                // session parameters with the VPS only, then add SPS/PPS afterwards
+                // via vkUpdateVideoSessionParametersKHR (done below). Passing all
+                // three at create time leaves the driver's SPS/PPS tables empty on
+                // this NVIDIA driver -> NULL-deref SIGSEGV in vkCmdDecodeVideoKHR.
                 h265_add_info.s_type =
                     vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR;
                 h265_add_info.p_next = std::ptr::null();
@@ -752,14 +773,10 @@ impl VideoSessionParameters {
                 h265_add_info.p_std_vp_ss = std_vps_h265
                     .as_ref()
                     .map_or(std::ptr::null(), |v| v as *const _);
-                h265_add_info.std_sps_count = std_sps_h265.is_some() as u32;
-                h265_add_info.p_std_sp_ss = std_sps_h265
-                    .as_ref()
-                    .map_or(std::ptr::null(), |s| s as *const _);
-                h265_add_info.std_pps_count = std_pps_h265.is_some() as u32;
-                h265_add_info.p_std_pp_ss = std_pps_h265
-                    .as_ref()
-                    .map_or(std::ptr::null(), |p| p as *const _);
+                h265_add_info.std_sps_count = 0;
+                h265_add_info.p_std_sp_ss = std::ptr::null();
+                h265_add_info.std_pps_count = 0;
+                h265_add_info.p_std_pp_ss = std::ptr::null();
 
                 h265_params.s_type =
                     vk::StructureType::VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR;
@@ -908,6 +925,67 @@ impl VideoSessionParameters {
             }
             params
         };
+
+        // Add SPS/PPS via vkUpdateVideoSessionParametersKHR, matching the C++
+        // reference sequence (create with VPS only, then update SPS, then PPS).
+        // The NVIDIA driver does not process SPS/PPS supplied at create time.
+        if matches!(codec, VideoCodec::DecodeH265) {
+            let update_fn = unsafe {
+                instance.get_device_proc_addr(
+                    device.handle(),
+                    c"vkUpdateVideoSessionParametersKHR".as_ptr(),
+                )
+            };
+            match update_fn {
+                Some(f) => {
+                    type UpdFn = unsafe extern "system" fn(
+                        vk::Device,
+                        vk::VideoSessionParametersKHR,
+                        *const vk::VideoSessionParametersUpdateInfoKHR<'_>,
+                    ) -> vk::Result;
+                    let upd: UpdFn = unsafe { std::mem::transmute(f) };
+                    // Vulkan spec (VUID-...-07215): update_sequence_count must be the
+                    // object's current counter + 1 on every update (starts at 0).
+                    // A zero count made the NVIDIA driver drop the SPS/PPS updates.
+                    let mut seq = 0u32;
+                    if let Some(sps) = std_sps_h265 {
+                        // The driver may retain this pointer (it does not copy the
+                        // data), so leak it like the AV1 sequence header above.
+                        let sps_ptr = Box::leak(Box::new(sps)) as *const StdVideoH265SequenceParameterSet;
+                        let mut add_info =
+                            vk::VideoDecodeH265SessionParametersAddInfoKHR::default();
+                        add_info.std_sps_count = 1;
+                        add_info.p_std_sp_ss = sps_ptr;
+                        seq += 1;
+                        let update_info = vk::VideoSessionParametersUpdateInfoKHR {
+                            p_next: &add_info as *const _ as *const _,
+                            update_sequence_count: seq,
+                            ..Default::default()
+                        };
+                        let r = unsafe { upd(device.handle(), parameters, &update_info) };
+                        eprintln!("[SessionParams] vkUpdateVideoSessionParametersKHR (SPS) -> {:?}", r);
+                    }
+                    if let Some(pps) = std_pps_h265 {
+                        let pps_ptr = Box::leak(Box::new(pps)) as *const StdVideoH265PictureParameterSet;
+                        let mut add_info =
+                            vk::VideoDecodeH265SessionParametersAddInfoKHR::default();
+                        add_info.std_pps_count = 1;
+                        add_info.p_std_pp_ss = pps_ptr;
+                        seq += 1;
+                        let update_info = vk::VideoSessionParametersUpdateInfoKHR {
+                            p_next: &add_info as *const _ as *const _,
+                            update_sequence_count: seq,
+                            ..Default::default()
+                        };
+                        let r = unsafe { upd(device.handle(), parameters, &update_info) };
+                        eprintln!("[SessionParams] vkUpdateVideoSessionParametersKHR (PPS) -> {:?}", r);
+                    }
+                }
+                None => eprintln!(
+                    "[SessionParams] WARNING: vkUpdateVideoSessionParametersKHR not found; SPS/PPS will be missing from session parameters"
+                ),
+            }
+        }
 
         Ok(Self {
             parameters,

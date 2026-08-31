@@ -26,17 +26,23 @@ fn main() {
         }
     };
 
-    // VP9 profiles to test (Profile 0 is most common - 4:2:0 8-bit)
-    let profiles = [
-        (0u32, "Profile 0 (4:2:0, 8-bit)"),
-        (1u32, "Profile 1 (4:2:0, 10-bit)"),
-        (2u32, "Profile 2 (4:2:2, 8-bit)"),
-        (3u32, "Profile 3 (4:4:4, 12-bit)"),
+    // VP9 profiles to test. Per the VP9 bitstream spec:
+    //   Profile 0: 8-bit, 4:2:0 (implicit)
+    //   Profile 1: 8-bit, explicit subsampling
+    //   Profile 2: 10/12-bit, 4:2:0 (implicit)
+    //   Profile 3: 10/12-bit, explicit subsampling
+    let profiles: [(u32, vk::VideoComponentBitDepthFlagsKHR, &str); 6] = [
+        (0, vk::VideoComponentBitDepthFlagsKHR::TYPE_8, "Profile 0 (4:2:0, 8-bit)"),
+        (1, vk::VideoComponentBitDepthFlagsKHR::TYPE_8, "Profile 1 (explicit subsampling, 8-bit)"),
+        (2, vk::VideoComponentBitDepthFlagsKHR::TYPE_10, "Profile 2 (4:2:0, 10-bit)"),
+        (2, vk::VideoComponentBitDepthFlagsKHR::TYPE_12, "Profile 2 (4:2:0, 12-bit)"),
+        (3, vk::VideoComponentBitDepthFlagsKHR::TYPE_10, "Profile 3 (explicit subsampling, 10-bit)"),
+        (3, vk::VideoComponentBitDepthFlagsKHR::TYPE_12, "Profile 3 (explicit subsampling, 12-bit)"),
     ];
 
     let mut any_supported = false;
 
-    for (profile_idc, profile_name) in &profiles {
+    for (profile_idc, bit_depth, profile_name) in &profiles {
         println!("\nTesting VP9 {}:", profile_name);
         println!("----------------------------------------");
 
@@ -54,8 +60,8 @@ fn main() {
             p_next: &vp9_profile as *const _ as *const _,
             video_codec_operation: vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9),
             chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-            chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            luma_bit_depth: *bit_depth,
+            chroma_bit_depth: *bit_depth,
             _marker: Default::default(),
         };
 

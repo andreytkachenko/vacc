@@ -1255,21 +1255,38 @@ impl Av1Decoder {
                 std::ptr::null_mut()
             };
 
-        // Append setup slot to the end of the single array (C++ reference pattern)
-        if has_setup_slot {
-            let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
-                std::ptr::null()
+        // Append setup slot to the end of the single array (C++ reference pattern).
+        //
+        // CRITICAL (same fix as H264/H265, VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239):
+        // BeginVideoCoding declares the output slot with slot_index=-1 — at Begin
+        // execution time the slot is INACTIVE; the decode's pSetupReferenceSlot
+        // (real index) then associates it. Declaring the actual (inactive) index
+        // makes the NVIDIA driver trap in vkCmdDecodeVideoKHR. Matches FFmpeg.
+        let setup_slot_decode_ptr: *const vk::VideoReferenceSlotInfoKHR<'static> =
+            if has_setup_slot {
+                let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
+                    std::ptr::null()
+                } else {
+                    setup_slot_info_khr_ptr as *const _
+                };
+                slots.push(vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: setup_p_next,
+                    slot_index: -1,
+                    p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
+                    _marker: Default::default(),
+                });
+                // Separate copy with the actual index for decode's pSetupReferenceSlot.
+                Box::leak(Box::new(vk::VideoReferenceSlotInfoKHR {
+                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                    p_next: setup_p_next,
+                    slot_index: output_slot_index,
+                    p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
+                    _marker: Default::default(),
+                }))
             } else {
-                setup_slot_info_khr_ptr as *const _
+                std::ptr::null()
             };
-            slots.push(vk::VideoReferenceSlotInfoKHR {
-                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                p_next: setup_p_next,
-                slot_index: output_slot_index,
-                p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
-                _marker: Default::default(),
-            });
-        }
 
         // Finalize: leak the single array for Vulkan's raw pointer usage
         let slots_ptr = if slots.is_empty() {
@@ -1760,6 +1777,11 @@ impl Av1Decoder {
                 _marker: Default::default(),
             };
 
+            // No inline queries for AV1: the session is created WITHOUT the
+            // INLINE_QUERIES flag (see session.rs) — with the flag set the
+            // NVIDIA driver unconditionally dereferences an empty
+            // VkVideoInlineQueryInfoKHR and segfaults here. pNext chain is
+            // just the AV1 picture info (matches FFmpeg).
             let decode_info = vk::VideoDecodeInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
                 p_next: av1_decode_info as *const _ as *const _,
@@ -1768,11 +1790,7 @@ impl Av1Decoder {
                 src_buffer_offset: bitstream_offset,
                 src_buffer_range: bitstream_range,
                 dst_picture_resource,
-                p_setup_reference_slot: if has_setup_slot && !slots_ptr.is_null() {
-                    unsafe { slots_ptr.add(num_refs) }
-                } else {
-                    std::ptr::null()
-                },
+                p_setup_reference_slot: setup_slot_decode_ptr,
                 reference_slot_count: num_refs as u32,
                 p_reference_slots: if num_refs == 0 {
                     std::ptr::null()

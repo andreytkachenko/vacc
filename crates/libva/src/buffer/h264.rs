@@ -27,6 +27,10 @@ impl PictureH264 {
             va_reserved: Default::default(),
         })
     }
+
+    pub fn picture_id(&self) -> bindings::VASurfaceID { self.0.picture_id }
+    pub fn frame_idx(&self) -> u32 { self.0.frame_idx }
+    pub fn top_field_order_cnt(&self) -> i32 { self.0.TopFieldOrderCnt }
 }
 
 /// Wrapper over the `seq_fields` bindgen field in `VAPictureParameterBufferH264`.

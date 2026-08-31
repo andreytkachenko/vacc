@@ -134,20 +134,6 @@ impl H264Dpb {
 
     /// Recompute FrameNumWrap for all slots relative to `cur_fn` (C++ picture_numbers).
     fn refresh_frame_num_wrap(&mut self, cur_fn: u32) {
-        if std::env::var("VACC_DBG_H264").is_ok() {
-            eprintln!(
-                "[DPB] refresh_wrap: cur_fn={} max_fn={} before=[{}]",
-                cur_fn,
-                self.max_frame_num,
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.state != 0)
-                    .map(|(i, s)| format!("s{}/f{}/w{}", i, s.frame_num, s.frame_num_wrap))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
         for s in &mut self.slots {
             if s.state == 0 {
                 continue;
@@ -157,18 +143,6 @@ impl H264Dpb {
             } else {
                 s.frame_num as i32
             };
-        }
-        if std::env::var("VACC_DBG_H264").is_ok() {
-            eprintln!(
-                "[DPB] refresh_wrap: after=[{}]",
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.state != 0)
-                    .map(|(i, s)| format!("s{}/f{}/w{}", i, s.frame_num, s.frame_num_wrap))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
         }
     }
 
@@ -212,23 +186,24 @@ impl H264Dpb {
     /// (first empty slot, C++ C.4.5.1/4.5.2). Does NOT store the current yet.
     pub fn prepare_current(&mut self) -> usize {
         let cur = self.cur.as_ref().expect("picture_start not called").clone();
-        if cur.is_ref {
+        if cur.is_idr {
+            // H.264 8.2.5: when the current picture is an IDR, all short-term
+            // and long-term reference pictures are unmarked. Without this the
+            // previous GOP's refs stay marked; frame_num wraps modulo
+            // MaxFrameNum, so an old ref can then sort ahead of the new GOP's
+            // frames in the P-slice list (descending PicNum) and be selected
+            // as L0[0] for the first P-frame after the IDR (corrupting it and
+            // everything that references it). FFmpeg unmarks all at an IDR;
+            // other backends reset their DPB explicitly on IDRs.
+            for s in &mut self.slots {
+                s.marking = MARKING_UNUSED;
+            }
+        } else if cur.is_ref {
             if cur.mmco {
                 self.apply_mmco(&cur);
             } else {
                 self.apply_sliding_window(&cur);
             }
-        }
-
-        if std::env::var("VACC_DBG_H264").is_ok() {
-            let mut out = String::from(&format!("RUST-PREP cur_fn={} cur_poc={} is_ref={} mmco={} after_mark=[", cur.frame_num, cur.poc, cur.is_ref, cur.mmco));
-            for (i, s) in self.slots.iter().enumerate() {
-                if s.state != 0 {
-                    out.push_str(&format!("s{}/p{}/f{}/r{}/o{} ", i, s.poc, s.frame_num, if s.is_ref() { 1 } else { 0 }, if s.needed_for_output { 1 } else { 0 }));
-                }
-            }
-            out.push(']');
-            eprintln!("{}", out);
         }
 
         // C.4.4: IDR with no_output_of_prior_pics clears all slots.
@@ -275,12 +250,6 @@ impl H264Dpb {
         // all wraps on the next picture_start call. We store frame_num directly to match
         // the C++ oracle which doesn't pre-compute a persistent FrameNumWrap.
         let frame_num_wrap = cur.frame_num as i32;
-        if std::env::var("VACC_DBG_H264").is_ok() {
-            eprintln!(
-                "[DPB] commit_current: slot={} fn={} poc={} wrap={} is_ref={}",
-                slot, cur.frame_num, cur.poc, frame_num_wrap, cur.is_ref
-            );
-        }
         if slot < self.slots.len() {
             let s = &mut self.slots[slot];
             *s = H264DpbSlot {
@@ -298,17 +267,6 @@ impl H264Dpb {
             self.display_bump();
         }
 
-        if std::env::var("VACC_DBG_H264").is_ok() {
-            let mut out = String::from(&format!("RUST-DPBSTATE cur_poc={} mmco={} state=[", cur.poc, if cur.mmco { 1 } else { 0 }));
-            for (i, s) in self.slots.iter().enumerate() {
-                if s.state != 0 {
-                    let r = if s.is_ref() { 1 } else { 0 };
-                    out.push_str(&format!("s{}:p{}/f{}/r{}/o{} ", i, s.poc, s.frame_num, r, if s.needed_for_output { 1 } else { 0 }));
-                }
-            }
-            out.push(']');
-            eprintln!("{}", out);
-        }
     }
 
     /// Number of full-frame pictures pending output (C++ dpb_reordering_delay).
@@ -353,9 +311,6 @@ impl H264Dpb {
         // with the same FrameNum as the current is unmarked (non-conforming stream).
         for (i, s) in self.slots.iter_mut().enumerate() {
             if s.is_ref() && s.frame_num == cur.frame_num {
-                if std::env::var("VACC_DBG_H264").is_ok() {
-                    eprintln!("RUST-FNCONFLICT cur_fn={} cur_poc={} unmark s{}/p{}/f{}", cur.frame_num, cur.poc, i, s.poc, s.frame_num);
-                }
                 s.marking = MARKING_UNUSED;
             }
         }
@@ -376,10 +331,6 @@ impl H264Dpb {
                     min_wrap = s.frame_num_wrap;
                     imin = i;
                 }
-            }
-            if std::env::var("VACC_DBG_H264").is_ok() {
-                eprintln!("RUST-SLIDE cur_fn={} cur_poc={} nrefs={} num_ref_frames={} evict=s{}/p{}/f{}/w{}",
-                    cur.frame_num, cur.poc, num_refs, self.num_ref_frames, imin, self.slots[imin].poc, self.slots[imin].frame_num, min_wrap);
             }
             self.slots[imin].marking = MARKING_UNUSED;
         }

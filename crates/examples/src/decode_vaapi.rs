@@ -98,7 +98,7 @@ fn main() {
 
     for (i, frame) in frames.iter().enumerate() {
         let output_path = format!("{}_frame_{}.yuv", stem, i);
-        let yuv_data = frame_to_yuv420p(frame);
+        let yuv_data = frame_to_yuv(frame);
         match std::fs::write(&output_path, yuv_data) {
             Ok(()) => println!("  Saved frame {} to {}", i, output_path),
             Err(e) => eprintln!("  Failed to save frame {}: {}", i, e),
@@ -135,70 +135,79 @@ fn detect_codec(path: &str) -> &'static str {
     }
 }
 
-/// Convert decoded frame to yuv420p planar format.
-fn frame_to_yuv420p(frame: &vk_video_core::frame::DecodedFrame) -> Vec<u8> {
+/// Append `w` samples from `src` (row start) to `out`, honoring `bps`.
+/// iHD top-justifies 10-bit P016 samples (value << 6); when `top_justified`
+/// is set, normalize to the bottom-justified yuv420p10le layout.
+fn push_samples(out: &mut Vec<u8>, src: *const u8, w: usize, bps: usize, top_justified: bool) {
+    if top_justified && bps == 2 {
+        for i in 0..w {
+            let v = u16::from_le_bytes(unsafe { [*src.add(i * 2), *src.add(i * 2 + 1)] }) >> 6;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, w * bps) });
+    }
+}
+
+/// Convert a decoded frame to canonical planar Y+U+V raw bytes (rows packed,
+/// `bps` bytes per sample). Matches FFmpeg's planar raw layouts:
+/// yuv420p / yuv420p10le (4:2:0) and gbrp / yuv444p (4:4:4).
+fn frame_to_yuv(frame: &vk_video_core::frame::DecodedFrame) -> Vec<u8> {
     if let Some(ref pixel_data) = frame.pixel_data {
-        let disp_w = frame.width as usize;
-        let disp_h = frame.height as usize;
-        let uv_disp_w = disp_w / 2;
-        let uv_disp_h = disp_h / 2;
+        // Bytes per sample: 16-bit formats carry "16" in the name.
+        let bps = if pixel_data.format.contains("16") { 2 } else { 1 };
+        // iHD top-justifies 10-bit P016 samples (value << 6); normalize to the
+        // bottom-justified yuv420p10le layout for FFmpeg comparison.
+        let p016 = pixel_data.format == "P016";
 
-        let mut yuv_data = Vec::with_capacity(disp_w * disp_h + uv_disp_w * uv_disp_h * 2);
+        let y_w = pixel_data.y.width as usize;
+        let y_h = pixel_data.y.height as usize;
+        let c_w = pixel_data.u.width as usize;
+        let c_h = pixel_data.u.height as usize;
 
-        // Copy Y plane
-        let y_pitch = pixel_data.y.pitch;
-        let y_width = pixel_data.y.width;
-        for y in 0..disp_h {
-            let src_start = y * y_pitch;
-            yuv_data.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(pixel_data.y.data.add(src_start), disp_w.min(y_width))
-            });
+        let mut out = Vec::with_capacity((y_w * y_h + c_w * c_h * 2) * bps);
+
+        // Y plane: row by row, honoring pitch, `bps` bytes per sample.
+        {
+            let y_pitch = pixel_data.y.pitch;
+            for row in 0..y_h {
+                let src = unsafe { pixel_data.y.data.add(row * y_pitch) };
+                push_samples(&mut out, src, y_w, bps, p016);
+            }
         }
 
-        // Copy U plane (handle NV12 vs planar)
-        let u_pitch = pixel_data.u.pitch;
-        let u_width = pixel_data.u.width;
         if pixel_data.v.is_none() {
-            // NV12: U and V are interleaved. Deinterleave U (even bytes).
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                for x in 0..uv_disp_w {
-                    let u_byte = unsafe { *pixel_data.u.data.add(src_start + x * 2) };
-                    yuv_data.push(u_byte);
-                }
-            }
-        } else {
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                yuv_data.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(pixel_data.u.data.add(src_start), uv_disp_w.min(u_width))
-                });
-            }
-        }
-
-        // Copy V plane (handle NV12 vs planar)
-        if let Some(ref v_plane) = pixel_data.v {
-            let v_pitch = v_plane.pitch;
-            let v_width = v_plane.width;
-            for y in 0..uv_disp_h {
-                let src_start = y * v_pitch;
-                yuv_data.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(v_plane.data.add(src_start), uv_disp_w.min(v_width))
-                });
-            }
-        } else {
-            // NV12: V is interleaved with U, copy every other byte starting at offset 1
+            // Semi-planar (NV12/P016): U and V interleaved in the u plane.
+            // De-interleave into planar U then planar V.
             let u_pitch = pixel_data.u.pitch;
-            for y in 0..uv_disp_h {
-                let src_start = y * u_pitch;
-                for x in 0..uv_disp_w {
-                    let v_byte = unsafe { *pixel_data.u.data.add(src_start + x * 2 + 1) };
-                    yuv_data.push(v_byte);
+            for row in 0..c_h {
+                let src = unsafe { pixel_data.u.data.add(row * u_pitch) };
+                for col in 0..c_w {
+                    push_samples(&mut out, unsafe { src.add(col * 2 * bps) }, 1, bps, p016);
                 }
+            }
+            for row in 0..c_h {
+                let src = unsafe { pixel_data.u.data.add(row * u_pitch) };
+                for col in 0..c_w {
+                    push_samples(&mut out, unsafe { src.add(col * 2 * bps + bps) }, 1, bps, p016);
+                }
+            }
+        } else {
+            // Planar: copy U plane then V plane.
+            let u_pitch = pixel_data.u.pitch;
+            for row in 0..c_h {
+                let src = unsafe { pixel_data.u.data.add(row * u_pitch) };
+                push_samples(&mut out, src, c_w, bps, p016);
+            }
+            let v = pixel_data.v.as_ref().unwrap();
+            let v_pitch = v.pitch;
+            for row in 0..c_h {
+                let src = unsafe { v.data.add(row * v_pitch) };
+                push_samples(&mut out, src, c_w, bps, p016);
             }
         }
 
-        yuv_data
+        out
     } else {
         Vec::new()
     }

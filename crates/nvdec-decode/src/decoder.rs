@@ -526,8 +526,13 @@ impl NvdecH264Decoder {
                     }
 
                     // Keep bitstream_data and slice_offsets alive during decode
+                    let procparams = crate::ffi::default_procparams();
                     let result = unsafe {
-                        (funcs.decode_picture)(decoder_handle as *mut std::ffi::c_void, &picparams)
+                        (funcs.decode_picture)(
+                            decoder_handle as *mut std::ffi::c_void,
+                            &picparams,
+                            &procparams,
+                        )
                     };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(

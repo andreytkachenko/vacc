@@ -16,6 +16,7 @@ use vk_video_core::{
     picture::{H265Pps, H265Sps},
     session::Extent2D,
 };
+use vk_video_parser::h265_dpb::{resolve_refs, H265Dpb};
 use vk_video_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
 
 use crate::{
@@ -35,322 +36,79 @@ use crate::{
 /// Number of decode surfaces / DPB slots (matches the C reference).
 const NUM_SURFACES: i32 = 16;
 
-/// Maximum number of pictures held in the DPB array (matches the cuvid parser).
-const MAX_DPB_ENTRIES: usize = 4;
-
-/// A single entry in the DPB array (slot-indexed, matching the cuvid layout).
-#[derive(Debug, Clone, Copy)]
-struct H265DpbEntry {
-    /// Surface where this picture was decoded.
-    surface_idx: i32,
-    /// Picture order count.
-    poc: i32,
-    /// Fill order, used for FIFO eviction (lower = older).
-    fill_order: u32,
+/// HEVC decoded-picture-buffer context: the common spec-compliant DPB (the
+/// single source of truth shared with the other backends) plus the mapping
+/// to cuvid's 16 physical decode surfaces.
+struct H265DpbCtx {
+    /// Common DPB (spec 8.3.2 marking / eviction / allocation).
+    dpb: H265Dpb,
+    /// Common-DPB slot -> physical cuvid surface index (None = unassigned).
+    slot_surfaces: [Option<i32>; NUM_SURFACES as usize],
+    /// Surfaces holding a decoded but not-yet-extracted frame; protected from
+    /// reuse until the frame is read back.
+    surface_pending: [bool; NUM_SURFACES as usize],
 }
 
-/// POC-based HEVC decoded picture buffer.
-///
-/// Mirrors the NVIDIA cuvid parser: a persistent 16-slot array where each
-/// slot holds (surface, poc) or is empty. For a non-CRA picture the array is
-/// set to the picture's references; for a CRA it carries over the previous
-/// references plus the just-decoded picture, capped at [`MAX_DPB_ENTRIES`]
-/// (FIFO eviction). `StCurrBefore`/`StCurrAfter` index into this array by
-/// slot.
-#[derive(Debug)]
-struct H265Dpb {
-    /// The DPB array, indexed by slot (0-15).
-    slots: [Option<H265DpbEntry>; NUM_SURFACES as usize],
-    /// Global fill counter for FIFO eviction.
-    fill_counter: u32,
-    /// POC physically on each surface (None if never used).
-    surface_poc: [Option<i32>; NUM_SURFACES as usize],
-    /// Whether each surface's frame has been extracted.
-    surface_extracted: [bool; NUM_SURFACES as usize],
-}
-
-impl Default for H265Dpb {
-    fn default() -> Self {
-        Self {
-            slots: [None; NUM_SURFACES as usize],
-            fill_counter: 0,
-            surface_poc: [None; NUM_SURFACES as usize],
-            surface_extracted: [false; NUM_SURFACES as usize],
-        }
-    }
-}
-
-impl H265Dpb {
+impl H265DpbCtx {
     fn new() -> Self {
-        Self::default()
+        Self {
+            dpb: H265Dpb::new(NUM_SURFACES as usize),
+            slot_surfaces: [None; NUM_SURFACES as usize],
+            surface_pending: [false; NUM_SURFACES as usize],
+        }
     }
 
     fn reset(&mut self) {
-        self.slots = [None; NUM_SURFACES as usize];
-        self.fill_counter = 0;
-        self.surface_poc = [None; NUM_SURFACES as usize];
-        self.surface_extracted = [false; NUM_SURFACES as usize];
+        self.dpb.invalidate_all();
+        self.slot_surfaces = [None; NUM_SURFACES as usize];
+        self.surface_pending = [false; NUM_SURFACES as usize];
     }
 
-    /// Is surface `s` held in the DPB array (a live reference)?
-    fn is_live_ref(&self, s: i32) -> bool {
-        self.slots
-            .iter()
-            .any(|e| e.as_ref().map(|e| e.surface_idx == s).unwrap_or(false))
-    }
-
-    /// Find the surface physically holding the given POC.
-    fn surface_of(&self, poc: i32) -> Option<i32> {
-        self.surface_poc
-            .iter()
-            .position(|p| *p == Some(poc))
-            .map(|i| i as i32)
-    }
-
-    /// Update the DPB array to hold exactly `ref_pocs` (the current picture's
-    /// references). Slots for references still present are kept (sticky);
-    /// stale slots are cleared; new references are added to empty slots.
-    fn set_references(&mut self, ref_pocs: &[i32]) {
-        for slot in self.slots.iter_mut() {
-            if let Some(e) = slot {
-                if !ref_pocs.contains(&e.poc) {
-                    *slot = None;
-                }
-            }
-        }
-        for &poc in ref_pocs {
-            if self
-                .slots
-                .iter()
-                .any(|s| s.as_ref().map(|e| e.poc == poc).unwrap_or(false))
-            {
-                continue;
-            }
-            let surface = match self.surface_of(poc) {
-                Some(s) => s,
-                None => continue,
-            };
-            if let Some((i, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
-                *slot = Some(H265DpbEntry {
-                    surface_idx: surface,
-                    poc,
-                    fill_order: self.fill_counter,
-                });
-                self.fill_counter += 1;
+    /// Drop surface bindings for slots invalidated by `picture_start`.
+    fn drop_invalidated(&mut self) {
+        for (i, s) in self.dpb.slots().iter().enumerate() {
+            if !s.valid {
+                self.slot_surfaces[i] = None;
             }
         }
     }
 
-    /// Add the previous picture (a CRA's carry-over) to the DPB array, capping
-    /// at [`MAX_DPB_ENTRIES`] (evicting the oldest, FIFO, when over the cap).
-    fn add_prev_picture(&mut self, surface_idx: i32, poc: i32) {
-        self.surface_poc[surface_idx as usize] = Some(poc);
-        if let Some((_, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
-            *slot = Some(H265DpbEntry {
-                surface_idx,
-                poc,
-                fill_order: self.fill_counter,
-            });
-            self.fill_counter += 1;
-        }
-        while self.count() > MAX_DPB_ENTRIES {
-            self.evict_oldest();
-        }
-    }
-
-    fn count(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
-    }
-
-    /// Evict the longest-held slot (lowest fill_order = oldest, FIFO).
-    fn evict_oldest(&mut self) {
-        let mut oldest: Option<(usize, u32)> = None;
-        for (i, e) in self.slots.iter().enumerate() {
-            if let Some(en) = e {
-                if oldest.map(|(_, o)| en.fill_order < o).unwrap_or(true) {
-                    oldest = Some((i, en.fill_order));
-                }
-            }
-        }
-        if let Some((i, _)) = oldest {
-            self.slots[i] = None;
-        }
-    }
-
-    /// Choose the surface index for the next picture (`CurrPicIdx`): the
-    /// lowest-index surface that is not a live reference and has no pending
-    /// (unextracted) frame.
+    /// Choose the decode surface (`CurrPicIdx`): the lowest-index surface that
+    /// is neither a live DPB reference nor holding a pending (unextracted)
+    /// frame.
     fn choose_surface(&self) -> i32 {
         for s in 0..NUM_SURFACES as usize {
-            if self.is_live_ref(s as i32) {
+            if self.slot_surfaces.iter().any(|o| *o == Some(s as i32)) {
                 continue;
             }
-            if self.surface_poc[s].is_some() && !self.surface_extracted[s] {
+            if self.surface_pending[s] {
                 continue;
             }
             return s as i32;
         }
-        // Fallback: lowest-index non-live surface.
+        // Fallback: lowest-index non-reference surface.
         for s in 0..NUM_SURFACES as usize {
-            if !self.is_live_ref(s as i32) {
+            if !self.slot_surfaces.iter().any(|o| *o == Some(s as i32)) {
                 return s as i32;
             }
         }
         0
     }
 
-    /// Record that a picture was decoded to the given surface. The surface now
-    /// holds a pending (unextracted) frame, so clear the extracted flag;
-    /// otherwise a recycled surface would look free and be clobbered.
-    fn note_decoded(&mut self, surface_idx: i32, poc: i32) {
-        self.surface_poc[surface_idx as usize] = Some(poc);
-        self.surface_extracted[surface_idx as usize] = false;
+    /// Bind the current slot to its surface and commit the picture to the
+    /// common DPB.
+    fn commit(&mut self, slot: usize, surface: i32) {
+        self.slot_surfaces[slot] = Some(surface);
+        self.surface_pending[surface as usize] = true;
+        self.dpb.commit_current(slot);
     }
 
-    /// Mark the surface's frame as extracted (so the surface may be recycled).
-    fn mark_extracted(&mut self, surface_idx: i32) {
-        if self.surface_poc[surface_idx as usize].is_some() {
-            self.surface_extracted[surface_idx as usize] = true;
+    /// Mark a surface's frame as extracted (the surface may be recycled).
+    fn mark_extracted(&mut self, surface: i32) {
+        if (0..NUM_SURFACES as usize).contains(&(surface as usize)) {
+            self.surface_pending[surface as usize] = false;
         }
     }
-
-    /// Find the DPB slot index holding the given POC.
-    fn find_ref_slot(&self, poc: i32) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|e| e.as_ref().map(|e| e.poc == poc).unwrap_or(false))
-    }
-
-    /// Build the CUVID HEVC DPB state.
-    ///
-    /// The arrays are indexed by **slot** (0-15), matching the cuvid layout:
-    /// - `ref_pic_idx[slot]` = surface index of the picture in that slot
-    /// - `pic_order_cnt_val[slot]` = POC of the picture in that slot
-    /// - `st_curr_before[j]` / `st_curr_after[j]` = **slot index** of the
-    ///   j-th L0/L1 reference
-    fn build_state(
-        &self,
-        ref_s0: &[i32],
-        ref_s1: &[i32],
-        num_bits: i32,
-        curr_poc: i32,
-    ) -> H265DpbState {
-        let mut state = H265DpbState::default();
-
-        for (slot, e) in self.slots.iter().enumerate() {
-            match e {
-                Some(en) => {
-                    state.ref_pic_idx[slot] = en.surface_idx;
-                    state.pic_order_cnt_val[slot] = en.poc;
-                    state.is_long_term[slot] = 0;
-                }
-                None => {
-                    state.ref_pic_idx[slot] = -1;
-                    state.pic_order_cnt_val[slot] = 0;
-                    state.is_long_term[slot] = 0;
-                }
-            }
-        }
-
-        for (j, &poc) in ref_s0.iter().enumerate().take(8) {
-            state.st_curr_before[j] = self.find_ref_slot(poc).unwrap_or(0) as u8;
-        }
-        for (j, &poc) in ref_s1.iter().enumerate().take(8) {
-            state.st_curr_after[j] = self.find_ref_slot(poc).unwrap_or(0) as u8;
-        }
-
-        state.num_poc_st_curr_before = ref_s0.len() as i32;
-        state.num_poc_st_curr_after = ref_s1.len() as i32;
-        state.num_poc_lt_curr = 0;
-        state.num_poc_total_curr = ref_s0.len() as i32 + ref_s1.len() as i32;
-        state.num_bits_for_short_term_rps_in_slice = num_bits;
-        state.num_delta_pocs_of_ref_rps_idx = 0;
-        state.curr_pic_order_cnt_val = curr_poc;
-        state
-    }
-}
-
-/// Compute the number of bits used to code a short-term reference picture set
-/// in the slice header. Handles both direct and predictive RPS.
-///
-/// `rps` is the reference picture set from the parser. `curr_poc` is the
-/// current picture's POC. `ref_s0` / `ref_s1` are the reference POCs in RPS order.
-fn hevc_rps_bit_count(
-    curr_poc: i32,
-    ref_s0: &[i32],
-    ref_s1: &[i32],
-    rps: Option<&vk_video_core::picture::H265ShortTermRefPicSet>,
-) -> i32 {
-    fn ue(v: u32) -> u32 {
-        if v == 0 {
-            return 1;
-        }
-        let n = v + 1;
-        let k = (32 - n.leading_zeros()) as u32;
-        2 * k - 1
-    }
-
-    let rps = match rps {
-        Some(r) => r,
-        None => return 0,
-    };
-
-    // Predictive RPS: different syntax
-    if rps.inter_ref_pic_set_prediction_flag {
-        let mut bits: u32 = 0;
-        bits += ue(rps.delta_idx_minus1); // delta_idx_minus1
-        bits += ue(rps.abs_delta_rps_minus1 as u32); // abs_delta_rps_minus1
-        bits += 1; // delta_rps_sign
-                   // For each entry in the reference RPS + 1, there's a use_delta_flag
-                   // and potentially a used_by_curr_pic_flag
-        let ref_rps_idx = rps.delta_idx_minus1 as usize;
-        // We can't easily compute the exact reference RPS size here,
-        // so use a conservative estimate based on the current RPS
-        let num_entries = rps.num_negative_pics as usize + rps.num_positive_pics as usize;
-        for _ in 0..=num_entries {
-            bits += 1; // use_delta_flag
-            bits += 1; // used_by_curr_pic_flag (when use_delta_flag == 1)
-        }
-        return bits as i32;
-    }
-
-    // Direct RPS
-    direct_rps_bit_count(curr_poc, ref_s0, ref_s1)
-}
-
-/// Compute the direct (non-predictive) short-term RPS bit count for the given
-/// reference POCs. `ref_s0` must be sorted by decreasing POC (so delta_poc_s0
-/// is increasing); `ref_s1` by increasing POC (so delta_poc_s1 is increasing).
-fn direct_rps_bit_count(curr_poc: i32, ref_s0: &[i32], ref_s1: &[i32]) -> i32 {
-    fn ue(v: u32) -> u32 {
-        if v == 0 {
-            return 1;
-        }
-        let n = v + 1;
-        let k = (32 - n.leading_zeros()) as u32;
-        2 * k - 1
-    }
-
-    let d0: Vec<i32> = ref_s0.iter().map(|&r| curr_poc - r).collect();
-    let d1: Vec<i32> = ref_s1.iter().map(|&r| r - curr_poc).collect();
-
-    let mut c0: Vec<i32> = Vec::with_capacity(d0.len());
-    for (i, &d) in d0.iter().enumerate() {
-        c0.push(if i == 0 { d - 1 } else { d - d0[i - 1] - 1 });
-    }
-    let mut c1: Vec<i32> = Vec::with_capacity(d1.len());
-    for (i, &d) in d1.iter().enumerate() {
-        c1.push(if i == 0 { d - 1 } else { d - d1[i - 1] - 1 });
-    }
-
-    let mut bits: u32 = ue(d0.len() as u32) + ue(d1.len() as u32);
-    for &c in &c0 {
-        bits += ue(c as u32) + 1;
-    }
-    for &c in &c1 {
-        bits += ue(c as u32) + 1;
-    }
-    bits as i32
 }
 
 /// NVDEC HEVC decoder using vk-video-parser.
@@ -365,12 +123,7 @@ pub struct NvdecH265Decoder {
     frame_count: Mutex<u32>,
     display_area: Mutex<(i32, i32, i32, i32)>,
     initialized: Mutex<bool>,
-    dpb: Mutex<H265Dpb>,
-    /// DPB state submitted to the decoder for the previous picture. A CRA
-    /// (IRAP, non-IDR) carries this forward unchanged — stale refs are
-    /// retained across a CRA and only an IDR resets the DPB (matches the
-    /// cuvid parser, which reports the previous picture's DPB at a CRA).
-    prev_dpb_state: Mutex<H265DpbState>,
+    dpb: Mutex<H265DpbCtx>,
     prev_coded_size: Mutex<(u32, u32)>,
     pending_data: Vec<u8>,
     parsed_offset: usize,
@@ -389,11 +142,11 @@ pub struct NvdecH265Decoder {
     /// Minimum POC gap observed between consecutively decoded frames.
     /// Used to determine the stream's POC increment for reorder buffering.
     min_poc_gap: i32,
-
-    /// (surface, poc) of the most recently decoded picture, used for CRA
-    /// carry-over (a CRA adds the previous picture to the DPB array).
-    /// (surface, poc, slice_type) of the last decoded picture.
-    last_decoded: Option<(i32, i32, u8)>,
+    /// Range of unwrapped POCs observed so far. When min == max the stream has
+    /// no reordering (e.g. an all-IDR stream where every picture has POC 0), so
+    /// display order == decode order and frames must be presented immediately.
+    uw_min: Option<i32>,
+    uw_max: Option<i32>,
 
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
@@ -437,8 +190,7 @@ impl NvdecH265Decoder {
             frame_count: Mutex::new(0),
             display_area: Mutex::new((0, 0, 0, 0)),
             initialized: Mutex::new(false),
-            dpb: Mutex::new(H265Dpb::new()),
-            prev_dpb_state: Mutex::new(H265DpbState::default()),
+            dpb: Mutex::new(H265DpbCtx::new()),
             prev_coded_size: Mutex::new((0, 0)),
             pending_data: data,
             parsed_offset: 0,
@@ -450,7 +202,8 @@ impl NvdecH265Decoder {
             prev_decoded_poc: None,
             last_presented_unwrapped: None,
             min_poc_gap: 1,
-            last_decoded: None,
+            uw_min: None,
+            uw_max: None,
             pinned_cache: Mutex::new(None),
             dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
                 .ok()
@@ -548,6 +301,12 @@ impl NvdecH265Decoder {
                             // POC wrap period from the SPS.
                             self.poc_period =
                                 1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+                            // Reorder delay for the common DPB's display logic.
+                            self.dpb
+                                .lock()
+                                .unwrap()
+                                .dpb
+                                .set_max_num_reorder_frames(h265_sps.max_num_reorder_pics[0] as u32);
                         }
                     }
                 }
@@ -555,12 +314,13 @@ impl NvdecH265Decoder {
                     if slices.is_empty() {
                         break;
                     }
-                    if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                        let dpb = self.dpb.lock().unwrap();
-                        let occ: Vec<i32> = dpb
-                            .slots
+                    if debug_status {
+                        let ctx = self.dpb.lock().unwrap();
+                        let occ: Vec<i32> = ctx
+                            .dpb
+                            .slots()
                             .iter()
-                            .map(|s| s.as_ref().map(|e| e.poc).unwrap_or(-1))
+                            .map(|s| if s.valid { s.poc } else { -1 })
                             .collect();
                         eprintln!("[dpb-start] slots={:?}", occ);
                     }
@@ -584,159 +344,118 @@ impl NvdecH265Decoder {
 
                     let poc = info.curr_pic_order_cnt_val;
 
-                    // Reset DPB on IRAP (IDR) pictures.
+                    // Reset presentation state on IRAP (IDR) pictures. The
+                    // common DPB handles the NoRaslOutput reset itself in
+                    // picture_start.
                     if info.is_idr {
-                        let mut dpb = self.dpb.lock().unwrap();
-                        dpb.reset();
                         self.poc_cycle = 0;
                         self.prev_decoded_poc = None;
-                        self.last_decoded = None;
                     }
-                    if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                        let dpb = self.dpb.lock().unwrap();
-                        let occ: Vec<i32> = dpb
-                            .slots
+
+                    // --- Stage the current picture in the common DPB (spec
+                    // 8.3.2): NoRaslOutput reset, RPS marking (used + future-use
+                    // keep-alive), eviction, slot allocation. A CRA's unused RPS
+                    // entries keep the pre-CRA references alive for the
+                    // following open-GOP pictures. ---
+                    let slot = {
+                        let mut ctx = self.dpb.lock().unwrap();
+                        let slot = ctx.dpb.picture_start(sps, info, info.is_reference);
+                        ctx.drop_invalidated();
+                        slot
+                    };
+
+                    // --- CUVID RefPicSet* arrays: the current picture's USED
+                    // short-term / long-term references in RPS order (spec 8.3.3
+                    // initial lists), mapped to common-DPB slot indices. Unused
+                    // RPS entries are excluded (the CUVID structs carry no used
+                    // flags; a CRA has NumPocTotalCurr = 0). ---
+                    let (before, after, lt) = {
+                        let ctx = self.dpb.lock().unwrap();
+                        let resolved = resolve_refs(sps, info);
+                        let (all_b, all_a, all_lt) = ctx.dpb.match_rps_slots();
+                        let b: Vec<i32> = resolved
+                            .st_curr_before
                             .iter()
-                            .map(|s| s.as_ref().map(|e| e.poc).unwrap_or(-1))
+                            .zip(all_b.iter())
+                            .filter(|(r, _)| r.used)
+                            .map(|(_, s)| *s)
                             .collect();
+                        let a: Vec<i32> = resolved
+                            .st_curr_after
+                            .iter()
+                            .zip(all_a.iter())
+                            .filter(|(r, _)| r.used)
+                            .map(|(_, s)| *s)
+                            .collect();
+                        let l: Vec<i32> = resolved
+                            .long_term
+                            .iter()
+                            .zip(all_lt.iter())
+                            .filter(|(r, _)| r.used)
+                            .map(|(_, s)| *s)
+                            .collect();
+                        (b, a, l)
+                    };
+
+                    // NumBitsForShortTermRPSInSlice: bit size of
+                    // short_term_ref_pic_set() in the slice header, measured by
+                    // the parser. 0 when the RPS comes from the SPS, or for IDR
+                    // (no RPS block at all).
+                    let num_bits = if info.short_term_ref_pic_set_sps_flag {
+                        0
+                    } else {
+                        info.num_bits_for_strps_in_slice as i32
+                    };
+
+                    if debug_status {
                         eprintln!(
-                            "[dpb-after-idr-check] is_idr={} is_rap={} slots={:?}",
-                            info.is_idr, info.is_rap, occ
+                            "[dbg] poc={} is_idr={} is_rap={} slice_type={} rps_sps_flag={} rps_idx={} before={:?} after={:?} lt={:?} num_bits={}",
+                            poc, info.is_idr, info.is_rap, info.slice_type,
+                            info.short_term_ref_pic_set_sps_flag, info.short_term_ref_pic_set_idx,
+                            before, after, lt, num_bits
                         );
                     }
 
-                    // Recover the RPS reference POCs. IDR pictures carry no RPS
-                    // in the slice header, so the RPS bit count is 0.
-                    let (ref_s0, ref_s1) = Self::recover_rps_pocs(sps, info);
-                    // A CRA (IRAP, non-IDR) has an empty RPS in the slice header.
-                    let is_cra = !info.is_idr && ref_s0.is_empty() && ref_s1.is_empty();
-                    if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                        let rps_dbg = if info.short_term_ref_pic_set_sps_flag {
-                            sps.short_term_ref_pic_sets
-                                .get(info.short_term_ref_pic_set_idx as usize)
-                        } else {
-                            info.slice_strps.as_ref()
-                        };
-                        if let Some(r) = rps_dbg {
-                            let s0: Vec<i32> = (0..r.num_negative_pics as usize)
-                                .map(|i| {
-                                    let st = r.delta_poc_s0_minus1[i] as i32;
-                                    if st > 32767 {
-                                        st - 65536
-                                    } else {
-                                        st
-                                    }
-                                })
-                                .collect();
-                            let s1: Vec<i32> = (0..r.num_positive_pics as usize)
-                                .map(|i| {
-                                    let st = r.delta_poc_s1_minus1[i] as i32;
-                                    if st > 32767 {
-                                        st - 65536
-                                    } else {
-                                        st
-                                    }
-                                })
-                                .collect();
-                            eprintln!(
-                                "[rps] poc={} sps_flag={} idx={} inter={} numneg={} numpos={} s0={:?} s1={:?} used0={:b} used1={:b} -> ref_s0={:?} ref_s1={:?}",
-                                poc, info.short_term_ref_pic_set_sps_flag,
-                                info.short_term_ref_pic_set_idx, r.inter_ref_pic_set_prediction_flag,
-                                r.num_negative_pics, r.num_positive_pics, s0, s1,
-                                r.used_by_curr_pic_s0_flag, r.used_by_curr_pic_s1_flag,
-                                ref_s0, ref_s1
-                            );
-                        }
-                    }
-                    // Update the DPB array to match this picture, compute the RPS
-                    // bit count, and choose the decode surface (CurrPicIdx).
-                    //
-                    // - IDR: the DPB was already reset above (empty array);
-                    //   num_bits = 0.
-                    // - CRA: carry over the previous references plus the
-                    //   just-decoded picture (capped at MAX_DPB_ENTRIES); the
-                    //   num_bits is computed from the resulting DPB array
-                    //   (matching the cuvid parser).
-                    // - Other: set the array to this picture's references; the
-                    //   num_bits is computed from the slice RPS.
+                    // --- Choose the decode surface (CurrPicIdx) and build the
+                    // CUVID DPB state (16-entry array, slot-indexed). ---
                     let (curr_pic_idx, dpb_state) = {
-                        let mut dpb = self.dpb.lock().unwrap();
-                        if !info.is_idr {
-                            if is_cra {
-                                // Carry the previous picture into the CRA's DPB
-                                // only if it is a reference (non-B slice); the
-                                // cuvid parser keeps the DPB unchanged when the
-                                // previous picture is a B-frame (not referenced
-                                // by the following picture).
-                                if let Some((prev_surf, prev_poc, prev_slice)) = self.last_decoded {
-                                    if prev_slice != 2 {
-                                        dpb.add_prev_picture(prev_surf, prev_poc);
-                                    }
-                                }
-                            } else {
-                                let all_refs: Vec<i32> =
-                                    ref_s0.iter().chain(ref_s1.iter()).copied().collect();
-                                dpb.set_references(&all_refs);
+                        let ctx = self.dpb.lock().unwrap();
+                        let curr_pic_idx = ctx.choose_surface();
+                        let mut state = H265DpbState::default();
+                        for i in 0..NUM_SURFACES as usize {
+                            if ctx.dpb.slots()[i].valid {
+                                state.ref_pic_idx[i] = ctx.slot_surfaces[i].unwrap_or(-1);
+                                state.pic_order_cnt_val[i] = ctx.dpb.slots()[i].poc;
+                                state.is_long_term[i] = ctx.dpb.slots()[i].is_long_term as u8;
                             }
                         }
-                        let num_bits = if info.is_idr {
-                            0
-                        } else if is_cra {
-                            // The cuvid parser computes the CRA's
-                            // NumBitsForShortTermRPSInSlice from the carried-over
-                            // DPB array (previous references plus the
-                            // just-decoded picture), not the empty intra RPS.
-                            let mut s0: Vec<i32> = Vec::new();
-                            let mut s1: Vec<i32> = Vec::new();
-                            for slot in dpb.slots.iter() {
-                                if let Some(e) = slot {
-                                    if e.poc < poc {
-                                        s0.push(e.poc);
-                                    } else if e.poc > poc {
-                                        s1.push(e.poc);
-                                    }
-                                }
-                            }
-                            s0.sort_by(|a, b| b.cmp(a));
-                            s1.sort();
-                            if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                                eprintln!("[dbg-cra] poc={} dpb_s0={:?} dpb_s1={:?}", poc, s0, s1);
-                            }
-                            direct_rps_bit_count(poc, &s0, &s1)
-                        } else {
-                            let rps = if info.short_term_ref_pic_set_sps_flag {
-                                let idx = info.short_term_ref_pic_set_idx as usize;
-                                sps.short_term_ref_pic_sets.get(idx)
-                            } else {
-                                info.slice_strps.as_ref()
-                            };
-                            hevc_rps_bit_count(poc, &ref_s0, &ref_s1, rps)
-                        };
-                        if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                            eprintln!(
-                                "[dbg] poc={} is_idr={} is_cra={} slice_type={} rps_sps_flag={} rps_idx={} ref_s0={:?} ref_s1={:?} num_bits={}",
-                                poc, info.is_idr, is_cra, info.slice_type,
-                                info.short_term_ref_pic_set_sps_flag, info.short_term_ref_pic_set_idx,
-                                ref_s0, ref_s1, num_bits
-                            );
+                        for (j, &s) in before.iter().enumerate().take(8) {
+                            state.st_curr_before[j] = s.max(0) as u8;
                         }
-                        let curr_pic_idx = dpb.choose_surface();
-                        let dpb_state = dpb.build_state(&ref_s0, &ref_s1, num_bits, poc);
-                        (curr_pic_idx, dpb_state)
+                        for (j, &s) in after.iter().enumerate().take(8) {
+                            state.st_curr_after[j] = s.max(0) as u8;
+                        }
+                        for (j, &s) in lt.iter().enumerate().take(8) {
+                            state.lt_curr[j] = s.max(0) as u8;
+                        }
+                        state.num_poc_st_curr_before = before.len() as i32;
+                        state.num_poc_st_curr_after = after.len() as i32;
+                        state.num_poc_lt_curr = lt.len() as i32;
+                        state.num_poc_total_curr = (before.len() + after.len() + lt.len()) as i32;
+                        state.num_bits_for_short_term_rps_in_slice = num_bits;
+                        state.num_delta_pocs_of_ref_rps_idx = 0;
+                        state.curr_pic_order_cnt_val = poc;
+                        (curr_pic_idx, state)
                     };
-                    // Remember this picture's DPB state so a following CRA can
-                    // carry its stale entries forward.
-                    {
-                        *self.prev_dpb_state.lock().unwrap() = dpb_state;
-                    }
-                    if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                        let dpb = self.dpb.lock().unwrap();
-                        let occupied: Vec<i32> = dpb
-                            .slots
+                    if debug_status {
+                        let ctx = self.dpb.lock().unwrap();
+                        let occ: Vec<i32> = ctx
+                            .dpb
+                            .slots()
                             .iter()
-                            .map(|s| s.as_ref().map(|e| e.poc).unwrap_or(-1))
+                            .map(|s| if s.valid { s.poc } else { -1 })
                             .collect();
-                        eprintln!("[dpb] poc={} slots={:?}", poc, occupied);
+                        eprintln!("[dpb] poc={} slots={:?}", poc, occ);
                     }
 
                     // Build the bitstream: slice NALs only, each prefixed with a
@@ -808,8 +527,13 @@ impl NvdecH265Decoder {
                         }
                     }
 
+                    let procparams = crate::ffi::default_procparams();
                     let result = unsafe {
-                        (funcs.decode_picture)(decoder_handle as *mut std::ffi::c_void, &picparams)
+                        (funcs.decode_picture)(
+                            decoder_handle as *mut std::ffi::c_void,
+                            &picparams,
+                            &procparams,
+                        )
                     };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(
@@ -864,7 +588,7 @@ impl NvdecH265Decoder {
                         };
                         eprintln!(
                             "[decode] pic={} surf={} poc={} status={} ({}) api_result={}",
-                            self.dump_params_count - 1,
+                            self.dump_params_count.saturating_sub(1),
                             curr_pic_idx,
                             poc,
                             st as u32,
@@ -873,27 +597,19 @@ impl NvdecH265Decoder {
                         );
                     }
 
-                    // Record the decoded picture's surface (for reference
-                    // lookup and CRA carry-over).
+                    // --- Commit the picture to the common DPB and bind its
+                    // surface (protected until extracted). ---
                     let seq = self.seq_counter;
                     self.seq_counter += 1;
                     {
-                        let mut dpb = self.dpb.lock().unwrap();
-                        dpb.note_decoded(curr_pic_idx, poc);
-                    }
-                    self.last_decoded = Some((curr_pic_idx, poc, info.slice_type));
-                    if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                        let dpb = self.dpb.lock().unwrap();
-                        let occ: Vec<i32> = dpb
-                            .slots
-                            .iter()
-                            .map(|s| s.as_ref().map(|e| e.poc).unwrap_or(-1))
-                            .collect();
-                        eprintln!("[dpb-after-add] poc={} slots={:?}", poc, occ);
+                        let mut ctx = self.dpb.lock().unwrap();
+                        ctx.commit(slot, curr_pic_idx);
                     }
 
                     // Track for display-order presentation.
                     let unwrapped = self.unwrapped_poc(poc);
+                    self.uw_min = Some(self.uw_min.map_or(unwrapped, |m| m.min(unwrapped)));
+                    self.uw_max = Some(self.uw_max.map_or(unwrapped, |m| m.max(unwrapped)));
                     self.reorder
                         .insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
 
@@ -906,61 +622,6 @@ impl NvdecH265Decoder {
 
         self.parsed_offset = self.pending_data.len();
         Ok(())
-    }
-
-    /// Recover the RPS reference POCs (s0 = before, s1 = after) from the slice
-    /// header info. Handles both slice-level and SPS-level RPS. Filters by
-    /// used_by_curr_pic_*_flag to only include pictures actually used as references.
-    fn recover_rps_pocs(
-        sps: &H265Sps,
-        info: &vk_video_parser::h265::SliceHeaderInfo,
-    ) -> (Vec<i32>, Vec<i32>) {
-        // Select the RPS: slice-level or SPS-level
-        let rps = if info.short_term_ref_pic_set_sps_flag {
-            let idx = info.short_term_ref_pic_set_idx as usize;
-            sps.short_term_ref_pic_sets.get(idx)
-        } else {
-            info.slice_strps.as_ref()
-        };
-        let rps = match rps {
-            Some(r) => r,
-            None => return (Vec::new(), Vec::new()),
-        };
-
-        let mut ref_s0 = Vec::new();
-        let mut ref_s1 = Vec::new();
-
-        // S0: negative POC deltas (references before current picture)
-        for i in 0..rps.num_negative_pics as usize {
-            // Filter by used_by_curr_pic_s0_flag
-            if ((rps.used_by_curr_pic_s0_flag >> i) & 1) == 0 {
-                continue;
-            }
-            let stored = rps.delta_poc_s0_minus1[i] as i32;
-            let signed = if stored > 32767 {
-                stored - 65536
-            } else {
-                stored
-            };
-            ref_s0.push(info.curr_pic_order_cnt_val + signed);
-        }
-
-        // S1: positive POC deltas (references after current picture)
-        for i in 0..rps.num_positive_pics as usize {
-            // Filter by used_by_curr_pic_s1_flag
-            if ((rps.used_by_curr_pic_s1_flag >> i) & 1) == 0 {
-                continue;
-            }
-            let stored = rps.delta_poc_s1_minus1[i] as i32;
-            let signed = if stored > 32767 {
-                stored - 65536
-            } else {
-                stored
-            };
-            ref_s1.push(info.curr_pic_order_cnt_val + signed);
-        }
-
-        (ref_s0, ref_s1)
     }
 
     /// Create the NVDEC decoder from SPS parameters.
@@ -1018,7 +679,17 @@ impl NvdecH265Decoder {
         let display_width = (display_right - display_left) as u32;
         let display_height = (display_bottom - display_top) as u32;
 
-        let output_format = if sps.bit_depth_luma_minus8 > 0 {
+        let output_format = if sps.chroma_format_idc == 0 {
+            // Monochrome (4:0:0): Y-only surface.
+            cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_YUV400
+        } else if sps.chroma_format_idc == 3 {
+            // 4:4:4 planar.
+            if sps.bit_depth_luma_minus8 > 0 {
+                cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_YUV444_16Bit
+            } else {
+                cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_YUV444
+            }
+        } else if sps.bit_depth_luma_minus8 > 0 {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_P016
         } else {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_NV12
@@ -1150,12 +821,8 @@ impl NvdecH265Decoder {
             let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
         }
         {
-            let mut dpb = self.dpb.lock().unwrap();
-            dpb.reset();
-        }
-        {
-            let mut prev = self.prev_dpb_state.lock().unwrap();
-            *prev = H265DpbState::default();
+            let mut ctx = self.dpb.lock().unwrap();
+            ctx.reset();
         }
         {
             let mut pending = self.pending_frames.lock().unwrap();
@@ -1197,6 +864,8 @@ impl NvdecH265Decoder {
         self.prev_decoded_poc = None;
         self.last_presented_unwrapped = None;
         self.poc_cycle = 0;
+        self.uw_min = None;
+        self.uw_max = None;
     }
 
     /// Extract ready frames in DISPLAY (ascending PO C) order.
@@ -1221,8 +890,15 @@ impl NvdecH265Decoder {
                 None => break,
             };
             // Guard 1: don't extract if the latest decoded frame has POC <= min
-            // (more frames with lower POC may arrive)
-            if self.presented_count > 0 && max_uw <= key.0 {
+            // (more frames with lower POC may arrive). Exception: when POC never
+            // advances at all (all-IDR stream: every picture has POC 0) no
+            // reordering exists and display order == decode order — holding back
+            // would stall forever while NVDEC recycles the pending surfaces.
+            let poc_flat = match (self.uw_min, self.uw_max) {
+                (Some(lo), Some(hi)) => lo == hi,
+                _ => false,
+            };
+            if self.presented_count > 0 && max_uw <= key.0 && !poc_flat {
                 break;
             }
             // Guard 2: don't extract if there's a gap larger than the POC increment
@@ -1312,8 +988,23 @@ impl NvdecH265Decoder {
         };
         let (crop_left, crop_top, _, _) = display_area;
 
-        let y_size = display_width * display_height;
-        let interleaved_uv_size = display_width * (display_height / 2);
+        let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
+        let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
+        // P016/YUV444_16Bit: 2 bytes per sample.
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let row_bytes = display_width * bps;
+        let y_size = row_bytes * display_height;
+        // NV12/P016: one interleaved UV plane at half resolution.
+        // YUV444/YUV444_16Bit: two planar U/V planes at full resolution.
+        let uv_plane_size = if is_mono {
+            0
+        } else if is_444 {
+            row_bytes * display_height
+        } else {
+            row_bytes * (display_height / 2)
+        };
+        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let interleaved_uv_size = uv_plane_size * num_uv_planes;
         let total = y_size + interleaved_uv_size;
         let pinned_base = {
             let mut cache = self.pinned_cache.lock().unwrap();
@@ -1337,7 +1028,6 @@ impl NvdecH265Decoder {
             }
         };
         let pinned_y = pinned_base;
-        let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         let mut copy_y = CUDA_MEMCPY2D {
             srcXInBytes: crop_left as u64,
@@ -1355,8 +1045,8 @@ impl NvdecH265Decoder {
             dstHost: pinned_y,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: row_bytes as u64,
+            WidthInBytes: row_bytes as u64,
             Height: display_height as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_y) } {
@@ -1368,33 +1058,46 @@ impl NvdecH265Decoder {
             }
         }
 
-        let coded_height = info.coded_size.height as u64;
-        let mut copy_uv = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
-            srcY: coded_height + (crop_top as u64) / 2,
-            srcMemoryType: CU_MEMORYTYPE_DEVICE,
-            _reserved0: 0,
-            srcHost: std::ptr::null(),
-            srcDevice: dev_ptr,
-            srcArray: 0,
-            srcPitch: pitch as u64,
-            dstXInBytes: 0,
-            dstY: 0,
-            dstMemoryType: CU_MEMORYTYPE_HOST,
-            _reserved1: 0,
-            dstHost: pinned_uv,
-            dstDevice: 0,
-            dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
-            Height: (display_height / 2) as u64,
-        };
-        match unsafe { cu_memcpy_2d(&copy_uv) } {
-            Ok(CUDA_SUCCESS) => {}
-            other => {
-                eprintln!("[NVDEC] cuMemcpy2D(UV) failed: {:?}", other);
-                let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
-                return None;
+        if !is_mono {
+            let coded_height = info.coded_size.height as u64;
+            for plane in 0..num_uv_planes {
+                let (src_y, rows) = if is_444 {
+                    (coded_height * (plane as u64 + 1) + crop_top as u64, display_height as u64)
+                } else {
+                    (coded_height + (crop_top as u64) / 2, (display_height / 2) as u64)
+                };
+                let dst = unsafe {
+                    (pinned_base as *mut u8).add(y_size + plane * uv_plane_size)
+                        as *mut std::ffi::c_void
+                };
+                let mut copy_uv = CUDA_MEMCPY2D {
+                    srcXInBytes: crop_left as u64,
+                    srcY: src_y,
+                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                    _reserved0: 0,
+                    srcHost: std::ptr::null(),
+                    srcDevice: dev_ptr,
+                    srcArray: 0,
+                    srcPitch: pitch as u64,
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: CU_MEMORYTYPE_HOST,
+                    _reserved1: 0,
+                    dstHost: dst,
+                    dstDevice: 0,
+                    dstArray: 0,
+                    dstPitch: row_bytes as u64,
+                    WidthInBytes: row_bytes as u64,
+                    Height: rows,
+                };
+                match unsafe { cu_memcpy_2d(&copy_uv) } {
+                    Ok(CUDA_SUCCESS) => {}
+                    other => {
+                        eprintln!("[NVDEC] cuMemcpy2D(UV plane {}) failed: {:?}", plane, other);
+                        let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                        return None;
+                    }
+                }
             }
         }
 
@@ -1405,56 +1108,115 @@ impl NvdecH265Decoder {
         unsafe {
             std::ptr::copy_nonoverlapping(pinned_y as *const u8, y_plane.as_mut_ptr(), y_size);
             std::ptr::copy_nonoverlapping(
-                pinned_uv as *const u8,
+                (pinned_base as *mut u8).add(y_size),
                 interleaved_uv.as_mut_ptr(),
                 interleaved_uv_size,
             );
         }
 
-        // De-interleave NV12 UV to planar U and V.
-        let uv_size = (display_width / 2) * (display_height / 2);
-        let mut u_plane = vec![0u8; uv_size];
-        let mut v_plane = vec![0u8; uv_size];
-        for y in 0..(display_height / 2) {
-            for x in 0..(display_width / 2) {
-                let src_idx = y * display_width + x * 2;
-                let dst_idx = y * (display_width / 2) + x;
-                u_plane[dst_idx] = interleaved_uv[src_idx];
-                v_plane[dst_idx] = interleaved_uv[src_idx + 1];
+        let pixel_data = if is_mono {
+            // Monochrome (YUV400): Y plane only.
+            let mut buffer = vec![0u8; y_size];
+            buffer.copy_from_slice(&y_plane);
+            let y_ptr = buffer.as_ptr();
+            Some(PixelData {
+                format: if bps == 2 { "GRAY_16BIT" } else { "GRAY" }.to_string(),
+                y: PixelPlane {
+                    data: y_ptr,
+                    pitch: row_bytes,
+                    width: display_width,
+                    height: display_height,
+                },
+                u: PixelPlane {
+                    data: y_ptr,
+                    pitch: 0,
+                    width: 0,
+                    height: 0,
+                },
+                v: None,
+                buffer,
+            })
+        } else if is_444 {
+            // YUV444: U and V already planar at full resolution in pinned memory.
+            let uv_size = display_width * display_height;
+            let mut buffer = Vec::with_capacity(y_size + uv_size * 2);
+            buffer.extend_from_slice(&y_plane);
+            buffer.extend_from_slice(&interleaved_uv);
+            let y_ptr = buffer.as_ptr();
+            let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
+            let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
+            Some(PixelData {
+                format: if bps == 2 { "YUV444_16BIT" } else { "YUV444" }.to_string(),
+                y: PixelPlane {
+                    data: y_ptr,
+                    pitch: row_bytes,
+                    width: display_width,
+                    height: display_height,
+                },
+                u: PixelPlane {
+                    data: u_ptr,
+                    pitch: row_bytes,
+                    width: display_width,
+                    height: display_height,
+                },
+                v: Some(PixelPlane {
+                    data: v_ptr,
+                    pitch: row_bytes,
+                    width: display_width,
+                    height: display_height,
+                }),
+                buffer,
+            })
+        } else {
+            // De-interleave NV12/P016 UV to planar U and V (byte-based).
+            let uv_w = display_width / 2;
+            let uv_h = display_height / 2;
+            let uv_size = uv_w * uv_h * bps;
+            let mut u_plane = vec![0u8; uv_size];
+            let mut v_plane = vec![0u8; uv_size];
+            for y in 0..uv_h {
+                for x in 0..uv_w {
+                    let src_idx = (y * display_width + x * 2) * bps;
+                    let dst_idx = (y * uv_w + x) * bps;
+                    u_plane[dst_idx..dst_idx + bps]
+                        .copy_from_slice(&interleaved_uv[src_idx..src_idx + bps]);
+                    v_plane[dst_idx..dst_idx + bps]
+                        .copy_from_slice(&interleaved_uv[src_idx + bps..src_idx + 2 * bps]);
+                }
             }
-        }
 
-        let mut buffer = Vec::with_capacity(y_size + uv_size * 2);
-        buffer.extend_from_slice(&y_plane);
-        buffer.extend_from_slice(&u_plane);
-        buffer.extend_from_slice(&v_plane);
+            let mut buffer = Vec::with_capacity(y_size + uv_size * 2);
+            buffer.extend_from_slice(&y_plane);
+            buffer.extend_from_slice(&u_plane);
+            buffer.extend_from_slice(&v_plane);
 
-        let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-        let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
+            let y_ptr = buffer.as_ptr();
+            let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
+            let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
 
-        let pixel_data = Some(PixelData {
-            format: "I420".to_string(),
-            y: PixelPlane {
-                data: y_ptr,
-                pitch: display_width,
-                width: display_width,
-                height: display_height,
-            },
-            u: PixelPlane {
-                data: u_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
-                height: display_height / 2,
-            },
-            v: Some(PixelPlane {
-                data: v_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
-                height: display_height / 2,
-            }),
-            buffer,
-        });
+            Some(PixelData {
+                format: if bps == 2 { "I420_16BIT" } else { "I420" }.to_string(),
+                y: PixelPlane {
+                    data: y_ptr,
+                    pitch: row_bytes,
+                    width: display_width,
+                    height: display_height,
+                },
+                u: PixelPlane {
+                    data: u_ptr,
+                    pitch: row_bytes / 2,
+                    width: display_width / 2,
+                    height: display_height / 2,
+                },
+                v: Some(PixelPlane {
+                    data: v_ptr,
+                    pitch: row_bytes / 2,
+                    width: display_width / 2,
+                    height: display_height / 2,
+                }),
+                buffer,
+            })
+        };
 
         let frame_index = {
             let mut count = self.frame_count.lock().unwrap();
@@ -1491,7 +1253,7 @@ impl NvdecH265Decoder {
         })
     }
 
-    /// Dump a decoded picture (DECODE order) as NV12 (full coded size).
+    /// Dump a decoded picture (DECODE order) as raw planes (full coded size).
     fn dump_decode_order_frame(&self, pic_index: i32, count: u32) {
         let path = match &self.dump_decode_order_path {
             Some(p) => p.clone(),
@@ -1513,9 +1275,20 @@ impl NvdecH265Decoder {
         };
         let coded_w = info.coded_size.width as usize;
         let coded_h = info.coded_size.height as usize;
-        let y_size = coded_w * coded_h;
-        let uv_size = coded_w * (coded_h / 2);
-        let total = y_size + uv_size;
+        let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
+        let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let row_bytes = coded_w * bps;
+        let y_size = row_bytes * coded_h;
+        let uv_plane_size = if is_mono {
+            0
+        } else if is_444 {
+            row_bytes * coded_h
+        } else {
+            row_bytes * (coded_h / 2)
+        };
+        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let total = y_size + uv_plane_size * num_uv_planes;
 
         let funcs = match get_funcs() {
             Ok(f) => f,
@@ -1568,32 +1341,45 @@ impl NvdecH265Decoder {
                     dstHost: p,
                     dstDevice: 0,
                     dstArray: 0,
-                    dstPitch: coded_w as u64,
-                    WidthInBytes: coded_w as u64,
+                    dstPitch: row_bytes as u64,
+                    WidthInBytes: row_bytes as u64,
                     Height: coded_h as u64,
                 };
                 let _ = unsafe { cu_memcpy_2d(&copy_y) };
-                let mut copy_uv = CUDA_MEMCPY2D {
-                    srcXInBytes: 0,
-                    srcY: coded_h as u64,
-                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                    _reserved0: 0,
-                    srcHost: std::ptr::null(),
-                    srcDevice: dev_ptr,
-                    srcArray: 0,
-                    srcPitch: pitch as u64,
-                    dstXInBytes: 0,
-                    dstY: 0,
-                    dstMemoryType: CU_MEMORYTYPE_HOST,
-                    _reserved1: 0,
-                    dstHost: unsafe { (p as *mut u8).add(y_size) as *mut std::ffi::c_void },
-                    dstDevice: 0,
-                    dstArray: 0,
-                    dstPitch: coded_w as u64,
-                    WidthInBytes: coded_w as u64,
-                    Height: (coded_h / 2) as u64,
-                };
-                let _ = unsafe { cu_memcpy_2d(&copy_uv) };
+                if !is_mono {
+                    for plane in 0..num_uv_planes {
+                        let src_y = if is_444 {
+                            (coded_h * (plane + 1)) as u64
+                        } else {
+                            coded_h as u64
+                        };
+                        let rows = if is_444 { coded_h as u64 } else { (coded_h / 2) as u64 };
+                        let mut copy_uv = CUDA_MEMCPY2D {
+                            srcXInBytes: 0,
+                            srcY: src_y,
+                            srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                            _reserved0: 0,
+                            srcHost: std::ptr::null(),
+                            srcDevice: dev_ptr,
+                            srcArray: 0,
+                            srcPitch: pitch as u64,
+                            dstXInBytes: 0,
+                            dstY: 0,
+                            dstMemoryType: CU_MEMORYTYPE_HOST,
+                            _reserved1: 0,
+                            dstHost: unsafe {
+                                (p as *mut u8).add(y_size + plane * uv_plane_size)
+                                    as *mut std::ffi::c_void
+                            },
+                            dstDevice: 0,
+                            dstArray: 0,
+                            dstPitch: row_bytes as u64,
+                            WidthInBytes: row_bytes as u64,
+                            Height: rows,
+                        };
+                        let _ = unsafe { cu_memcpy_2d(&copy_uv) };
+                    }
+                }
                 let mut buf = vec![0u8; total];
                 unsafe {
                     std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
@@ -1630,7 +1416,19 @@ impl NvdecH265Decoder {
         };
         let w = info.coded_size.width as usize;
         let h = info.coded_size.height as usize;
-        let total = w * h * 3 / 2;
+        let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
+        let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let row_bytes = w * bps;
+        let uv_plane_size = if is_mono {
+            0
+        } else if is_444 {
+            row_bytes * h
+        } else {
+            row_bytes * (h / 2)
+        };
+        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let total = row_bytes * h + uv_plane_size * num_uv_planes;
         let funcs = match get_funcs() {
             Ok(f) => f,
             Err(_) => return,
@@ -1664,7 +1462,7 @@ impl NvdecH265Decoder {
         }
         let host = unsafe { cu_mem_host_alloc(total) };
         if let Ok(p) = host {
-            let y_size = w * h;
+            let y_size = row_bytes * h;
             let mut cy = CUDA_MEMCPY2D {
                 srcXInBytes: 0,
                 srcY: 0,
@@ -1681,32 +1479,41 @@ impl NvdecH265Decoder {
                 dstHost: p,
                 dstDevice: 0,
                 dstArray: 0,
-                dstPitch: w as u64,
-                WidthInBytes: w as u64,
+                dstPitch: row_bytes as u64,
+                WidthInBytes: row_bytes as u64,
                 Height: h as u64,
             };
             let _ = unsafe { cu_memcpy_2d(&cy) };
-            let mut cuv = CUDA_MEMCPY2D {
-                srcXInBytes: 0,
-                srcY: h as u64,
-                srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                _reserved0: 0,
-                srcHost: std::ptr::null(),
-                srcDevice: dev_ptr,
-                srcArray: 0,
-                srcPitch: pitch as u64,
-                dstXInBytes: 0,
-                dstY: 0,
-                dstMemoryType: CU_MEMORYTYPE_HOST,
-                _reserved1: 0,
-                dstHost: unsafe { (p as *mut u8).add(y_size) as *mut std::ffi::c_void },
-                dstDevice: 0,
-                dstArray: 0,
-                dstPitch: w as u64,
-                WidthInBytes: w as u64,
-                Height: (h / 2) as u64,
-            };
-            let _ = unsafe { cu_memcpy_2d(&cuv) };
+            if !is_mono {
+                for plane in 0..num_uv_planes {
+                    let src_y = if is_444 { (h * (plane + 1)) as u64 } else { h as u64 };
+                    let rows = if is_444 { h as u64 } else { (h / 2) as u64 };
+                    let mut cuv = CUDA_MEMCPY2D {
+                        srcXInBytes: 0,
+                        srcY: src_y,
+                        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                        _reserved0: 0,
+                        srcHost: std::ptr::null(),
+                        srcDevice: dev_ptr,
+                        srcArray: 0,
+                        srcPitch: pitch as u64,
+                        dstXInBytes: 0,
+                        dstY: 0,
+                        dstMemoryType: CU_MEMORYTYPE_HOST,
+                        _reserved1: 0,
+                        dstHost: unsafe {
+                            (p as *mut u8).add(y_size + plane * uv_plane_size)
+                                as *mut std::ffi::c_void
+                        },
+                        dstDevice: 0,
+                        dstArray: 0,
+                        dstPitch: row_bytes as u64,
+                        WidthInBytes: row_bytes as u64,
+                        Height: rows,
+                    };
+                    let _ = unsafe { cu_memcpy_2d(&cuv) };
+                }
+            }
             let mut buf = vec![0u8; total];
             unsafe { std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total) };
             let _ = std::fs::write(path, &buf);
@@ -1782,12 +1589,8 @@ impl Decoder for NvdecH265Decoder {
         }
         self.parser.reset();
         {
-            let mut dpb = self.dpb.lock().unwrap();
-            dpb.reset();
-        }
-        {
-            let mut prev = self.prev_dpb_state.lock().unwrap();
-            *prev = H265DpbState::default();
+            let mut ctx = self.dpb.lock().unwrap();
+            ctx.reset();
         }
         {
             let mut pending = self.pending_frames.lock().unwrap();

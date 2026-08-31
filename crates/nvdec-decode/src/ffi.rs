@@ -157,6 +157,8 @@ pub enum cudaVideoSurfaceFormat {
     cudaVideoSurfaceFormat_YUV444 = 2,
     /// 16 bit Planar YUV [Y plane followed by U and V planes]
     cudaVideoSurfaceFormat_YUV444_16Bit = 3,
+    /// Monochrome [Y plane only]
+    cudaVideoSurfaceFormat_YUV400 = 4,
 }
 
 /// Deinterlacing mode enums
@@ -1127,6 +1129,18 @@ pub struct CUVIDPROCPARAMS {
     pub Reserved: [c_uint; 46],
     pub histogram_dptr: *mut c_ulonglong,
     pub Reserved2: [*mut c_void; 1],
+}
+
+/// Default postprocessing parameters for progressive content:
+/// progressive frame, top field first, no external output stream.
+///
+/// `cuvidDecodePicture` requires this pointer (passing NULL is undefined
+/// behavior); NVIDIA's own samples always supply an explicit struct.
+pub fn default_procparams() -> CUVIDPROCPARAMS {
+    let mut p = unsafe { std::mem::zeroed::<CUVIDPROCPARAMS>() };
+    p.progressive_frame = 1;
+    p.top_field_first = 1;
+    p
 }
 
 /// Decode status structure

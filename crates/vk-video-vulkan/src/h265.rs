@@ -1,6 +1,7 @@
 //! H.265/HEVC Vulkan video decoder.
 
 use ash::vk;
+use ash::vk::Handle;
 use ash::vk::native::*;
 
 use super::{VideoError, VideoResult};
@@ -19,6 +20,14 @@ pub struct H265RefPictureInfo<'a> {
     pub image: vk::Image,
     /// Current image layout (for memory barriers)
     pub current_layout: vk::ImageLayout,
+    /// Absolute array layer of this slot's subresource within its image
+    /// (slot index when the DPB is a layered image, 0 otherwise). Image
+    /// memory barriers address the image directly, so they need the absolute
+    /// layer (picture-resource baseArrayLayer stays view-relative: 0).
+    pub image_base_layer: u32,
+    /// The slot's picture is a long-term reference of the current picture
+    /// (StdVideoDecodeH265ReferenceInfoFlags.used_for_long_term_reference).
+    pub used_for_long_term_reference: bool,
 }
 
 /// H.265 decoder state.
@@ -38,6 +47,11 @@ pub struct H265Decoder {
     prev_pic_order_cnt_lsb: u32,
     /// Monotonically increasing counter for session parameter updates.
     update_sequence_count: u32,
+    /// Whether the mandatory one-time codec reset (vkCmdControlVideoCodingKHR
+    /// with RESET) has been issued for this session. The Vulkan spec REQUIRES a
+    /// reset before the first video coding operation on a newly created session;
+    /// the NVIDIA driver traps in vkCmdDecodeVideoKHR without it.
+    reset_done: bool,
 }
 
 impl H265Decoder {
@@ -51,6 +65,7 @@ impl H265Decoder {
             frame_count: 0,
             prev_pic_order_cnt_lsb: 0,
             update_sequence_count: 0,
+            reset_done: false,
         }
     }
 
@@ -152,42 +167,51 @@ impl H265Decoder {
         bitstream_range: u64,
         output_image_view: vk::ImageView,
         output_image: vk::Image,
+        output_format: vk::Format,
         coded_extent: vk::Extent2D,
         dpb_setup_picture: Option<H265RefPictureInfo<'a>>,
         dpb_ref_pictures: &[H265RefPictureInfo<'a>],
         slice_offsets: &[u32],
-        pic_order_cnt: Option<i32>,
-        is_intra: Option<bool>,
-        is_reference: Option<bool>,
-        is_idr: Option<bool>,
-        num_bits_for_st_ref_pic_set_in_slice: i32,
-        num_delta_pocs_of_ref_rps_idx: i32,
-        ref_pocs: &[i32],
-        dpb_entries: &[&super::dpb::DpbEntry],
+        h265_info: &vk_video_parser::h265::SliceHeaderInfo,
+        rps_slots: (&[i32], &[i32], &[i32]),
+        query_pool: vk::QueryPool,
+        frame_index: u32,
     ) -> VideoResult<()> {
-        let (effective_poc, effective_is_intra, effective_is_ref, effective_is_idr) =
-            if let (Some(poc), Some(intra), Some(ref_), Some(idr)) =
-                (pic_order_cnt, is_intra, is_reference, is_idr)
-            {
-                (poc, intra, ref_, idr)
-            } else {
-                let sps = self.sps.as_ref().expect("H265 SPS not set before decode");
-                let log2_max_poc_lsb = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
-                let max_poc_lsb = 1u32 << log2_max_poc_lsb;
-                ((self.frame_count % max_poc_lsb) as i32, false, true, false)
-            };
+        // POC / RPS / list data come from the common parser + common DPB
+        // (single source of truth shared across backends).
+        let pic_info = self.build_picture_info(coded_extent, h265_info, rps_slots);
 
-        let pic_info = self.build_picture_info(
-            coded_extent,
-            effective_poc,
-            effective_is_intra,
-            effective_is_ref,
-            effective_is_idr,
-            num_bits_for_st_ref_pic_set_in_slice,
-            num_delta_pocs_of_ref_rps_idx,
-            ref_pocs,
-            dpb_entries,
-        );
+        if super::vacc_debug() && !dpb_ref_pictures.is_empty() {
+            eprintln!(
+                "[PIC-INFO] sps_vps_id={} pps_sps_id={} pps_id={} numDeltaPocsRefRpsIdx={} numBitsStrpsInSlice={} poc={} stBefore=[{:02x?}] stAfter=[{:02x?}] ltCurr=[{:02x?}] irap={} idr={} isref={} strps_sps_flag={}",
+                pic_info.sps_video_parameter_set_id,
+                pic_info.pps_seq_parameter_set_id,
+                pic_info.pps_pic_parameter_set_id,
+                pic_info.NumDeltaPocsOfRefRpsIdx,
+                pic_info.NumBitsForSTRefPicSetInSlice,
+                pic_info.PicOrderCntVal,
+                pic_info.RefPicSetStCurrBefore,
+                pic_info.RefPicSetStCurrAfter,
+                pic_info.RefPicSetLtCurr,
+                pic_info.flags.IrapPicFlag(),
+                pic_info.flags.IdrPicFlag(),
+                pic_info.flags.IsReference(),
+                pic_info.flags.short_term_ref_pic_set_sps_flag()
+            );
+            eprintln!(
+                "[PIC-INFO] begin_slots: setup={} refs={:?}",
+                dpb_setup_picture.as_ref().map(|s| s.slot_index).unwrap_or(u32::MAX),
+                dpb_ref_pictures.iter().map(|r| (r.slot_index, r.pic_order_cnt, r.used_for_long_term_reference)).collect::<Vec<_>>()
+            );
+        }
+
+        // Video result-status queries must be explicitly reset after pool
+        // creation and between uses (VUID-vkCmdDecodeVideoKHR-pNext-08366).
+        // Matches C++ ref VkVideoDecoder.cpp: CmdResetQueryPool is recorded
+        // right after BeginCommandBuffer, before CmdBeginVideoCodingKHR.
+        if query_pool != vk::QueryPool::null() {
+            self.cmd_reset_query_pool(cmd_buffer, query_pool, frame_index, 1);
+        }
 
         // H.265 requires VkVideoDecodeH265DpbSlotInfoKHR in the pNext chain of
         // each reference slot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07163).
@@ -202,6 +226,12 @@ impl H265Decoder {
             ref_std_info
         });
 
+        // LT reference flag per reference slot (common DPB marking).
+        let lt_flags: Vec<u32> = dpb_ref_pictures
+            .iter()
+            .map(|info| u32::from(info.used_for_long_term_reference))
+            .collect();
+
         // Second: create VkVideoDecodeH265DpbSlotInfoKHR for setup slot
         let setup_dpb_slot_info =
             setup_ref_std_info
@@ -214,28 +244,50 @@ impl H265Decoder {
                 });
 
         // Third: create VkVideoReferenceSlotInfoKHR for setup slot
-        // Use actual slot index (matches C++ reference implementation)
+        // (DecodeVideo's pSetupReferenceSlot — actual slot index)
         let setup_slot = dpb_setup_picture.as_ref().map(|info| {
-            let pnext = setup_dpb_slot_info
-                .as_ref()
-                .map_or(std::ptr::null(), |s| s as *const _ as *const _);
             vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                p_next: pnext,
+                p_next: setup_dpb_slot_info
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _ as *const _),
                 slot_index: info.slot_index as i32, // Use actual slot index
                 p_picture_resource: &info.picture_resource as *const _,
                 _marker: Default::default(),
             }
         });
 
+        // Third-bis: copy of the setup slot for BeginVideoCoding.
+        // Spec (vkCmdBeginVideoCodingKHR): a non-negative slotIndex must
+        // identify a DPB slot in the ACTIVE state at execution time
+        // (VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239). The output slot is
+        // still INACTIVE when Begin executes — it only becomes active when the
+        // decode activates it. So it must be bound with
+        // slotIndex = VK_VIDEO_DECODE_SLOT_INDEX_NONE (-1) + picture resource
+        // ("added to the set of bound reference picture resources without an
+        // associated DPB slot"; the decode's pSetupReferenceSlot then
+        // associates it with the actual slot). Matches FFmpeg
+        // vulkan_decode.c ff_vk_decode_frame ("The current decoding reference
+        // has to be bound as an inactive reference"). Declaring the actual
+        // (inactive) index here makes the NVIDIA driver trap in
+        // vkCmdDecodeVideoKHR.
+        let setup_slot_for_begin = setup_slot.as_ref().map(|s| vk::VideoReferenceSlotInfoKHR {
+            s_type: s.s_type,
+            p_next: s.p_next,
+            slot_index: -1,
+            p_picture_resource: s.p_picture_resource,
+            _marker: Default::default(),
+        });
+
         // Fourth: create StdVideoDecodeH265ReferenceInfo for each ref picture
         let ref_std_infos: Vec<StdVideoDecodeH265ReferenceInfo> = dpb_ref_pictures
             .iter()
-            .map(|info| {
+            .zip(lt_flags.iter())
+            .map(|(info, lt_flag)| {
                 let mut ref_std_info =
                     unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
                 ref_std_info.PicOrderCntVal = info.pic_order_cnt;
-                ref_std_info.flags.set_used_for_long_term_reference(0);
+                ref_std_info.flags.set_used_for_long_term_reference(*lt_flag);
                 ref_std_info.flags.set_unused_for_reference(0);
                 ref_std_info
             })
@@ -287,12 +339,12 @@ impl H265Decoder {
         let begin_video_coding_slots: Vec<vk::VideoReferenceSlotInfoKHR> = if !ref_slots.is_empty()
         {
             let mut combined = ref_slots.clone();
-            if let Some(ref setup) = setup_slot {
+            if let Some(ref setup) = setup_slot_for_begin {
                 combined.push(*setup);
             }
             combined
         } else {
-            setup_slot.into_iter().collect()
+            setup_slot_for_begin.into_iter().collect()
         };
 
         let begin_slot_count = begin_video_coding_slots.len() as u32;
@@ -316,6 +368,14 @@ impl H265Decoder {
 
         self.cmd_begin_video_coding(cmd_buffer, &begin_coding_info);
 
+        // MANDATORY codec reset before the first frame (Vulkan spec: a newly
+        // created video session must be reset before any video coding op). Matches
+        // the C++ reference (VkVideoDecoder.cpp:1187-1196) and our H264 path.
+        if !self.reset_done {
+            self.cmd_control_video_coding(cmd_buffer);
+            self.reset_done = true;
+        }
+
         // Barriers AFTER BeginVideoCoding and BEFORE DecodeVideo
         // This matches C++ reference VkVideoDecoder.cpp:1216-1227
         // Bitstream buffer barrier
@@ -335,14 +395,22 @@ impl H265Decoder {
         };
 
         // Output image barrier
-        // Use COLOR aspect (matches C++ reference VkVideoDecoder.cpp:857)
+        // Multi-planar formats must not use COLOR in the aspect mask (the
+        // NVIDIA driver loses the device when decoding P010 with COLOR).
         // When dpb_setup_picture points to the same image as dstPictureResource,
         // use VIDEO_DECODE_DPB_KHR layout (per Vulkan spec).
-        let subresource_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+        // With a layered DPB image the barrier must target the output slot's
+        // own array layer (C++ ref VkVideoDecoder.cpp:841-861); targeting
+        // layer 0 of the shared image invalidates another frame's contents.
+        let output_image_base_layer = dpb_setup_picture
+            .as_ref()
+            .map(|s| s.image_base_layer)
+            .unwrap_or(0);
+        let output_subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: super::profile_chain::aspect_mask_for_format(output_format),
             base_mip_level: 0,
             level_count: 1,
-            base_array_layer: 0,
+            base_array_layer: output_image_base_layer,
             layer_count: 1,
         };
 
@@ -365,7 +433,7 @@ impl H265Decoder {
             image: output_image,
             old_layout: vk::ImageLayout::UNDEFINED,
             new_layout,
-            subresource_range,
+            subresource_range: output_subresource_range,
             _marker: Default::default(),
         };
 
@@ -388,7 +456,13 @@ impl H265Decoder {
                     image: ref_pic.image,
                     old_layout: ref_pic.current_layout,
                     new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                    subresource_range,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: super::profile_chain::aspect_mask_for_format(output_format),
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: ref_pic.image_base_layer,
+                        layer_count: 1,
+                    },
                     _marker: Default::default(),
                 });
             }
@@ -435,9 +509,28 @@ impl H265Decoder {
             _marker: Default::default(),
         };
 
+        // Match the C++ reference (VkVideoDecoder.cpp:1211-1230): the session is
+        // created with VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR and every
+        // decode command carries a VkVideoInlineQueryInfoKHR. The reference uses
+        // one RESULT_STATUS_ONLY query per frame; queryPool=NULL + queryCount=0
+        // means "no queries" (legal per spec) when no pool is available.
+        let inline_query = if query_pool != vk::QueryPool::null() {
+            super::inline_queries::VideoInlineQueryInfoKHR {
+                s_type: super::inline_queries::VIDEO_INLINE_QUERY_INFO_KHR,
+                p_next: &h265_decode_info as *const _ as *const _,
+                query_pool: query_pool.as_raw(),
+                first_query: frame_index,
+                query_count: 1,
+            }
+        } else {
+            super::inline_queries::empty_inline_queries(
+                &h265_decode_info as *const _ as *const _,
+            )
+        };
+
         let decode_info = vk::VideoDecodeInfoKHR {
             s_type: vk::StructureType::VIDEO_DECODE_INFO_KHR,
-            p_next: &h265_decode_info as *const _ as *const _,
+            p_next: &inline_query as *const _ as *const _,
             flags: vk::VideoDecodeFlagsKHR::empty(),
             src_buffer: bitstream_buffer,
             src_buffer_offset: bitstream_offset,
@@ -469,84 +562,91 @@ impl H265Decoder {
     fn build_picture_info(
         &self,
         _coded_extent: vk::Extent2D,
-        pic_order_cnt_val: i32,
-        is_intra: bool,
-        is_reference: bool,
-        is_idr: bool,
-        num_bits_for_st_ref_pic_set_in_slice: i32,
-        num_delta_pocs_of_ref_rps_idx: i32,
-        ref_pocs: &[i32],
-        dpb_entries: &[&super::dpb::DpbEntry],
+        info: &vk_video_parser::h265::SliceHeaderInfo,
+        rps_slots: (&[i32], &[i32], &[i32]),
     ) -> StdVideoDecodeH265PictureInfo {
         let sps = self.sps.as_ref().expect("H265 SPS not set before decode");
         let pps = self.pps.as_ref().expect("H265 PPS not set before decode");
 
         let mut pic_info = unsafe { std::mem::zeroed::<StdVideoDecodeH265PictureInfo>() };
 
-        // Per C++ reference VulkanVideoParser.cpp:2379-2397:
-        // Fields are populated from parsed slice header data
         pic_info.sps_video_parameter_set_id = sps.sps_video_parameter_set_id;
         pic_info.pps_seq_parameter_set_id = pps.pps_seq_parameter_set_id as u8;
         pic_info.pps_pic_parameter_set_id = pps.pps_pic_parameter_set_id as u8;
 
-        // IrapPicFlag: true for IRAP frames (BLA, CRA, IDR = NAL types 16-23)
-        // is_intra indicates this is an IRAP frame
-        pic_info.flags.set_IrapPicFlag(if is_intra { 1 } else { 0 });
-        // IdrPicFlag: true only for IDR pictures (NAL unit types 19-20: IDR_W_RADL/IDR_N_LP)
-        pic_info.flags.set_IdrPicFlag(if is_idr { 1 } else { 0 });
+        // IrapPicFlag: IRAP picture (BLA/CRA/IDR, NAL types 16-23) — NOT the
+        // intra slice type: a CRA may carry an inter slice.
+        pic_info.flags.set_IrapPicFlag(u32::from(info.is_rap));
+        // IdrPicFlag: IDR pictures only (NAL unit types 19-20).
+        pic_info.flags.set_IdrPicFlag(u32::from(info.is_idr));
+        pic_info.flags.set_IsReference(u32::from(info.is_reference));
         pic_info
             .flags
-            .set_IsReference(if is_reference { 1 } else { 0 });
+            .set_short_term_ref_pic_set_sps_flag(u32::from(info.short_term_ref_pic_set_sps_flag));
 
-        // NumBitsForShortTermRPSInSlice: size of short-term RPS in slice header
-        // Per C++ reference VulkanVideoParser.cpp:2392
-        // Set from AccessUnit when slice-level RPS is used
-        pic_info.NumBitsForSTRefPicSetInSlice = num_bits_for_st_ref_pic_set_in_slice as u16;
-
-        // NumDeltaPocsOfRefRpsIdx: delta POCS of reference RPS index
-        // Per C++ reference VulkanVideoParser.cpp:2396
-        // Set from AccessUnit when predictive RPS is used
-        pic_info.NumDeltaPocsOfRefRpsIdx = num_delta_pocs_of_ref_rps_idx as u8;
-
-        // PicOrderCntVal from parsed slice header (CurrPicOrderCntVal)
-        // Per C++ reference VulkanVideoParser.cpp:2397
-        pic_info.PicOrderCntVal = pic_order_cnt_val;
-
-        // RefPicSet arrays: DPB slot indices of reference pictures for current frame
-        // Per C++ reference VulkanVideoParser.cpp:1666-1718
-        // Map ref_pocs to DPB slot indices and split into Before/After based on POC
-        pic_info.RefPicSetStCurrBefore = [0xffu8; 8];
-        pic_info.RefPicSetStCurrAfter = [0xffu8; 8];
-        pic_info.RefPicSetLtCurr = [0xffu8; 8];
-
-        // Build mapping from ref_pocs to DPB slots
-        let mut num_st_before = 0u32;
-        let mut num_st_after = 0u32;
-
-        for &ref_poc in ref_pocs {
-            // Find the DPB entry with this POC
-            if let Some(entry) = dpb_entries.iter().find(|e| e.pic_order_cnt[0] == ref_poc) {
-                let slot_idx = (entry.slot_index & 0xf) as u8;
-
-                if ref_poc < pic_order_cnt_val {
-                    // Reference with POC < current POC goes to StCurrBefore
-                    if num_st_before < 8 {
-                        pic_info.RefPicSetStCurrBefore[num_st_before as usize] = slot_idx;
-                        num_st_before += 1;
-                    }
-                } else if ref_poc > pic_order_cnt_val {
-                    // Reference with POC > current POC goes to StCurrAfter
-                    if num_st_after < 8 {
-                        pic_info.RefPicSetStCurrAfter[num_st_after as usize] = slot_idx;
-                        num_st_after += 1;
-                    }
-                }
-                // References with equal POC are ignored (shouldn't happen normally)
-            }
-            // Reference POC not found in DPB - skip silently
+        // RPS reconstruction hints for the driver (IDR pictures carry no RPS):
+        // - SPS-flagged RPS: NumDeltaPocs[RefRpsIdx] = number of DeltaPoc
+        //   entries (S0 + S1) in that SPS short-term reference picture set;
+        // - in-slice RPS: its SizeInBits in the slice header.
+        if !info.is_idr && info.short_term_ref_pic_set_sps_flag {
+            let rps = sps
+                .short_term_ref_pic_sets
+                .get(info.short_term_ref_pic_set_idx as usize)
+                .expect("SPS STRPS index out of range");
+            pic_info.NumDeltaPocsOfRefRpsIdx =
+                (rps.num_negative_pics + rps.num_positive_pics) as u8;
+            pic_info.NumBitsForSTRefPicSetInSlice = 0;
+        } else if !info.is_idr {
+            pic_info.NumDeltaPocsOfRefRpsIdx = 0;
+            pic_info.NumBitsForSTRefPicSetInSlice = info.num_bits_for_strps_in_slice;
         }
 
+        // CurrPicOrderCntVal from the common parser.
+        pic_info.PicOrderCntVal = info.curr_pic_order_cnt_val;
+
+        // RefPicSet arrays: DPB slot of each RPS entry (common DPB match),
+        // STD_VIDEO_H265_NO_REFERENCE_PICTURE (0xff) when the entry's picture
+        // is not in the DPB or has no entry.
+        pic_info.RefPicSetStCurrBefore = [0xff; 8];
+        pic_info.RefPicSetStCurrAfter = [0xff; 8];
+        pic_info.RefPicSetLtCurr = [0xff; 8];
+        let fill = |arr: &mut [u8; 8], slots: &[i32]| {
+            for (i, s) in slots.iter().enumerate().take(8) {
+                arr[i] = if *s >= 0 { *s as u8 } else { 0xff };
+            }
+        };
+        fill(&mut pic_info.RefPicSetStCurrBefore, rps_slots.0);
+        fill(&mut pic_info.RefPicSetStCurrAfter, rps_slots.1);
+        fill(&mut pic_info.RefPicSetLtCurr, rps_slots.2);
+
         pic_info
+    }
+
+    // Helper: dispatch vkCmdResetQueryPool (video result-status queries must
+    // be reset after pool creation and between uses, VUID-08366)
+    fn cmd_reset_query_pool(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        first_query: u32,
+        query_count: u32,
+    ) {
+        let fn_ptr = unsafe {
+            self.instance.get_device_proc_addr(
+                self.device.handle(),
+                c"vkCmdResetQueryPool".as_ptr(),
+            )
+        };
+        if let Some(ptr) = fn_ptr {
+            unsafe {
+                type FnType =
+                    unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
+                let f: FnType = std::mem::transmute(ptr);
+                f(cmd_buffer, query_pool, first_query, query_count);
+            }
+        } else if super::vacc_debug() {
+            eprintln!("[H265] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
+        }
     }
 
     // Helper: dispatch cmdPipelineBarrier2
@@ -605,7 +705,6 @@ impl H265Decoder {
         }
     }
 
-    #[allow(dead_code)]
     fn cmd_control_video_coding(&self, cmd_buffer: vk::CommandBuffer) {
         let coding_control_info = vk::VideoCodingControlInfoKHR {
             s_type: vk::StructureType::VIDEO_CODING_CONTROL_INFO_KHR,
@@ -626,6 +725,11 @@ impl H265Decoder {
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, &coding_control_info);
             }
+            if super::vacc_debug() {
+                eprintln!("[H265] issued codec RESET (vkCmdControlVideoCodingKHR)");
+            }
+        } else {
+            eprintln!("[H265] WARNING: vkCmdControlVideoCodingKHR not found; skipping mandatory reset");
         }
     }
 

@@ -9,6 +9,35 @@ use crate::bitreader::BitReader;
 use crate::nal::{self, H265NalUnitType, NalUnit};
 use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 
+/// One entry of ref_pic_lists_modification (per reference list).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct H265ListModification {
+    /// ref_pic_list_modification_flag_lX[i]
+    pub flag: bool,
+    /// ref_idx_lX[i] (valid when flag is true)
+    pub ref_idx: u8,
+}
+
+/// A long-term reference picture signaled in the slice header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct H265LtRef {
+    /// lt_idx_sps (valid when `from_sps` is true); poc_lsb comes from the SPS
+    pub sps_idx: u8,
+    /// True when the POC LSB comes from sps.lt_ref_pic_poc_lsb_sps[sps_idx]
+    pub from_sps: bool,
+    /// poc_lsb_lt (slice-signal long-term pictures only)
+    pub poc_lsb: u32,
+    /// used_by_curr_pic_lt_sps_flag / used_by_curr_pic_lt_flag
+    pub used_by_curr_pic: bool,
+    /// delta_poc_msb_present_flag
+    pub delta_poc_msb_present: bool,
+    /// delta_poc_msb_cycle_lt
+    pub delta_poc_msb_cycle: u32,
+    /// Full resolved POC (POCmsbCycl + POClsb, per H.265 spec 8.3.1).
+    /// Valid when used_by_curr_pic is true.
+    pub resolved_poc: i32,
+}
+
 /// Parsed slice header information for H.265.
 #[derive(Debug, Clone)]
 pub struct SliceHeaderInfo {
@@ -24,16 +53,119 @@ pub struct SliceHeaderInfo {
     pub is_rap: bool,
     /// Whether this picture is a reference picture
     pub is_reference: bool,
+    /// no_output_of_prior_pics_flag: raw bitstream value, read for all IRAP
+    /// NAL types 16-23; false (inferred) for non-IRAP.
+    pub no_output_of_prior_pics_flag: bool,
     /// short_term_ref_pic_set_sps_flag from slice header (for StdVideoDecodeH265PictureInfo)
     pub short_term_ref_pic_set_sps_flag: bool,
     /// Index into SPS short_term_ref_pic_sets array (when short_term_ref_pic_set_sps_flag is true)
     pub short_term_ref_pic_set_idx: u8,
     /// Slice-level STRPS (when short_term_ref_pic_set_sps_flag is false)
     pub slice_strps: Option<vk_video_core::picture::H265ShortTermRefPicSet>,
+    /// num_ref_idx_l0_active_minus1 (inter slices; 0 for intra)
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// num_ref_idx_l1_active_minus1 (B slices; 0 otherwise)
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// ref_pic_lists_modification for list 0 (B slices with lists_modification_present_flag)
+    pub ref_pic_lists_modification_l0: Vec<H265ListModification>,
+    /// ref_pic_lists_modification for list 1
+    pub ref_pic_lists_modification_l1: Vec<H265ListModification>,
+    /// Long-term reference pictures signaled in this slice header
+    pub long_term_refs: Vec<H265LtRef>,
+    /// num_long_term_sps (count of SPS-signal LT refs in long_term_refs)
+    pub num_long_term_sps: u8,
+    /// num_long_term_pics (count of slice-signal LT refs in long_term_refs)
+    pub num_long_term_pics: u8,
+    /// slice_temporal_mvp_enabled_flag
+    pub slice_temporal_mvp_enabled_flag: bool,
+    /// SizeInBits of short_term_ref_pic_set() in the slice header (0 when
+    /// short_term_ref_pic_set_sps_flag is 1)
+    pub num_bits_for_strps_in_slice: u16,
+
+    // --- Fields beyond the RPS block (H.265 7.3.6.1), parsed in FFmpeg
+    // n8.1.2 hls_slice_header order; needed by VAAPI slice buffers ---
+
+    /// slice_segment_address (0 for first slice segments).
+    pub slice_segment_address: u32,
+    /// pic_output_flag (only when PPS output_flag_present_flag; 1 otherwise).
+    pub pic_output_flag: bool,
+    /// colour_plane_id (only when SPS separate_colour_plane_flag).
+    pub colour_plane_id: u8,
+    /// slice_sample_adaptive_offset_flag[0] (luma).
+    pub slice_sao_luma_flag: bool,
+    /// slice_sample_adaptive_offset_flag[1] (chroma; false when no chroma).
+    pub slice_sao_chroma_flag: bool,
+    /// mvd_l1_zero_flag (B slices).
+    pub mvd_l1_zero_flag: bool,
+    /// cabac_init_flag (P and B slices when PPS cabac_init_present_flag).
+    pub cabac_init_flag: bool,
+    /// collocated_from_l0_flag (B slices with slice_temporal_mvp_enabled_flag;
+    /// true for P slices / when not signaled).
+    pub collocated_from_l0_flag: bool,
+    /// collocated_ref_idx (when the collocated list has > 1 reference; 0
+    /// otherwise). VA-API wants 0xFF when slice_temporal_mvp_enabled_flag is 0.
+    pub collocated_ref_idx: u8,
+    /// five_minus_max_num_merge_cand (inter slices).
+    pub five_minus_max_num_merge_cand: u8,
+    /// slice_qp_delta (all slices).
+    pub slice_qp_delta: i32,
+    /// slice_cb/cr_qp_offset (when PPS slice_chroma_qp_offsets_present).
+    pub slice_cb_qp_offset: i32,
+    pub slice_cr_qp_offset: i32,
+    /// Effective slice_deblocking_filter_disabled_flag (PPS value when no
+    /// slice-level override was read).
+    pub slice_deblocking_filter_disabled_flag: bool,
+    /// slice_beta/tc_offset_div2 (only when the slice enables the filter and
+    /// the PPS disables it by default; 0 otherwise).
+    pub slice_beta_offset_div2: i32,
+    pub slice_tc_offset_div2: i32,
+    /// Effective slice_loop_filter_across_slices_enabled_flag (PPS value when
+    /// not read from the bitstream).
+    pub slice_loop_filter_across_slices_enabled_flag: bool,
+    /// num_entry_point_offsets / entry_point_offset_length (only present when
+    /// PPS tiles or entropy_coding_sync is enabled; 0 otherwise).
+    /// Per the current H.265 spec, entry_point_offset_length is coded as
+    /// ue(v) + 1 bits.
+    pub num_entry_point_offsets: u16,
+    pub entry_point_offset_length: u16,
+    /// Raw coded entry-point values (one per entry point). Each value is the
+    /// byte size of that sub-part minus one; cumulative sizes give the entry
+    /// point offsets relative to slice data start.
+    pub entry_point_offsets: Vec<u32>,
+    /// pred_weight_table data (all zero when no weighted prediction table was
+    /// read; matches VASliceParameterBufferHEVC layout). Per-reference flag
+    /// form: references without a flag keep the zeroed (unweighted) values.
+    pub luma_log2_weight_denom: u8,
+    pub delta_chroma_log2_weight_denom: i8,
+    pub delta_luma_weight_l0: [i8; 15],
+    pub luma_offset_l0: [i16; 15],
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    pub chroma_offset_l0: [[i16; 2]; 15],
+    pub delta_luma_weight_l1: [i8; 15],
+    pub luma_offset_l1: [i16; 15],
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    pub chroma_offset_l1: [[i16; 2]; 15],
+
+    // --- Range-extension / SCC slice fields (VASliceParameterBufferHEVCRext)
+
+    /// cu_chroma_qp_offset_enabled_flag (when PPS chroma_qp_offset_list_enabled).
+    pub cu_chroma_qp_offset_enabled_flag: bool,
+    /// use_integer_mv_flag (when SPS motion_vector_resolution_control_idc == 2).
+    pub use_integer_mv_flag: bool,
+    /// slice_act_*_qp_offset (when PPS pps_slice_act_qp_offsets_present_flag;
+    /// raw coded values, range [-12, 12]).
+    pub slice_act_y_qp_offset: i32,
+    pub slice_act_cb_qp_offset: i32,
+    pub slice_act_cr_qp_offset: i32,
+    /// Bit position (from NAL payload start, i.e. after the 16-bit NAL
+    /// header) at the end of the parsed slice header — start of
+    /// rbsp_slice_trailing_bits. VA-API slice_data_byte_offset (relative to
+    /// the NAL unit header) = 2 + (header_bit_size + 8) / 8.
+    pub header_bit_size: u16,
 }
 
 impl SliceHeaderInfo {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             slice_type: 0,
             pic_order_cnt_lsb: 0,
@@ -41,9 +173,55 @@ impl SliceHeaderInfo {
             is_idr: false,
             is_rap: false,
             is_reference: false,
+            no_output_of_prior_pics_flag: false,
             short_term_ref_pic_set_sps_flag: true, // Default: RPS in SPS
             short_term_ref_pic_set_idx: 0,
             slice_strps: None,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            ref_pic_lists_modification_l0: Vec::new(),
+            ref_pic_lists_modification_l1: Vec::new(),
+            long_term_refs: Vec::new(),
+            num_long_term_sps: 0,
+            num_long_term_pics: 0,
+            slice_temporal_mvp_enabled_flag: false,
+            num_bits_for_strps_in_slice: 0,
+            slice_segment_address: 0,
+            pic_output_flag: true,
+            colour_plane_id: 0,
+            slice_sao_luma_flag: false,
+            slice_sao_chroma_flag: false,
+            mvd_l1_zero_flag: false,
+            cabac_init_flag: false,
+            collocated_from_l0_flag: true,
+            collocated_ref_idx: 0,
+            five_minus_max_num_merge_cand: 0,
+            slice_qp_delta: 0,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            slice_deblocking_filter_disabled_flag: false,
+            slice_beta_offset_div2: 0,
+            slice_tc_offset_div2: 0,
+            slice_loop_filter_across_slices_enabled_flag: false,
+            num_entry_point_offsets: 0,
+            entry_point_offset_length: 0,
+            entry_point_offsets: Vec::new(),
+            luma_log2_weight_denom: 0,
+            delta_chroma_log2_weight_denom: 0,
+            delta_luma_weight_l0: [0; 15],
+            luma_offset_l0: [0; 15],
+            delta_chroma_weight_l0: [[0; 2]; 15],
+            chroma_offset_l0: [[0; 2]; 15],
+            delta_luma_weight_l1: [0; 15],
+            luma_offset_l1: [0; 15],
+            delta_chroma_weight_l1: [[0; 2]; 15],
+            chroma_offset_l1: [[0; 2]; 15],
+            cu_chroma_qp_offset_enabled_flag: false,
+            use_integer_mv_flag: false,
+            slice_act_y_qp_offset: 0,
+            slice_act_cb_qp_offset: 0,
+            slice_act_cr_qp_offset: 0,
+            header_bit_size: 0,
         }
     }
 }
@@ -61,8 +239,6 @@ pub struct H265Parser {
     // POC tracking per H.265 spec section 8.3.1
     prev_pic_order_cnt_msb: i32,
     prev_pic_order_cnt_lsb: i32,
-    /// Flag: true when we have an IRAP picture with NoRaslOutputFlag
-    no_rasl_output_flag: bool,
     /// Flag: true when we have a valid previous non-discardable picture for POC derivation
     has_prev_pic: bool,
     /// All NAL units parsed from the current packet, cached so that repeated
@@ -112,7 +288,6 @@ impl H265Parser {
             // Initialize per VulkanH265Parser.cpp:110
             prev_pic_order_cnt_msb: 0,
             prev_pic_order_cnt_lsb: 0,
-            no_rasl_output_flag: false,
             has_prev_pic: false,
             cached_nals: Vec::new(),
             cached_payload_len: 0,
@@ -920,12 +1095,14 @@ impl H265Parser {
         }
         sps.sps_extension_present_flag = r.read_bit()?;
         if sps.sps_extension_present_flag {
-            // Must consume all sps_extension bits even if not storing values
-            // Per H.265 spec: sps_range_extension_flag(1) + sps_multilayer_extension_flag(1) + sps_extension_6bits(6)
-            // Then conditional extension data based on flags
+            // Per H.265 spec / FFmpeg n8.1.2: 4 extension flags + 4 reserved
+            // bits, then conditional extension data in order: range,
+            // multilayer, 3D, SCC.
             sps.sps_range_extension_flag = r.read_bit()?;
             let sps_multilayer_extension_flag = r.read_bit()?;
-            let _sps_extension_6bits = r.read_bits(6)?;
+            let sps_3d_extension_flag = r.read_bit()?;
+            let sps_scc_extension_flag = r.read_bit()?;
+            let _sps_extension_4bits = r.read_bits(4)?;
 
             if sps.sps_range_extension_flag {
                 // Parse range extension flags per H.265 spec Table 7-8
@@ -938,14 +1115,61 @@ impl H265Parser {
                 sps.high_precision_offsets_enabled_flag = r.read_bit()?;
                 sps.persistent_rice_adaptation_enabled_flag = r.read_bit()?;
                 sps.cabac_bypass_alignment_enabled_flag = r.read_bit()?;
-                let sps_scc_extension_flag = r.read_bit()?; // sps_scc_extension_flag
-                if sps_scc_extension_flag {
-                    let _ = r.read_bit()?; // sps_curr_pic_ref_enabled_flag
-                    sps.palette_mode_enabled_flag = r.read_bit()?; // palette_mode_enabled_flag
-                }
             }
             if sps_multilayer_extension_flag {
-                let _ = r.read_bit()?;
+                let _ = r.read_bit()?; // inter_view_mv_vert_constraint_flag
+            }
+            if sps_3d_extension_flag {
+                // sps_3d_extension (IVMC depth video — extremely rare; consume
+                // per FFmpeg n8.1.2 so the bitstream position stays correct).
+                for i in 0..=1u32 {
+                    let _ = r.read_bit()?; // iv_di_mc_enabled_flag
+                    let _ = r.read_bit()?; // iv_mv_scal_enabled_flag
+                    if i == 0 {
+                        let _ = r.read_ue()?; // log2_ivmc_sub_pb_size_minus3
+                        let _ = r.read_bit()?; // iv_res_pred_enabled_flag
+                        let _ = r.read_bit()?; // depth_ref_enabled_flag
+                        let _ = r.read_bit()?; // vsp_mc_enabled_flag
+                        let _ = r.read_bit()?; // dbbp_enabled_flag
+                    } else {
+                        let _ = r.read_bit()?; // tex_mc_enabled_flag
+                        let _ = r.read_ue()?; // log2_ivmc_sub_pb_size_minus3
+                        let _ = r.read_bit()?; // intra_contour_enabled_flag
+                        let _ = r.read_bit()?; // intra_dc_only_wedge_enabled_flag
+                        let _ = r.read_bit()?; // cqt_cu_part_pred_enabled_flag
+                        let _ = r.read_bit()?; // inter_dc_only_enabled_flag
+                        let _ = r.read_bit()?; // skip_intra_enabled_flag
+                    }
+                }
+            }
+            if sps_scc_extension_flag {
+                let _sps_curr_pic_ref_enabled_flag = r.read_bit()?;
+                let palette_mode_enabled_flag = r.read_bit()?;
+                sps.palette_mode_enabled_flag = palette_mode_enabled_flag;
+                if palette_mode_enabled_flag {
+                    let _palette_max_size = r.read_ue()?;
+                    let _delta_palette_max_predictor_size = r.read_ue()?;
+                    let palette_predictor_initializers_present = r.read_bit()?;
+                    if palette_predictor_initializers_present {
+                        let count = r.read_ue()? + 1;
+                        let num_comps = if sps.chroma_format_idc == 0 { 1 } else { 3 };
+                        for comp in 0..num_comps {
+                            let bit_depth = if comp == 0 {
+                                sps.bit_depth_luma_minus8 + 8
+                            } else {
+                                sps.bit_depth_chroma_minus8 + 8
+                            };
+                            for _i in 0..count {
+                                let _ = r.read_bits(bit_depth as u8)?;
+                            }
+                        }
+                    }
+                }
+                // motion_vector_resolution_control_idc +
+                // intra_boundary_filtering_disabled_flag sit at the end of
+                // sps_scc_extension (FFmpeg n8.1.2).
+                sps.motion_vector_resolution_control_idc = r.read_bits(2)? as u8;
+                let _intra_boundary_filtering_disabled = r.read_bit()?;
             }
         }
 
@@ -1013,11 +1237,11 @@ impl H265Parser {
             }
         }
 
-        // pps_loop_filter_across_tiles_enabled_flag: NVIDIA's cuvid parser only
-        // reads this bit when tiles are enabled; with no tiles it infers 1 and
-        // reads pps_loop_filter_across_slices_enabled_flag at that bit position.
-        // (Matches the pixel-perfect C reference; a literal spec read of the bit
-        // when entropy_sync=1 && tiles=0 shifts every later PPS field by 1 bit.)
+        // pps_loop_filter_across_tiles_enabled_flag: present in the bitstream
+        // only when tiles_enabled_flag (verified against FFmpeg 8.0
+        // ff_hevc_decode_nal_pps and NVIDIA VulkanH265Parser.cpp); otherwise
+        // inferred as 1. Reading it when entropy_sync=1 && tiles=0 would shift
+        // every later PPS field by one bit.
         if pps.tiles_enabled_flag {
             pps.loop_filter_across_tiles_enabled_flag = r.read_bit()?;
         } else {
@@ -1057,12 +1281,16 @@ impl H265Parser {
         pps.slice_segment_header_extension_present_flag = r.read_bit()?;
         pps.pps_extension_present_flag = r.read_bit()?;
         if pps.pps_extension_present_flag {
-            // Parse pps_extension per H.265 spec Table 7.9
+            // Per H.265 spec / FFmpeg n8.1.2: 4 extension flags + 4 reserved
+            // bits, then conditional extension data in order: range (only for
+            // Rext+ profiles), multilayer, 3D, SCC.
             pps.pps_range_extension_flag = r.read_bit()?;
             let pps_multilayer_extension_flag = r.read_bit()?;
+            let pps_3d_extension_flag = r.read_bit()?;
+            let pps_scc_extension_flag = r.read_bit()?;
             let _pps_extension_4bits = r.read_bits(4)?;
 
-            if pps.pps_range_extension_flag {
+            if sps.profile_idc >= 2 /* REXT */ && pps.pps_range_extension_flag {
                 if pps.transform_skip_enabled_flag {
                     pps.log2_max_transform_skip_block_size_minus2 = r.read_ue()? as u8;
                 }
@@ -1076,28 +1304,129 @@ impl H265Parser {
                         pps.cr_qp_offset_list[i] = r.read_se()? as i8;
                     }
                 }
-                // SAO offset scale fields are conditional per H.265 spec Table 7.9:
-                // sps_sao_luma_allowed_flag = sample_adaptive_offset_enabled_flag
-                //   && max_transform_hierarchy_depth_intra > log2_min_luma_transform_block_size_minus2
-                // sps_sao_chroma_allowed_flag = sps_sao_luma_allowed_flag && chroma_format_idc != 3
-                let sps_sao_luma_allowed = sps.sample_adaptive_offset_enabled_flag
-                    && (sps.max_transform_hierarchy_depth_intra
-                        > sps.log2_min_luma_transform_block_size_minus2);
-                let sps_sao_chroma_allowed = sps_sao_luma_allowed && (sps.chroma_format_idc != 3);
-                if sps_sao_luma_allowed {
-                    pps.log2_sao_offset_scale_luma = r.read_ue()? as u8;
-                }
-                if sps_sao_chroma_allowed {
-                    pps.log2_sao_offset_scale_chroma = r.read_ue()? as u8;
-                }
+                // log2_sao_offset_scale_luma/chroma are UNCONDITIONAL in the
+                // current spec (verified against FFmpeg n8.1.2
+                // pps_range_extensions).
+                pps.log2_sao_offset_scale_luma = r.read_ue()? as u8;
+                pps.log2_sao_offset_scale_chroma = r.read_ue()? as u8;
             }
             if pps_multilayer_extension_flag {
                 let _poc_reset_info_present_flag = r.read_bit()?;
                 if r.read_bit()? {
-                    // infer_scaling_list_flag
+                    // pps_infer_scaling_list_flag
                     let _ = r.read_bits(6)?; // scaling_list_ref_layer_id
                 }
-                let _ = r.read_ue()?; // num_ref_loc_offsets
+                let num_ref_loc_offsets = r.read_ue()?;
+                for _i in 0..num_ref_loc_offsets {
+                    let _ = r.read_bits(6)?; // ref_loc_offset_layer_id
+                    if r.read_bit()? {
+                        // scaled_ref_layer_offset_present_flag
+                        for _j in 0..4 {
+                            let _ = r.read_se()?;
+                        }
+                    }
+                    if r.read_bit()? {
+                        // ref_region_offset_present_flag
+                        for _j in 0..4 {
+                            let _ = r.read_se()?;
+                        }
+                    }
+                    if r.read_bit()? {
+                        // resample_phase_set_present_flag
+                        let _ = r.read_ue()?; // phase_hor_luma
+                        let _ = r.read_ue()?; // phase_ver_luma
+                        let _ = r.read_ue()?; // phase_hor_chroma
+                        let _ = r.read_ue()?; // phase_ver_chroma
+                    }
+                }
+                if r.read_bit()? {
+                    // colour_mapping_enabled_flag: colour_mapping_table() is a
+                    // recursive octant structure (depth video only) — reject
+                    // rather than mis-parse.
+                    return Err(ParserError::NonCompliantStream);
+                }
+            }
+            if pps_3d_extension_flag {
+                // pps_3d_extension (IVMC depth video — extremely rare; consume
+                // per FFmpeg n8.1.2 so the bitstream position stays correct).
+                if r.read_bit()? {
+                    // dlts_present_flag
+                    let _pps_depth_layers_minus1 = r.read_bits(6)?;
+                    let bit_depth_for_depth_layers = r.read_bits(4)? + 8;
+                    for _i in 0..=_pps_depth_layers_minus1 {
+                        if r.read_bit()? {
+                            // dlt_flag[i]
+                            if !r.read_bit()? {
+                                // dlt_pred_flag[i] == 0
+                                if r.read_bit()? {
+                                    // dlt_val_flags_present_flag[i]
+                                    for _j in 0..(1u32 << bit_depth_for_depth_layers) - 1 {
+                                        let _ = r.read_bit()?; // dlt_value_flag
+                                    }
+                                } else {
+                                    // delta_dlt()
+                                    let num_val_delta_dlt =
+                                        r.read_bits(bit_depth_for_depth_layers as u8)?;
+                                    if num_val_delta_dlt > 0 {
+                                        let mut max_diff: u32 = 0;
+                                        let mut min_diff_minus1: i32 = -1;
+                                        if num_val_delta_dlt > 1 {
+                                            max_diff = r.read_bits(bit_depth_for_depth_layers as u8)?;
+                                        }
+                                        if num_val_delta_dlt > 2 && max_diff > 0 {
+                                            let len = max_diff.ilog2() + 1;
+                                            min_diff_minus1 =
+                                                r.read_bits(len as u8)? as i32;
+                                        }
+                                        if (max_diff as i32) > min_diff_minus1 + 1 {
+                                            let len =
+                                                (max_diff - (min_diff_minus1 + 1) as u32).ilog2() + 1;
+                                            for _k in 1..num_val_delta_dlt {
+                                                let _ = r.read_bits(len as u8)?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if pps_scc_extension_flag {
+                let _pps_curr_pic_ref_enabled_flag = r.read_bit()?;
+                let residual_adaptive_colour_transform_enabled = r.read_bit()?;
+                if residual_adaptive_colour_transform_enabled {
+                    // Gates slice-level slice_act_*_qp_offset in the slice header.
+                    pps.pps_slice_act_qp_offsets_present_flag = r.read_bit()?;
+                    // Raw coded values (spec: ActQpOffset + 5 / + 3).
+                    pps.pps_act_y_qp_offset_plus5 = r.read_se()? as i8;
+                    pps.pps_act_cb_qp_offset_plus5 = r.read_se()? as i8;
+                    pps.pps_act_cr_qp_offset_plus3 = r.read_se()? as i8;
+                }
+                if r.read_bit()? {
+                    // pps_palette_predictor_initializers_present_flag
+                    let count = r.read_ue()?;
+                    pps.pps_num_palette_predictor_initializers = count as u8;
+                    if count > 0 {
+                        let monochrome = r.read_bit()?;
+                        let luma_depth = r.read_ue()? + 8;
+                        pps.luma_bit_depth_entry_minus8 = (luma_depth - 8) as u8;
+                        let chroma_depth = if !monochrome {
+                            let d = r.read_ue()? + 8;
+                            pps.chroma_bit_depth_entry_minus8 = (d - 8) as u8;
+                            Some(d)
+                        } else {
+                            None
+                        };
+                        let num_comps = if monochrome { 1 } else { 3 };
+                        for comp in 0..num_comps {
+                            let depth = if comp == 0 { luma_depth } else { chroma_depth.unwrap() };
+                            for _i in 0..count {
+                                let _ = r.read_bits(depth as u8)?;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1133,15 +1462,11 @@ impl H265Parser {
 
         let mut info = SliceHeaderInfo::new();
 
-        // Determine IdrPicFlag from NAL unit type
-        // H.265 spec: NUT_IDR_W_RADL=19, NUT_IDR_N_LP=20
+        // IdrPicFlag: IDR_W_RADL (19) / IDR_N_LP (20)
         info.is_idr = nal_unit_type == 19 || nal_unit_type == 20;
-        // For Vulkan Video decode, also treat BLA (18-20) as "IDR-like" for reference purposes
-        // when no_output_of_prior_pics_flag is set (handled later in slice header parsing)
 
-        // Determine RapPicFlag from NAL unit type
-        // RapPicFlag = (nal_unit_type >= 16 && nal_unit_type <= 23)
-        info.is_rap = nal_unit_type >= 16 && nal_unit_type <= 23;
+        // RapPicFlag: IRAP = NAL types 16-23 (BLA, IDR, CRA, RSV_IRAP)
+        info.is_rap = (16..=23).contains(&nal_unit_type);
 
         // Determine is_reference from NAL unit type
         // Per H.265 spec:
@@ -1156,17 +1481,12 @@ impl H265Parser {
         // first_slice_segment_in_pic_flag
         let first_slice_segment_in_pic_flag = r.read_bit()?;
 
-        // no_output_of_prior_pics_flag
-        // Per H.265 spec 7.3.7: present in the bitstream (first slice segment) for
-        // IDR (19,20) / BLA (16,17,18) / CRA (21); inferred as 0 (not read) for
-        // RSV_IRAP (22,23).
-        let mut no_output_of_prior_pics_flag = false;
-        let is_idr_pic = nal_unit_type == 19 || nal_unit_type == 20;
-        let is_bla_or_cra = (nal_unit_type >= 16 && nal_unit_type <= 18) || nal_unit_type == 21;
-        if is_idr_pic || is_bla_or_cra {
-            no_output_of_prior_pics_flag = r.read_bit()?; // Read from bitstream (present for IDR/BLA/CRA)
-        }
-        // RSV_IRAP (22,23): inferred as 0, don't read
+        // no_output_of_prior_pics_flag: present in the bitstream for ALL IRAP
+        // NAL types 16-23 (verified against FFmpeg hls_slice_header and x265
+        // encoder output, which writes it even for IDR); inferred 0 (not read)
+        // for non-IRAP. Store the raw bitstream value.
+        let no_output_of_prior_pics_flag = if info.is_rap { r.read_bit()? } else { false };
+        info.no_output_of_prior_pics_flag = no_output_of_prior_pics_flag;
 
         // pic_parameter_set_id
         let _slice_pps_id = r.read_ue()?;
@@ -1189,7 +1509,7 @@ impl H265Parser {
                 (sps.pic_height_in_luma_samples as u32 + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
             let pic_size_in_ctbs = pic_width_in_ctbs * pic_height_in_ctbs;
             let slice_segment_address_bits = (pic_size_in_ctbs as f64).log2().ceil() as u8;
-            let _slice_segment_address = r.read_bits(slice_segment_address_bits)?;
+            info.slice_segment_address = r.read_bits(slice_segment_address_bits)?;
 
             // For dependent slices, most info is inherited from first slice
             if dependent_slice_segment_flag {
@@ -1222,14 +1542,14 @@ impl H265Parser {
             n => n, // unexpected value; pass through
         } as u8;
 
-        // pic_output_flag (if output_flag_present_flag)
+        // pic_output_flag (if output_flag_present_flag; inferred 1 otherwise)
         if pps.output_flag_present_flag {
-            let _ = r.read_bit()?;
+            info.pic_output_flag = r.read_bit()?;
         }
 
         // colour_plane_id (if separate_colour_plane_flag)
         if sps.separate_colour_plane_flag {
-            let _ = r.read_bits(2)?;
+            info.colour_plane_id = r.read_bits(2)? as u8;
         }
 
         // pic_order_cnt_lsb (if not IDR)
@@ -1242,17 +1562,21 @@ impl H265Parser {
 
         // Compute full POC value per H.265 spec section 8.3.1
         // (based on VulkanH265Parser.cpp:2757-2799)
-        let is_irap = nal_unit_type >= 16 && nal_unit_type <= 23;
-        let mut pic_order_cnt_msb: i32;
+        let pic_order_cnt_msb: i32;
 
-        // NoRaslOutputFlag: true for BLA (16-18) or IDR (19-20) per C++ reference VulkanH265Parser.cpp:324
-        let no_rasl_output_flag = is_irap && nal_unit_type <= 20;
+        // NoRaslOutputFlag per H.265 spec 8.3.1:
+        // - 1 for IDR (19-20): POC is 0, pic_order_cnt_lsb absent from bitstream
+        // - equal to no_output_of_prior_pics_flag for other IRAPs (BLA/CRA/RSV_IRAP)
+        // - 0 for non-IRAP
+        let no_rasl_output_flag = if info.is_idr {
+            true
+        } else {
+            no_output_of_prior_pics_flag
+        };
         if no_rasl_output_flag {
             // IRAP with NoRaslOutputFlag: MSB is 0
             pic_order_cnt_msb = 0;
-            self.no_rasl_output_flag = true;
         } else {
-            self.no_rasl_output_flag = false;
             let max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
 
             if self.has_prev_pic {
@@ -1277,32 +1601,31 @@ impl H265Parser {
 
         info.curr_pic_order_cnt_val = pic_order_cnt_msb + info.pic_order_cnt_lsb as i32;
 
-        // Update prevPicOrderCntMsb/Lsb per HEVC spec 8.3.1:
-        // Only update for non-RASL pictures with temporal_id == 0.
-        // RASL (types 22-23) must NOT update prev state.
-        // sub_layer_non_ref (even NAL types) must NOT update prev state.
-        let temporal_id = (nal_data[1] & 0x07) - 1; // nuh_temporal_id_plus1 - 1
-        let is_rasl = nal_unit_type >= 22 && nal_unit_type <= 23;
-        let is_sub_layer_non_ref = nal_unit_type % 2 == 0;
-        if temporal_id == 0 && !is_rasl && !is_sub_layer_non_ref {
+        // Update prevPicOrderCntMsb/Lsb per HEVC spec 8.3.1 (matching FFmpeg's
+        // pocTid0 update rule): only the first slice of a temporal_id_plus1 == 1
+        // picture with NAL type TRAIL_R (1), TSA_R (3), STSA_R (5) or IRAP (16-23).
+        let temporal_id_plus1 = nal_data[1] & 0x07; // nuh_temporal_id_plus1
+        if first_slice_segment_in_pic_flag
+            && temporal_id_plus1 == 1
+            && matches!(nal_unit_type, 1 | 3 | 5 | 16..=23)
+        {
             self.prev_pic_order_cnt_lsb = info.pic_order_cnt_lsb as i32;
             self.prev_pic_order_cnt_msb = pic_order_cnt_msb;
             self.has_prev_pic = true;
         }
 
-        // short_term_ref_pic_set_sps_flag
-        // Per H.265 spec 7.3.3 this block (STRPS + long-term refs +
-        // slice_temporal_mvp_enabled_flag) is present only when
-        // `!NoRaslOutputFlag && SliceType != I`. IDR/CRA/BLA are always intra
-        // (SliceType == I) and carry NoRaslOutputFlag, so the block is absent
-        // for them. Gating on SliceType != I (info.slice_type != 0) is
-        // equivalent and correctly skips the block for CRA (which the old
-        // `!is_idr` gate wrongly read, corrupting the CRA slice header).
-        if info.slice_type != 0 {
+        // short_term_ref_pic_set_sps_flag + RPS block
+        // Per H.265 spec 7.3.7 (verified against x265 encoder output and
+        // FFmpeg's hls_slice_header): this block (STRPS + long-term refs +
+        // slice_temporal_mvp_enabled_flag) is present for ALL non-IDR pictures,
+        // including I-slice CRA pictures (whose RPS entries are simply unused).
+        // IDR pictures carry neither pic_order_cnt_lsb nor an RPS.
+        if !info.is_idr {
             let short_term_ref_pic_set_sps_flag = r.read_bit()?;
             info.short_term_ref_pic_set_sps_flag = short_term_ref_pic_set_sps_flag;
             if !short_term_ref_pic_set_sps_flag {
                 // STRPS in slice - parse and store it
+                let bits_before = r.position();
                 let strps = Self::parse_short_term_ref_pic_set(
                     &mut r,
                     sps.num_short_term_ref_pic_sets as usize,
@@ -1310,6 +1633,8 @@ impl H265Parser {
                     &sps.short_term_ref_pic_sets,
                 )?;
                 info.slice_strps = Some(strps);
+                // NumBitsForShortTermRPSInSlice: SizeInBits of short_term_ref_pic_set()
+                info.num_bits_for_strps_in_slice = (r.position() - bits_before) as u16;
             } else if sps.num_short_term_ref_pic_sets > 1 {
                 let strps_idx_bits = (sps.num_short_term_ref_pic_sets as f64).log2().ceil() as u8;
                 info.short_term_ref_pic_set_idx = r.read_bits(strps_idx_bits)? as u8;
@@ -1325,29 +1650,303 @@ impl H265Parser {
                     0
                 };
                 let num_long_term_pics = r.read_ue()? as u8;
+                info.num_long_term_sps = num_long_term_sps;
+                info.num_long_term_pics = num_long_term_pics;
 
                 for i in 0u8..(num_long_term_sps + num_long_term_pics) {
-                    if i < num_long_term_sps && sps.num_long_term_ref_pics_sps > 1 {
-                        let lt_idx_bits =
-                            (sps.num_long_term_ref_pics_sps as f64).log2().ceil() as u8;
-                        let _ = r.read_bits(lt_idx_bits)?;
-                    } else if i >= num_long_term_sps {
+                    let mut lt_ref = H265LtRef::default();
+                    if i < num_long_term_sps {
+                        lt_ref.from_sps = true;
+                        if sps.num_long_term_ref_pics_sps > 1 {
+                            let lt_idx_bits =
+                                (sps.num_long_term_ref_pics_sps as f64).log2().ceil() as u8;
+                            lt_ref.sps_idx = r.read_bits(lt_idx_bits)? as u8;
+                        }
+                        // poc_lsb comes from sps.lt_ref_pic_poc_lsb_sps[sps_idx];
+                        // the used flag is indexed by the SPS LT index (not the
+                        // position in the current slice's LT list).
+                        lt_ref.used_by_curr_pic =
+                            (sps.used_by_curr_pic_lt_sps_flag >> lt_ref.sps_idx) & 1 == 1;
+                    } else {
                         let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u8 + 4;
-                        let _ = r.read_bits(poc_lsb_bits)?; // poc_lsb_lt
-                        let _ = r.read_bit()?; // used_by_curr_pic_lt_flag
+                        lt_ref.poc_lsb = r.read_bits(poc_lsb_bits)? as u32; // poc_lsb_lt
+                        lt_ref.used_by_curr_pic = r.read_bit()?; // used_by_curr_pic_lt_flag
                     }
-                    let delta_poc_msb_present_flag = r.read_bit()?;
-                    if delta_poc_msb_present_flag {
-                        let _ = r.read_ue()?; // delta_poc_msb_cycle_lt
+                    lt_ref.delta_poc_msb_present = r.read_bit()?;
+                    if lt_ref.delta_poc_msb_present {
+                        lt_ref.delta_poc_msb_cycle = r.read_ue()? as u32;
                     }
+                    info.long_term_refs.push(lt_ref);
                 }
             }
 
             // slice_temporal_mvp_enabled_flag
             if sps.sps_temporal_mvp_enabled_flag {
-                let _ = r.read_bit()?;
+                info.slice_temporal_mvp_enabled_flag = r.read_bit()?;
+            }
+
+        } else {
+            // IDR pictures carry no RPS: short_term_ref_pic_set_sps_flag is
+            // absent from the bitstream and must be signaled as 0 to the
+            // driver (signaling 1 makes it reconstruct an SPS RPS that does
+            // not exist, e.g. when num_short_term_ref_pic_sets == 0).
+            info.short_term_ref_pic_set_sps_flag = false;
+        }
+
+        // slice_sample_adaptive_offset_flag[] (verified against FFmpeg n8.1.2
+        // hls_slice_header): present for ALL non-dependent slice segments —
+        // including I and IDR slices — when sample_adaptive_offset_enabled_flag
+        // is set: one luma flag plus two chroma flags when chroma is present.
+        // It sits AFTER the RPS block / slice_temporal_mvp bit and BEFORE the
+        // num_ref_idx fields.
+        if sps.sample_adaptive_offset_enabled_flag {
+            info.slice_sao_luma_flag = r.read_bit()?;
+            // H.265 7.3.6.1: exactly ONE chroma SAO flag (slice_sao_chroma_flag)
+            // when ChromaFormatIDC > 0 — NOT two. (FFmpeg assigns the single
+            // bit to both internal flag[1] and flag[2].)
+            if sps.chroma_format_idc != 0 {
+                info.slice_sao_chroma_flag = r.read_bit()?;
             }
         }
+
+        // --- Inter slice segment fields (SliceType != I) ---
+        if info.slice_type != 0 {
+            // num_ref_idx_active_override_flag + num_ref_idx_l*_active_minus1.
+            // H.265 (unlike H.264): the active reference counts default to
+            // the PPS values and are overridden only when the flag is set.
+            let override_flag = r.read_bit()?;
+            if override_flag {
+                info.num_ref_idx_l0_active_minus1 = r.read_ue()? as u8;
+                if info.slice_type == 2 {
+                    info.num_ref_idx_l1_active_minus1 = r.read_ue()? as u8;
+                }
+            } else {
+                info.num_ref_idx_l0_active_minus1 =
+                    pps.num_ref_idx_l0_default_active_minus1 as u8;
+                if info.slice_type == 2 {
+                    info.num_ref_idx_l1_active_minus1 =
+                        pps.num_ref_idx_l1_default_active_minus1 as u8;
+                }
+            }
+
+            let n0 = info.num_ref_idx_l0_active_minus1 as usize + 1;
+            let n1 = if info.slice_type == 2 {
+                info.num_ref_idx_l1_active_minus1 as usize + 1
+            } else {
+                0
+            };
+
+            // ref_pic_lists_modification (H.265 7.3.6.1, verified against
+            // FFmpeg n8.1.2): the L0 modification flag is present for BOTH P
+            // and B slices (when ListsModificationPresent &&
+            // NumRefIdxL0Active > 1); the L1 flag is B-only. When set, the
+            // whole list is replaced by fixed-length indices of
+            // ceil(log2(max(NumRefIdxL0Active, NumRefIdxL1Active))) bits —
+            // NOT the H.264-style per-entry flag+ue(v) form.
+            if pps.lists_modification_present_flag && n0.max(n1) > 1 {
+                let idx_bits = (n0.max(n1) as f64).log2().ceil() as u8;
+                // L0: P and B slices
+                if r.read_bit()? {
+                    for _i in 0..n0 {
+                        info.ref_pic_lists_modification_l0.push(H265ListModification {
+                            flag: true,
+                            ref_idx: r.read_bits(idx_bits)? as u8,
+                        });
+                    }
+                }
+                // L1: B slices only
+                if info.slice_type == 2 && r.read_bit()? {
+                    for _i in 0..n1 {
+                        info.ref_pic_lists_modification_l1.push(H265ListModification {
+                            flag: true,
+                            ref_idx: r.read_bits(idx_bits)? as u8,
+                        });
+                    }
+                }
+            }
+
+            // mvd_l1_zero_flag (B slices only).
+            if info.slice_type == 2 {
+                info.mvd_l1_zero_flag = r.read_bit()?;
+            }
+
+            // cabac_init_flag (P and B slices when PPS cabac_init_present_flag).
+            if pps.cabac_init_present_flag {
+                info.cabac_init_flag = r.read_bit()?;
+            }
+
+            // Collocated picture signaling (when slice_temporal_mvp_enabled_flag):
+            // collocated_from_l0_flag is B-only; collocated_ref_idx is present
+            // when the collocated list has > 1 active reference.
+            if info.slice_temporal_mvp_enabled_flag {
+                let from_l0 = if info.slice_type == 2 { r.read_bit()? } else { true };
+                info.collocated_from_l0_flag = from_l0;
+                if (if from_l0 { n0 } else { n1 }) > 1 {
+                    info.collocated_ref_idx = r.read_ue()? as u8;
+                }
+            }
+
+            // pred_weight_table (per-reference flag form, verified against
+            // FFmpeg n8.1.2): P slices when PPS weighted_pred_flag, B slices
+            // when PPS weighted_bipred_flag.
+            if (pps.weighted_pred_flag && info.slice_type == 1)
+                || (pps.weighted_bipred_flag && info.slice_type == 2)
+            {
+                info.luma_log2_weight_denom = r.read_ue()? as u8;
+                if sps.chroma_format_idc != 0 {
+                    info.delta_chroma_log2_weight_denom = r.read_se()? as i8;
+                }
+                // L0: per-reference flag bitfields (MSB first), then the
+                // weighted entries. Unflagged references keep zeroed values.
+                let luma_flags = if n0 > 0 { r.read_bits(n0 as u8)? } else { 0 };
+                let chroma_flags = if sps.chroma_format_idc != 0 && n0 > 0 {
+                    r.read_bits(n0 as u8)?
+                } else {
+                    0
+                };
+                for i in 0..n0 {
+                    if (luma_flags >> (n0 - 1 - i)) & 1 == 1 {
+                        let w = r.read_se()? as i8;
+                        let o = r.read_se()? as i16;
+                        if i < 15 {
+                            info.delta_luma_weight_l0[i] = w;
+                            info.luma_offset_l0[i] = o;
+                        }
+                    }
+                    if (chroma_flags >> (n0 - 1 - i)) & 1 == 1 {
+                        for j in 0..2 {
+                            let w = r.read_se()? as i8;
+                            let o = r.read_se()? as i16;
+                            if i < 15 {
+                                info.delta_chroma_weight_l0[i][j] = w;
+                                info.chroma_offset_l0[i][j] = o;
+                            }
+                        }
+                    }
+                }
+                // L1 (B slices only).
+                if info.slice_type == 2 {
+                    let luma_flags = if n1 > 0 { r.read_bits(n1 as u8)? } else { 0 };
+                    let chroma_flags = if sps.chroma_format_idc != 0 && n1 > 0 {
+                        r.read_bits(n1 as u8)?
+                    } else {
+                        0
+                    };
+                    for i in 0..n1 {
+                        if (luma_flags >> (n1 - 1 - i)) & 1 == 1 {
+                            let w = r.read_se()? as i8;
+                            let o = r.read_se()? as i16;
+                            if i < 15 {
+                                info.delta_luma_weight_l1[i] = w;
+                                info.luma_offset_l1[i] = o;
+                            }
+                        }
+                        if (chroma_flags >> (n1 - 1 - i)) & 1 == 1 {
+                            for j in 0..2 {
+                                let w = r.read_se()? as i8;
+                                let o = r.read_se()? as i16;
+                                if i < 15 {
+                                    info.delta_chroma_weight_l1[i][j] = w;
+                                    info.chroma_offset_l1[i][j] = o;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // five_minus_max_num_merge_cand.
+            info.five_minus_max_num_merge_cand = r.read_ue()? as u8;
+
+            // use_integer_mv_flag (SPS motion_vector_resolution_control_idc == 2).
+            if sps.motion_vector_resolution_control_idc == 2 {
+                info.use_integer_mv_flag = r.read_bit()?;
+            }
+        }
+
+        // --- Slice-level parameters (all slice types) ---
+
+        // slice_qp_delta.
+        info.slice_qp_delta = r.read_se()?;
+
+        // slice_cb/cr_qp_offset.
+        if pps.pps_slice_chroma_qp_offsets_present_flag {
+            info.slice_cb_qp_offset = r.read_se()?;
+            info.slice_cr_qp_offset = r.read_se()?;
+        }
+
+        // slice_act_*_qp_offset (SCC, when PPS pps_slice_act_qp_offsets_present).
+        if pps.pps_slice_act_qp_offsets_present_flag {
+            info.slice_act_y_qp_offset = r.read_se()?;
+            info.slice_act_cb_qp_offset = r.read_se()?;
+            info.slice_act_cr_qp_offset = r.read_se()?;
+        }
+
+        // cu_chroma_qp_offset_enabled_flag (range extension).
+        if pps.chroma_qp_offset_list_enabled_flag {
+            info.cu_chroma_qp_offset_enabled_flag = r.read_bit()?;
+        }
+
+        // Deblocking filter slice-level control (verified against FFmpeg n8.1.2):
+        // the override flag is read only when deblocking_filter_override_enabled;
+        // otherwise the PPS values are inherited. When overridden and the
+        // filter stays enabled, beta/tc offsets are coded.
+        if pps.deblocking_filter_control_present_flag {
+            let override_flag = if pps.deblocking_filter_override_enabled_flag {
+                r.read_bit()?
+            } else {
+                false
+            };
+            if override_flag {
+                info.slice_deblocking_filter_disabled_flag = r.read_bit()?;
+                if !info.slice_deblocking_filter_disabled_flag {
+                    info.slice_beta_offset_div2 = r.read_se()?;
+                    info.slice_tc_offset_div2 = r.read_se()?;
+                }
+            } else {
+                info.slice_deblocking_filter_disabled_flag =
+                    pps.pps_deblocking_filter_disabled_flag;
+            }
+        }
+
+        // slice_loop_filter_across_slices_enabled_flag (verified against
+        // FFmpeg n8.1.2): read only when the PPS enables it AND (SAO is active
+        // in this slice OR deblocking is not disabled); otherwise inferred
+        // from the PPS value.
+        let sao_active = info.slice_sao_luma_flag || info.slice_sao_chroma_flag;
+        if pps.pps_loop_filter_across_slices_enabled_flag
+            && (sao_active || !info.slice_deblocking_filter_disabled_flag)
+        {
+            info.slice_loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        } else {
+            info.slice_loop_filter_across_slices_enabled_flag =
+                pps.pps_loop_filter_across_slices_enabled_flag;
+        }
+
+        // Entry points (PPS tiles or entropy coding sync). Per the current
+        // H.265 spec, entry_point_offset_length is coded as ue(v) + 1.
+        if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
+            info.num_entry_point_offsets = r.read_ue()? as u16;
+            if info.num_entry_point_offsets > 0 {
+                info.entry_point_offset_length = (r.read_ue()? + 1) as u16;
+                for _ in 0..info.num_entry_point_offsets {
+                    info
+                        .entry_point_offsets
+                        .push(r.read_bits(info.entry_point_offset_length as u8)?);
+                }
+            }
+        }
+
+        // slice_header_extension (slice_segment_header_extension_present_flag).
+        if pps.slice_segment_header_extension_present_flag {
+            let ext_bytes = r.read_ue()?;
+            for _ in 0..ext_bytes {
+                let _ = r.read_byte()?;
+            }
+        }
+
+        // End of coded slice header: start of rbsp_slice_trailing_bits.
+        info.header_bit_size = r.position() as u16;
 
         Ok(info)
     }
@@ -1426,7 +2025,6 @@ impl VideoParser for H265Parser {
         let mut result_pps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut result_vps: Option<vk_video_core::picture::BoxedPictureParametersSet> = None;
         let mut slice_nals: Vec<crate::SliceEntry> = Vec::new();
-        let mut first_slice_offset: Option<usize> = None;
         let mut last_slice_end: Option<usize> = None;
         // Cursor index of the first collected slice NAL. Used to roll the
         // cursor back when a parameter set is returned instead of the slices
@@ -1554,9 +2152,9 @@ impl VideoParser for H265Parser {
                         break;
                     }
 
-                    // Track byte range for bytes_consumed
-                    if first_slice_offset.is_none() {
-                        first_slice_offset = Some(off);
+                    // Cursor of the first collected slice NAL (for parameter-set
+                    // rollback). bytes_consumed is derived from last_slice_end.
+                    if first_slice_cursor.is_none() {
                         first_slice_cursor = Some(i);
                     }
                     last_slice_end = Some(off + sz);
@@ -1606,12 +2204,11 @@ impl VideoParser for H265Parser {
         } else if !slice_nals.is_empty() {
             self.nal_cursor = i;
             self.frame_count += 1;
-            let bytes_consumed =
-                if let (Some(first_off), Some(last_end)) = (first_slice_offset, last_slice_end) {
-                    last_end - first_off
-                } else {
-                    0
-                };
+            // Consume from the packet start through the end of the last slice
+            // NAL. Using last_end (not last_end - first_off) advances the caller's
+            // byte offset past any leading gap (start codes / non-VCL NALs before
+            // the first slice), so the next parse() does not re-find this picture.
+            let bytes_consumed = last_slice_end.unwrap_or(0);
             // Clear first_slice_header so the next picture gets a fresh parse
             self.first_slice_header.take();
             Ok(ParseResult::Slice {
@@ -1637,7 +2234,6 @@ impl VideoParser for H265Parser {
         self.prev_pic_order_cnt_msb = 0;
         self.prev_pic_order_cnt_lsb = 0;
         self.has_prev_pic = false;
-        self.no_rasl_output_flag = false;
         self.cached_nals.clear();
         self.cached_payload_len = 0;
         self.nal_cursor = 0;
@@ -2456,5 +3052,92 @@ mod tests {
             }
         }
         assert_eq!(pictures, 5, "Expected 5 pictures (one Slice result each)");
+    }
+
+    // ========================================================================
+    // Slice-header bit-alignment verification against the real big_buck stream
+    // ========================================================================
+
+    /// Verifies that `parse_slice_segment_header` consumes exactly the right
+    /// number of bits for every slice in the stream.
+    ///
+    /// Ground truth: FFmpeg n8.1.2 `hls_slice_header`, immediately after the
+    /// last coded header field, reads ONE bit and requires it to be 1
+    /// ("alignment_bit_equal_to_one"), then aligns to a byte boundary to derive
+    /// `data_offset` (the VAAPI `slice_data_byte_offset`). If our header parse
+    /// is misaligned by even one bit, that alignment bit will read 0 and FFmpeg
+    /// (and any VA driver relying on `slice_data_byte_offset`) breaks.
+    ///
+    /// NOTE: `rbsp_trailing_bits` live at the END of the NAL RBSP (before EOB),
+    /// NOT right after the slice header — the bits immediately following the
+    /// header are the start of the CABAC-coded slice data. So we check the
+    /// FFmpeg alignment-bit invariant, not a trailing-ones run.
+    #[test]
+    fn test_big_buck_slice_headers_aligned() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/big_buck_bunney.h265");
+        let data = std::fs::read(path).expect("assets/big_buck_bunney.h265 not found");
+
+        let mut parser = H265Parser::new();
+        let packet = crate::bitstream::BitstreamPacket::new(data);
+
+        let mut pictures = 0usize;
+        let mut slices = 0usize;
+        loop {
+            let result = parser.parse(&packet).expect("parse failed");
+            match result {
+                ParseResult::Slice {
+                    slices: entries, ..
+                } => {
+                    pictures += 1;
+                    for (i, entry) in entries.iter().enumerate() {
+                        if let Some(crate::SliceHeader::H265(info)) = &entry.slice_header {
+                            // Rewalk the RBSP from after the 2-byte NAL header and
+                            // skip exactly header_bit_size bits.
+                            let mut r = BitReader::new(&entry.nal_data[2..], true);
+                            let mut remaining = info.header_bit_size as u64;
+                            while remaining >= 8 {
+                                r.read_bits(8).expect("skip failed");
+                                remaining -= 8;
+                            }
+                            if remaining > 0 {
+                                r.read_bits(remaining as u8).expect("skip failed");
+                            }
+
+                            // The header alone cannot consume the whole NAL unit —
+                            // there must be slice data + trailing bits remaining.
+                            assert!(
+                                u64::from(info.header_bit_size) < (entry.nal_data.len() as u64) * 8,
+                                "picture {} slice {}: header consumed the entire NAL",
+                                pictures,
+                                i
+                            );
+
+                            // FFmpeg invariant: the first bit after the coded slice
+                            // header must be 1.
+                            let align_bit = r
+                                .read_bit()
+                                .unwrap_or_else(|e| panic!("picture {} slice {}: {e:?}", pictures, i));
+                            assert!(
+                                align_bit,
+                                "picture {} slice {} (header_bit_size={}): \
+                                 alignment bit after coded header is 0 — header parse \
+                                 is misaligned",
+                                pictures,
+                                i,
+                                info.header_bit_size
+                            );
+
+                            slices += 1;
+                        }
+                    }
+                }
+                ParseResult::Nothing | ParseResult::EndOfStream => break,
+                ParseResult::ParameterSet { .. } => {}
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        assert!(pictures >= 290, "expected ~300 pictures, got {pictures}");
+        assert!(slices >= 290, "expected ~300 slice headers, got {slices}");
     }
 }

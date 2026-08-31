@@ -5,6 +5,7 @@
 
 pub mod device;
 pub mod decoder;
+mod vp9_qlookup;
 
 pub use device::VaapiDecoderDevice;
 pub use decoder::VaapiDecoder;

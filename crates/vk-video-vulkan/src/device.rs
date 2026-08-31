@@ -6,21 +6,6 @@ use std::ffi::CString;
 use super::vp9::{vp9_vk_constants, VideoDecodeVP9CapabilitiesKHR, VideoDecodeVP9ProfileInfoKHR};
 use super::{AppInfo, VideoError, VideoResult};
 
-/// PhysicalDeviceVideoDecodeFeaturesKHR - not available in ash 0.38, define manually.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct PhysicalDeviceVideoDecodeFeaturesKHR {
-    s_type: vk::StructureType,
-    p_next: *mut std::ffi::c_void,
-    video_decode_h264: u32,
-    video_decode_h265: u32,
-    video_decode_av1: u32,
-    video_decode_vp9: u32,
-}
-
-const PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR: vk::StructureType =
-    vk::StructureType::from_raw(1000346000);
-
 /// PhysicalDeviceVideoMaintenance2FeaturesKHR - not available in ash 0.38, define manually.
 /// The videoMaintenance2 feature makes videoSessionParameters = VK_NULL_HANDLE legal in
 /// vkCmdBeginVideoCodingKHR for AV1/VP9/H.264/H.265 decode
@@ -184,6 +169,11 @@ impl VideoDeviceBuilder {
         eprintln!("[VideoDeviceBuilder] Getting memory properties...");
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        if std::env::var("VACC_DEBUG").is_ok() {
+            for (i, mt) in memory_properties.memory_types.iter().enumerate() {
+                eprintln!("[MEMTYPE] type={} flags=0x{:x}", i, mt.property_flags.as_raw());
+            }
+        }
 
         let debug_messenger = if has_validation {
             Self::create_debug_messenger(&entry, &instance)?
@@ -616,19 +606,11 @@ impl VideoDeviceBuilder {
         sync2_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
         sync2_features.synchronization2 = 1;
 
-        let mut video_decode_features = PhysicalDeviceVideoDecodeFeaturesKHR::default();
-        video_decode_features.s_type = PHYSICAL_DEVICE_VIDEO_DECODE_FEATURES_KHR;
-        video_decode_features.p_next = &mut sync2_features as *mut _ as *mut _;
-        video_decode_features.video_decode_h264 = 1;
-        video_decode_features.video_decode_h265 = 1;
-        video_decode_features.video_decode_av1 = 1;
-        video_decode_features.video_decode_vp9 = 1;
-
         let mut sampler_ycbcr_features =
             vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
         sampler_ycbcr_features.s_type =
             vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
-        sampler_ycbcr_features.p_next = &mut video_decode_features as *mut _ as *mut _;
+        sampler_ycbcr_features.p_next = &mut sync2_features as *mut _ as *mut _;
         sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
 
         let mut video_maintenance1_features = PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
@@ -784,41 +766,6 @@ impl VulkanDevice {
             _marker: Default::default(),
         };
         let profile_ptr: *const vk::VideoProfileInfoKHR = &profile_info;
-
-        // DEBUG (iteration 17): print profile info used for capabilities query
-        eprintln!(
-            "[CAPABILITIES-QUERY] VkVideoProfileInfoKHR: codecOp={:?} chromaSub={:?} lumaBit={:?} chromaBit={:?}",
-            profile_info.video_codec_operation,
-            profile_info.chroma_subsampling,
-            profile_info.luma_bit_depth,
-            profile_info.chroma_bit_depth,
-        );
-        match codec {
-            VideoCodec::DecodeAv1 => {
-                eprintln!(
-                    "[CAPABILITIES-QUERY]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}",
-                    av1_profile.std_profile, av1_profile.film_grain_support
-                );
-            }
-            VideoCodec::DecodeH264 => {
-                eprintln!(
-                    "[CAPABILITIES-QUERY]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={:?}",
-                    h264_profile.std_profile_idc, h264_profile.picture_layout
-                );
-            }
-            VideoCodec::DecodeH265 => {
-                eprintln!(
-                    "[CAPABILITIES-QUERY]   VkVideoDecodeH265ProfileInfoKHR: stdProfileIdc={}",
-                    h265_profile.std_profile_idc
-                );
-            }
-            VideoCodec::DecodeVp9 => {
-                eprintln!(
-                    "[CAPABILITIES-QUERY]   VkVideoDecodeVP9ProfileInfoKHR: stdProfile={}",
-                    vp9_profile.std_profile
-                );
-            }
-        }
 
         // Get function pointer
         let get_caps_fn = unsafe {

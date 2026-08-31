@@ -93,7 +93,7 @@ fn main() {
 
     for (i, frame) in frames.iter().enumerate() {
         let output_path = format!("{}_frame_{}.yuv", stem, i);
-        let yuv_data = frame_to_yuv420p(frame);
+        let yuv_data = frame_to_yuv(frame);
         match std::fs::write(&output_path, yuv_data) {
             Ok(()) => println!("  Saved frame {} to {}", i, output_path),
             Err(e) => eprintln!("  Failed to save frame {}: {}", i, e),
@@ -145,40 +145,45 @@ fn detect_codec(path: &str) -> &'static str {
     }
 }
 
-/// Convert decoded frame to yuv420p planar format, cropping to the conformance window.
-fn frame_to_yuv420p(frame: &vk_video_vulkan::DecodedFrame) -> Vec<u8> {
+/// Convert decoded frame to planar YUV (Y, U, V concatenated), cropping to the
+/// conformance window. Sample size and chroma dimensions come from the decoded
+/// pixel metadata, so 8-bit/10-bit and 4:2:0/4:2:2/4:4:4 layouts all work.
+fn frame_to_yuv(frame: &vk_video_vulkan::DecodedFrame) -> Vec<u8> {
+    let px = &frame.pixels;
+    let ss = px.sample_size as usize;
     let coded_w = frame.coded_width as usize;
+    let coded_h = frame.coded_height as usize;
+    let cw = px.chroma_width as usize;
+    let ch = px.chroma_height as usize;
     let disp_w = frame.display_width as usize;
     let disp_h = frame.display_height as usize;
     let crop_x = frame.crop_left as usize;
     let crop_y = frame.crop_top as usize;
 
-    let y_stride = coded_w;
-    let uv_stride = coded_w / 2;
-    let uv_crop_x = crop_x / 2;
-    let uv_crop_y = crop_y / 2;
-    let uv_disp_w = disp_w / 2;
-    let uv_disp_h = disp_h / 2;
+    // Subsampling factors relative to luma (1 for 4:4:4/mono, 2 for 4:2:0/4:2:2).
+    let sw = if cw == 0 { 1 } else { coded_w / cw };
+    let sh = if ch == 0 { 1 } else { coded_h / ch };
+    let ccrop_x = crop_x / sw;
+    let ccrop_y = crop_y / sh;
+    let cdisp_w = disp_w / sw;
+    let cdisp_h = disp_h / sh;
 
-    let mut yuv_data = Vec::with_capacity(disp_w * disp_h + uv_disp_w * uv_disp_h * 2);
+    let mut out = Vec::with_capacity((disp_w * disp_h + 2 * cdisp_w * cdisp_h) * ss);
 
-    // Crop Y plane
     for y in crop_y..crop_y + disp_h {
-        let src_start = y * y_stride + crop_x;
-        yuv_data.extend_from_slice(&frame.pixels.y_plane[src_start..src_start + disp_w]);
+        let start = (y * coded_w + crop_x) * ss;
+        out.extend_from_slice(&px.y_plane[start..start + disp_w * ss]);
+    }
+    if cw > 0 {
+        for y in ccrop_y..ccrop_y + cdisp_h {
+            let start = (y * cw + ccrop_x) * ss;
+            out.extend_from_slice(&px.u_plane[start..start + cdisp_w * ss]);
+        }
+        for y in ccrop_y..ccrop_y + cdisp_h {
+            let start = (y * cw + ccrop_x) * ss;
+            out.extend_from_slice(&px.v_plane[start..start + cdisp_w * ss]);
+        }
     }
 
-    // Crop U plane
-    for y in uv_crop_y..uv_crop_y + uv_disp_h {
-        let src_start = y * uv_stride + uv_crop_x;
-        yuv_data.extend_from_slice(&frame.pixels.u_plane[src_start..src_start + uv_disp_w]);
-    }
-
-    // Crop V plane
-    for y in uv_crop_y..uv_crop_y + uv_disp_h {
-        let src_start = y * uv_stride + uv_crop_x;
-        yuv_data.extend_from_slice(&frame.pixels.v_plane[src_start..src_start + uv_disp_w]);
-    }
-
-    yuv_data
+    out
 }

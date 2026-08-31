@@ -18,6 +18,7 @@ pub mod frame;
 pub mod h264;
 pub mod h265;
 pub mod image;
+pub mod inline_queries;
 pub mod profile_chain;
 pub mod readback;
 pub mod session;

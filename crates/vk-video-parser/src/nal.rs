@@ -67,13 +67,14 @@ impl H264NalUnitType {
 
 /// H.265 NAL unit types (raw values from H.265 spec).
 ///
-/// Per ITU-T H.265 Table 7-1:
+/// Per ITU-T H.265 Table 7-1 (values verified against FFmpeg's enum and
+/// x265 encoder output):
 /// 0: TRAIL_N, 1: TRAIL_R, 2: TSA_N, 3: TSA_R, 4: STSA_N, 5: STSA_R,
 /// 6: RADL_N, 7: RADL_R, 8: RASL_N, 9: RASL_R,
-/// 16: IDR_W_RADL, 17: IDR_N_LP, 18: BLA_W_LP, 19: BLA_W_RADL,
-/// 20: BLA_N_LP, 21: CRA_NUT,
-/// 32: VPS, 33: SPS, 34: PPS, 35: PREFIX_SEI, 36: SUFFIX_SEI,
-/// 37: FD_H, 38: RESERVED, 39: RSV_IRAP_V39, 40: RSV_VCL_N40, 41: RSV_VCL_N41
+/// 16: BLA_W_LP, 17: BLA_W_RADL, 18: BLA_N_LP, 19: IDR_W_RADL,
+/// 20: IDR_N_LP, 21: CRA_NUT, 22: RSV_IRAP_VCL_20, 23: RSV_IRAP_VCL_21,
+/// 32: VPS, 33: SPS, 34: PPS, 35: AUD, 36: EOS, 37: EOB,
+/// 38: FD, 39: SEI_PREFIX, 40: SEI_SUFFIX
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum H265NalUnitType {
@@ -97,46 +98,44 @@ pub enum H265NalUnitType {
     RaslN = 8,
     /// Coded slice segment of a RASL picture (RASL_R) - reference
     RaslR = 9,
-    // 10-15: Reserved or extension types
+    // 10-15: Reserved VCL NAL units
     /// Coded slice segment of a BLA picture (BLA_W_LP) - reference
-    CodNalSliceBlaW = 16,
+    BlaWlp = 16,
     /// Coded slice segment of a BLA picture (BLA_W_RADL) - reference
-    CodNalSliceBlaRadl = 17,
+    BlaWRadl = 17,
     /// Coded slice segment of a BLA picture (BLA_N_LP) - reference
-    CodNalSliceBlaN = 18,
+    BlaNlp = 18,
     /// Coded slice segment of an IDR picture (IDR_W_RADL) - reference
-    CodNalSliceIdrW = 19,
+    IdrWRadl = 19,
     /// Coded slice segment of an IDR picture (IDR_N_LP) - reference
-    CodNalSliceIdrN = 20,
+    IdrNlp = 20,
     /// Coded slice segment of a CRA picture (CRA_NUT) - reference
-    CodNalSliceCra = 21,
-    // 22-25: Reserved
-    // 26-31: Reserved
+    CraNut = 21,
+    /// Reserved IRAP VCL NAL unit (RSV_IRAP_VCL_20)
+    RsvIrapVcl20 = 22,
+    /// Reserved IRAP VCL NAL unit (RSV_IRAP_VCL_21)
+    RsvIrapVcl21 = 23,
+    // 24-31: Reserved VCL NAL units
     /// Video parameter set
     Vps = 32,
     /// Sequence parameter set
     Sps = 33,
     /// Picture parameter set
     Pps = 34,
-    /// Prefix Supplemental enhancement information
-    SeiPrefix = 35,
-    /// Suffix Supplemental enhancement information
-    SeiSuffix = 36,
     /// Access unit delimiter
-    AccessUnitDelimiter = 37,
+    Aud = 35,
     /// End of sequence
-    EndOfSequence = 38,
+    Eos = 36,
     /// End of bitstream
-    EndOfBitstream = 39,
+    Eob = 37,
     /// Filler data
-    FillerData = 40,
+    Fd = 38,
     /// Prefix SEI NAL unit
-    SeiPrefixN = 41,
+    SeiPrefix = 39,
     /// Suffix SEI NAL unit
-    SeiSuffixN = 42,
-    // 43-45: Reserved
-    // 46-47: Reserved
-    // 48-63: Undefined
+    SeiSuffix = 40,
+    // 41-47: Reserved non-VCL NAL units
+    // 48-63: Undefined non-VCL NAL units
 }
 
 impl H265NalUnitType {
@@ -152,23 +151,23 @@ impl H265NalUnitType {
             7 => Some(Self::RadlR),
             8 => Some(Self::RaslN),
             9 => Some(Self::RaslR),
-            16 => Some(Self::CodNalSliceBlaW),
-            17 => Some(Self::CodNalSliceBlaRadl),
-            18 => Some(Self::CodNalSliceBlaN),
-            19 => Some(Self::CodNalSliceIdrW),
-            20 => Some(Self::CodNalSliceIdrN),
-            21 => Some(Self::CodNalSliceCra),
+            16 => Some(Self::BlaWlp),
+            17 => Some(Self::BlaWRadl),
+            18 => Some(Self::BlaNlp),
+            19 => Some(Self::IdrWRadl),
+            20 => Some(Self::IdrNlp),
+            21 => Some(Self::CraNut),
+            22 => Some(Self::RsvIrapVcl20),
+            23 => Some(Self::RsvIrapVcl21),
             32 => Some(Self::Vps),
             33 => Some(Self::Sps),
             34 => Some(Self::Pps),
-            35 => Some(Self::SeiPrefix),
-            36 => Some(Self::SeiSuffix),
-            37 => Some(Self::AccessUnitDelimiter),
-            38 => Some(Self::EndOfSequence),
-            39 => Some(Self::EndOfBitstream),
-            40 => Some(Self::FillerData),
-            41 => Some(Self::SeiPrefixN),
-            42 => Some(Self::SeiSuffixN),
+            35 => Some(Self::Aud),
+            36 => Some(Self::Eos),
+            37 => Some(Self::Eob),
+            38 => Some(Self::Fd),
+            39 => Some(Self::SeiPrefix),
+            40 => Some(Self::SeiSuffix),
             _ => None,
         }
     }
@@ -187,32 +186,46 @@ impl H265NalUnitType {
                 | Self::RadlR
                 | Self::RaslN
                 | Self::RaslR
-                | Self::CodNalSliceIdrW
-                | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW
-                | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN
-                | Self::CodNalSliceCra
+                | Self::BlaWRadl
+                | Self::IdrWRadl
+                | Self::IdrNlp
+                | Self::BlaWlp
+                | Self::BlaNlp
+                | Self::CraNut
+                | Self::RsvIrapVcl20
+                | Self::RsvIrapVcl21
         )
     }
 
     /// Check if this NAL unit type is an IRAP picture (random access point).
-    /// IRAP = IDR, BLA, CRA, or Reserved IRAP
+    /// IRAP = BLA, IDR, CRA, or Reserved IRAP (NAL types 16-23).
     pub const fn is_irap(&self) -> bool {
         matches!(
             self,
-            Self::CodNalSliceIdrW
-                | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW
-                | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN
-                | Self::CodNalSliceCra
+            Self::IdrWRadl
+                | Self::IdrNlp
+                | Self::BlaWlp
+                | Self::BlaWRadl
+                | Self::BlaNlp
+                | Self::CraNut
+                | Self::RsvIrapVcl20
+                | Self::RsvIrapVcl21
         )
     }
 
-    /// Check if this NAL unit type is an IDR picture.
+    /// Check if this NAL unit type is an IDR picture (IDR_W_RADL/IDR_N_LP).
     pub const fn is_idr(&self) -> bool {
-        matches!(self, Self::CodNalSliceIdrW | Self::CodNalSliceIdrN)
+        matches!(self, Self::IdrWRadl | Self::IdrNlp)
+    }
+
+    /// Check if this NAL unit type is a BLA picture (BLA_W_LP/BLA_N_LP).
+    pub const fn is_bla(&self) -> bool {
+        matches!(self, Self::BlaWlp | Self::BlaNlp)
+    }
+
+    /// Check if this NAL unit type is a CRA picture (CRA_NUT).
+    pub const fn is_cra(&self) -> bool {
+        matches!(self, Self::CraNut)
     }
 
     /// Check if this NAL unit type is a parameter set.
@@ -221,7 +234,8 @@ impl H265NalUnitType {
     }
 
     /// Check if this NAL unit type is a reference picture.
-    /// Per H.265 spec: odd VCL NAL types (1,3,5,7,9,11,13,15,17,19,21) are reference.
+    /// Per H.265 spec: the _R VCL NAL types (odd values) are reference pictures;
+    /// all IRAP types (16-22) are reference pictures.
     pub const fn is_reference(&self) -> bool {
         matches!(
             self,
@@ -230,12 +244,14 @@ impl H265NalUnitType {
                 | Self::StsaR
                 | Self::RadlR
                 | Self::RaslR
-                | Self::CodNalSliceIdrW
-                | Self::CodNalSliceIdrN
-                | Self::CodNalSliceBlaW
-                | Self::CodNalSliceBlaRadl
-                | Self::CodNalSliceBlaN
-                | Self::CodNalSliceCra
+                | Self::BlaWRadl
+                | Self::IdrWRadl
+                | Self::IdrNlp
+                | Self::BlaWlp
+                | Self::BlaNlp
+                | Self::CraNut
+                | Self::RsvIrapVcl20
+                | Self::RsvIrapVcl21
         )
     }
 }
