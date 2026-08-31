@@ -215,8 +215,8 @@ cd vk-video
 # Build
 cargo build
 
-# Run example
-cargo run --example basic_decode
+# Run example (unified decode: pts, size, pixel hash per frame)
+cargo run --release -p examples --example decode -- -b <vaapi|vulkan|nvdec> -i <file.ivf|h264|h265>
 ```
 
 ## Reference
