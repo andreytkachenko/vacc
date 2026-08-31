@@ -186,7 +186,19 @@ impl H264Dpb {
     /// (first empty slot, C++ C.4.5.1/4.5.2). Does NOT store the current yet.
     pub fn prepare_current(&mut self) -> usize {
         let cur = self.cur.as_ref().expect("picture_start not called").clone();
-        if cur.is_ref {
+        if cur.is_idr {
+            // H.264 8.2.5: when the current picture is an IDR, all short-term
+            // and long-term reference pictures are unmarked. Without this the
+            // previous GOP's refs stay marked; frame_num wraps modulo
+            // MaxFrameNum, so an old ref can then sort ahead of the new GOP's
+            // frames in the P-slice list (descending PicNum) and be selected
+            // as L0[0] for the first P-frame after the IDR (corrupting it and
+            // everything that references it). FFmpeg unmarks all at an IDR;
+            // other backends reset their DPB explicitly on IDRs.
+            for s in &mut self.slots {
+                s.marking = MARKING_UNUSED;
+            }
+        } else if cur.is_ref {
             if cur.mmco {
                 self.apply_mmco(&cur);
             } else {

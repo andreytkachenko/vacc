@@ -1007,7 +1007,11 @@ impl VideoDecoder {
     }
 
     fn decode_all_vp9(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
-        let frames = super::access_unit::extract_vp9_frames(&self.bitstream_data, max_frames);
+        // Extract a generous multiple of AUs: VP9 has hidden reference-only
+        // frames (show_frame=0) that are decoded but produce no display output,
+        // so `max_frames` AUs can yield fewer than `max_frames` display frames.
+        let au_budget = max_frames.saturating_mul(4).max(64);
+        let frames = super::access_unit::extract_vp9_frames(&self.bitstream_data, au_budget);
 
         if frames.is_empty() {
             return Err(VideoError::DecoderInit("No VP9 frames found".to_string()));
@@ -1030,7 +1034,13 @@ impl VideoDecoder {
         let _align_width = self.picture_access_granularity.width;
         let _align_height = self.picture_access_granularity.height;
 
-        for (frame_idx, vp9_frame) in frames.iter().enumerate().take(max_frames) {
+        for (frame_idx, vp9_frame) in frames.iter().enumerate() {
+            // Stop once we have the requested number of DISPLAY frames. Hidden
+            // reference-only AUs are still decoded (they feed later references)
+            // but do not count toward this total.
+            if decoded_frames.len() >= max_frames {
+                break;
+            }
             // Parse frame header
             let parser = self
                 .vp9_parser
@@ -1286,6 +1296,7 @@ impl VideoDecoder {
             frame_count += 1;
         }
 
+        decoded_frames.truncate(max_frames);
         Ok(decoded_frames)
     }
 

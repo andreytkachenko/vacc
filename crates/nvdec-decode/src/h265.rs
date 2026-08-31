@@ -142,6 +142,11 @@ pub struct NvdecH265Decoder {
     /// Minimum POC gap observed between consecutively decoded frames.
     /// Used to determine the stream's POC increment for reorder buffering.
     min_poc_gap: i32,
+    /// Range of unwrapped POCs observed so far. When min == max the stream has
+    /// no reordering (e.g. an all-IDR stream where every picture has POC 0), so
+    /// display order == decode order and frames must be presented immediately.
+    uw_min: Option<i32>,
+    uw_max: Option<i32>,
 
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
@@ -197,6 +202,8 @@ impl NvdecH265Decoder {
             prev_decoded_poc: None,
             last_presented_unwrapped: None,
             min_poc_gap: 1,
+            uw_min: None,
+            uw_max: None,
             pinned_cache: Mutex::new(None),
             dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
                 .ok()
@@ -601,6 +608,8 @@ impl NvdecH265Decoder {
 
                     // Track for display-order presentation.
                     let unwrapped = self.unwrapped_poc(poc);
+                    self.uw_min = Some(self.uw_min.map_or(unwrapped, |m| m.min(unwrapped)));
+                    self.uw_max = Some(self.uw_max.map_or(unwrapped, |m| m.max(unwrapped)));
                     self.reorder
                         .insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
 
@@ -855,6 +864,8 @@ impl NvdecH265Decoder {
         self.prev_decoded_poc = None;
         self.last_presented_unwrapped = None;
         self.poc_cycle = 0;
+        self.uw_min = None;
+        self.uw_max = None;
     }
 
     /// Extract ready frames in DISPLAY (ascending PO C) order.
@@ -879,8 +890,15 @@ impl NvdecH265Decoder {
                 None => break,
             };
             // Guard 1: don't extract if the latest decoded frame has POC <= min
-            // (more frames with lower POC may arrive)
-            if self.presented_count > 0 && max_uw <= key.0 {
+            // (more frames with lower POC may arrive). Exception: when POC never
+            // advances at all (all-IDR stream: every picture has POC 0) no
+            // reordering exists and display order == decode order — holding back
+            // would stall forever while NVDEC recycles the pending surfaces.
+            let poc_flat = match (self.uw_min, self.uw_max) {
+                (Some(lo), Some(hi)) => lo == hi,
+                _ => false,
+            };
+            if self.presented_count > 0 && max_uw <= key.0 && !poc_flat {
                 break;
             }
             // Guard 2: don't extract if there's a gap larger than the POC increment

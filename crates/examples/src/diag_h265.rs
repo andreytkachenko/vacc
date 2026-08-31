@@ -101,10 +101,23 @@ fn main() {
                     let model_a = ue_bits(nn) + sum_raw0 + nn + ue_bits(np) + sum_raw1 + np; // with used flags
                     let model_b = ue_bits(nn) + sum_raw0 + ue_bits(np) + sum_raw1; // no flags
                     println!(
-                        "PIC {pic}: type={} poc={} idr={} rap={} ref={} nn={} np={} raw0={:?} raw1={:?} ref0={:?} ref1={:?} bitsA={} bitsB={}",
+                        "PIC {pic}: type={} poc={} idr={} rap={} ref={} nn={} np={} raw0={:?} raw1={:?} ref0={:?} ref1={:?} bitsA={} bitsB={} hbs={} nal={}",
                         info.slice_type, info.curr_pic_order_cnt_val, info.is_idr,
                         info.is_rap, info.is_reference, nn, np, raw0, raw1,
-                        refpoc0, refpoc1, model_a, model_b
+                        refpoc0, refpoc1, model_a, model_b, info.header_bit_size,
+                        slices[0].nal_data.len()
+                    );
+                    println!(
+                        "     q={} cb={} cr={} saoL={} saoC={} deb={:?} beta={} tc={} lfas={} tmvp={} stflag={} stidx={} nref0={} nref1={} cabinit={} mvd1z={} coll0={} ext={}",
+                        info.slice_qp_delta, info.slice_cb_qp_offset, info.slice_cr_qp_offset,
+                        info.slice_sao_luma_flag, info.slice_sao_chroma_flag,
+                        info.slice_deblocking_filter_disabled_flag, info.slice_beta_offset_div2,
+                        info.slice_tc_offset_div2, info.slice_loop_filter_across_slices_enabled_flag,
+                        info.slice_temporal_mvp_enabled_flag, info.short_term_ref_pic_set_sps_flag,
+                        info.short_term_ref_pic_set_idx, info.num_ref_idx_l0_active_minus1,
+                        info.num_ref_idx_l1_active_minus1, info.cabac_init_flag,
+                        info.mvd_l1_zero_flag, info.collocated_from_l0_flag,
+                        info.num_entry_point_offsets
                     );
                 }
                 pic += 1;

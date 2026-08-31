@@ -119,7 +119,7 @@ fn main() {
 
     for (frame_idx, frame) in frames.iter().enumerate() {
         if let Some(ref pixel_data) = frame.pixel_data {
-            let output_path = format!("{}_disp{}.yuv", out_prefix, frame_idx);
+            let output_path = format!("{}_frame_{}.yuv", out_prefix, frame_idx);
             let nv12 = frame_to_nv12(pixel_data, bps);
             match std::fs::write(&output_path, &nv12) {
                 Ok(()) => {

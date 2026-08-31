@@ -1448,8 +1448,11 @@ impl VaapiDecoder {
                             sps.log2_max_frame_num_minus4, sps.pic_order_cnt_type, sps.log2_max_pic_order_cnt_lsb_minus4,
                             sps.max_pic_order_cnt_lsb, sps.max_num_ref_frames, sps.gaps_in_frame_num_value_allowed_flag, sps.frame_mbs_only_flag);
                     }
-                    ctx.poc_calc.reset();
-                    ctx.curr_poc = 0;
+                    // NOTE: do NOT reset POC state here. Encoders (e.g. x264)
+                    // re-send SPS/PPS before every keyframe; a mid-stream
+                    // parameter set does not restart the POC sequence. POC
+                    // state is only reset for IDR pictures (see Slice arm),
+                    // per H.264 8.2.1.
                     // Continue loop to find slices
                     continue;
                 }
@@ -1460,8 +1463,7 @@ impl VaapiDecoder {
                     ctx.max_frame_num = sps.max_frame_num;
                     ctx.dpb.max_frame_num = sps.max_frame_num;
                     ctx.dpb.num_ref_frames = sps.max_num_ref_frames.min(ctx.slot_surfaces.len() as u32).max(1);
-                    ctx.poc_calc.reset();
-                    ctx.curr_poc = 0;
+                    // (no POC reset here; see SPS arm comment above)
                     // Continue loop to find slices
                     continue;
                 }
@@ -1505,6 +1507,14 @@ impl VaapiDecoder {
                     let sps = self.stream.sps.as_ref()
                         .expect("SPS should be available for H264 slice");
                     if let Some(vk_video_parser::SliceHeader::H264(slh)) = &first_slice_header {
+                        // Per H.264 8.2.1 an IDR picture restarts the POC
+                        // state (PicOrderCntMsb = 0). Non-IDR pictures —
+                        // including CRAs, which do NOT clear the DPB — must
+                        // continue the existing POC sequence even if the
+                        // encoder re-sent SPS/PPS just before them.
+                        if slh.nal_unit_type == 5 {
+                            ctx.poc_calc.reset();
+                        }
                         let is_ref = slh.nal_ref_idc != 0;
                         ctx.curr_poc = ctx.poc_calc.calculate(sps, slh, is_ref);
                     }

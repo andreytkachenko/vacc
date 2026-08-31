@@ -261,7 +261,13 @@ by Vulkan Video decode (4:2:0 only).",
     let session_dpb_slots = max_dpb_slots + 1;
 
     // Step 5: Create video session
-    let output_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+    // The picture format must match the stream's bit depth (spec VUID:
+    // component depth of pictureFormat == lumaBitDepth of the profile).
+    let output_format = match bit_depth {
+        10 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        12 => vk::Format::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16,
+        _ => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+    };
 
     let session_params = VideoSessionParams {
         queue_family_index: decode_qf,
@@ -275,8 +281,8 @@ by Vulkan Video decode (4:2:0 only).",
             std_profile: use_profile,
         },
         chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        luma_bit_depth,
+        chroma_bit_depth,
         inline_queries: false,
     };
 
@@ -414,7 +420,12 @@ by Vulkan Video decode (4:2:0 only).",
     vp9_decoder.set_max_dpb_slots(max_dpb_slots);
 
     // Step 13: Decode frames
-    let frames_to_decode = raw_frames.len().min(max_frames_arg);
+    // VP9 has hidden reference-only frames (show_frame=0) that are decoded but
+    // never displayed, so `max_frames_arg` AUs can yield fewer than
+    // `max_frames_arg` display frames. Use a generous AU budget and stop early
+    // once the requested number of DISPLAY frames has been produced.
+    let au_budget = max_frames_arg.saturating_mul(4).max(64);
+    let frames_to_decode = raw_frames.len().min(au_budget);
 
     // DPB management state
     let mut dpb_manager = Vp9DpbManager::new(max_dpb_slots);
@@ -425,6 +436,12 @@ by Vulkan Video decode (4:2:0 only).",
     parser.reset();
 
     for (frame_idx, frame_info) in raw_frames.iter().enumerate().take(frames_to_decode) {
+        // Stop once we have the requested number of display frames. Hidden
+        // reference-only AUs still get decoded (they feed later references) but
+        // do not count toward this total.
+        if frame_count as usize >= max_frames_arg {
+            break;
+        }
         let frame_data = &frame_info.data;
         let packet_offset = frame_info.packet_file_offset;
         let superframe_offset = frame_info.superframe_frame_offset as u32;
@@ -491,6 +508,7 @@ by Vulkan Video decode (4:2:0 only).",
                     frame_idx,
                     frame_count as usize, // Use display order index
                     bitstream_path,
+                    bit_depth,
                 );
             } else {
                 eprintln!(
@@ -781,10 +799,11 @@ by Vulkan Video decode (4:2:0 only).",
                 coded_height,
                 parsed.frame_width,
                 parsed.frame_height,
-                frame_idx,
-                frame_count as usize, // Use display order index
-                bitstream_path,
-            );
+                  frame_idx,
+                  frame_count as usize, // Use display order index
+                  bitstream_path,
+                  bit_depth,
+              );
 
             // Restore DPB layout after readback
             dpb_manager.set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
@@ -1460,12 +1479,15 @@ fn readback_and_verify(
     _frame_idx: usize,        // Bitstream frame index (kept for debugging)
     display_frame_idx: usize, // Display order index (used for naming)
     bitstream_path: &str,
+    bit_depth: u8,
 ) {
     let y_size = (width * height) as usize;
     let uv_width = width.div_ceil(2);
     let uv_height = height.div_ceil(2);
     let uv_size = (uv_width * uv_height * 2) as usize;
-    let total_size = (y_size + uv_size) as u64;
+    let bps = if bit_depth > 8 { 2 } else { 1 };
+    let y_bytes = y_size * bps;
+    let total_size = ((y_size + uv_size) * bps) as u64;
 
     // Create staging buffer
     let buffer = unsafe {
@@ -1616,14 +1638,14 @@ fn readback_and_verify(
                 })],
         );
 
-        // Copy PLANE_1 (UV interleaved) to buffer at offset y_size
+        // Copy PLANE_1 (UV interleaved) to buffer at offset y_bytes
         device.cmd_copy_image_to_buffer(
             cmd_buffer,
             image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             buffer,
             &[vk::BufferImageCopy::default()
-                .buffer_offset(y_size as u64)
+                .buffer_offset(y_bytes as u64)
                 .buffer_row_length(0)
                 .buffer_image_height(0)
                 .image_subresource(
@@ -1761,7 +1783,7 @@ fn readback_and_verify(
         // Read data from mapped memory
         let data_ptr = mapped_ptr as *const u8;
         let data = std::slice::from_raw_parts(data_ptr, total_size as usize);
-        let y_data = &data[..y_size];
+        let y_data = &data[..y_bytes];
 
         // Analyze Y plane (values available for debugging if needed)
         let mut _sum: u64 = 0;
@@ -1780,20 +1802,38 @@ fn readback_and_verify(
         }
 
         // Save all frames for verification
-        // Convert from Vulkan G8_B8R8_2PLANE (Y + interleaved UV) to yuv420p (Y + U + V planar)
+        // Convert from Vulkan 2-plane (Y + interleaved UV) to yuv420p (Y + U + V planar),
+        // downconverting 10/12-bit samples to 8-bit with the same rounding as ffmpeg.
         let uv_plane_size = (uv_width * uv_height) as usize;
         let mut yuv_data = Vec::with_capacity(y_size + uv_plane_size * 2);
-        yuv_data.extend_from_slice(&data[..y_size]); // Y plane
-                                                     // De-interleave UV plane: Vulkan stores UVUVUV..., yuv420p expects UUUU...VVVV...
-        let uv_interleaved = &data[y_size..y_size + uv_plane_size * 2];
-        let mut u_plane = vec![0u8; uv_plane_size];
-        let mut v_plane = vec![0u8; uv_plane_size];
-        for i in 0..uv_plane_size {
-            u_plane[i] = uv_interleaved[i * 2];
-            v_plane[i] = uv_interleaved[i * 2 + 1];
+        if bps == 1 {
+            yuv_data.extend_from_slice(&data[..y_size]); // Y plane
+                                                         // De-interleave UV plane: Vulkan stores UVUVUV..., yuv420p expects UUUU...VVVV...
+            let uv_interleaved = &data[y_size..y_size + uv_plane_size * 2];
+            let mut u_plane = vec![0u8; uv_plane_size];
+            let mut v_plane = vec![0u8; uv_plane_size];
+            for i in 0..uv_plane_size {
+                u_plane[i] = uv_interleaved[i * 2];
+                v_plane[i] = uv_interleaved[i * 2 + 1];
+            }
+            yuv_data.extend_from_slice(&u_plane);
+            yuv_data.extend_from_slice(&v_plane);
+        } else {
+            // Y plane: u16 LE samples, value in the low bits
+            for i in 0..y_size {
+                let v = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                yuv_data.push(downconvert_sample(v, bit_depth));
+            }
+            // UV plane: interleaved u16 LE (U0 V0 U1 V1 ...)
+            for i in 0..uv_plane_size {
+                let u = u16::from_le_bytes([data[y_bytes + i * 4], data[y_bytes + i * 4 + 1]]);
+                yuv_data.push(downconvert_sample(u, bit_depth));
+            }
+            for i in 0..uv_plane_size {
+                let v = u16::from_le_bytes([data[y_bytes + i * 4 + 2], data[y_bytes + i * 4 + 3]]);
+                yuv_data.push(downconvert_sample(v, bit_depth));
+            }
         }
-        yuv_data.extend_from_slice(&u_plane);
-        yuv_data.extend_from_slice(&v_plane);
 
         // Derive output filename from input path
         let stem = std::path::Path::new(bitstream_path)
@@ -1810,6 +1850,16 @@ fn readback_and_verify(
         device.destroy_buffer(buffer, None);
         device.unmap_memory(memory);
         device.free_memory(memory, None);
+    }
+}
+
+/// Downconvert a high-depth sample to 8-bit using round-to-nearest,
+/// matching ffmpeg's swscale depth reduction ((v + 2^(d-9)) >> (d-8)).
+fn downconvert_sample(v: u16, bit_depth: u8) -> u8 {
+    match bit_depth {
+        10 => ((v + 2) >> 2) as u8,
+        12 => ((v + 8) >> 4) as u8,
+        _ => v as u8,
     }
 }
 
