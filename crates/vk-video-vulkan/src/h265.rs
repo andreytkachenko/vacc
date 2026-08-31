@@ -683,9 +683,12 @@ impl H265Decoder {
                 type FnType = unsafe extern "system" fn(
                     vk::CommandBuffer,
                     *const vk::VideoBeginCodingInfoKHR<'_>,
-                );
+                ) -> i64;
                 let f: FnType = std::mem::transmute(ptr);
-                f(cmd_buffer, info);
+                let rc = f(cmd_buffer, info);
+                if std::env::var("VACC_DBG_H265").is_ok() {
+                    eprintln!("[H265-DEC] vkCmdBeginVideoCodingKHR rc={rc} (0x{rc:x})");
+                }
             }
         }
     }
@@ -698,9 +701,15 @@ impl H265Decoder {
         if let Some(ptr) = fn_ptr {
             unsafe {
                 type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
+                    unsafe extern "system" fn(
+                        vk::CommandBuffer,
+                        *const vk::VideoDecodeInfoKHR<'_>,
+                    ) -> i64;
                 let f: FnType = std::mem::transmute(ptr);
-                f(cmd_buffer, info);
+                let rc = f(cmd_buffer, info);
+                if std::env::var("VACC_DBG_H265").is_ok() {
+                    eprintln!("[H265-DEC] vkCmdDecodeVideoKHR rc={rc} (0x{rc:x})");
+                }
             }
         }
     }
@@ -750,9 +759,12 @@ impl H265Decoder {
                 type FnType = unsafe extern "system" fn(
                     vk::CommandBuffer,
                     *const vk::VideoEndCodingInfoKHR<'_>,
-                );
+                ) -> i64;
                 let f: FnType = std::mem::transmute(ptr);
-                f(cmd_buffer, &end_coding_info);
+                let r = f(cmd_buffer, &end_coding_info);
+                if std::env::var("VACC_DBG_H265").is_ok() {
+                    eprintln!("[H265-DEC] vkCmdEndVideoCodingKHR rc={r} (0x{r:x})");
+                }
             }
         }
     }
@@ -1166,6 +1178,30 @@ pub fn convert_h265_pps(pps: &H265Pps) -> StdVideoH265PictureParameterSet {
         0
     });
 
+    // TEMPORARY debug override for PPS field isolation testing
+    if let Ok(v) = std::env::var("VACC_PPS_OVR") {
+        for pair in v.split(',') {
+            if let Some((k, val)) = pair.split_once('=') {
+                let v: u32 = val.parse().unwrap_or(0);
+                match k {
+                    "across_slices" => flags.set_pps_loop_filter_across_slices_enabled_flag(v),
+                    "lists_mod" => flags.set_lists_modification_present_flag(v),
+                    "log2_par_merge" => {} // handled below via struct field
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut log2_par_merge = pps.log2_parallel_merge_level_minus2;
+    if let Ok(v) = std::env::var("VACC_PPS_OVR") {
+        for pair in v.split(',') {
+            if let Some(("log2_par_merge", val)) = pair.split_once('=') {
+                log2_par_merge = val.parse().unwrap_or(log2_par_merge);
+            }
+        }
+    }
+
     StdVideoH265PictureParameterSet {
         flags,
         pps_pic_parameter_set_id: pps.pps_pic_parameter_set_id as u8,
@@ -1180,7 +1216,7 @@ pub fn convert_h265_pps(pps: &H265Pps) -> StdVideoH265PictureParameterSet {
         pps_cr_qp_offset: pps.pps_cr_qp_offset,
         pps_beta_offset_div2: pps.pps_beta_offset_div2,
         pps_tc_offset_div2: pps.pps_tc_offset_div2,
-        log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level_minus2,
+        log2_parallel_merge_level_minus2: log2_par_merge,
         log2_max_transform_skip_block_size_minus2: pps.log2_max_transform_skip_block_size_minus2,
         diff_cu_chroma_qp_offset_depth: pps.diff_cu_chroma_qp_offset_depth,
         chroma_qp_offset_list_len_minus1: pps.chroma_qp_offset_list_len_minus1,

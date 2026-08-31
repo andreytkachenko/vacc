@@ -279,11 +279,15 @@ pub struct Av1FrameHeader {
     pub order_hints: [u8; 8],
     /// Loop restoration type per plane [y, u, v] (StdVideo enum values).
     pub loop_restoration_type: [u8; 3],
-    /// Loop restoration size (log2) per plane [y, u, v].
+    /// Loop restoration size spec code per plane [y, u, v]:
+    /// 0: 32px, 1: 64px, 2: 128px, 3: 256px (AV1 data-model numbering,
+    /// identical to `CUVIDAV1PICPARAMS.lr_unit_size`).
     pub loop_restoration_size: [u16; 3],
     /// Whether luma loop restoration is used.
     pub uses_lr: bool,
-    /// Global motion type per model [7] (IDENTITY=0, TRANSLATION=1, AFFINE=2, ROTZOOM=3).
+    /// Global motion type per model [7] (spec order: IDENTITY=0,
+    /// TRANSLATION=1, ROTZOOM=2, AFFINE=3 — matches both the AV1 bitstream
+    /// and VAAPI's VAAV1TransformationType).
     pub global_motion_type: [u8; 7],
     /// Global motion parameters [7 models][6 params] (wmmat).
     pub global_motion_params: [[i32; 6]; 7],
@@ -321,16 +325,9 @@ pub struct Av1Parser {
     stream_format: StreamFormat,
     /// Whether we should probe for Annex B format.
     should_probe_for_annexb: bool,
-    /// Reference frame sizes for frame size inheritance (per AV1 spec 7.20).
-    ref_frame_sizes: [(u32, u32); 8],
-    /// Reference frame order hints for short signaling derivation.
-    ref_frame_order_hints: [u32; 8],
-    /// Per-frame-buffer global motion models [8 slots][7 models] of (type, wmmat[6]).
-    ref_global_models: [[(u8, [i32; 6]); 7]; 8],
-    /// Per-frame-buffer segmentation [8 slots] of (FeatureEnabled[8], FeatureData[8][8]).
-    ref_segmentation: [([u8; 8], [[i16; 8]; 8]); 8],
-    /// Per-frame-buffer loop filter deltas [8 slots] of (ref_deltas[8], mode_deltas[2]).
-    ref_loop_filter: [([i8; 8], [i8; 2]); 8],
+    /// Common AV1 DPB state machine (frame buffers, slot bookkeeping, POC)
+    /// shared with all decode backends.
+    pub dpb: crate::av1_dpb::Av1Dpb,
     /// Persistent CDEF strengths carried across frames (AV1: levels not re-coded
     /// in the current frame inherit the previous frame's values). Mirrors the
     /// C++ reference's persistent `m_PicData.CDEF`. Format:
@@ -352,19 +349,32 @@ impl Av1Parser {
             frame_count: 0,
             stream_format: StreamFormat::LowOverhead,
             should_probe_for_annexb: true,
-            ref_frame_sizes: [(0, 0); 8],
-            ref_frame_order_hints: [0; 8],
-            ref_global_models: [Self::default_global_models(); 8],
-            ref_segmentation: [(([0; 8]), [[0; 8]; 8]); 8],
-            ref_loop_filter: [(([0; 8]), [0; 2]); 8],
+            dpb: crate::av1_dpb::Av1Dpb::new(16),
             last_cdef: (0, 0, [0; 8], [0; 8], [0; 8], [0; 8]),
         }
     }
 
-    /// Default global motion models: all identity {type=0, wmmat=[0,0,65536,0,0,65536]}.
-    fn default_global_models() -> [(u8, [i32; 6]); 7] {
-        let identity = (0u8, [0i32, 0, 65536, 0, 0, 65536]);
-        [identity; 7]
+    /// Load an already-parsed sequence header (e.g. when a backend parsed it
+    /// from container data before creating the per-packet parse loop).
+    pub fn set_active_sps(&mut self, sps: vk_video_core::picture::Av1Sps) {
+        self.active_sps = Some(sps);
+    }
+
+    /// Common AV1 DPB (frame buffers / slot allocation / POC) shared with
+    /// the decode backends.
+    pub fn dpb(&self) -> &crate::av1_dpb::Av1Dpb {
+        &self.dpb
+    }
+
+    /// Mutable access to the common AV1 DPB.
+    pub fn dpb_mut(&mut self) -> &mut crate::av1_dpb::Av1Dpb {
+        &mut self.dpb
+    }
+
+    /// Configure the number of backend DPB slots (DPB images / surfaces).
+    /// Must be called before decoding frames.
+    pub fn set_dpb_slots(&mut self, num_slots: u32) {
+        self.dpb = crate::av1_dpb::Av1Dpb::new(num_slots);
     }
 
     /// Probe the input data for the Annex B format.
@@ -860,13 +870,12 @@ impl Av1Parser {
         Ok(())
     }
 
-    /// Parse color_config syntax element.
+    /// Parse color_config syntax element (AV1 spec 5.5.1).
     fn parse_color_config(
         sps: &mut vk_video_core::picture::Av1Sps,
         r: &mut BitReader,
     ) -> ParserResult<()> {
         let seq_profile = sps.profile as u32;
-        let start_pos = r.position();
 
         // high_bitdepth (1 bit)
         sps.high_bitdepth = r.read_bit()?;
@@ -878,7 +887,7 @@ impl Av1Parser {
             false
         };
 
-        // mono_chrome (1 bit) - not present for profile 1
+        // mono_chrome (1 bit) - implicit 0 for profile 1 (High)
         sps.mono_chrome = if seq_profile == 1 {
             false
         } else {
@@ -890,19 +899,11 @@ impl Av1Parser {
 
         let (color_primaries, transfer_characteristics, matrix_coefficients) =
             if sps.color_description_present {
-                // color_primaries (8 bits)
-                let color_primaries = r.read_bits(8)? as u8;
-
-                // transfer_characteristics (8 bits)
-                let transfer_characteristics = r.read_bits(8)? as u8;
-
-                // matrix_coefficients (8 bits)
-                let matrix_coefficients = r.read_bits(8)? as u8;
-
+                // color_primaries / transfer / matrix (8 bits each)
                 (
-                    color_primaries,
-                    transfer_characteristics,
-                    matrix_coefficients,
+                    r.read_bits(8)? as u8,
+                    r.read_bits(8)? as u8,
+                    r.read_bits(8)? as u8,
                 )
             } else {
                 (2, 2, 2) // Default: BT.709
@@ -912,38 +913,62 @@ impl Av1Parser {
         sps.matrix_coefficients = matrix_coefficients;
 
         if sps.mono_chrome {
-            // color_range (1 bit)
+            // color_range (1 bit). Subsampling and separate_uv_delta_q are
+            // INFERRED (x=y=1, separate_uv_delta_q=0) - not in the bitstream.
             sps.color_range = r.read_bit()?;
+            sps.subsampling_x = 1;
+            sps.subsampling_y = 1;
+            sps.separate_uv_delta_q = false;
         } else {
             // Check for sRGB color space per AV1 spec:
             // is_srgb = (color_primaries == 1) && (transfer_characteristics == 13) && (matrix_coefficients == 1)
             let is_srgb = (color_primaries == 1)
                 && (transfer_characteristics == 13)
                 && (matrix_coefficients == 1);
-            if !is_srgb {
+            if is_srgb {
+                // INFERRED: full range, 4:4:4; separate_uv_delta_q present.
+                sps.color_range = true;
+                sps.subsampling_x = 0;
+                sps.subsampling_y = 0;
+                sps.separate_uv_delta_q = r.read_bit()?;
+            } else {
                 // color_range (1 bit)
                 sps.color_range = r.read_bit()?;
 
-                // subsampling_x, subsampling_y - profile 2 only, and only when twelve_bit is true
-                // Per AV1 spec 5.3.3: subsampling_x/y present when seq_profile==2 AND twelve_bit==1
-                if seq_profile == 2 && sps.twelve_bit {
+                // Chroma subsampling per profile (AV1 spec 5.5.1):
+                //   profile 0 (Main): implicit 4:2:0
+                //   profile 1 (High): implicit 4:4:4
+                //   profile 2 (Professional): implicit 4:2:2 at 10-bit;
+                //     subsampling_x/y read at 12-bit.
+                if seq_profile == 0 {
+                    sps.subsampling_x = 1;
+                    sps.subsampling_y = 1;
+                } else if seq_profile == 1 {
+                    sps.subsampling_x = 0;
+                    sps.subsampling_y = 0;
+                } else if sps.twelve_bit {
                     // subsampling_x (1 bit)
                     sps.subsampling_x = r.read_bit()? as u8;
                     if sps.subsampling_x != 0 {
                         // subsampling_y (1 bit)
                         sps.subsampling_y = r.read_bit()? as u8;
-
-                        // chroma_sample_position (2 bits) - only if subsampled in both dimensions
-                        if sps.subsampling_y != 0 {
-                            sps.chroma_sample_position = r.read_bits(2)? as u8;
-                        }
+                    } else {
+                        sps.subsampling_y = 0;
                     }
+                } else {
+                    sps.subsampling_x = 1;
+                    sps.subsampling_y = 0;
                 }
+
+                // chroma_sample_position (2 bits) - present only for 4:2:0
+                if sps.subsampling_x != 0 && sps.subsampling_y != 0 {
+                    sps.chroma_sample_position = r.read_bits(2)? as u8;
+                }
+
+                // separate_uv_delta_q (1 bit)
+                sps.separate_uv_delta_q = r.read_bit()?;
             }
         }
-
-        // separate_uv_delta_q (1 bit)
-        sps.separate_uv_delta_q = r.read_bit()?;
 
         Ok(())
     }
@@ -1214,17 +1239,15 @@ impl Av1Parser {
             };
         let inherit_size = |fh: &mut Av1FrameHeader,
                             primary_ref: u8,
-                            sizes: &[(u32, u32); 8],
+                            dpb: &crate::av1_dpb::Av1Dpb,
                             sps: &vk_video_core::picture::Av1Sps| {
-            match sizes.get(primary_ref as usize) {
-                Some(&(w, h)) if w > 0 && h > 0 => {
-                    fh.frame_width = w;
-                    fh.frame_height = h;
-                }
-                _ => {
-                    fh.frame_width = sps.max_frame_width_minus_1 as u32 + 1;
-                    fh.frame_height = sps.max_frame_height_minus_1 as u32 + 1;
-                }
+            let (w, h) = dpb.frame_buffer_dims(primary_ref as usize);
+            if w > 0 && h > 0 {
+                fh.frame_width = w;
+                fh.frame_height = h;
+            } else {
+                fh.frame_width = sps.max_frame_width_minus_1 as u32 + 1;
+                fh.frame_height = sps.max_frame_height_minus_1 as u32 + 1;
             }
         };
 
@@ -1235,7 +1258,7 @@ impl Av1Parser {
                 fh.frame_width = r.read_bits(sps.frame_width_bits)? + 1;
                 fh.frame_height = r.read_bits(sps.frame_height_bits)? + 1;
             } else {
-                inherit_size(&mut fh, primary_ref, &self.ref_frame_sizes, sps);
+                inherit_size(&mut fh, primary_ref, &self.dpb, sps);
             }
             read_superres_render(&mut fh, &mut r)?;
             read_render_size(&mut fh, &mut r)?;
@@ -1285,7 +1308,7 @@ impl Av1Parser {
                     let found_ref = r.read_bit()?;
                     if found_ref {
                         let ref_idx = fh.ref_frame_idx[i];
-                        inherit_size(&mut fh, ref_idx, &self.ref_frame_sizes, sps);
+                        inherit_size(&mut fh, ref_idx, &self.dpb, sps);
                         fh.render_width = fh.frame_width;
                         fh.render_height = fh.frame_height;
                         found = true;
@@ -1299,7 +1322,7 @@ impl Av1Parser {
                         fh.frame_width = r.read_bits(sps.frame_width_bits)? + 1;
                         fh.frame_height = r.read_bits(sps.frame_height_bits)? + 1;
                     } else {
-                        inherit_size(&mut fh, primary_ref, &self.ref_frame_sizes, sps);
+                        inherit_size(&mut fh, primary_ref, &self.dpb, sps);
                     }
                     read_superres_render(&mut fh, &mut r)?;
                     read_render_size(&mut fh, &mut r)?;
@@ -1310,7 +1333,7 @@ impl Av1Parser {
                     fh.frame_width = r.read_bits(sps.frame_width_bits)? + 1;
                     fh.frame_height = r.read_bits(sps.frame_height_bits)? + 1;
                 } else {
-                    inherit_size(&mut fh, primary_ref, &self.ref_frame_sizes, sps);
+                    inherit_size(&mut fh, primary_ref, &self.dpb, sps);
                 }
                 read_superres_render(&mut fh, &mut r)?;
                 read_render_size(&mut fh, &mut r)?;
@@ -1341,9 +1364,10 @@ impl Av1Parser {
             for i in 0..7 {
                 let ref_idx = fh.ref_frame_idx[i] as usize;
                 fh.order_hints[i] = self
-                    .ref_frame_order_hints
+                    .dpb
+                    .frame_buffers
                     .get(ref_idx)
-                    .copied()
+                    .map(|b| b.order_hint)
                     .unwrap_or(0) as u8;
             }
         }
@@ -1470,111 +1494,10 @@ impl Av1Parser {
             None => return,
         };
         let ohb = sps.order_hint_bits_minus1 as u32;
-        let cur_frame_hint = 1 << ohb;
-
-        let mut ref_idx: [i32; 7] = [-1; 7];
-        let mut used = [false; 8];
-
-        ref_idx[0] = last_frame_idx as i32; // LAST
-        ref_idx[3] = golden_frame_idx as i32; // GOLDEN
-        used[last_frame_idx as usize] = true;
-        used[golden_frame_idx as usize] = true;
-
-        // shiftedOrderHints[i] = curFrameHint + GetRelativeDist1(RefOrderHint[i], OrderHint)
-        let shifted: Vec<i32> = (0..8)
-            .map(|i| {
-                cur_frame_hint as i32
-                    + Self::get_relative_dist1(
-                        self.ref_frame_order_hints[i] as i32,
-                        order_hint as i32,
-                        ohb,
-                    )
-            })
-            .collect();
-
-        // ALTREF_FRAME (idx 6): unused, hint>=cur, MAX hint
-        let mut best = -1i32;
-        let mut best_hint = -1i32;
-        for i in 0..8 {
-            if !used[i]
-                && shifted[i] >= cur_frame_hint as i32
-                && (best < 0 || shifted[i] >= best_hint)
-            {
-                best = i as i32;
-                best_hint = shifted[i];
-            }
-        }
-        if best >= 0 {
-            ref_idx[6] = best;
-            used[best as usize] = true;
-        }
-        // BWDREF_FRAME (idx 4): unused, hint>=cur, MIN hint
-        let mut best = -1i32;
-        let mut best_hint = -1i32;
-        for i in 0..8 {
-            if !used[i]
-                && shifted[i] >= cur_frame_hint as i32
-                && (best < 0 || shifted[i] < best_hint)
-            {
-                best = i as i32;
-                best_hint = shifted[i];
-            }
-        }
-        if best >= 0 {
-            ref_idx[4] = best;
-            used[best as usize] = true;
-        }
-        // ALTREF2_FRAME (idx 5): unused, hint>=cur, MIN hint
-        let mut best = -1i32;
-        let mut best_hint = -1i32;
-        for i in 0..8 {
-            if !used[i]
-                && shifted[i] >= cur_frame_hint as i32
-                && (best < 0 || shifted[i] < best_hint)
-            {
-                best = i as i32;
-                best_hint = shifted[i];
-            }
-        }
-        if best >= 0 {
-            ref_idx[5] = best;
-            used[best as usize] = true;
-        }
-        // Ref_Frame_List = [LAST2(1), LAST3(2), BWDREF(4), ALTREF2(5), ALTREF(6)]: unused, hint<cur, MAX hint
-        for name in [1, 2, 4, 5, 6] {
-            if ref_idx[name] < 0 {
-                let mut best = -1i32;
-                let mut best_hint = -1i32;
-                for i in 0..8 {
-                    if !used[i]
-                        && shifted[i] < cur_frame_hint as i32
-                        && (best < 0 || shifted[i] >= best_hint)
-                    {
-                        best = i as i32;
-                        best_hint = shifted[i];
-                    }
-                }
-                if best >= 0 {
-                    ref_idx[name] = best;
-                    used[best as usize] = true;
-                }
-            }
-        }
-        // Final: fill remaining with argmin over ALL i of shifted
-        let mut fill = 0i32;
-        let mut fill_hint = i32::MAX;
-        for i in 0..8 {
-            if shifted[i] < fill_hint {
-                fill = i as i32;
-                fill_hint = shifted[i];
-            }
-        }
-        for i in 0..7 {
-            if ref_idx[i] < 0 {
-                ref_idx[i] = fill;
-            }
-        }
-
+        // AV1 spec 7.4.1 reference-list derivation (common DPB implementation).
+        let ref_idx = self
+            .dpb
+            .set_frame_refs(last_frame_idx as i32, golden_frame_idx as i32, order_hint, ohb);
         for i in 0..7 {
             fh.ref_frame_idx[i] = ref_idx[i] as u8;
         }
@@ -1613,9 +1536,10 @@ impl Av1Parser {
         for i in 0..7 {
             let frame_idx = fh.ref_frame_idx[i] as usize;
             let ref_off = self
-                .ref_frame_order_hints
+                .dpb
+                .frame_buffers
                 .get(frame_idx)
-                .copied()
+                .map(|b| b.order_hint)
                 .unwrap_or(0) as i32;
             let rel_off = Self::get_relative_dist1(ref_off, cur, ohb);
             if rel_off < 0
@@ -1638,9 +1562,10 @@ impl Av1Parser {
             for i in 0..7 {
                 let frame_idx = fh.ref_frame_idx[i] as usize;
                 let ref_off = self
-                    .ref_frame_order_hints
+                    .dpb
+                    .frame_buffers
                     .get(frame_idx)
-                    .copied()
+                    .map(|b| b.order_hint)
                     .unwrap_or(0) as i32;
                 if Self::get_relative_dist1(ref_off, ref0_off, ohb) < 0
                     && (ref1_off == -1 || Self::get_relative_dist1(ref_off, ref1_off, ohb) > 0)
@@ -1950,9 +1875,9 @@ impl Av1Parser {
             // the primary reference frame buffer when segmentation_update_data is
             // false (the feature data is not re-signaled in the bitstream).
             let ref_idx = fh.ref_frame_idx[primary_ref as usize] as usize;
-            if let Some((feature_enabled, feature_data)) = self.ref_segmentation.get(ref_idx) {
-                fh.segment_feature_enabled = *feature_enabled;
-                fh.segment_feature_data = *feature_data;
+            if let Some(buf) = self.dpb.frame_buffers.get(ref_idx) {
+                fh.segment_feature_enabled = buf.segment_feature_enabled;
+                fh.segment_feature_data = buf.segment_feature_data;
             }
         }
         Ok(())
@@ -2004,10 +1929,9 @@ impl Av1Parser {
         // primary reference frame buffer (overrides the default).
         if fh.primary_ref_frame != 7 {
             let prim_buf_idx = fh.ref_frame_idx[fh.primary_ref_frame as usize] as usize;
-            if prim_buf_idx < 8 {
-                let (ref_deltas, mode_deltas) = self.ref_loop_filter[prim_buf_idx];
-                fh.loop_filter_ref_deltas = ref_deltas;
-                fh.loop_filter_mode_deltas = mode_deltas;
+            if let Some(buf) = self.dpb.frame_buffers.get(prim_buf_idx) {
+                fh.loop_filter_ref_deltas = buf.loop_filter_ref_deltas;
+                fh.loop_filter_mode_deltas = buf.loop_filter_mode_deltas;
             }
         }
 
@@ -2155,7 +2079,10 @@ impl Av1Parser {
                 fh.loop_restoration_size[2] = fh.loop_restoration_size[0];
             }
         }
-        fh.loop_restoration_size[1] = fh.loop_restoration_size[1] >> lr_uv_shift >> lr_uv_shift;
+        // Match the NVIDIA reference decoder exactly: shift the luma size
+        // (not the already-adjusted chroma size) by uv_shift twice.
+        fh.loop_restoration_size[1] =
+            (fh.loop_restoration_size[0] >> lr_uv_shift) >> lr_uv_shift;
         Ok(())
     }
 
@@ -2169,14 +2096,14 @@ impl Av1Parser {
     ) -> ParserResult<()> {
         let _ = sps;
         // prev models: from primary ref buffer, else identity
-        let prev: [(u8, [i32; 6]); 7] = if primary_ref != 7 {
-            let ref_idx = fh.ref_frame_idx[primary_ref as usize] as usize;
-            self.ref_global_models
-                .get(ref_idx)
-                .copied()
-                .unwrap_or_else(Self::default_global_models)
+        let prev: [(u8, [i32; 6]); crate::av1_dpb::AV1_NUM_REF_NAMES] = if primary_ref != 7 {
+            self.dpb
+                .frame_buffers
+                .get(fh.ref_frame_idx[primary_ref as usize] as usize)
+                .map(|b| b.global_motion)
+                .unwrap_or_else(crate::av1_dpb::default_global_models)
         } else {
-            Self::default_global_models()
+            crate::av1_dpb::default_global_models()
         };
 
         let allow_hp = fh.allow_high_precision_mv;
@@ -2233,36 +2160,11 @@ impl Av1Parser {
         Ok(())
     }
 
-    /// Update reference frame tracking state after parsing a frame header (AV1 spec 7.20).
+    /// Update reference frame tracking state after parsing a frame header
+    /// (AV1 spec 7.20). The per-buffer content state lives in the common
+    /// AV1 DPB.
     fn update_ref_frames(&mut self, fh: &Av1FrameHeader) {
-        // Update sizes for refreshed frame slots
-        for i in 0..8usize {
-            if (fh.refresh_frame_flags & (1 << i)) != 0 {
-                self.ref_frame_sizes[i] = (fh.frame_width, fh.frame_height);
-                self.ref_frame_order_hints[i] = fh.order_hint;
-                // C++ VulkanAV1Decoder.cpp:401-402: save loop filter ref/mode
-                // deltas per refreshed frame buffer for later inheritance.
-                self.ref_loop_filter[i] = (fh.loop_filter_ref_deltas, fh.loop_filter_mode_deltas);
-                // C++ VulkanAV1Decoder.cpp:399: save the current frame's global
-                // motion models per refreshed frame buffer for later inheritance.
-                // Without this, ref_global_models stays at the identity default
-                // and every subsequent frame's global motion params are decoded
-                // against the wrong "previous" model (multi-ref INTER frames
-                // then decode to the primary reference's content).
-                let mut models: [(u8, [i32; 6]); 7] = Default::default();
-                for j in 0..7 {
-                    models[j] = (fh.global_motion_type[j], fh.global_motion_params[j]);
-                }
-                self.ref_global_models[i] = models;
-                // C++ VulkanAV1Decoder.cpp:404-405: save the current frame's
-                // segmentation state per refreshed frame buffer for later
-                // inheritance (same class of bug as the iter-22 global-motion
-                // fix). Without this, ref_segmentation stays zero and any
-                // frame with segmentation_update_data==0 would inherit the
-                // wrong (all-zero) feature state instead of the primary ref's.
-                self.ref_segmentation[i] = (fh.segment_feature_enabled, fh.segment_feature_data);
-            }
-        }
+        self.dpb.update_content(fh);
     }
 
     /// Update detected format from sequence header.
@@ -2273,13 +2175,32 @@ impl Av1Parser {
         self.detected_format.coded_width = coded_width;
         self.detected_format.coded_height = coded_height;
 
-        // AV1 bit depth is determined from profile and color config
-        // For now, default to 8-bit (actual bit depth is in frame header)
-        self.detected_format.luma_bit_depth = vk_video_core::format::ComponentBitDepth::Bit8;
-        self.detected_format.chroma_bit_depth = vk_video_core::format::ComponentBitDepth::Bit8;
+        // AV1 bit depth comes from the sequence header color config
+        // (high_bitdepth / twelve_bit flags).
+        let luma_bd = if sps.twelve_bit {
+            vk_video_core::format::ComponentBitDepth::Bit12
+        } else if sps.high_bitdepth {
+            vk_video_core::format::ComponentBitDepth::Bit10
+        } else {
+            vk_video_core::format::ComponentBitDepth::Bit8
+        };
+        self.detected_format.luma_bit_depth = luma_bd;
+        self.detected_format.chroma_bit_depth = luma_bd;
 
-        // AV1 chroma subsampling - typically 4:2:0 for profile 0
-        self.detected_format.chroma_subsampling = vk_video_core::format::ChromaSubsampling::_420;
+        // AV1 chroma subsampling from color config (spec 5.5.1):
+        //   mono_chrome      -> Monochrome
+        //   csx=0, csy=0     -> 4:4:4
+        //   csx=1, csy=0     -> 4:2:2
+        //   csx=1, csy=1     -> 4:2:0
+        self.detected_format.chroma_subsampling = if sps.mono_chrome {
+            vk_video_core::format::ChromaSubsampling::Monochrome
+        } else if sps.subsampling_x == 0 && sps.subsampling_y == 0 {
+            vk_video_core::format::ChromaSubsampling::_444
+        } else if sps.subsampling_y == 0 {
+            vk_video_core::format::ChromaSubsampling::_422
+        } else {
+            vk_video_core::format::ChromaSubsampling::_420
+        };
 
         self.detected_format.codec_profile = sps.profile as u32;
         self.detected_format.film_grain_used = sps.film_grain_params_present;
@@ -2392,8 +2313,7 @@ impl VideoParser for Av1Parser {
         self.frame_count = 0;
         self.stream_format = StreamFormat::LowOverhead;
         self.should_probe_for_annexb = true;
-        self.ref_frame_sizes = [(0, 0); 8];
-        self.ref_frame_order_hints = [0; 8];
+        self.dpb.reset();
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {

@@ -6,8 +6,6 @@
 //! All StdVideo* structs match vulkan_video_codec_av1std.h and
 //! vulkan_video_codec_av1std_decode.h exactly.
 
-use std::collections::VecDeque;
-
 use ash::vk;
 use ash::vk::Handle;
 
@@ -618,47 +616,18 @@ pub fn convert_av1_sps(
 // ============================================================================
 
 /// AV1 decoder state.
+///
+/// All DPB / frame-buffer / POC bookkeeping lives in the common
+/// `vk_video_parser::av1_dpb::Av1Dpb` owned by the parser (single shared
+/// implementation across backends). This struct only holds Vulkan-specific
+/// handles and the decode-command counter.
 pub struct Av1Decoder {
     device: ash::Device,
     instance: ash::Instance,
     /// Session handle.
     session: vk::VideoSessionKHR,
-    /// Frame buffer to DPB slot mapping.
-    /// Maps AV1 frame buffer indices (0-7) to DPB slot indices.
-    /// -1 means the frame buffer is not currently assigned to any DPB slot.
-    frame_buffer_to_dpb_slot: [i32; 8],
-    /// Order hints for each frame buffer (for reference frame management).
-    frame_buffer_order_hint: [u32; 8],
-    /// Coded dimensions (width, height) of the frame currently stored in each
-    /// frame buffer. (0, 0) means the frame buffer has not been refreshed yet.
-    /// Needed for show_existing_frame, whose frame header does not carry size.
-    frame_buffer_dims: [(u32, u32); 8],
-    /// Per-frame-buffer reference info for the VkVideoDecodeAV1DpbSlotInfoKHR
-    /// pNext chain (C++ VulkanAV1Decoder.cpp:323-334 populates these; leaving
-    /// them zero made INTER frames decode wrong). SavedOrderHints[ref_name] is
-    /// the refreshing frame's OrderHints[ref_name]. ref_dist[ref_name] stores
-    /// the RAW signed distance GetRelativeDist(cur_OH, OrderHints[ref_name])
-    /// (C++ m_pBuffers[i].RefFrameSignBias[ref_name], initialized to 0, index 0
-    /// never set); the RefFrameSignBias bitmask bit ref_name is set when
-    /// ref_dist[ref_name] <= 0 (so an unrefreshed buffer, dist=0, yields all
-    /// bits set — matching C++ exactly).
-    frame_buffer_saved_order_hints: [[u8; 8]; 8],
-    frame_buffer_ref_dist: [[i8; 8]; 8],
-    frame_buffer_frame_type: [u8; 8],
-    frame_buffer_disable_cdf: [u8; 8],
-    frame_buffer_seg_enabled: [u8; 8],
-    /// Frame counter.
+    /// Number of decode commands issued (diagnostics).
     frame_count: u32,
-    /// FIFO of available DPB slots for AV1 output allocation (iteration 7 fix).
-    ///
-    /// Mirrors the C++ `m_dpbSlotsAvailable` queue (VulkanVideoParser.cpp
-    /// `DpbSlots::AllocateSlot`/`FreeSlot`). A slot is available iff it is not
-    /// currently held by any frame buffer; this is the C++ invariant that a DPB
-    /// slot is freed only when its picture is no longer in any frame buffer
-    /// (`ResetPicDpbSlots`). Consequently a slot popped from this queue can
-    /// never be a reference for the current or any future frame, so the output
-    /// slot never clobbers a still-live reference.
-    av1_available_slots: VecDeque<u32>,
 }
 
 impl Av1Decoder {
@@ -668,348 +637,12 @@ impl Av1Decoder {
             instance,
             session: vk::VideoSessionKHR::null(),
             frame_count: 0,
-            frame_buffer_to_dpb_slot: [-1; 8],
-            frame_buffer_order_hint: [0; 8],
-            frame_buffer_dims: [(0, 0); 8],
-            frame_buffer_saved_order_hints: [[0; 8]; 8],
-            frame_buffer_ref_dist: [[0; 8]; 8],
-            frame_buffer_frame_type: [0; 8],
-            frame_buffer_disable_cdf: [0; 8],
-            frame_buffer_seg_enabled: [0; 8],
-            av1_available_slots: VecDeque::new(),
         }
     }
 
     /// Set the session handle.
     pub fn set_session(&mut self, session: &super::session::VideoSession) {
         self.session = session.handle();
-    }
-
-    /// Get the DPB slot index for an AV1 frame buffer index.
-    pub fn get_pic_idx_for_frame_buffer(&self, frame_buffer_idx: usize) -> i32 {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_to_dpb_slot[frame_buffer_idx]
-        } else {
-            -1
-        }
-    }
-
-    /// Set the DPB slot for an AV1 frame buffer.
-    pub fn set_frame_buffer_dpb_slot(&mut self, frame_buffer_idx: usize, dpb_slot: i32) {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_to_dpb_slot[frame_buffer_idx] = dpb_slot;
-        }
-    }
-
-    /// Set the order hint for a frame buffer.
-    pub fn set_frame_buffer_order_hint(&mut self, frame_buffer_idx: usize, order_hint: u32) {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_order_hint[frame_buffer_idx] = order_hint;
-        }
-    }
-
-    /// Get the order hint for a frame buffer.
-    pub fn get_frame_buffer_order_hint(&self, frame_buffer_idx: usize) -> u32 {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_order_hint[frame_buffer_idx]
-        } else {
-            0
-        }
-    }
-
-    /// Record the coded dimensions of the frame stored in a frame buffer.
-    pub fn set_frame_buffer_dims(&mut self, frame_buffer_idx: usize, width: u32, height: u32) {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_dims[frame_buffer_idx] = (width, height);
-        }
-    }
-
-    /// Get the coded dimensions of the frame stored in a frame buffer.
-    /// Returns (0, 0) if the frame buffer has not been refreshed.
-    pub fn get_frame_buffer_dims(&self, frame_buffer_idx: usize) -> (u32, u32) {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_dims[frame_buffer_idx]
-        } else {
-            (0, 0)
-        }
-    }
-
-    /// Record the reference info for a frame buffer when it is refreshed by the
-    /// current frame (C++ VulkanAV1Decoder.cpp:390-394). `order_hints` is the
-    /// CURRENT (refreshing) frame's OrderHints array, `current_order_hint` its
-    /// OrderHint, `ohb` = order_hint_bits_minus_1.
-    pub fn set_frame_buffer_ref_info(
-        &mut self,
-        frame_buffer_idx: usize,
-        order_hints: &[u8; 8],
-        current_order_hint: u32,
-        ohb: u32,
-        frame_type: u8,
-        disable_cdf: u8,
-        seg_enabled: u8,
-    ) {
-        if frame_buffer_idx < 8 {
-            self.frame_buffer_saved_order_hints[frame_buffer_idx] = *order_hints;
-            // C++ VulkanAV1Decoder.cpp UpdateFramePointers loops refName =
-            // LAST_FRAME(1) .. NUM_REF_FRAMES-1(7) and stores the RAW signed
-            // distance (m_pBuffers[i].RefFrameSignBias[refName] =
-            // GetRelativeDist(pStd->OrderHint, pStd->OrderHints[refName])).
-            // Index 0 (INTRA) is never set (stays 0). The RefFrameSignBias
-            // bitmask is computed at read time as (dist <= 0).
-            for ref_name in 1..8usize {
-                let rel = Self::get_relative_dist(
-                    current_order_hint as i32,
-                    order_hints[ref_name] as i32,
-                    ohb,
-                );
-                self.frame_buffer_ref_dist[frame_buffer_idx][ref_name] = rel as i8;
-            }
-            self.frame_buffer_frame_type[frame_buffer_idx] = frame_type;
-            self.frame_buffer_disable_cdf[frame_buffer_idx] = disable_cdf;
-            self.frame_buffer_seg_enabled[frame_buffer_idx] = seg_enabled;
-        }
-    }
-
-    /// Get the stored reference info for a frame buffer.
-    pub fn get_frame_buffer_ref_info(
-        &self,
-        frame_buffer_idx: usize,
-    ) -> Option<(&[u8; 8], u8, u8, u8, u8)> {
-        if frame_buffer_idx < 8 {
-            // Compute the RefFrameSignBias bitmask from the raw distances
-            // (C++ VulkanAV1Decoder.cpp:331-333): bit ref_name (1..7) set when
-            // ref_dist[ref_name] <= 0. Bit 0 (INTRA) is never set for a ref slot.
-            let mut bias = 0u8;
-            for ref_name in 1..8usize {
-                if self.frame_buffer_ref_dist[frame_buffer_idx][ref_name] <= 0 {
-                    bias |= 1 << ref_name;
-                }
-            }
-            Some((
-                &self.frame_buffer_saved_order_hints[frame_buffer_idx],
-                bias,
-                self.frame_buffer_frame_type[frame_buffer_idx],
-                self.frame_buffer_disable_cdf[frame_buffer_idx],
-                self.frame_buffer_seg_enabled[frame_buffer_idx],
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Find the first frame buffer currently mapped to a given DPB slot.
-    pub fn get_frame_buffer_for_dpb_slot(&self, dpb_slot: i32) -> Option<usize> {
-        (0..8).find(|&i| self.frame_buffer_to_dpb_slot[i] == dpb_slot)
-    }
-
-    /// AV1 GetRelativeDist (C++ VulkanAV1Decoder.cpp:352-369): signed distance
-    /// from `b` to `a` in order-hint space, wrapped to [-2^(ohb), 2^(ohb)).
-    pub(crate) fn get_relative_dist(a: i32, b: i32, ohb: u32) -> i32 {
-        let bits = ohb + 1;
-        let diff = a - b;
-        let m = 1 << (bits - 1);
-        (diff & (m - 1)) - (diff & m)
-    }
-
-    /// AV1 SetFrameRefs (C++ VulkanAV1Decoder.cpp:1579-1711): when
-    /// enable_order_hint is true, the bitstream only carries lst_ref and
-    /// gld_ref; the decoder must derive the full ref_frame_idx array by
-    /// selecting frames based on order-hint distances.  Returns
-    /// [LAST, LAST2, LAST3, GOLDEN, BWDREF, ALTREF2, ALTREF] buffer indices.
-    pub fn set_frame_refs(
-        lst_ref: i32,
-        gld_ref: i32,
-        ref_order_hint: &[u32; 8],
-        cur_order_hint: u32,
-        ohb: u32,
-    ) -> [i32; 7] {
-        let cur_frame_hint = 1_i32 << ohb;
-        let cur_oh = cur_order_hint as i32;
-
-        // shiftedOrderHints[i] = curFrameHint + GetRelativeDist1(RefOrderHint[i], cur_OH)
-        let shifted: [i32; 8] = std::array::from_fn(|i| {
-            cur_frame_hint + Self::get_relative_dist(ref_order_hint[i] as i32, cur_oh, ohb)
-        });
-
-        let mut rfi = [-1_i32; 7];
-        let mut used = [false; 8];
-
-        // LAST and GOLDEN come directly from the bitstream
-        rfi[0] = lst_ref; // LAST
-        rfi[3] = gld_ref; // GOLDEN
-        used[lst_ref as usize] = true;
-        used[gld_ref as usize] = true;
-
-        // Inline pick logic (no closures to avoid borrow conflicts)
-        // ALTREF: hint >= curFrameHint, largest
-        {
-            let mut best: Option<usize> = None;
-            for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint {
-                    continue;
-                }
-                if best.map_or(true, |b| shifted[i] >= shifted[b]) {
-                    best = Some(i);
-                }
-            }
-            if let Some(r) = best {
-                rfi[6] = r as i32;
-                used[r] = true;
-            }
-        }
-        // BWDREF: hint >= curFrameHint, smallest
-        {
-            let mut best: Option<usize> = None;
-            for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint {
-                    continue;
-                }
-                if best.map_or(true, |b| shifted[i] < shifted[b]) {
-                    best = Some(i);
-                }
-            }
-            if let Some(r) = best {
-                rfi[4] = r as i32;
-                used[r] = true;
-            }
-        }
-        // ALTREF2: hint >= curFrameHint, smallest
-        {
-            let mut best: Option<usize> = None;
-            for i in 0..8usize {
-                if used[i] || shifted[i] < cur_frame_hint {
-                    continue;
-                }
-                if best.map_or(true, |b| shifted[i] < shifted[b]) {
-                    best = Some(i);
-                }
-            }
-            if let Some(r) = best {
-                rfi[5] = r as i32;
-                used[r] = true;
-            }
-        }
-        // LAST2, LAST3, BWDREF: hint < curFrameHint, largest
-        for &ref_name in &[2, 3, 5, 6, 7] {
-            // LAST2=2, LAST3=3, BWDREF=5, ALTREF2=6, ALTREF=7
-            let idx = ref_name - 1;
-            if rfi[idx] < 0 {
-                let mut best: Option<usize> = None;
-                for i in 0..8usize {
-                    if used[i] || shifted[i] >= cur_frame_hint {
-                        continue;
-                    }
-                    if best.map_or(true, |b| shifted[i] >= shifted[b]) {
-                        best = Some(i);
-                    }
-                }
-                if let Some(r) = best {
-                    rfi[idx] = r as i32;
-                    used[r] = true;
-                }
-            }
-        }
-        // Fallback: assign buffer with smallest shiftedOrderHint to remaining -1 slots
-        let fallback = (0..8usize).min_by_key(|&i| shifted[i]).unwrap_or(0);
-        for i in 0..7 {
-            if rfi[i] < 0 {
-                rfi[i] = fallback as i32;
-            }
-        }
-        rfi
-    }
-
-    /// Reset DPB state (e.g., on key frame or discontinuity).
-    pub fn reset_dpb(&mut self) {
-        self.frame_buffer_to_dpb_slot.fill(-1);
-        self.frame_buffer_order_hint.fill(0);
-        self.frame_buffer_dims.fill((0, 0));
-        self.frame_buffer_saved_order_hints.fill([0; 8]);
-        self.frame_buffer_ref_dist.fill([0; 8]);
-        self.frame_buffer_frame_type.fill(0);
-        self.frame_buffer_disable_cdf.fill(0);
-        self.frame_buffer_seg_enabled.fill(0);
-    }
-
-    /// Reset the AV1 available-slot FIFO to all slots in index order.
-    ///
-    /// Called on key frames / first frame (C++ `DpbSlots::Init` pushes slots
-    /// 0..maxSize-1 in order; `Deinit`+re-Init happens on a session reset).
-    pub fn reset_av1_fifo(&mut self, num_slots: u32) {
-        self.av1_available_slots.clear();
-        for s in 0..num_slots {
-            self.av1_available_slots.push_back(s);
-        }
-    }
-
-    /// Allocate the output DPB slot for the current frame using C++ FIFO
-    /// semantics (VulkanVideoParser.cpp `DpbSlots::AllocateSlot`).
-    ///
-    /// A slot is available iff it is not currently held by any frame buffer.
-    /// This matches the C++ invariant exactly: a DPB slot is freed only when its
-    /// picture is no longer in any frame buffer (`ResetPicDpbSlots`), so a slot
-    /// popped here can never be a reference for the current or any future frame.
-    /// The oldest available slot (FIFO front) is returned, matching the C++
-    /// rotation. There is always at least one available slot: 8 frame buffers +
-    /// 1 output <= num_slots (10 for AV1).
-    pub fn allocate_output_slot(&mut self, num_slots: u32) -> u32 {
-        let n = num_slots as usize;
-        // Slots currently held by a frame buffer (live references).
-        let mut in_use = vec![false; n];
-        for &slot in &self.frame_buffer_to_dpb_slot {
-            if slot >= 0 && (slot as usize) < n {
-                in_use[slot as usize] = true;
-            }
-        }
-        // Drop any FIFO entries that are now in use (defensive).
-        self.av1_available_slots
-            .retain(|&s| (s as usize) < n && !in_use[s as usize]);
-        // Append newly-available slots (not in use, not already queued) at the
-        // back, in slot-index order.
-        for s in 0..n {
-            if !in_use[s] && !self.av1_available_slots.contains(&(s as u32)) {
-                self.av1_available_slots.push_back(s as u32);
-            }
-        }
-        // Pop the oldest available slot (FIFO front).
-        self.av1_available_slots.pop_front().unwrap_or(0)
-    }
-
-    /// Compute reference DPB slot indices for building the Vulkan decode command.
-    ///
-    /// Returns an array indexed by AV1 reference name, as required by
-    /// VkVideoDecodeAV1PictureInfoKHR::referenceNameSlotIndices:
-    ///   [0] = LAST_FRAME, [1] = LAST2_FRAME, [2] = LAST3_FRAME,
-    ///   [3] = GOLDEN_FRAME, [4] = BWDREF_FRAME, [5] = ALTREF2_FRAME,
-    ///   [6] = ALTREF_FRAME
-    ///
-    /// Each value is the DPB slot index of the picture referenced by that
-    /// reference name (it must equal the slotIndex of one of the reference
-    /// slots passed to vkCmdDecodeVideoKHR — same convention as the C++
-    /// reference, which uses the DPB slot number directly), or -1 if the
-    /// reference name is not used (key frame, or frame buffer not mapped).
-    pub fn compute_reference_name_slot_indices(
-        &self,
-        is_key_frame: bool,
-        ref_frame_idx: &[u8; 7],
-        _primary_ref_frame: u8,
-    ) -> [i32; 7] {
-        if is_key_frame {
-            return [-1; 7];
-        }
-
-        // ref_frame_idx (AV1 spec) is indexed by reference name:
-        // [0]=LAST, [1]=LAST2, [2]=LAST3, [3]=GOLDEN, [4]=BWDREF,
-        // [5]=ALTREF2, [6]=ALTREF. Each entry holds the AV1 frame buffer
-        // index (1..7) of the picture that reference name references.
-        let mut result = [-1i32; 7];
-        for i in 0..7usize {
-            let fb = ref_frame_idx[i] as usize;
-            if fb < 8 {
-                result[i] = self.frame_buffer_to_dpb_slot[fb];
-            }
-        }
-        result
     }
 
     /// Record an AV1 decode command.
@@ -1021,6 +654,7 @@ impl Av1Decoder {
         bitstream_buffer: vk::Buffer,
         bitstream_offset: u64,
         bitstream_range: u64,
+        dpb: &vk_video_parser::av1_dpb::Av1Dpb,
         output_image_view: vk::ImageView,
         output_image: vk::Image,
         coded_extent: vk::Extent2D,
@@ -1072,41 +706,43 @@ impl Av1Decoder {
                 // VulkanAV1Decoder.cpp:323-334). Leaving these zero made INTER
                 // frames decode with motion-compensation errors.
                   if let Some(&ref_slot) = dpb_ref_slot_indices.get(i) {
-                      let fb_opt = self.get_frame_buffer_for_dpb_slot(ref_slot);
+                      let fb_opt = dpb.frame_buffer_for_slot(ref_slot);
                       if self.frame_count < 8 && super::vacc_debug() {
                           eprintln!("[FB-LOOKUP] fc={} ref[i={}] slot={} -> fb={:?}",
                               self.frame_count, i, ref_slot, fb_opt);
                       }
                       if let Some(fb) = fb_opt {
-                          if let Some((saved_oh, bias, ftype, dcdf, seg)) =
-                              self.get_frame_buffer_ref_info(fb)
-                          {
-                               info.SavedOrderHints = *saved_oh;
-                               info.RefFrameSignBias = bias;
-                              info.frame_type = ftype;
-                              info.flags.set_disable_frame_end_update_cdf(dcdf as u32);
-                              info.flags.set_segmentation_enabled(seg as u32);
-                               // DEBUG: print EXACT values READ from frame buffer for this reference
-                               if self.frame_count < 8 && super::vacc_debug() {
-                                   eprintln!(
-                                       "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={}: OrderHint={}, frame_type={}, dcdf={}, seg={}, SavedOH=[{},{},{},{},{},{},{},{}], Bias={:02x}",
-                                       self.frame_count, i, fb, ref_slot,
-                                       info.OrderHint, ftype, dcdf, seg,
-                                       saved_oh[0], saved_oh[1], saved_oh[2], saved_oh[3],
-                                       saved_oh[4], saved_oh[5], saved_oh[6], saved_oh[7],
-                                       bias
-                                   );
-                               }
-                           } else {
-                               if self.frame_count < 8 && super::vacc_debug() {
-                                   eprintln!(
-                                       "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={} -> NO REF INFO (stale!)",
-                                       self.frame_count, i, fb, ref_slot
-                                   );
-                               }
-                           }
+                          // Per-buffer reference info comes from the common DPB
+                          // (C++ VulkanAV1Decoder.cpp:323-334).
+                          let fb_state = &dpb.frame_buffers[fb];
+                          info.SavedOrderHints = fb_state.saved_order_hints;
+                          info.RefFrameSignBias = dpb.ref_frame_sign_bias_mask(fb);
+                          info.frame_type = fb_state.frame_type;
+                          info.flags.set_disable_frame_end_update_cdf(
+                              fb_state.disable_frame_end_update_cdf as u32,
+                          );
+                          info.flags.set_segmentation_enabled(
+                              fb_state.segmentation_enabled as u32,
+                          );
+                          if self.frame_count < 8 && super::vacc_debug() {
+                              eprintln!(
+                                  "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={}: OrderHint={}, frame_type={}, SavedOH=[{},{},{},{},{},{},{},{}], Bias={:02x}",
+                                  self.frame_count, i, fb, ref_slot,
+                                  info.OrderHint, fb_state.frame_type,
+                                  fb_state.saved_order_hints[0], fb_state.saved_order_hints[1],
+                                  fb_state.saved_order_hints[2], fb_state.saved_order_hints[3],
+                                  fb_state.saved_order_hints[4], fb_state.saved_order_hints[5],
+                                  fb_state.saved_order_hints[6], fb_state.saved_order_hints[7],
+                                  info.RefFrameSignBias
+                              );
+                          }
+                      } else if self.frame_count < 8 && super::vacc_debug() {
+                          eprintln!(
+                              "[GET_FB-REFINFO] fc={} GET ref[i={}] slot={} -> NO REF INFO (stale!)",
+                              self.frame_count, i, ref_slot
+                          );
                       }
-                 }
+                  }
                 info
             })
             .collect();
@@ -1204,12 +840,10 @@ impl Av1Decoder {
                 // for av1name in 0..8 (INCLUDING bit 0/INTRA). ref_dist[0] is
                 // never set (stays 0) so (0 <= 0) sets bit 0; an unrefreshed
                 // buffer (all dists 0) yields all bits set, matching C++.
-                let mut setup_bias = 0u8;
-                for av1name in 0..8usize {
-                    if self.frame_buffer_ref_dist[0][av1name] <= 0 {
-                        setup_bias |= 1 << av1name;
-                    }
-                }
+                let mut setup_bias = dpb.ref_frame_sign_bias_mask(0);
+                // C++ sets bit 0 too: m_pBuffers[0].RefFrameSignBias[0] is
+                // initialized to 0, so (0 <= 0) sets the INTRA bit.
+                setup_bias |= 1;
                 info.RefFrameSignBias = setup_bias;
                 info.flags.set_disable_frame_end_update_cdf(
                     picture_info_container

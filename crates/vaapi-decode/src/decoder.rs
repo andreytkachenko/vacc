@@ -1,7 +1,7 @@
 //! VAAPI video decoder implementing the Decoder trait.
 //!
 //! Uses cros-libva's typestate Picture pattern for safe decode operations.
-//! Supports H.264, H.265, VP9 decoding with proper buffer management.
+//! Supports H.264, H.265, VP9, AV1 decoding with proper buffer management.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -18,6 +18,10 @@ use libva::{
     Picture, PictureNew, PictureEnd, PictureRender, PictureSync, Surface, Image,
     PictureParameterBufferVP9, SegmentParameterVP9, SliceParameterBufferVP9,
     VP9PicFields, VP9SegmentFlags,
+    AV1FilmGrain, AV1FilmGrainFields, AV1LoopFilterFields, AV1LoopRestorationFields,
+    AV1ModeControlFields, AV1PicInfoFields, AV1QMatrixFields, AV1SeqFields,
+    AV1Segmentation, AV1SegmentInfoFields, AV1WarpedMotionParams,
+    PictureParameterBufferAV1, SliceParameterBufferAV1,
 };
 use libva::VAProfile::Type as VAProfileType;
 use libva::{
@@ -36,9 +40,10 @@ use vk_video_core::{
     frame::{DecodedFrame, PixelData, PixelPlane},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     session::Extent2D,
-    picture::{H264Sps, H264Pps, H265Sps, H265Pps, Vp9FrameData},
+    picture::{Av1Sps, H264Sps, H264Pps, H265Sps, H265Pps, Vp9FrameData},
 };
 use vk_video_parser::{
+    av1::Av1Parser,
     bitstream::BitstreamPacket, h264::H264Parser, h265::H265Parser,
     h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG},
     h265_dpb::H265Dpb,
@@ -344,12 +349,18 @@ struct StreamInfo {
     vp9_profile: u8,
     /// Luma/chroma bit depth from the first VP9 frame; 8 for other codecs.
     vp9_bit_depth: u8,
+    /// AV1 sequence header profile (0/1); 0 for other codecs.
+    av1_profile: u8,
+    /// AV1 bit depth from the sequence header; 8 for other codecs.
+    av1_bit_depth: u8,
     /// H.264 specific
     sps: Option<H264Sps>,
     pps: Option<H264Pps>,
     /// H.265 specific
     h265_sps: Option<H265Sps>,
     h265_pps: Option<H265Pps>,
+    /// AV1 sequence header (SPS equivalent).
+    av1_sps: Option<Av1Sps>,
 }
 
 /// H.265 decode context.
@@ -378,6 +389,17 @@ struct H265SliceInfo {
 /// - `slot_surfaces`: maps a common-DPB slot index to a VA surface-pool index.
 struct Vp9Context {
     dpb: Vp9Dpb,
+    /// DPB slot index -> surface pool index (None if the slot has no surface).
+    slot_surfaces: Vec<Option<usize>>,
+}
+
+/// AV1 decode context.
+///
+/// The common decode state (8 frame buffers, FIFO slot allocation,
+/// reference-list resolution, POC) lives in the `Av1Parser`'s built-in
+/// `Av1Dpb` (ONE DPB manager across backends). This context only maps the
+/// common-DPB slot indices to VA surface-pool indices.
+struct Av1Context {
     /// DPB slot index -> surface pool index (None if the slot has no surface).
     slot_surfaces: Vec<Option<usize>>,
 }
@@ -427,9 +449,11 @@ pub struct VaapiDecoder {
     h264_ctx: Option<H264Context>,
     vp9_ctx: Option<Vp9Context>,
     h265_ctx: Option<H265Context>,
+    av1_ctx: Option<Av1Context>,
     parser: Option<H264Parser>,
     vp9_parser: Option<Vp9Parser>,
     h265_parser: Option<H265Parser>,
+    av1_parser: Option<Av1Parser>,
     /// True if the input is an IVF container (packets start at offset 32).
     input_is_ivf: bool,
 }
@@ -561,6 +585,28 @@ impl VaapiDecoder {
             None
         };
 
+        // AV1 uses the common parser + DPB (ONE implementation across
+        // backends). The sequence header parsed in parse_av1_info is loaded
+        // into the parser so frame headers can be parsed per packet.
+        let (av1_ctx, av1_parser) = if stream.codec == CoreVideoCodec::DecodeAv1 {
+            let num_slots = num_surfaces;
+            let mut p = Av1Parser::new();
+            p.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeAv1))
+                .map_err(|e| Error::Parser(e.to_string()))?;
+            p.set_dpb_slots(num_slots as u32);
+            if let Some(sps) = stream.av1_sps.clone() {
+                p.set_active_sps(sps);
+            }
+            (
+                Some(Av1Context {
+                    slot_surfaces: vec![None; num_slots],
+                }),
+                Some(p),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             _display: display,
             _config: config,
@@ -577,9 +623,11 @@ impl VaapiDecoder {
             h264_ctx,
             vp9_ctx,
             h265_ctx,
+            av1_ctx,
             parser,
             vp9_parser,
             h265_parser,
+            av1_parser,
             input_is_ivf: is_ivf,
         })
     }
@@ -1273,6 +1321,23 @@ impl Decoder for VaapiDecoder {
                 }
             }
 
+            if self.stream.codec == CoreVideoCodec::DecodeAv1 {
+                // AV1 frames are emitted in decode order, like the NVDEC and
+                // Vulkan backends (show-existing commands re-display in
+                // place; the current sample set has no display reordering
+                // beyond decode order).
+                let offset_before = self.parse_offset;
+                match self.decode_av1_pending()? {
+                    Some(frame) => return Ok(Some(frame)),
+                    None => {
+                        if self.parse_offset == offset_before {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // Dispatch to the codec-specific incremental decoder.
             let decoded = if self.stream.codec == CoreVideoCodec::DecodeH264 {
                 self.decode_h264_pending()?
@@ -1351,6 +1416,14 @@ impl Decoder for VaapiDecoder {
                 *s = None;
             }
         }
+        if let Some(ctx) = self.av1_ctx.as_mut() {
+            for s in ctx.slot_surfaces.iter_mut() {
+                *s = None;
+            }
+        }
+        if let Some(parser) = self.av1_parser.as_mut() {
+            parser.dpb_mut().reset();
+        }
 
         // Clear pending data
         self.pending_data.clear();
@@ -1396,6 +1469,11 @@ impl Decoder for VaapiDecoder {
                 *s = None;
             }
         }
+        if let Some(ctx) = self.av1_ctx.as_mut() {
+            for s in ctx.slot_surfaces.iter_mut() {
+                *s = None;
+            }
+        }
 
         // Reset parser state
         if let Some(ref mut parser) = self.parser {
@@ -1406,6 +1484,14 @@ impl Decoder for VaapiDecoder {
         }
         if let Some(ref mut parser) = self.h265_parser {
             parser.reset();
+        }
+        if let Some(ref mut parser) = self.av1_parser {
+            parser.reset();
+            parser.dpb_mut().reset();
+            // Re-load the sequence header (reset() clears it).
+            if let Some(sps) = self.stream.av1_sps.clone() {
+                parser.set_active_sps(sps);
+            }
         }
 
         Ok(())
@@ -2346,6 +2432,106 @@ fn read_from_image(
     }))
 }
 
+/// Read a P010/P012 VA image at native bit depth: planar Y/U/V with 16-bit
+/// samples right-aligned to the content bit depth (left-aligned in the
+/// surface). Matches the NVDEC P016 readback convention and ffmpeg's
+/// yuv420p10le/yuv420p12le rawvideo layout. Plane `width` is in BYTES per
+/// row (2 bytes per sample) so generic byte-row writers work unchanged.
+fn read_from_image_p01x_native(
+    image: Image,
+    display_width: u32,
+    display_height: u32,
+) -> Result<Option<PixelData>> {
+    let va_image = image.image();
+    let data = image.as_ref();
+
+    let fourcc = va_image.format.fourcc;
+    let (shift, format_str) = if fourcc == libva::VA_FOURCC_P010 {
+        (6u32, "P010LE".to_string())
+    } else if fourcc == libva::VA_FOURCC_P012 {
+        (4u32, "P012LE".to_string())
+    } else {
+        return Err(Error::VaApi(format!(
+            "Unsupported image format for native readback: {:X}",
+            fourcc
+        )));
+    };
+
+    if va_image.num_planes < 2 {
+        return Err(Error::VaApi(format!(
+            "Unexpected num_planes={} for format {}",
+            va_image.num_planes, format_str
+        )));
+    }
+
+    // Copy data into an owned buffer so we can drop the Image (which unmaps
+    // the surface).
+    let buffer = data.to_vec();
+
+    // Crop to the display size (top-left origin).
+    let out_width = display_width.min(va_image.width as u32) as usize;
+    let out_height = display_height.min(va_image.height as u32) as usize;
+    let uv_width = (out_width + 1) / 2;
+    let uv_height = (out_height + 1) / 2;
+
+    let y_offset = va_image.offsets[0] as usize;
+    let uv_offset = va_image.offsets[1] as usize;
+    let y_pitch = va_image.pitches[0] as usize / 2; // u16 samples per row
+    let uv_pitch = va_image.pitches[1] as usize / 2;
+
+    // Planar u16 LE output: Y (out_width*out_height), U, V (uv_width*uv_height).
+    let y_samples = out_width * out_height;
+    let uv_samples = uv_width * uv_height;
+    let mut out = vec![0u8; (y_samples + 2 * uv_samples) * 2];
+
+    for y in 0..out_height {
+        for x in 0..out_width {
+            let off = y_offset + (y * y_pitch + x) * 2;
+            let v = u16::from_ne_bytes([buffer[off], buffer[off + 1]]);
+            out[(y * out_width + x) * 2..(y * out_width + x) * 2 + 2]
+                .copy_from_slice(&(v >> shift).to_le_bytes());
+        }
+    }
+    for y in 0..uv_height {
+        for x in 0..uv_width {
+            let off = uv_offset + (y * uv_pitch + x * 2) * 2;
+            let u = u16::from_ne_bytes([buffer[off], buffer[off + 1]]);
+            let v = u16::from_ne_bytes([buffer[off + 2], buffer[off + 3]]);
+            out[(y_samples + y * uv_width + x) * 2..(y_samples + y * uv_width + x) * 2 + 2]
+                .copy_from_slice(&(u >> shift).to_le_bytes());
+            out[(y_samples + uv_samples + y * uv_width + x) * 2
+                ..(y_samples + uv_samples + y * uv_width + x) * 2 + 2]
+                .copy_from_slice(&(v >> shift).to_le_bytes());
+        }
+    }
+
+    // Image is dropped here, unmapping the surface.
+    drop(image);
+
+    Ok(Some(PixelData {
+        format: format_str,
+        y: PixelPlane {
+            data: out.as_ptr(),
+            pitch: out_width * 2,
+            width: out_width * 2,
+            height: out_height,
+        },
+        u: PixelPlane {
+            data: unsafe { out.as_ptr().add(y_samples * 2) },
+            pitch: uv_width * 2,
+            width: uv_width * 2,
+            height: uv_height,
+        },
+        v: Some(PixelPlane {
+            data: unsafe { out.as_ptr().add((y_samples + uv_samples) * 2) },
+            pitch: uv_width * 2,
+            width: uv_width * 2,
+            height: uv_height,
+        }),
+        buffer: out,
+    }))
+}
+
 /// Read pixel data from a VA surface after decode.
 ///
 /// Strategy (in order):
@@ -2412,15 +2598,26 @@ fn parse_stream_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         CoreVideoCodec::DecodeH264 => parse_h264_info(display, data),
         CoreVideoCodec::DecodeH265 => parse_h265_info(display, data),
         CoreVideoCodec::DecodeVp9 => parse_vp9_info(display, data),
+        CoreVideoCodec::DecodeAv1 => parse_av1_info(display, data),
         _ => Err(Error::CodecNotSupported(format!("Unsupported codec: {:?}", codec))),
     }
 }
 
 /// Detect codec from bitstream data.
 fn detect_codec(data: &[u8]) -> CoreVideoCodec {
-    // Check for IVF container (VP9)
+    // Check for IVF container; the codec fourcc at [8..12] disambiguates
+    // VP09 (VP9) from AV01 (AV1).
     if data.len() >= 32 && data[0..4] == *b"DKIF" {
-        return CoreVideoCodec::DecodeVp9;
+        let fourcc = &data[8..12];
+        return match fourcc {
+            b"AV01" => CoreVideoCodec::DecodeAv1,
+            _ => CoreVideoCodec::DecodeVp9,
+        };
+    }
+
+    // Check for AV1 OBU header (marker bit 0b01: temporal_id|type|size|ext).
+    if data.first().is_some_and(|&b| (b & 0xC0) == 0x40) {
+        return CoreVideoCodec::DecodeAv1;
     }
 
     // Check for VP9 frame marker
@@ -2434,7 +2631,13 @@ fn detect_codec(data: &[u8]) -> CoreVideoCodec {
         break;
     }
 
-    // Check NAL types
+    // Check NAL types. H.264 NAL type = byte & 0x1F (5 bits); H.265 NAL type =
+    // (byte >> 1) & 0x3F (6 bits). Check the H.265 interpretation first: types
+    // 32-34 (VPS/SPS/PPS) cannot be expressed as H.264 NAL types, and in
+    // conformant streams parameter sets precede slices. The H.264 check requires
+    // nal_ref_idc=3 (spec-mandated for SPS/PPS), which excludes H.265 slice bytes
+    // that mimic H.264 SPS/PPS under the 5-bit interpretation (e.g. IDR_N_LP
+    // 0x28 reads as type 8).
     for i in 0..data.len().min(4096) {
         let start = if i + 4 <= data.len() && data[i..i+4] == [0x00, 0x00, 0x00, 0x01] {
             i + 4
@@ -2616,10 +2819,13 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         rt_format,
         vp9_profile: 0,
         vp9_bit_depth: 8,
+        av1_profile: 0,
+        av1_bit_depth: 8,
         sps: sps_opt,
         pps: pps_opt,
         h265_sps: None,
         h265_pps: None,
+        av1_sps: None,
     })
 }
 
@@ -2749,10 +2955,13 @@ fn parse_h265_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         rt_format,
         vp9_profile: 0,
         vp9_bit_depth: 8,
+        av1_profile: 0,
+        av1_bit_depth: 8,
         sps: None,
         pps: None,
         h265_sps: sps_opt,
         h265_pps: pps_opt,
+        av1_sps: None,
     })
 }
 
@@ -2839,10 +3048,255 @@ fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         rt_format,
         vp9_profile: profile_num,
         vp9_bit_depth: bit_depth,
+        av1_profile: 0,
+        av1_bit_depth: 8,
         sps: None,
         pps: None,
         h265_sps: None,
         h265_pps: None,
+        av1_sps: None,
+    })
+}
+
+/// Find the Sequence Header OBU (type 1) payload in a packet, if present.
+fn av1_find_sps_obu(packet: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+    while pos < packet.len().saturating_sub(1) {
+        let first = packet[pos];
+        let obu_type = (first >> 3) & 0x0F;
+        let ext = (first >> 2) & 1;
+        let has_size = (first >> 1) & 1 != 0;
+        let header_size = 1 + ext as usize;
+        if has_size && pos + header_size < packet.len() {
+            let mut size: usize = 0;
+            let mut shift = 0;
+            let mut size_pos = pos + header_size;
+            loop {
+                if size_pos >= packet.len() {
+                    break;
+                }
+                let b = packet[size_pos];
+                size |= ((b & 0x7F) as usize) << shift;
+                shift += 7;
+                size_pos += 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            if obu_type == 1 {
+                let payload_end = (size_pos + size).min(packet.len());
+                return Some(packet[size_pos..payload_end].to_vec());
+            }
+            let next = size_pos + size;
+            pos = if next > pos { next } else { size_pos + 1 };
+        } else {
+            pos += header_size.max(1);
+        }
+    }
+    None
+}
+
+/// A Frame OBU (type 6) or show-existing FrameHeader OBU (type 3) payload.
+struct Av1FrameObu {
+    /// The OBU payload (frame header + tile data for Frame OBUs; frame header
+    /// only for show_existing FrameHeader OBUs).
+    payload: Vec<u8>,
+}
+
+/// Extract all Frame OBUs (type 6) and show-existing FrameHeader OBUs (type 3)
+/// from a packet, in order.
+///
+/// A type-3 FrameHeader OBU is extracted only when its payload signals
+/// `show_existing_frame = 1` (MSB of the first payload byte). Those carry no
+/// tile data — the decode loop re-displays the referenced frame buffer instead
+/// of issuing a GPU decode. Redundant frame headers (type 3 with
+/// `show_existing_frame = 0`) are skipped: the corresponding Frame OBU is
+/// decoded instead (C++ reference behavior).
+fn av1_extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
+    let mut obus = Vec::new();
+    let mut pos = 0;
+    while pos < packet.len().saturating_sub(1) {
+        let first = packet[pos];
+        let obu_type = (first >> 3) & 0x0F;
+        let ext = (first >> 2) & 1;
+        let has_size = (first >> 1) & 1 != 0;
+        let header_size = 1 + ext as usize;
+        if has_size && pos + header_size < packet.len() {
+            let mut size: usize = 0;
+            let mut shift = 0;
+            let mut size_pos = pos + header_size;
+            loop {
+                if size_pos >= packet.len() {
+                    break;
+                }
+                let b = packet[size_pos];
+                size |= ((b & 0x7F) as usize) << shift;
+                shift += 7;
+                size_pos += 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            let is_frame = obu_type == 6;
+            let is_show_existing =
+                obu_type == 3 && size > 0 && size_pos < packet.len() && (packet[size_pos] & 0x80) != 0;
+            if is_frame || is_show_existing {
+                let payload_end = (size_pos + size).min(packet.len());
+                obus.push(Av1FrameObu {
+                    payload: packet[size_pos..payload_end].to_vec(),
+                });
+            }
+            let next = size_pos + size;
+            pos = if next > pos { next } else { size_pos + 1 };
+        } else {
+            pos += header_size.max(1);
+        }
+    }
+    obus
+}
+
+/// Parse AV1 stream info from the first sequence header + frame.
+fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
+    // Walk IVF packets (32-byte container header; each packet is a 12-byte
+    // header: u32 size + u64 pts) or a single raw buffer, until we have both
+    // a sequence header OBU and a parseable frame OBU.
+    let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
+    let mut pos = if is_ivf { 32 } else { 0 };
+    let mut sps_payload: Option<Vec<u8>> = None;
+    let mut frame_payload: Option<Vec<u8>> = None;
+
+    loop {
+        let payload: Vec<u8>;
+        if is_ivf {
+            if pos + 12 > data.len() {
+                break;
+            }
+            let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            if size == 0 || pos + 12 + size > data.len() {
+                break;
+            }
+            payload = data[pos + 12..pos + 12 + size].to_vec();
+            pos += 12 + size;
+        } else {
+            if pos >= data.len() {
+                break;
+            }
+            payload = data[pos..].to_vec();
+            pos = data.len();
+        }
+
+        if sps_payload.is_none() {
+            if let Some(s) = av1_find_sps_obu(&payload) {
+                sps_payload = Some(s);
+            }
+        }
+        if frame_payload.is_none() {
+            for obu in av1_extract_frame_obus(&payload) {
+                frame_payload = Some(obu.payload);
+                break;
+            }
+        }
+        if sps_payload.is_some() && frame_payload.is_some() {
+            break;
+        }
+    }
+
+    let sps_data = sps_payload.ok_or_else(|| {
+        Error::DecoderInit("AV1 sequence header OBU not found".to_string())
+    })?;
+    let frame_data = frame_payload
+        .ok_or_else(|| Error::DecoderInit("No AV1 frame OBU found".to_string()))?;
+
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeAv1))
+        .map_err(|e| Error::Parser(e.to_string()))?;
+
+    let sps = parser
+        .parse_sequence_header_obu(&sps_data)
+        .map_err(|e| Error::Parser(e.to_string()))?;
+
+    // VAAPI AV1 supports 8-bit/10-bit 4:2:0 only (VAProfileAV1Profile0/1).
+    // Reject other chroma formats and 12-bit early with a clear message
+    // instead of silently mis-decoding.
+    if sps.mono_chrome || !(sps.subsampling_x == 1 && sps.subsampling_y == 1) {
+        let name = if sps.subsampling_x == 0 && sps.subsampling_y == 0 {
+            "4:4:4"
+        } else if sps.subsampling_y == 0 {
+            "4:2:2"
+        } else {
+            "monochrome"
+        };
+        return Err(Error::DecoderInit(format!(
+            "AV1 {name} not supported by this VAAPI backend (4:2:0 only)"
+        )));
+    }
+
+    let bit_depth = if sps.twelve_bit { 12 } else if sps.high_bitdepth { 10 } else { 8 };
+    if bit_depth == 12 {
+        return Err(Error::DecoderInit(
+            "AV1 12-bit not supported by this VAAPI backend (8/10-bit only)".to_string(),
+        ));
+    }
+
+    let profile = match sps.profile {
+        0 => libva::VAProfile::VAProfileAV1Profile0,
+        1 => libva::VAProfile::VAProfileAV1Profile1,
+        p => {
+            return Err(Error::DecoderInit(format!(
+                "Unsupported AV1 profile {p} (VAAPI supports profiles 0/1)"
+            )))
+        }
+    };
+    if !display
+        .query_config_entrypoints(profile)
+        .map(|e| e.contains(&libva::VAEntrypoint::VAEntrypointVLD))
+        .unwrap_or(false)
+    {
+        return Err(Error::DecoderInit(format!(
+            "VA driver lacks AV1 profile {} decode",
+            sps.profile
+        )));
+    }
+
+    // Surface (rt) format per bit depth. 10-bit content decodes into P010
+    // surfaces so readback preserves full precision.
+    let rt_format = match bit_depth {
+        8 => libva::VA_RT_FORMAT_YUV420,
+        _ => libva::VA_RT_FORMAT_YUV420_10,
+    };
+
+    // Parse the first frame header for the coded dimensions (this parser
+    // instance is throwaway).
+    let fh = parser
+        .parse_frame_header(&frame_data, &sps)
+        .map_err(|e| Error::Parser(format!("Failed to parse AV1 frame dimensions: {e}")))?;
+    let width = fh.frame_width;
+    let height = fh.frame_height;
+    if width == 0 || height == 0 {
+        return Err(Error::DecoderInit("Failed to parse AV1 dimensions".to_string()));
+    }
+    let display_width = if fh.render_width > 0 { fh.render_width } else { width };
+    let display_height = if fh.render_height > 0 { fh.render_height } else { height };
+
+    Ok(StreamInfo {
+        codec: CoreVideoCodec::DecodeAv1,
+        profile,
+        width,
+        height,
+        display_width,
+        display_height,
+        max_dpb: 8, // AV1 has 8 frame buffers
+        rt_format,
+        vp9_profile: 0,
+        vp9_bit_depth: 8,
+        av1_profile: sps.profile,
+        av1_bit_depth: bit_depth,
+        sps: None,
+        pps: None,
+        h265_sps: None,
+        h265_pps: None,
+        av1_sps: Some(sps),
     })
 }
 
@@ -3164,6 +3618,560 @@ impl VaapiDecoder {
         self.frame_count += 1;
         Ok(Some(frame))
     }
+}
+
+/// VA image fourcc for readback of the current AV1 stream (NV12 for
+/// 8-bit, P010/P012 for 10/12-bit native-depth surfaces).
+fn av1_image_fourcc(stream: &StreamInfo) -> u32 {
+    match stream.av1_bit_depth {
+        10 => libva::VA_FOURCC_P010,
+        12 => libva::VA_FOURCC_P012,
+        _ => libva::VA_FOURCC_NV12,
+    }
+}
+
+/// Read AV1 output pixels from a surface. 8-bit uses the shared NV12 path;
+/// 10/12-bit read back natively (P010/P012) so no precision is lost in the
+/// driver's down-convert.
+fn read_av1_surface_pixels(
+    surface: &Surface<DmaBufSurfaceDescriptor>,
+    stream: &StreamInfo,
+    fourcc: u32,
+) -> Result<Option<PixelData>> {
+    if fourcc == libva::VA_FOURCC_P010 || fourcc == libva::VA_FOURCC_P012 {
+        let format = libva::VAImageFormat {
+            fourcc,
+            ..Default::default()
+        };
+        match Image::create_from(
+            surface,
+            format,
+            (stream.width, stream.height),
+            (stream.width, stream.height),
+        ) {
+            Ok(image) => {
+                return read_from_image_p01x_native(
+                    image,
+                    stream.display_width,
+                    stream.display_height,
+                )
+            }
+            Err(_) => {}
+        }
+        return Err(Error::VaApi(format!(
+            "P010/P012 surface read failed (fourcc {:X})",
+            fourcc
+        )));
+    }
+    read_surface_pixels(
+        surface,
+        stream.width,
+        stream.height,
+        stream.display_width,
+        stream.display_height,
+        &[fourcc],
+    )
+}
+
+impl VaapiDecoder {
+    /// Consume IVF packets / the raw buffer and decode AV1 frames until one
+    /// is displayed.
+    fn decode_av1_pending(&mut self) -> Result<Option<DecodedFrame>> {
+        if self.parse_offset >= self.pending_data.len() {
+            return Ok(None);
+        }
+
+        if !self.input_is_ivf {
+            // Raw single frame: the whole remaining buffer is one frame.
+            let data = self.pending_data[self.parse_offset..].to_vec();
+            self.parse_offset = self.pending_data.len();
+            for obu in av1_extract_frame_obus(&data) {
+                if let Some(frame) = self.decode_av1_frame(&obu.payload, 0)? {
+                    return Ok(Some(frame));
+                }
+            }
+            return Ok(None);
+        }
+
+        // IVF: 12-byte packet header (4-byte payload size + 8-byte pts).
+        loop {
+            if self.parse_offset + 12 > self.pending_data.len() {
+                return Ok(None);
+            }
+            let size = u32::from_le_bytes(
+                self.pending_data[self.parse_offset..self.parse_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if size == 0 || self.parse_offset + 12 + size > self.pending_data.len() {
+                return Ok(None);
+            }
+            let pts = u64::from_le_bytes(
+                self.pending_data[self.parse_offset + 4..self.parse_offset + 12]
+                    .try_into()
+                    .unwrap(),
+            );
+            let payload = self.pending_data
+                [self.parse_offset + 12..self.parse_offset + 12 + size]
+                .to_vec();
+            self.parse_offset += 12 + size;
+            for obu in av1_extract_frame_obus(&payload) {
+                if let Some(frame) = self.decode_av1_frame(&obu.payload, pts)? {
+                    return Ok(Some(frame));
+                }
+            }
+        }
+    }
+
+    /// Decode one AV1 frame OBU payload and, if it is displayed, return the
+    /// decoded picture.
+    fn decode_av1_frame(&mut self, data: &[u8], timestamp: u64) -> Result<Option<DecodedFrame>> {
+        let sps = self
+            .stream
+            .av1_sps
+            .clone()
+            .ok_or_else(|| Error::InvalidState("AV1 SPS not available".to_string()))?;
+        let parser = self
+            .av1_parser
+            .as_mut()
+            .ok_or_else(|| Error::InvalidState("AV1 parser not initialized".to_string()))?;
+
+        let fh = parser
+            .parse_frame_header(data, &sps)
+            .map_err(|e| Error::Parser(e.to_string()))?;
+
+        // show_existing_frame: no decode, no DPB change — re-display an
+        // already-decoded surface (always displayed).
+        if fh.show_existing_frame {
+            let slot = parser
+                .dpb()
+                .slot_of_frame_buffer(fh.frame_to_show_map_idx as usize);
+            if slot < 0 {
+                return Err(Error::InvalidState(format!(
+                    "show-existing-frame: frame buffer {} is empty",
+                    fh.frame_to_show_map_idx
+                )));
+            }
+            let pool_idx = self
+                .av1_ctx
+                .as_ref()
+                .ok_or_else(|| Error::InvalidState("AV1 context not initialized".to_string()))?
+                .slot_surfaces[slot as usize]
+                .ok_or_else(|| Error::InvalidState("show-existing-frame: slot has no surface".to_string()))?;
+            let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
+            self.surface_pool.sync_surface(pool_idx)?;
+            let pixel_data =
+                read_av1_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
+            let mut frame = DecodedFrame::new(
+                self.frame_count,
+                timestamp as i64,
+                self.stream.display_width,
+                self.stream.display_height,
+                false,
+            );
+            frame.pixel_data = pixel_data;
+            self.frame_count += 1;
+            parser.dpb_mut().note_displayed();
+            return Ok(Some(frame));
+        }
+
+        // 1. Output slot: key frame / first frame -> slot 0 + reset DPB; else
+        //    FIFO from the common DPB (never clobbers a live reference).
+        let is_key = fh.frame_type == 0;
+        let output_slot = {
+            let dpb = parser.dpb_mut();
+            if is_key || dpb.decoded_frames() == 0 {
+                dpb.reset_for_keyframe();
+                0
+            } else {
+                dpb.allocate_output_slot()
+            }
+        };
+
+        // 2. Release stale slot->surface mappings (slots no longer held by a
+        //    live frame buffer) and resolve the reference map from the
+        //    PRE-decode DPB state. ref_frame_map[i] is indexed by AV1 frame
+        //    buffer number (INTRA=0..ALTREF=7), exactly as VAAPI expects.
+        let mut ref_frame_map = [libva::VA_INVALID_ID; 8];
+        {
+            let dpb = parser.dpb();
+            let ctx = self
+                .av1_ctx
+                .as_mut()
+                .ok_or_else(|| Error::InvalidState("AV1 context not initialized".to_string()))?;
+            let mut live = vec![false; ctx.slot_surfaces.len()];
+            for fb in &dpb.frame_buffers {
+                if fb.slot >= 0 && (fb.slot as usize) < live.len() {
+                    live[fb.slot as usize] = true;
+                }
+            }
+            for (s, entry) in ctx.slot_surfaces.iter_mut().enumerate() {
+                if !live[s] {
+                    *entry = None;
+                }
+            }
+            for i in 0..8 {
+                let fb = &dpb.frame_buffers[i];
+                if fb.slot >= 0 {
+                    if let Some(pool_idx) = ctx.slot_surfaces[fb.slot as usize] {
+                        ref_frame_map[i] = self.surface_pool.entries[pool_idx].surface.id();
+                    }
+                }
+            }
+        }
+
+        // 3. Tile data = Frame OBU payload after the frame header. VAAPI's
+        //    host-side model: the driver decodes per-tile ranges within the
+        //    slice data buffer using the parameters we pass (it does not
+        //    parse the frame header itself).
+        let hdr = (fh.frame_header_size as usize).min(data.len());
+        let tile_len = data.len() - hdr;
+        if fh.tile_count > 1 {
+            return Err(Error::DecoderInit(format!(
+                "AV1 multi-tile frames (tile_count={}) are not supported by this VAAPI backend",
+                fh.tile_count
+            )));
+        }
+        if tile_len == 0 {
+            return Err(Error::DecoderInit(
+                "AV1 frame has no tile data (reduced still picture?)".to_string(),
+            ));
+        }
+
+        // 4. Allocate an output surface (any pool entry not referenced by a
+        //    live frame buffer).
+        let used_pool: std::collections::HashSet<usize> = self
+            .av1_ctx
+            .as_ref()
+            .ok_or_else(|| Error::InvalidState("AV1 context not initialized".to_string()))?
+            .slot_surfaces
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let (pool_idx, surface) = self
+            .surface_pool
+            .alloc_excluding(&used_pool)
+            .ok_or_else(|| Error::DecoderInit("No free VA surface for AV1 frame".to_string()))?;
+
+        // 5. Build the VA parameter buffers (FFmpeg vaapi_av1.c mapping).
+        let out_surface_id = self.surface_pool.entries[pool_idx].surface.id();
+        let (pic_type, slice_type) =
+            build_av1_va_buffers(&fh, &sps, ref_frame_map, out_surface_id, tile_len as u32)?;
+        let pic_buf = self
+            .context
+            .create_buffer(pic_type)
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+        let slice_buf = self
+            .context
+            .create_buffer(slice_type)
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+
+        // 6. Decode: picture parameters + slice parameters + tile data as
+        //    the slice data buffer (offset 0).
+        let mut picture = Picture::<PictureNew, Rc<Surface<DmaBufSurfaceDescriptor>>>::new(
+            timestamp,
+            Rc::clone(&self.context),
+            surface.clone(),
+        );
+        picture.add_buffer(pic_buf);
+        picture.add_buffer(slice_buf);
+        let slice_data_buf = self
+            .context
+            .create_buffer(BufferType::SliceData(data[hdr..].to_vec()))
+            .map_err(|e| Error::VaApi(e.to_string()))?;
+        picture.add_buffer(slice_data_buf);
+
+        let picture = picture.begin().map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture = picture.render().map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture = picture.end().map_err(|e| Error::VaApi(e.to_string()))?;
+        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
+            .sync()
+            .map_err(|e| Error::VaApi(e.0.to_string()))?;
+
+        self.surface_pool.mark_ready(pool_idx);
+
+        // 7. Commit this frame's refresh into the common DPB and track the
+        //    surface for the slot.
+        {
+            let ctx = self
+                .av1_ctx
+                .as_mut()
+                .ok_or_else(|| Error::InvalidState("AV1 context not initialized".to_string()))?;
+            ctx.slot_surfaces[output_slot as usize] = Some(pool_idx);
+            parser
+                .dpb_mut()
+                .commit_decoded(output_slot, &fh, sps.order_hint_bits_minus1 as u32);
+        }
+
+        // 8. Display if requested; otherwise the frame was decoded for
+        //    references only.
+        if !fh.show_frame {
+            return Ok(None);
+        }
+
+        self.surface_pool.sync_surface(pool_idx)?;
+        let pixel_data =
+            read_av1_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
+        let mut frame = DecodedFrame::new(
+            self.frame_count,
+            timestamp as i64,
+            self.stream.display_width,
+            self.stream.display_height,
+            false,
+        );
+        frame.pixel_data = pixel_data;
+        self.frame_count += 1;
+        parser.dpb_mut().note_displayed();
+        Ok(Some(frame))
+    }
+}
+
+/// Build the VA picture- and slice-parameter buffers for one AV1 frame.
+///
+/// Field mapping follows FFmpeg's `vaapi_av1.c` over this driver's
+/// `VADecPictureParameterBufferAV1`. The slice data buffer contains the tile
+/// region only (Frame OBU payload after the frame header); the single-tile
+/// slice parameter references it at offset 0.
+fn build_av1_va_buffers(
+    fh: &vk_video_parser::av1::Av1FrameHeader,
+    sps: &Av1Sps,
+    ref_frame_map: [libva::VASurfaceID; 8],
+    current_frame: libva::VASurfaceID,
+    tile_data_size: u32,
+) -> Result<(BufferType, BufferType)> {
+    // LRD type: the parser's loop_restoration_type is already in the VAAPI
+    // order — it equals FFmpeg's `remap_lr_type[bitstream]` (table
+    // {NONE, SWITCHABLE, WIENER, SGRPROJ} = {0, 3, 1, 2}), so pass it through
+    // unchanged.
+    let lrd_type = |pl: usize| fh.loop_restoration_type[pl].min(3) as u16;
+    // Raw spec shift values (VA derives the restoration unit size itself):
+    // lr_unit_shift = loop_restoration_size[0] - 1; lr_uv_shift is 1 iff the
+    // chroma size was shifted down from the luma size.
+    let lr_unit_shift = if fh.uses_lr {
+        (fh.loop_restoration_size[0].saturating_sub(1)) as u16
+    } else {
+        0
+    };
+    let lr_uv_shift = if fh.loop_restoration_size[1] < fh.loop_restoration_size[0] {
+        1
+    } else {
+        0
+    };
+
+    let seq_fields = AV1SeqFields::new(
+        sps.still_picture as u32,
+        sps.use_128x128_superblock as u32,
+        sps.enable_filter_intra as u32,
+        sps.enable_intra_edge_filter as u32,
+        sps.enable_interintra_compound as u32,
+        sps.enable_masked_compound as u32,
+        sps.enable_dual_filter as u32,
+        sps.enable_order_hint as u32,
+        sps.enable_jnt_motion as u32,
+        sps.enable_cdef as u32,
+        sps.mono_chrome as u32,
+        sps.color_range as u32,
+        sps.subsampling_x as u32,
+        sps.subsampling_y as u32,
+        sps.chroma_sample_position as u32,
+        sps.film_grain_params_present as u32,
+    );
+
+    let pic_info = AV1PicInfoFields::new(
+        fh.frame_type as u32,
+        fh.show_frame as u32,
+        fh.showable_frame as u32,
+        fh.error_resilient_mode as u32,
+        fh.disable_cdf_update as u32,
+        fh.allow_screen_content_tools as u32,
+        fh.force_integer_mv as u32,
+        fh.allow_intrabc as u32,
+        fh.use_superres as u32,
+        fh.allow_high_precision_mv as u32,
+        fh.is_motion_mode_switchable as u32,
+        fh.use_ref_frame_mvs as u32,
+        fh.disable_frame_end_update_cdf as u32,
+        fh.uniform_tile_spacing_flag as u32,
+        fh.allow_warped_motion as u32,
+        0, // large_scale_tile (unsupported)
+    );
+
+    let loop_filter_fields = AV1LoopFilterFields::new(
+        fh.loop_filter_sharpness,
+        fh.loop_filter_delta_enabled as u8,
+        fh.loop_filter_delta_update as u8,
+    );
+
+    let lrd_fields = AV1LoopRestorationFields::new(
+        lrd_type(0),
+        lrd_type(1),
+        lrd_type(2),
+        lr_unit_shift,
+        lr_uv_shift,
+    );
+
+    // Warped motion: the parser stores spec-order types (IDENTITY=0,
+    // TRANSLATION=1, ROTZOOM=2, AFFINE=3), matching VAAPI's
+    // VAAV1TransformationType 1:1. wmmat[6..8] are reserved (zero).
+    let wm: [AV1WarpedMotionParams; 7] = std::array::from_fn(|i| {
+        let mut wmmat = [0i32; 8];
+        wmmat[..6].copy_from_slice(&fh.global_motion_params[i]);
+        AV1WarpedMotionParams::new(fh.global_motion_type[i] as u32, wmmat, 0)
+    });
+
+    // Segmentation: feature_data[segment][feature], already clipped to the
+    // spec ranges by the common parser.
+    let seg_info = AV1Segmentation::new(
+        &AV1SegmentInfoFields::new(
+            fh.segmentation_enabled as u32,
+            fh.segmentation_update_map as u32,
+            fh.segmentation_temporal_update as u32,
+            fh.segmentation_update_data as u32,
+        ),
+        std::array::from_fn(|seg| {
+            std::array::from_fn(|feat| fh.segment_feature_data[seg][feat])
+        }),
+        std::array::from_fn(|seg| fh.segment_feature_enabled[seg]),
+    );
+
+    // Film grain: the common parser does not carry the grain metadata, so we
+    // never ask the driver to apply it (all fields zero, apply_grain=0).
+    let film_grain = AV1FilmGrain::new(
+        &AV1FilmGrainFields::new(0, 0, 0, 0, 0, 0, 0, 0),
+        0,
+        0,
+        [0; 14],
+        [0; 14],
+        0,
+        [0; 10],
+        [0; 10],
+        0,
+        [0; 10],
+        [0; 10],
+        [0; 24],
+        [0; 25],
+        [0; 25],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+
+    let qmatrix_fields = AV1QMatrixFields::new(
+        fh.using_qmatrix as u16,
+        fh.qm_y as u16,
+        fh.qm_u as u16,
+        fh.qm_v as u16,
+    );
+
+    let mode_control_fields = AV1ModeControlFields::new(
+        fh.delta_q_present as u32,
+        fh.delta_q_res as u32,
+        fh.delta_lf_present as u32,
+        fh.delta_lf_res as u32,
+        fh.delta_lf_multi as u32,
+        fh.tx_mode as u32,
+        fh.reference_select as u32,
+        fh.reduced_tx_set as u32,
+        fh.skip_mode_present as u32,
+    );
+
+    // CDEF strengths: packed (primary << 2) | secondary.
+    let cdef_y_strengths = std::array::from_fn(|i| {
+        ((fh.cdef_y_pri_strength[i] << 2) | (fh.cdef_y_sec_strength[i] & 3)) as u8
+    });
+    let cdef_uv_strengths = std::array::from_fn(|i| {
+        ((fh.cdef_uv_pri_strength[i] << 2) | (fh.cdef_uv_sec_strength[i] & 3)) as u8
+    });
+
+    // Per-tile width/height in superblocks minus 1 (63 entries; the last
+    // tile's is derived by the driver).
+    let mut width_in_sbs = [0u16; 63];
+    let mut height_in_sbs = [0u16; 63];
+    width_in_sbs.copy_from_slice(&fh.tile_width_in_sbs_minus_1.0[..63]);
+    height_in_sbs.copy_from_slice(&fh.tile_height_in_sbs_minus_1.0[..63]);
+
+    let pic = PictureParameterBufferAV1::new(
+        sps.profile,
+        sps.order_hint_bits_minus1,
+        if sps.twelve_bit {
+            2
+        } else if sps.high_bitdepth {
+            1
+        } else {
+            0
+        },
+        sps.matrix_coefficients,
+        &seq_fields,
+        current_frame,
+        current_frame, // no film grain: display picture == decoded picture
+        Vec::new(), // anchor_frames_list (large-scale tiles: unused)
+        (fh.frame_width - 1) as u16,
+        (fh.frame_height - 1) as u16,
+        0, // output_frame_width_in_tiles_minus_1 (LST)
+        0, // output_frame_height_in_tiles_minus_1 (LST)
+        ref_frame_map,
+        fh.ref_frame_idx,
+        fh.primary_ref_frame,
+        fh.order_hint as u8,
+        &seg_info,
+        &film_grain,
+        fh.tile_cols as u8,
+        fh.tile_rows as u8,
+        width_in_sbs,
+        height_in_sbs,
+        0, // tile_count_minus_1 (LST)
+        fh.context_update_tile_id as u16,
+        &pic_info,
+        if fh.use_superres {
+            fh.coded_denom + 9 // coded_denom is the raw 3-bit code
+        } else {
+            8
+        },
+        fh.interpolation_filter,
+        [fh.loop_filter_level[0], fh.loop_filter_level[1]],
+        fh.loop_filter_level_uv[0],
+        fh.loop_filter_level_uv[1],
+        &loop_filter_fields,
+        fh.loop_filter_ref_deltas,
+        fh.loop_filter_mode_deltas,
+        fh.base_q_index,
+        fh.delta_q_y_dc,
+        fh.delta_q_u_dc,
+        fh.delta_q_u_ac,
+        fh.delta_q_v_dc,
+        fh.delta_q_v_ac,
+        &qmatrix_fields,
+        &mode_control_fields,
+        fh.cdef_damping,
+        fh.cdef_bits,
+        cdef_y_strengths,
+        cdef_uv_strengths,
+        &lrd_fields,
+        &wm,
+    );
+
+    // Single-tile slice parameter: the whole tile region at offset 0.
+    let mut slice = SliceParameterBufferAV1::new();
+    slice.add_slice_parameter(
+        tile_data_size,
+        0,
+        libva::VA_SLICE_DATA_FLAG_ALL,
+        0, // tile_row
+        0, // tile_column
+        0, // tg_start (deprecated)
+        0, // tg_end (deprecated)
+        0, // anchor_frame_idx (LST)
+        0, // tile_idx_in_tile_list (LST)
+    );
+
+    Ok((
+        BufferType::PictureParameter(PictureParameter::AV1(pic)),
+        BufferType::SliceParameter(SliceParameter::AV1(slice)),
+    ))
 }
 
 /// Build the VA picture- and slice-parameter buffers for one VP9 frame.

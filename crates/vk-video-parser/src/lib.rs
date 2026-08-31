@@ -16,6 +16,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 pub mod av1;
+pub mod av1_dpb;
 pub mod bitreader;
 pub mod bitstream;
 pub mod h264;

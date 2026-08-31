@@ -925,45 +925,63 @@ pub fn readback_decoded_image_format(
             return Err(VideoError::FenceWait(e.to_string()));
         }
 
-        let mut y_plane = vec![0u8; (width * height) as usize];
         let uv_plane_size = (uv_width * uv_height) as usize;
-        let mut u_plane = vec![0u8; uv_plane_size];
-        let mut v_plane = vec![0u8; uv_plane_size];
+        let mut bit_depth = 8u32;
 
-        match hdr_source_for_format(source_format) {
-            Some(HdrSource::B16 { bits }) => {
-                // Plane 0: one u16 per luma sample (value in low `bits` bits).
-                let src = mapped_ptr as *const u16;
-                for i in 0..(width * height) as usize {
-                    let v = unsafe { *src.add(i) };
-                    y_plane[i] = scale_to_8(v, bits);
+        let (mut y_plane, mut u_plane, mut v_plane) =
+            match hdr_source_for_format(source_format) {
+                Some(HdrSource::B16 { bits }) => {
+                    bit_depth = bits;
+                    // Planes store little-endian 16-bit samples (value in the
+                    // low `bits` bits), matching ffmpeg rawvideo
+                    // yuv420p{10,12}le layout. The GPU stores G10X6/G12X4 with
+                    // the value in the HIGH bits of each u16.
+                    let ss = 2usize;
+                    let mut y_plane = vec![0u8; (width * height) as usize * ss];
+                    let mut u_plane = vec![0u8; uv_plane_size * ss];
+                    let mut v_plane = vec![0u8; uv_plane_size * ss];
+                    // Plane 0: one u16 per luma sample.
+                    let src = mapped_ptr as *const u16;
+                    for i in 0..(width * height) as usize {
+                        let x = unsafe { *src.add(i) } as u32 >> (16 - bits);
+                        y_plane[i * ss] = x as u8;
+                        y_plane[i * ss + 1] = (x >> 8) as u8;
+                    }
+                    // Plane 1: interleaved u16 U, u16 V pairs.
+                    let src = (mapped_ptr.add(y_size as usize)) as *const u16;
+                    for i in 0..uv_plane_size {
+                        let u = unsafe { *src.add(i * 2) } as u32 >> (16 - bits);
+                        let v = unsafe { *src.add(i * 2 + 1) } as u32 >> (16 - bits);
+                        u_plane[i * ss] = u as u8;
+                        u_plane[i * ss + 1] = (u >> 8) as u8;
+                        v_plane[i * ss] = v as u8;
+                        v_plane[i * ss + 1] = (v >> 8) as u8;
+                    }
+                    (y_plane, u_plane, v_plane)
                 }
-                // Plane 1: interleaved u16 U, u16 V pairs.
-                let src = (mapped_ptr.add(y_size as usize)) as *const u16;
-                for i in 0..uv_plane_size {
-                    u_plane[i] = scale_to_8(unsafe { *src.add(i * 2) }, bits);
-                    v_plane[i] = scale_to_8(unsafe { *src.add(i * 2 + 1) }, bits);
+                _ => {
+                    // 8-bit NV12: copy, then deinterleave UV.
+                    let mut y_plane = vec![0u8; (width * height) as usize];
+                    std::ptr::copy_nonoverlapping(
+                        mapped_ptr as *const u8,
+                        y_plane.as_mut_ptr(),
+                        y_size,
+                    );
+                    let mut uv_plane = vec![0u8; uv_size];
+                    std::ptr::copy_nonoverlapping(
+                        mapped_ptr.add(y_size) as *const u8,
+                        uv_plane.as_mut_ptr(),
+                        uv_size,
+                    );
+                    let mut u_plane = vec![0u8; uv_plane_size];
+                    let mut v_plane = vec![0u8; uv_plane_size];
+                    for i in 0..uv_plane_size {
+                        u_plane[i] = uv_plane[i * 2];
+                        v_plane[i] = uv_plane[i * 2 + 1];
+                    }
+                    (y_plane, u_plane, v_plane)
                 }
-            }
-            _ => {
-                // 8-bit NV12: copy, then deinterleave UV.
-                std::ptr::copy_nonoverlapping(
-                    mapped_ptr as *const u8,
-                    y_plane.as_mut_ptr(),
-                    y_size,
-                );
-                let mut uv_plane = vec![0u8; uv_size];
-                std::ptr::copy_nonoverlapping(
-                    mapped_ptr.add(y_size) as *const u8,
-                    uv_plane.as_mut_ptr(),
-                    uv_size,
-                );
-                for i in 0..uv_plane_size {
-                    u_plane[i] = uv_plane[i * 2];
-                    v_plane[i] = uv_plane[i * 2 + 1];
-                }
-            }
-        }
+            };
 
         device.unmap_memory(memory);
         device.free_memory(memory, None);
@@ -973,21 +991,11 @@ pub fn readback_decoded_image_format(
             y_plane,
             u_plane,
             v_plane,
-            sample_size: 1,
+            sample_size: if bit_depth > 8 { 2 } else { 1 },
             chroma_width: uv_width,
             chroma_height: uv_height,
         })
     }
-}
-
-/// Scale a `bits`-bit sample stored in the HIGH bits of a u16 (G10X6/G12X4
-/// packing: `value << (16 - bits)`) to 8-bit, rounded.
-#[inline]
-fn scale_to_8(v: u16, bits: u32) -> u8 {
-    let x = (v as u32) >> (16 - bits);
-    // For the max sample value the rounded result is 256; saturate instead of
-    // wrapping to 0 via the u8 cast.
-    (((x << 8) + (1u32 << (bits - 1))) >> bits).min(255) as u8
 }
 
 fn find_memory_type(

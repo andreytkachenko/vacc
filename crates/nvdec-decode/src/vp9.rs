@@ -59,13 +59,6 @@ use crate::{
 /// Number of VP9 frame buffers (frame contexts).
 const VP9_NUM_FRAME_BUFFERS: usize = 8;
 
-/// Slice data offsets for a single-slice VP9 frame (always `[0]`).
-///
-/// `CUVIDPICPARAMS::pSliceDataOffsets` must point to storage that stays alive
-/// for the duration of the subsequent `cuvidDecodePicture` call. VP9 frames
-/// are single-slice with the slice at byte offset 0, so a process-lifetime
-/// `static` is both safe and the simplest correct choice.
-static SLICE_DATA_OFFSETS: [c_uint; 1] = [0];
 
 /// Common VP9 DPB manager shared by ALL backends (Vulkan / NVDEC / VAAPI).
 /// For NVDEC, a DPB slot IS a cuvid surface index (`PicIdx`), so the common
@@ -101,6 +94,7 @@ pub fn build_cuvid_vp9_picparams(
     dpb: &mut Vp9DpbState,
     bitstream_ptr: *const u8,
     bitstream_len: u32,
+    slice_offsets: *const c_uint,
 ) -> CUVIDPICPARAMS {
     let is_key = fd.frame_is_intra;
 
@@ -234,7 +228,7 @@ pub fn build_cuvid_vp9_picparams(
     params.nBitstreamDataLen = bitstream_len;
     params.pBitstreamData = bitstream_ptr;
     params.nNumSlices = 1;
-    params.pSliceDataOffsets = SLICE_DATA_OFFSETS.as_ptr();
+    params.pSliceDataOffsets = slice_offsets;
     params.ref_pic_flag = 0;
     params.intra_pic_flag = is_key as c_int;
     params.Reserved = [0; 30];
@@ -341,13 +335,6 @@ fn expand_superframes(payload: &[u8]) -> Vec<ExpandedVp9Frame> {
 }
 
 /// Map a full bit depth (e.g. 8, 10, 12) to a [`ComponentBitDepth`].
-/// Scale a 16-bit P016 sample (left-aligned, low bits zero) to 8-bit with
-/// round-to-nearest and saturation, matching the Vulkan G10X6/G12X4 readback.
-fn scale_p016_to_8(v: u16, bits: u32) -> u8 {
-    let x = (v as u32) >> (16 - bits);
-    (((x << 8) + (1u32 << (bits - 1))) >> bits).min(255) as u8
-}
-
 fn bit_depth_component(bit_depth: u8) -> ComponentBitDepth {
     match bit_depth {
         8 => ComponentBitDepth::Bit8,
@@ -468,6 +455,13 @@ pub struct NvdecVp9Decoder {
     /// submitted for each picture (DECODE order) to this path.
     dump_params_path: Option<std::path::PathBuf>,
     dump_params_count: u32,
+    /// Per-decode slice-offset storage: `[0, bitstream_len, 0, ...]`.
+    ///
+    /// The NVDEC front end reads `nNumSlices + 1` entries from
+    /// `pSliceDataOffsets` (the last one is the terminating offset), so a
+    /// single-element array would make the driver read adjacent memory and
+    /// corrupt the decode. See the AV1 decoder for details.
+    slice_offsets: [u32; 64],
 }
 
 impl NvdecVp9Decoder {
@@ -515,6 +509,7 @@ impl NvdecVp9Decoder {
                 .ok()
                 .map(std::path::PathBuf::from),
             dump_params_count: 0,
+            slice_offsets: [0; 64],
         };
 
         decoder.init_parser_format()?;
@@ -609,9 +604,17 @@ impl NvdecVp9Decoder {
         // Build the picparams (reads the common DPB for references and picks
         // the output surface; the frame's refresh is committed below, after
         // the decode, so subsequent frames see the updated frame buffers).
+        self.slice_offsets[0] = 0;
+        self.slice_offsets[1] = data.len() as u32;
         let params = {
             let mut dpb = self.dpb.lock().unwrap();
-            build_cuvid_vp9_picparams(&parsed, &mut dpb, data.as_ptr(), data.len() as u32)
+            build_cuvid_vp9_picparams(
+                &parsed,
+                &mut dpb,
+                data.as_ptr(),
+                data.len() as u32,
+                self.slice_offsets.as_ptr().cast::<c_uint>(),
+            )
         };
 
         if let Some(dump_path) = &self.dump_params_path {
@@ -969,7 +972,6 @@ impl NvdecVp9Decoder {
 
         // P016 output holds 16-bit samples (10/12-bit content); NV12 is 8-bit.
         let luma_bd = info.luma_bit_depth.bit_depth();
-        let chroma_bd = info.chroma_bit_depth.bit_depth();
         let bps = if luma_bd > 8 { 2 } else { 1 }; // bytes per sample on device
         let row_bytes = display_width * bps;
 
@@ -1072,12 +1074,13 @@ impl NvdecVp9Decoder {
             );
         }
 
-        let uv_size = (display_width / 2) * (display_height / 2);
-        let mut y_plane = vec![0u8; display_width * display_height];
+        let ss = bps;
+        let uv_size = (display_width / 2) * (display_height / 2) * ss;
+        let mut y_plane = vec![0u8; display_width * display_height * ss];
         let mut u_plane = vec![0u8; uv_size];
         let mut v_plane = vec![0u8; uv_size];
 
-        if bps == 1 {
+        if ss == 1 {
             // NV12: samples are already 8-bit. De-interleave UV to planar.
             y_plane.copy_from_slice(&raw_y);
             for py in 0..(display_height / 2) {
@@ -1090,27 +1093,30 @@ impl NvdecVp9Decoder {
             }
         } else {
             // P016: 16-bit LE samples, left-aligned (10-bit: 6 LSBs zero,
-            // 12-bit: 4 LSBs zero). Scale to 8-bit with round + clamp.
-            for py in 0..display_height {
-                for x in 0..display_width {
-                    let off = (py * display_width + x) * 2;
-                    let v = u16::from_le_bytes([raw_y[off], raw_y[off + 1]]);
-                    y_plane[py * display_width + x] = scale_p016_to_8(v, luma_bd);
-                }
+            // 12-bit: 4 LSBs zero). Shift back to native bit depth.
+            let shift = 16u32 - luma_bd as u32;
+            for chunk in raw_y.chunks_exact_mut(2) {
+                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                chunk.copy_from_slice(&s.to_le_bytes());
             }
+            for chunk in raw_uv.chunks_exact_mut(2) {
+                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                chunk.copy_from_slice(&s.to_le_bytes());
+            }
+            y_plane.copy_from_slice(&raw_y);
             for py in 0..(display_height / 2) {
                 for x in 0..(display_width / 2) {
-                    let off = (py * display_width + x * 2) * 2;
-                    let u = u16::from_le_bytes([raw_uv[off], raw_uv[off + 1]]);
-                    let v = u16::from_le_bytes([raw_uv[off + 2], raw_uv[off + 3]]);
-                    let dst_idx = py * (display_width / 2) + x;
-                    u_plane[dst_idx] = scale_p016_to_8(u, chroma_bd);
-                    v_plane[dst_idx] = scale_p016_to_8(v, chroma_bd);
+                    let src_idx = (py * display_width + x * 2) * 2;
+                    let dst_idx = (py * (display_width / 2) + x) * 2;
+                    u_plane[dst_idx] = raw_uv[src_idx];
+                    u_plane[dst_idx + 1] = raw_uv[src_idx + 1];
+                    v_plane[dst_idx] = raw_uv[src_idx + 2];
+                    v_plane[dst_idx + 1] = raw_uv[src_idx + 3];
                 }
             }
         }
 
-        let out_y_size = display_width * display_height;
+        let out_y_size = display_width * display_height * ss;
         let mut buffer = Vec::with_capacity(out_y_size + uv_size * 2);
         buffer.extend_from_slice(&y_plane);
         buffer.extend_from_slice(&u_plane);
@@ -1120,24 +1126,31 @@ impl NvdecVp9Decoder {
         let u_ptr = unsafe { buffer.as_ptr().add(out_y_size) };
         let v_ptr = unsafe { buffer.as_ptr().add(out_y_size + uv_size) };
 
+        // width/pitch in bytes (tightly packed, so width == pitch).
+        let y_pitch = display_width * ss;
+        let uv_pitch = (display_width / 2) * ss;
         let pixel_data = Some(PixelData {
-            format: "I420".to_string(),
+            format: match info.luma_bit_depth {
+                ComponentBitDepth::Bit8 => "I420".to_string(),
+                ComponentBitDepth::Bit12 => "P012LE".to_string(),
+                _ => "P010LE".to_string(),
+            },
             y: PixelPlane {
                 data: y_ptr,
-                pitch: display_width,
-                width: display_width,
+                pitch: y_pitch,
+                width: y_pitch,
                 height: display_height,
             },
             u: PixelPlane {
                 data: u_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
+                pitch: uv_pitch,
+                width: uv_pitch,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
                 data: v_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
+                pitch: uv_pitch,
+                width: uv_pitch,
                 height: display_height / 2,
             }),
             buffer,
@@ -1407,8 +1420,15 @@ mod tests {
             let fd = parser
                 .parse_frame_with_offset(&f.data, f.superframe_frame_offset)
                 .expect("failed to parse frame");
-            let params =
-                build_cuvid_vp9_picparams(&fd, &mut dpb, f.data.as_ptr(), f.data.len() as u32);
+            let mut slice_offsets = [0u32; 64];
+            slice_offsets[1] = f.data.len() as u32;
+            let params = build_cuvid_vp9_picparams(
+                &fd,
+                &mut dpb,
+                f.data.as_ptr(),
+                f.data.len() as u32,
+                slice_offsets.as_ptr().cast::<c_uint>(),
+            );
             // Mirror NvdecVp9Decoder::process_frame: commit the refresh after
             // the (simulated) decode.
             dpb.commit_frame(fd.picture_info.refresh_frame_flags, params.CurrPicIdx);

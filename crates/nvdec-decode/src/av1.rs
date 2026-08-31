@@ -23,7 +23,7 @@
 //! - `primary_ref_frame` = DPB slot of the primary reference (255 if absent).
 
 use std::collections::VecDeque;
-use std::os::raw::{c_int, c_uchar, c_uint};
+use std::os::raw::{c_int, c_uint};
 use std::sync::Mutex;
 
 use vk_video_core::{
@@ -35,12 +35,13 @@ use vk_video_core::{
     session::Extent2D,
 };
 use vk_video_parser::av1::{Av1FrameHeader, Av1Parser};
+use vk_video_parser::av1_dpb::{Av1Dpb, AV1_NUM_FRAME_BUFFERS};
 use vk_video_parser::{DetectedVideoFormat, VideoParser};
 
 use crate::{
     device::{
-        cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc,
-        cu_memcpy_2d, cu_memcpy_dtoh, get_funcs, init_nvdec, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE,
+        cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
+        get_funcs, init_nvdec, query_decoder_caps, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE,
         CU_MEMORYTYPE_HOST,
     },
     error::{NvdecError, NvdecResult},
@@ -50,9 +51,6 @@ use crate::{
         CUVIDAV1REFFRAME, CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
     },
 };
-
-/// Number of AV1 frame buffers (frame contexts): INTRA + 7 reference slots.
-const AV1_NUM_FRAME_BUFFERS: usize = 8;
 
 /// Number of decode surfaces / DPB slots (matches the cuvid parser baseline).
 const NUM_SURFACES: u32 = 16;
@@ -67,259 +65,8 @@ const IVF_HEADER_SIZE: usize = 32;
 /// uninitialized.
 const BITSTREAM_PADDING: usize = 4096;
 
-/// Slice data offsets for a single-slice AV1 frame (always `[0]`).
-///
-/// `CUVIDPICPARAMS::pSliceDataOffsets` must point at storage that stays alive
-/// for the duration of the subsequent `cuvidDecodePicture` call. AV1 frames
-/// are single-slice with the slice at byte offset 0, so a process-lifetime
-/// `static` is both safe and the simplest correct choice.
-static SLICE_DATA_OFFSETS: [c_uint; 1] = [0];
 
-// ============================================================================
-// DPB state
-// ============================================================================
 
-/// AV1 DPB state for NVDEC surface management. Mirrors the Vulkan AV1 decoder
-/// DPB logic (`crates/vk-video-vulkan/src/av1.rs`).
-#[derive(Debug)]
-pub struct Av1DpbState {
-    /// Number of decode surfaces (e.g. 16).
-    pub num_surfaces: u32,
-    /// Frame buffer 0-7 -> DPB slot (surface index), `-1` = invalid.
-    fb_to_slot: [i32; AV1_NUM_FRAME_BUFFERS],
-    /// Order hint of the picture stored in each frame buffer.
-    fb_order_hint: [u32; AV1_NUM_FRAME_BUFFERS],
-    /// Coded (width, height) of the picture stored in each frame buffer.
-    fb_dims: [(u32, u32); AV1_NUM_FRAME_BUFFERS],
-    /// FIFO of available DPB slots (C++ `AllocateSlot`/`FreeSlot` semantics).
-    available_slots: VecDeque<u32>,
-    /// Number of real frames decoded (decode-order index / `decodePicIdx`).
-    decoded_frames: u32,
-}
-
-impl Av1DpbState {
-    /// Create a fresh DPB with `num_surfaces` decode surfaces.
-    pub fn new(num_surfaces: u32) -> Self {
-        Self {
-            num_surfaces,
-            fb_to_slot: [-1; AV1_NUM_FRAME_BUFFERS],
-            fb_order_hint: [0; AV1_NUM_FRAME_BUFFERS],
-            fb_dims: [(0, 0); AV1_NUM_FRAME_BUFFERS],
-            available_slots: VecDeque::new(),
-            decoded_frames: 0,
-        }
-    }
-
-    /// Reset frame-buffer state and the FIFO (key frame / first frame / new
-    /// stream). Does NOT reset the decode-order counter.
-    pub fn reset_dpb(&mut self) {
-        self.fb_to_slot = [-1; AV1_NUM_FRAME_BUFFERS];
-        self.fb_order_hint = [0; AV1_NUM_FRAME_BUFFERS];
-        self.fb_dims = [(0, 0); AV1_NUM_FRAME_BUFFERS];
-        self.available_slots.clear();
-        for s in 0..self.num_surfaces {
-            self.available_slots.push_back(s);
-        }
-    }
-
-    /// Allocate the output DPB slot using FIFO semantics (Vulkan
-    /// `allocate_output_slot`). A slot is available iff it is not currently
-    /// held by any frame buffer, so the output slot can never clobber a
-    /// reference needed by the current or any future frame.
-    pub fn allocate_output_slot(&mut self) -> u32 {
-        let n = self.num_surfaces as usize;
-        let mut in_use = vec![false; n];
-        for &slot in &self.fb_to_slot {
-            if slot >= 0 && (slot as usize) < n {
-                in_use[slot as usize] = true;
-            }
-        }
-        self.available_slots
-            .retain(|&s| (s as usize) < n && !in_use[s as usize]);
-        for s in 0..n {
-            if !in_use[s] && !self.available_slots.contains(&(s as u32)) {
-                self.available_slots.push_back(s as u32);
-            }
-        }
-        self.available_slots.pop_front().unwrap_or(0)
-    }
-
-    /// DPB slot for a frame buffer, or 255 if the buffer is invalid.
-    pub fn slot_of_frame_buffer(&self, fb: usize) -> i32 {
-        match self.fb_to_slot.get(fb) {
-            Some(&s) if s >= 0 => s,
-            _ => 255,
-        }
-    }
-
-    /// Order hints of all 8 frame buffers (for [`set_frame_refs`]).
-    pub fn frame_buffer_order_hints(&self) -> [u32; 8] {
-        self.fb_order_hint
-    }
-
-    /// Coded (width, height) of a frame buffer, or (0, 0) if invalid.
-    pub fn frame_buffer_dims(&self, fb: usize) -> (u32, u32) {
-        self.fb_dims.get(fb).copied().unwrap_or((0, 0))
-    }
-
-    /// Apply a refresh mask: for each bit `i` set in `refresh_frame_flags`,
-    /// frame buffer `i` now points at `curr_pic_idx` (with `order_hint` and
-    /// coded `dims`). Key frames pass `0xFF` (all frame buffers refreshed).
-    pub fn apply_refresh(
-        &mut self,
-        refresh_frame_flags: u8,
-        curr_pic_idx: i32,
-        order_hint: u32,
-        dims: (u32, u32),
-    ) {
-        for i in 0..AV1_NUM_FRAME_BUFFERS {
-            if refresh_frame_flags >> i & 1 != 0 {
-                self.fb_to_slot[i] = curr_pic_idx;
-                self.fb_order_hint[i] = order_hint;
-                self.fb_dims[i] = dims;
-            }
-        }
-    }
-
-    /// Increment the decode-order counter (call after a real frame decode).
-    pub fn note_decoded(&mut self) {
-        self.decoded_frames += 1;
-    }
-
-    /// Current decode-order index.
-    pub fn decoded_frames(&self) -> u32 {
-        self.decoded_frames
-    }
-
-    /// Reset all DPB state (new stream / reconfigure).
-    pub fn reset(&mut self) {
-        self.reset_dpb();
-        self.decoded_frames = 0;
-    }
-}
-
-// ============================================================================
-// AV1 reference derivation (mirrors Vulkan av1.rs)
-// ============================================================================
-
-/// AV1 `GetRelativeDist` (Vulkan av1.rs): signed distance from `b` to `a` in
-/// order-hint space, wrapped to `[-2^ohb, 2^ohb)`.
-fn get_relative_dist(a: i32, b: i32, ohb: u32) -> i32 {
-    let bits = ohb + 1;
-    let diff = a - b;
-    let m = 1 << (bits - 1);
-    (diff & (m - 1)) - (diff & m)
-}
-
-/// AV1 `SetFrameRefs` (Vulkan av1.rs): when `enable_order_hint` is true and
-/// `frame_refs_short_signaling` is set, the bitstream only carries `lst_ref`
-/// and `gld_ref`; the decoder derives the full `ref_frame_idx` array by
-/// selecting frames based on order-hint distances. Returns
-/// `[LAST, LAST2, LAST3, GOLDEN, BWDREF, ALTREF2, ALTREF]` buffer indices.
-fn set_frame_refs(
-    lst_ref: i32,
-    gld_ref: i32,
-    ref_order_hint: &[u32; 8],
-    cur_order_hint: u32,
-    ohb: u32,
-) -> [i32; 7] {
-    let cur_frame_hint = 1_i32 << ohb;
-    let cur_oh = cur_order_hint as i32;
-
-    // shiftedOrderHints[i] = curFrameHint + GetRelativeDist(RefOrderHint[i], cur_OH)
-    let shifted: [i32; 8] = std::array::from_fn(|i| {
-        cur_frame_hint + get_relative_dist(ref_order_hint[i] as i32, cur_oh, ohb)
-    });
-
-    let mut rfi = [-1_i32; 7];
-    let mut used = [false; 8];
-
-    // LAST and GOLDEN come directly from the bitstream.
-    rfi[0] = lst_ref; // LAST
-    rfi[3] = gld_ref; // GOLDEN
-    if lst_ref >= 0 && lst_ref < 8 {
-        used[lst_ref as usize] = true;
-    }
-    if gld_ref >= 0 && gld_ref < 8 {
-        used[gld_ref as usize] = true;
-    }
-
-    // ALTREF: hint >= curFrameHint, largest.
-    {
-        let mut best: Option<usize> = None;
-        for i in 0..8usize {
-            if used[i] || shifted[i] < cur_frame_hint {
-                continue;
-            }
-            if best.map_or(true, |b| shifted[i] >= shifted[b]) {
-                best = Some(i);
-            }
-        }
-        if let Some(r) = best {
-            rfi[6] = r as i32;
-            used[r] = true;
-        }
-    }
-    // BWDREF: hint >= curFrameHint, smallest.
-    {
-        let mut best: Option<usize> = None;
-        for i in 0..8usize {
-            if used[i] || shifted[i] < cur_frame_hint {
-                continue;
-            }
-            if best.map_or(true, |b| shifted[i] < shifted[b]) {
-                best = Some(i);
-            }
-        }
-        if let Some(r) = best {
-            rfi[4] = r as i32;
-            used[r] = true;
-        }
-    }
-    // ALTREF2: hint >= curFrameHint, smallest.
-    {
-        let mut best: Option<usize> = None;
-        for i in 0..8usize {
-            if used[i] || shifted[i] < cur_frame_hint {
-                continue;
-            }
-            if best.map_or(true, |b| shifted[i] < shifted[b]) {
-                best = Some(i);
-            }
-        }
-        if let Some(r) = best {
-            rfi[5] = r as i32;
-            used[r] = true;
-        }
-    }
-    // LAST2, LAST3, BWDREF, ALTREF2, ALTREF: hint < curFrameHint, largest.
-    for &ref_name in &[2, 3, 5, 6, 7] {
-        let idx = ref_name - 1;
-        if rfi[idx] < 0 {
-            let mut best: Option<usize> = None;
-            for i in 0..8usize {
-                if used[i] || shifted[i] >= cur_frame_hint {
-                    continue;
-                }
-                if best.map_or(true, |b| shifted[i] >= shifted[b]) {
-                    best = Some(i);
-                }
-            }
-            if let Some(r) = best {
-                rfi[idx] = r as i32;
-                used[r] = true;
-            }
-        }
-    }
-    // Fallback: assign buffer with smallest shiftedOrderHint to remaining -1 slots.
-    let fallback = (0..8usize).min_by_key(|&i| shifted[i]).unwrap_or(0);
-    for i in 0..7 {
-        if rfi[i] < 0 {
-            rfi[i] = fallback as i32;
-        }
-    }
-    rfi
-}
 
 // ============================================================================
 // OBU extraction
@@ -429,47 +176,40 @@ fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
 // ============================================================================
 
 /// Build a complete [`CUVIDPICPARAMS`] for one AV1 frame from parser output +
-/// DPB state.
+/// the common DPB state.
 ///
-/// `fh` is the [`Av1FrameHeader`], `sps` the [`Av1Sps`], `dpb` the running
-/// [`Av1DpbState`], and `bitstream_ptr`/`bitstream_len` point at the tile data
-/// (Frame OBU payload minus the frame header). The pointer must stay valid for
-/// the duration of the subsequent `cuvidDecodePicture` call.
+/// `fh` is the [`Av1FrameHeader`] (its `ref_frame_idx` is already fully
+/// resolved by the parser via the common DPB), `sps` the [`Av1Sps`], `dpb`
+/// the running common [`Av1Dpb`], and `bitstream_ptr`/`bitstream_len` point at
+/// the tile data (Frame OBU payload minus the frame header). The pointer must
+/// stay valid for the duration of the subsequent `cuvidDecodePicture` call.
 ///
 /// This allocates the output slot and computes the reference mapping from the
 /// **pre-decode** DPB state. It does NOT apply this frame's refresh — the
-/// caller does that after the decode (see [`Av1DpbState::apply_refresh`]).
+/// caller does that after the decode (see [`Av1Dpb::commit_decoded`]).
 pub fn build_cuvid_av1_picparams(
     fh: &Av1FrameHeader,
     sps: &Av1Sps,
-    dpb: &mut Av1DpbState,
+    dpb: &mut Av1Dpb,
     bitstream_ptr: *const u8,
     bitstream_len: u32,
     ts_90k: u64,
+    slice_offsets: *const c_uint,
 ) -> CUVIDPICPARAMS {
     let is_key = fh.frame_type == 0;
     let is_intra_only = fh.frame_type == 2;
 
     // 1. Output slot: key frame / first frame -> slot 0 + reset DPB; else FIFO.
     let output_slot = if is_key || dpb.decoded_frames() == 0 {
-        dpb.reset_dpb();
+        dpb.reset_for_keyframe();
         0
     } else {
         dpb.allocate_output_slot()
     };
 
-    // 2. Effective ref_frame_idx (reference name -> frame buffer index).
-    let effective_ref_frame_idx: [i32; 7] = if sps.enable_order_hint
-        && fh.frame_type != 0
-        && fh.frame_refs_short_signaling
-    {
-        let lst_ref = fh.ref_frame_idx[0] as i32;
-        let gld_ref = fh.ref_frame_idx[1] as i32;
-        let roh = dpb.frame_buffer_order_hints();
-        set_frame_refs(lst_ref, gld_ref, &roh, fh.order_hint, sps.order_hint_bits_minus1 as u32)
-    } else {
-        std::array::from_fn(|i| fh.ref_frame_idx[i] as i32)
-    };
+    // 2. Effective ref_frame_idx (reference name -> frame buffer index). The
+    // parser already resolved short signaling via the common DPB.
+    let effective_ref_frame_idx: [i32; 7] = std::array::from_fn(|i| fh.ref_frame_idx[i] as i32);
 
     // 3. AV1-specific parameters.
     let mut av1 = unsafe { std::mem::zeroed::<CUVIDAV1PICPARAMS>() };
@@ -638,19 +378,16 @@ pub fn build_cuvid_av1_picparams(
     loop_filter_flags |= (fh.delta_lf_multi as u8 & 1) << 5;
     av1.loop_filter_flags = loop_filter_flags;
 
-    // Loop restoration.
-    for i in 0..3 {
-        av1.lr_unit_size[i] = match fh.loop_restoration_size[i] {
-            32 => 0,
-            64 => 1,
-            128 => 2,
-            256 => 3,
-            _ => 0,
-        };
-        av1.lr_type[i] = fh.loop_restoration_type[i];
-    }
+        // Loop restoration. The parser stores the spec codes directly
+        // (0: 32px, 1: 64px, 2: 128px, 3: 256px) — the same numbering
+        // cuviddec.h documents for `lr_unit_size`.
+        for i in 0..3 {
+            av1.lr_unit_size[i] = fh.loop_restoration_size[i] as u8;
+            av1.lr_type[i] = fh.loop_restoration_type[i];
+        }
 
-    // Reference mapping (from the pre-decode DPB state).
+    // Reference mapping (from the pre-decode DPB state). The common DPB
+    // reports `-1` for an empty frame buffer; cuvid's sentinel is 255.
     for fb in 0..AV1_NUM_FRAME_BUFFERS {
         av1.ref_frame_map[fb] = dpb.slot_of_frame_buffer(fb) as u8;
     }
@@ -659,9 +396,9 @@ pub fn build_cuvid_av1_picparams(
         let slot = if fb < AV1_NUM_FRAME_BUFFERS {
             dpb.slot_of_frame_buffer(fb)
         } else {
-            255
+            -1
         };
-        if slot < 255 {
+        if slot >= 0 {
             let (w, h) = dpb.frame_buffer_dims(fb);
             av1.ref_frame[i] = CUVIDAV1REFFRAME {
                 width: w,
@@ -689,9 +426,9 @@ pub fn build_cuvid_av1_picparams(
         let slot = if fb < AV1_NUM_FRAME_BUFFERS {
             dpb.slot_of_frame_buffer(fb)
         } else {
-            255
+            -1
         };
-        av1.primary_ref_frame = slot as u8;
+        av1.primary_ref_frame = if slot >= 0 { slot as u8 } else { 255 };
     }
 
     // Global motion. The cuvid parser emits the identity matrix for INVALID
@@ -725,7 +462,7 @@ pub fn build_cuvid_av1_picparams(
     params.nBitstreamDataLen = bitstream_len;
     params.pBitstreamData = bitstream_ptr;
     params.nNumSlices = 1;
-    params.pSliceDataOffsets = SLICE_DATA_OFFSETS.as_ptr();
+    params.pSliceDataOffsets = slice_offsets;
     params.ref_pic_flag = (fh.refresh_frame_flags != 0) as c_int;
     params.intra_pic_flag = (is_key || is_intra_only) as c_int;
     // Display timestamp on the 90 kHz clock in Reserved[0]: NVIDIA's own
@@ -749,11 +486,11 @@ pub fn build_cuvid_av1_picparams(
 /// Not `Send`/`Sync`; use from a single thread. The CUDA context must be set
 /// current before decode methods.
 ///
-/// Driven by the [`Av1Parser`]: IVF packets (or a raw single frame) are
-/// OBU-walked, parsed, and each frame's [`CUVIDPICPARAMS`] is built by
-/// [`build_cuvid_av1_picparams`] (surface management via [`Av1DpbState`]) and
-/// submitted to `cuvidDecodePicture`. Displayed frames are extracted in
-/// display order (NV12 -> planar YUV420P).
+/// Driven by the [`Av1Parser`] (which owns the common AV1 DPB for surface
+/// management): IVF packets (or a raw single frame) are OBU-walked, parsed,
+/// and each frame's [`CUVIDPICPARAMS`] is built by
+/// [`build_cuvid_av1_picparams`] and submitted to `cuvidDecodePicture`.
+/// Displayed frames are extracted in display order (NV12 -> planar YUV420P).
 pub struct NvdecAv1Decoder {
     parser: Av1Parser,
     decoder: Mutex<CUvideodecoder>,
@@ -768,8 +505,6 @@ pub struct NvdecAv1Decoder {
     initialized: Mutex<bool>,
     /// Parsed sequence header (available after the first SPS OBU).
     sps: Mutex<Option<Av1Sps>>,
-    /// DPB surface management (16 surfaces).
-    dpb: Mutex<Av1DpbState>,
     /// (width, height) of the last decoder configuration.
     prev_coded_size: Mutex<(u32, u32)>,
     pending_data: Vec<u8>,
@@ -778,14 +513,28 @@ pub struct NvdecAv1Decoder {
     is_ivf: bool,
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
-    /// Cached pinned (page-locked) host buffer for the bitstream.
+    /// Ring of cached pinned (page-locked) host buffers for the bitstream.
     ///
-    /// `cuvidDecodePicture` reads the bitstream from this host pointer (it CPU-memcpys
-    /// it internally, so a device pointer segfaults). The buffer is allocated with
-    /// zero-filled padding beyond the data: the AV1 decoder's bit reader can read in
-    /// SIMD chunks that extend past `nBitstreamDataLen`, so the tail must be valid
-    /// (zero) memory, not uninitialized.
-    bitstream_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
+    /// `cuvidDecodePicture` may read the bitstream from this host pointer
+    /// asynchronously (after the call returns), so each decode's data must
+    /// survive until that decode completes. We round-robin through a ring of
+    /// pinned buffers so an in-flight decode never sees its bitstream
+    /// overwritten by a later one (NVIDIA's own parser stages each frame in
+    /// its own buffer for exactly this reason). Buffers are allocated with
+    /// zero-filled padding beyond the data: the AV1 decoder's bit reader can
+    /// read in SIMD chunks that extend past `nBitstreamDataLen`, so the tail
+    /// must be valid (zero) memory, not uninitialized.
+    bitstream_ring: Mutex<(Vec<(*mut std::ffi::c_void, usize)>, u32)>,
+    /// Per-decode slice-offset storage: `[0, bitstream_len, 0, ...]`.
+    ///
+    /// The NVDEC AV1 front end reads `nNumSlices + 1` entries from
+    /// `pSliceDataOffsets` — the last one is the terminating offset (the C
+    /// parser fills `[0, total_len]`) — even though cuviddec.h documents only
+    /// `nNumSlices` entries. Pointing at smaller storage makes the driver
+    /// read adjacent memory, which corrupts the decode (the driver reports
+    /// `cuvidDecodeStatus_Error` and pixels come out wrong toward the end of
+    /// the scan).
+    slice_offsets: [u32; 64],
     /// If set (via `NVDEC_DUMP_PARAMS`), dump the exact [`CUVIDPICPARAMS`]
     /// submitted for each picture (DECODE order) to this path.
     dump_params_path: Option<std::path::PathBuf>,
@@ -841,14 +590,14 @@ impl NvdecAv1Decoder {
             display_area: Mutex::new((0, 0, 0, 0)),
             initialized: Mutex::new(false),
             sps: Mutex::new(None),
-            dpb: Mutex::new(Av1DpbState::new(NUM_SURFACES)),
             prev_coded_size: Mutex::new((0, 0)),
             pending_data: data,
             parsed_offset: if is_ivf { IVF_HEADER_SIZE } else { 0 },
             is_ivf,
             ivf_timebase,
             pinned_cache: Mutex::new(None),
-            bitstream_cache: Mutex::new(None),
+            bitstream_ring: Mutex::new((Vec::new(), 0)),
+            slice_offsets: [0; 64],
             dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
                 .ok()
                 .map(std::path::PathBuf::from),
@@ -856,6 +605,7 @@ impl NvdecAv1Decoder {
         };
 
         decoder.init_parser_format()?;
+        decoder.parser.set_dpb_slots(NUM_SURFACES);
         decoder.parse_and_decode()?;
 
         let initialized = *decoder.initialized.lock().unwrap();
@@ -944,28 +694,29 @@ impl NvdecAv1Decoder {
     /// The buffer is grown on demand and kept alive across frames; it is only
     /// reallocated when a larger frame arrives (by which point the previous
     /// decode has completed, so the old buffer is not in use).
-    fn bitstream_buffer(&self, src: &[u8]) -> NvdecResult<*const u8> {
+    fn bitstream_buffer(&mut self, src: &[u8]) -> NvdecResult<*const u8> {
+        const RING_SIZE: usize = 8;
         let size = src.len();
         let need = size + BITSTREAM_PADDING;
-        let mut cache = self.bitstream_cache.lock().unwrap();
-        if cache.as_ref().map(|(_, cap)| *cap < need).unwrap_or(true) {
-            if let Some((p, _)) = cache.take() {
-                let _ = unsafe { cu_mem_free_host(p) };
-            }
-            let p = cu_mem_host_alloc(need)?;
-            *cache = Some((p, need));
+        let mut ring = self.bitstream_ring.lock().unwrap();
+        if ring.0.len() < RING_SIZE {
+            ring.0.push((std::ptr::null_mut(), 0));
         }
-        let p = cache.as_ref().unwrap().0;
-        // Padding byte is configurable (NVDEC_BS_PAD_BYTE, default 0x00) so we
-        // can test whether the NVDEC AV1 bit reader reads past
-        // `nBitstreamDataLen` and is sensitive to the tail bytes.
-        let pad_byte = std::env::var("NVDEC_BS_PAD_BYTE")
-            .ok()
-            .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
-            .unwrap_or(0x00);
+        let slot = (ring.1 % RING_SIZE as u32) as usize;
+        ring.1 += 1;
+        let (p, cap) = &mut ring.0[slot];
+        if *cap < need {
+            if !p.is_null() {
+                let _ = unsafe { cu_mem_free_host(*p) };
+            }
+            let np = cu_mem_host_alloc(need)?;
+            *p = np;
+            *cap = need;
+        }
+        let p = (*p).cast::<u8>();
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), p as *mut u8, size);
-            std::ptr::write_bytes((p as *mut u8).add(size), pad_byte, need - size);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), p, size);
+            std::ptr::write_bytes(p.add(size), 0x00, BITSTREAM_PADDING);
         }
         Ok(p as *const u8)
     }
@@ -987,11 +738,11 @@ impl NvdecAv1Decoder {
         // show_existing_frame: no decode, no DPB change — re-display an
         // already-decoded surface (always displayed).
         if fh.show_existing_frame {
-            let surface = {
-                let dpb = self.dpb.lock().unwrap();
-                dpb.slot_of_frame_buffer(fh.frame_to_show_map_idx as usize)
-            };
-            if surface < 255 {
+            let surface = self
+                .parser
+                .dpb()
+                .slot_of_frame_buffer(fh.frame_to_show_map_idx as usize);
+            if surface >= 0 {
                 if let Some(frame) = self.extract_frame(surface) {
                     self.pending_frames.lock().unwrap().push_back(frame);
                 }
@@ -1033,25 +784,24 @@ impl NvdecAv1Decoder {
         };
 
         // Build the picparams (allocates the output slot; references from the
-        // pre-decode DPB state).
-        let params = {
-            let mut dpb = self.dpb.lock().unwrap();
-            build_cuvid_av1_picparams(&fh, &sps, &mut dpb, tile_ptr, tile_len as u32, ts_90k)
-        };
+        // pre-decode common DPB state).
+        // The AV1 front end reads nNumSlices+1 slice offsets (terminator
+        // included) — fill [0, bitstream_len] before every decode.
+        self.slice_offsets[0] = 0;
+        self.slice_offsets[1] = tile_len as u32;
+        let params = build_cuvid_av1_picparams(
+            &fh,
+            &sps,
+            self.parser.dpb_mut(),
+            tile_ptr,
+            tile_len as u32,
+            ts_90k,
+            self.slice_offsets.as_ptr().cast::<c_uint>(),
+        );
 
         if let Some(dump_path) = &self.dump_params_path {
             dump_cuvid_av1_picparams(dump_path, self.dump_params_count, &params);
             self.dump_params_count += 1;
-        }
-
-        // [DEBUG] Dump the exact full bitstream passed to cuvidDecodePicture so
-        // it can be byte-compared against the NVIDIA baseline.
-        if let Ok(dir) = std::env::var("NVDEC_BS_DUMP_DIR") {
-            let n = params.nBitstreamDataLen as usize;
-            let bs = unsafe { std::slice::from_raw_parts(params.pBitstreamData, n) };
-            let _ = std::fs::create_dir_all(&dir);
-            let fp = std::path::Path::new(&dir).join(format!("nv_bs_{}.bin", self.frame_count.lock().unwrap()));
-            let _ = std::fs::write(&fp, bs);
         }
 
         let decoder_handle = {
@@ -1066,8 +816,6 @@ impl NvdecAv1Decoder {
         let funcs = get_funcs()?;
         let _ = cu_ctx_set_current();
 
-        let cuda_log = std::env::var("NVDEC_CUDA_LOG").is_ok();
-        let t0 = std::time::Instant::now();
         let procparams = crate::ffi::default_procparams();
         let result = unsafe {
             (funcs.decode_picture)(
@@ -1076,15 +824,6 @@ impl NvdecAv1Decoder {
                 &procparams,
             )
         };
-        if cuda_log {
-            eprintln!(
-                "[CUDA-LOG] decode#{} CurrPicIdx={} nBitLen={} decode_picture={}us",
-                self.frame_count.lock().unwrap(),
-                params.CurrPicIdx,
-                params.nBitstreamDataLen,
-                t0.elapsed().as_micros()
-            );
-        }
         if result != CUDA_SUCCESS {
             return Err(NvdecError::DecodeFailed(format!(
                 "cuvidDecodePicture failed: {}",
@@ -1092,64 +831,15 @@ impl NvdecAv1Decoder {
             )));
         }
 
-        if let Ok(d) = std::env::var("NVDEC_DECODE_DELAY_MS") {
-            if let Ok(ms) = d.parse::<u64>() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
-        let t1 = std::time::Instant::now();
         cu_ctx_synchronize()?;
-        if cuda_log {
-            eprintln!("[CUDA-LOG]   sync={}us", t1.elapsed().as_micros());
-        }
 
-        // [DEBUG] Poll the per-picture decode status (gated by NVDEC_DEBUG_STATUS).
-        if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-            let mut ds = crate::ffi::CUVIDGETDECODESTATUS {
-                decodeStatus: crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Invalid,
-                reserved: [0; 31],
-                pReserved: [std::ptr::null_mut(); 8],
-            };
-            let mut api: u32 = 0;
-            for _ in 0..50 {
-                api = unsafe {
-                    (funcs.get_decode_status)(
-                        decoder_handle as *mut std::ffi::c_void,
-                        params.CurrPicIdx,
-                        &mut ds,
-                    )
-                };
-                if ds.decodeStatus
-                    != crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                let _ = cu_ctx_synchronize();
-            }
-            let st = ds.decodeStatus as u32;
-            eprintln!(
-                "[STATUS] decode#{} CurrPicIdx={} status={} api={}",
-                self.frame_count.lock().unwrap(),
-                params.CurrPicIdx,
-                st,
-                api
-            );
-        }
+        // Commit this frame's refresh to the common DPB (now that the decode
+        // is submitted).
+        self.parser
+            .dpb_mut()
+            .commit_decoded(params.CurrPicIdx as u32, &fh, sps.order_hint_bits_minus1 as u32);
 
-        // Apply this frame's refresh (now that the decode is submitted).
-        {
-            let mut dpb = self.dpb.lock().unwrap();
-            dpb.apply_refresh(
-                fh.refresh_frame_flags,
-                params.CurrPicIdx,
-                fh.order_hint,
-                (fh.frame_width, fh.frame_height),
-            );
-            dpb.note_decoded();
-        }
-
-        if fh.show_frame && std::env::var("NVDEC_NO_EXTRACT").is_err() {
+        if fh.show_frame {
             if let Some(frame) = self.extract_frame(params.CurrPicIdx) {
                 self.pending_frames.lock().unwrap().push_back(frame);
             }
@@ -1176,6 +866,36 @@ impl NvdecAv1Decoder {
         } else {
             8
         };
+
+        // NVDEC extraction is 4:2:0 only. Reject other subsamplings early
+        // with a clear message instead of silently mis-decoding (a 4:2:2
+        // stream decoded as 4:2:0 produces wrong pixels and plane sizes).
+        if sps.mono_chrome || !(sps.subsampling_x == 1 && sps.subsampling_y == 1) {
+            let (cf, name) = if sps.subsampling_x == 0 && sps.subsampling_y == 0 {
+                (cudaVideoChromaFormat::cudaVideoChromaFormat_444, "4:4:4")
+            } else if sps.subsampling_y == 0 {
+                (cudaVideoChromaFormat::cudaVideoChromaFormat_422, "4:2:2")
+            } else {
+                (cudaVideoChromaFormat::cudaVideoChromaFormat_420, "4:2:0")
+            };
+            let hw_supported = query_decoder_caps(
+                cudaVideoCodec::cudaVideoCodec_AV1,
+                cf,
+                bit_depth.saturating_sub(8) as u32,
+            )
+            .map(|c| c.bIsSupported != 0)
+            .unwrap_or(false);
+            return Err(NvdecError::DecoderCreationFailed(format!(
+                "AV1 {} {}-bit not supported by this NVDEC backend (4:2:0 only){}",
+                name,
+                bit_depth,
+                if hw_supported {
+                    " - hardware reports support but no 4:2:2/4:4:4 output path is implemented"
+                } else {
+                    " - device does not support this chroma format for AV1"
+                }
+            )));
+        }
 
         let output_format = if bit_depth > 8 {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_P016
@@ -1245,7 +965,7 @@ impl NvdecAv1Decoder {
                 width: w,
                 height: h,
             },
-            chroma_subsampling: ChromaSubsampling::_420,
+            chroma_subsampling: ChromaSubsampling::_420, // only supported variant
             luma_bit_depth: bit_depth_component(bit_depth),
             chroma_bit_depth: bit_depth_component(bit_depth),
             profile_idc: Some(sps.profile as u32),
@@ -1329,10 +1049,7 @@ impl NvdecAv1Decoder {
                 let mut decoder = self.decoder.lock().unwrap();
                 *decoder = std::ptr::null_mut();
             }
-            {
-                let mut dpb = self.dpb.lock().unwrap();
-                dpb.reset();
-            }
+            self.parser.dpb_mut().reset();
             {
                 let mut pending = self.pending_frames.lock().unwrap();
                 pending.clear();
@@ -1427,30 +1144,17 @@ impl NvdecAv1Decoder {
             eprintln!("[NVDEC] cuvidMapVideoFrame64 failed: {}", map_result);
             return None;
         }
-        // [DEBUG] Dump the raw NV12 surface (full DtoH) for byte-comparison
-        // against the NVIDIA cuvid-parser baseline.
-        if let Ok(dir) = std::env::var("NVDEC_RAW_DUMP") {
-            let h = info.coded_size.height as usize;
-            let p = pitch as usize;
-            let surface_bytes = p * h * 3 / 2;
-            let mut host = vec![0u8; surface_bytes];
-            let _ = unsafe { cu_memcpy_dtoh(host.as_mut_ptr().cast(), dev_ptr, surface_bytes) };
-            let _ = std::fs::create_dir_all(&dir);
-            let fp = std::path::Path::new(&dir).join(format!("ours_raw_{}.bin", pic_index));
-            let _ = std::fs::write(&fp, host);
-            eprintln!(
-                "[RAW] pic={} pitch={} h={} surface_bytes={}",
-                pic_index, p, h, surface_bytes
-            );
-        }
         let display_area = {
             let d = self.display_area.lock().unwrap();
             *d
         };
         let (crop_left, crop_top, _, _) = display_area;
 
-        let y_size = display_width * display_height;
-        let interleaved_uv_size = display_width * (display_height / 2);
+        // P016 (10/12-bit) surfaces use 2-byte little-endian samples.
+        let ss = if info.luma_bit_depth == ComponentBitDepth::Bit8 { 1 } else { 2 };
+
+        let y_size = display_width * display_height * ss;
+        let interleaved_uv_size = display_width * (display_height / 2) * ss;
         let total = y_size + interleaved_uv_size;
         let pinned_base = {
             let mut cache = self.pinned_cache.lock().unwrap();
@@ -1477,7 +1181,7 @@ impl NvdecAv1Decoder {
         let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         let mut copy_y = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: crop_left as u64 * ss as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1492,8 +1196,8 @@ impl NvdecAv1Decoder {
             dstHost: pinned_y,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: display_width as u64 * ss as u64,
+            WidthInBytes: display_width as u64 * ss as u64,
             Height: display_height as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_y) } {
@@ -1507,7 +1211,7 @@ impl NvdecAv1Decoder {
 
         let coded_height = info.coded_size.height as u64;
         let copy_uv = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: crop_left as u64 * ss as u64,
             srcY: coded_height + (crop_top as u64) / 2,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1522,8 +1226,8 @@ impl NvdecAv1Decoder {
             dstHost: pinned_uv,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: display_width as u64 * ss as u64,
+            WidthInBytes: display_width as u64 * ss as u64,
             Height: (display_height / 2) as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_uv) } {
@@ -1548,16 +1252,43 @@ impl NvdecAv1Decoder {
             );
         }
 
-        // De-interleave NV12 UV to planar U and V.
-        let uv_size = (display_width / 2) * (display_height / 2);
+        // P016 surfaces store samples left-aligned with zeroed LSBs (10-bit:
+        // << 6, 12-bit: << 4). Shift back to native bit depth.
+        if ss == 2 {
+            let shift = 16u32 - info.luma_bit_depth.bit_depth() as u32;
+            for chunk in y_plane.chunks_exact_mut(2) {
+                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                chunk.copy_from_slice(&s.to_le_bytes());
+            }
+            for chunk in interleaved_uv.chunks_exact_mut(2) {
+                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                chunk.copy_from_slice(&s.to_le_bytes());
+            }
+        }
+
+        // De-interleave the semi-planar UV to planar U and V (u8 or u16 LE).
+        let uv_size = (display_width / 2) * (display_height / 2) * ss;
         let mut u_plane = vec![0u8; uv_size];
         let mut v_plane = vec![0u8; uv_size];
-        for y in 0..(display_height / 2) {
-            for x in 0..(display_width / 2) {
-                let src_idx = y * display_width + x * 2;
-                let dst_idx = y * (display_width / 2) + x;
-                u_plane[dst_idx] = interleaved_uv[src_idx];
-                v_plane[dst_idx] = interleaved_uv[src_idx + 1];
+        if ss == 1 {
+            for y in 0..(display_height / 2) {
+                for x in 0..(display_width / 2) {
+                    let src_idx = y * display_width + x * 2;
+                    let dst_idx = y * (display_width / 2) + x;
+                    u_plane[dst_idx] = interleaved_uv[src_idx];
+                    v_plane[dst_idx] = interleaved_uv[src_idx + 1];
+                }
+            }
+        } else {
+            for y in 0..(display_height / 2) {
+                for x in 0..(display_width / 2) {
+                    let src_idx = y * display_width * 2 + x * 4;
+                    let dst_idx = y * (display_width / 2) * 2 + x * 2;
+                    u_plane[dst_idx] = interleaved_uv[src_idx];
+                    u_plane[dst_idx + 1] = interleaved_uv[src_idx + 1];
+                    v_plane[dst_idx] = interleaved_uv[src_idx + 2];
+                    v_plane[dst_idx + 1] = interleaved_uv[src_idx + 3];
+                }
             }
         }
 
@@ -1570,24 +1301,31 @@ impl NvdecAv1Decoder {
         let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
         let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
 
+        // width/pitch in bytes (tightly packed, so width == pitch).
+        let y_pitch = display_width * ss;
+        let uv_pitch = (display_width / 2) * ss;
         let pixel_data = Some(PixelData {
-            format: "I420".to_string(),
+            format: match info.luma_bit_depth {
+                ComponentBitDepth::Bit8 => "I420".to_string(),
+                ComponentBitDepth::Bit12 => "P012LE".to_string(),
+                _ => "P010LE".to_string(),
+            },
             y: PixelPlane {
                 data: y_ptr,
-                pitch: display_width,
-                width: display_width,
+                pitch: y_pitch,
+                width: y_pitch,
                 height: display_height,
             },
             u: PixelPlane {
                 data: u_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
+                pitch: uv_pitch,
+                width: uv_pitch,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
                 data: v_ptr,
-                pitch: display_width / 2,
-                width: display_width / 2,
+                pitch: uv_pitch,
+                width: uv_pitch,
                 height: display_height / 2,
             }),
             buffer,
@@ -1675,12 +1413,9 @@ impl Decoder for NvdecAv1Decoder {
             let mut d = self.decoder.lock().unwrap();
             *d = std::ptr::null_mut();
         }
+        // parser.reset() also resets the common AV1 DPB.
         self.parser.reset();
         *self.sps.lock().unwrap() = None;
-        {
-            let mut dpb = self.dpb.lock().unwrap();
-            dpb.reset();
-        }
         {
             let mut pending = self.pending_frames.lock().unwrap();
             pending.clear();
@@ -1729,9 +1464,11 @@ impl Drop for NvdecAv1Decoder {
                 let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
             }
         }
-        if let Ok(mut cache) = self.bitstream_cache.lock() {
-            if let Some((ptr, _)) = cache.take() {
-                let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
+        if let Ok(mut ring) = self.bitstream_ring.lock() {
+            for (ptr, _) in ring.0.drain(..) {
+                if !ptr.is_null() {
+                    let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
+                }
             }
         }
     }
@@ -1853,4 +1590,14 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
         )
     };
     let _ = writeln!(f, "RAW = {}", raw.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    // Full bitstream MD5 for content verification (matches the cuvid baseline tool).
+    let bs_len = p.nBitstreamDataLen as usize;
+    if bs_len > 0 && !p.pBitstreamData.is_null() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let full = unsafe { std::slice::from_raw_parts(p.pBitstreamData, bs_len) };
+        let mut h = DefaultHasher::new();
+        full.hash(&mut h);
+        let _ = writeln!(f, "BITSTREAM_MD5_LEN = {} {}", bs_len, h.finish());
+    }
 }

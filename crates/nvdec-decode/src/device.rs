@@ -120,6 +120,8 @@ struct CudaFuncs {
     cu_stream_destroy: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_mem_host_alloc: unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize, u32) -> u32,
     cu_mem_free_host: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
+    cu_mem_alloc_v2: unsafe extern "C" fn(*mut crate::ffi::CUdeviceptr, usize) -> u32,
+    cu_mem_free_v2: unsafe extern "C" fn(crate::ffi::CUdeviceptr) -> u32,
 }
 
 /// Loaded NVDEC library functions as raw function pointers.
@@ -367,6 +369,18 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
                 NvdecError::LibLoadError(format!("Failed to resolve cuMemFreeHost: {}", e))
             })?;
 
+        let cu_mem_alloc_v2 = *lib
+            .get::<unsafe extern "C" fn(*mut crate::ffi::CUdeviceptr, usize) -> u32>(b"cuMemAlloc_v2\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuMemAlloc_v2: {}", e))
+            })?;
+
+        let cu_mem_free_v2 = *lib
+            .get::<unsafe extern "C" fn(crate::ffi::CUdeviceptr) -> u32>(b"cuMemFree_v2\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuMemFree_v2: {}", e))
+            })?;
+
         let cu_memcpy_dtoh = *lib.get::<unsafe extern "C" fn(*mut std::ffi::c_void, crate::ffi::CUdeviceptr, usize) -> u32>(b"cuMemcpyDtoH_v2\0")
             .or_else(|_| lib.get::<unsafe extern "C" fn(*mut std::ffi::c_void, crate::ffi::CUdeviceptr, usize) -> u32>(b"cuMemcpyDtoH\0"))
             .map_err(|e| NvdecError::LibLoadError(format!("Failed to resolve cuMemcpyDtoH: {}", e)))?;
@@ -387,6 +401,8 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             cu_stream_destroy,
             cu_mem_host_alloc,
             cu_mem_free_host,
+            cu_mem_alloc_v2,
+            cu_mem_free_v2,
         };
 
         Ok((lib, funcs))
@@ -859,6 +875,34 @@ pub unsafe fn cu_mem_free_host(ptr: *mut std::ffi::c_void) -> NvdecResult<u32> {
         .get()
         .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
     Ok(unsafe { (funcs.cu_mem_free_host)(ptr) })
+}
+
+/// Allocate device memory.
+///
+/// # Errors
+///
+/// Returns [`NvdecError::CudaError`] if allocation fails.
+pub fn cu_mem_alloc_device(size: usize) -> NvdecResult<crate::ffi::CUdeviceptr> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    let mut ptr: crate::ffi::CUdeviceptr = 0;
+    let result = unsafe { (funcs.cu_mem_alloc_v2)(&mut ptr, size) };
+    if result != CUDA_SUCCESS {
+        return Err(NvdecError::CudaError(format!(
+            "cuMemAlloc_v2 failed with error {}",
+            result
+        )));
+    }
+    Ok(ptr)
+}
+
+/// Free device memory allocated with [`cu_mem_alloc_device`].
+pub unsafe fn cu_mem_free_device(ptr: crate::ffi::CUdeviceptr) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_mem_free_v2)(ptr) })
 }
 
 /// Perform an asynchronous 2D memory copy on a CUDA stream.

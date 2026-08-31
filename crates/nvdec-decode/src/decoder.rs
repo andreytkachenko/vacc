@@ -485,12 +485,15 @@ impl NvdecH264Decoder {
                         }
                         *self.sps_pps_fed.lock().unwrap() = true;
                     }
-                    let mut slice_offsets = Vec::with_capacity(slices.len());
+                    let mut slice_offsets = Vec::with_capacity(slices.len() + 1);
                     for slice_entry in &slices {
                         slice_offsets.push(bitstream_data.len() as u32);
                         bitstream_data.extend_from_slice(&[0u8, 0, 1]);
                         bitstream_data.extend_from_slice(&slice_entry.nal_data);
                     }
+                    // The NVDEC front end may read nNumSlices+1 entries (the
+                    // last one as a terminating offset) — provide it.
+                    slice_offsets.push(bitstream_data.len() as u32);
 
                     let picparams = build_cuvid_picparams(
                         &sps,

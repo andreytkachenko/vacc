@@ -242,20 +242,26 @@ fn parse_h265_slice_header(
 
     let mut num_bits_for_st_ref_pic_set_in_slice: i32 = 0;
     let mut num_delta_pocs_of_ref_rps_idx: i32 = 0;
-    let mut short_term_ref_pic_set_sps_flag: bool = !is_idr;
+    let mut short_term_ref_pic_set_sps_flag: bool = false;
     let mut ref_pocs: Vec<i32> = Vec::new();
 
-    if !is_idr {
-        short_term_ref_pic_set_sps_flag = r.read_bit().unwrap_or(0) == 1;
+    // RPS/ref fields are present only for inter slices.
+    // Raw H.265 bitstream slice_type: 0=B, 1=P, 2=I (unlike H.264).
+    if slice_type != 2 {
+        // short_term_ref_pic_set_sps_flag: present only when NumShortTermRefPicSets != 0.
+        short_term_ref_pic_set_sps_flag = if sps.num_short_term_ref_pic_sets > 0 {
+            r.read_bit().unwrap_or(0) == 1
+        } else {
+            false
+        };
 
         if !short_term_ref_pic_set_sps_flag {
             let bitcnt_before = r.pos();
 
-            let inter_ref_pic_set_prediction_flag = if sps.num_short_term_ref_pic_sets > 0 {
-                r.read_bit().unwrap_or(0) == 1
-            } else {
-                false
-            };
+            // inter_ref_pic_set_prediction_flag: always present for explicit
+            // slice-level RPS (spec 8.3.2: present when NumShortTermRefPicSets == 0
+            // and i == 0, or when NumShortTermRefPicSets > i).
+            let inter_ref_pic_set_prediction_flag = r.read_bit().unwrap_or(0) == 1;
 
             if inter_ref_pic_set_prediction_flag {
                 let idx = sps.num_short_term_ref_pic_sets as u32;
@@ -893,6 +899,13 @@ pub fn extract_all_access_units(
                                 current_ref_pocs = slice_ref_pocs;
                                 current_no_output_of_prior_pics_flag =
                                     slice_no_output_of_prior_pics_flag;
+                                if std::env::var("VACC_DBG_AU").is_ok() {
+                                    eprintln!(
+                                        "[H265-AU] nal={} poc={} lsb={} msb={} stype={} idr={} ref={} ref_pocs={:?}",
+                                        nal_unit_type, poc[0], poc_lsb, poc_msb, slice_type,
+                                        slice_is_idr, slice_is_reference, current_ref_pocs
+                                    );
+                                }
                                 prev_frame_num += 1;
                                 current_frame_num = prev_frame_num;
 
