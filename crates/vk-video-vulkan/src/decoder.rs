@@ -256,7 +256,6 @@ impl VideoDecoder {
             .ok_or_else(|| VideoError::VideoNotSupported("No decode queue".to_string()))?;
 
         // Query device capabilities
-        eprintln!("[Decoder] Querying video capabilities...");
         let caps = vulkan.query_video_capabilities(
             codec,
             parsed.profile_idc,
@@ -518,10 +517,14 @@ impl VideoDecoder {
         })
     }
 
-    /// Decode all frames from the bitstream.
+    /// Decode up to `max_frames` frames from the bitstream.
     ///
-    /// Returns frames in decoding order. Use `reorder_to_presentation` to
-    /// reorder by presentation order (POC).
+    /// H.264/H.265: returns frames in presentation order (POC). B-frames are
+    /// decoded after their future references, so a small SPS-bounded margin of
+    /// extra access units is decoded to complete the trailing display frame;
+    /// out-of-window frames are discarded.
+    /// VP9/AV1: returns frames in decoding order (use
+    /// `reorder_to_presentation` if the stream reorders).
     pub fn decode_all(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
         match self.decoded_codec {
             AccessUnitCodec::H264 | AccessUnitCodec::H265 => self.decode_all_h26x(max_frames),
@@ -559,10 +562,24 @@ impl VideoDecoder {
     }
 
     fn decode_all_h26x(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
+        // B-frames are decoded AFTER their future reference P-frame, so
+        // decoding exactly `max_frames` access units can leave the last
+        // in-window display frame undecoded while emitting an out-of-window
+        // one (the trailing group straddles the window boundary). Decode a
+        // margin of extra AUs bounded by the stream's reorder depth, then
+        // return the first `max_frames` frames in presentation order.
+        // Worst-case overshoot = 1 (future P) + max B-frames per group.
+        let reorder_margin: u32 = match &self.parsed.sps {
+            Some(H264OrH265Sps::H264(sps)) => sps.max_num_ref_frames.max(4) + 1,
+            Some(H264OrH265Sps::H265(sps)) => (sps.max_num_reorder_pics[0] as u32).max(1) + 1,
+            None => 8,
+        };
+        let au_budget = max_frames.saturating_add(reorder_margin as usize);
+
         let items = super::access_unit::extract_all_access_units(
             self.bitstream_data(),
             self.decoded_codec,
-            max_frames,
+            au_budget,
             self.parsed.sps.as_ref(),
             self.parsed.pps.as_ref(),
         );
@@ -571,7 +588,7 @@ impl VideoDecoder {
             return Err(VideoError::DecoderInit("No access units found".to_string()));
         }
 
-        let items: Vec<_> = items.into_iter().take(max_frames * 2).collect();
+        let items: Vec<_> = items.into_iter().take(au_budget * 2).collect();
 
         // H.265: common parser + common DPB — the single source of truth for
         // POC, reference lists and DPB slot allocation/liveness (shared with
@@ -643,7 +660,10 @@ impl VideoDecoder {
                             p_next: &profile_info as *const _ as *const _,
                             flags: vk::QueryPoolCreateFlags::empty(),
                             query_type: vk::QueryType::RESULT_STATUS_ONLY_KHR,
-                            query_count: (max_frames as u32).max(1),
+                            // One query per decoded AU (index = au count - 1);
+                            // size the pool for the full AU budget (including
+                            // the reorder margin) and round up for safety.
+                            query_count: ((au_budget as u32) + 3) & !3u32,
                             pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
                             _marker: Default::default(),
                         },
@@ -676,7 +696,10 @@ impl VideoDecoder {
                             p_next: &profile_info as *const _ as *const _,
                             flags: vk::QueryPoolCreateFlags::empty(),
                             query_type: vk::QueryType::RESULT_STATUS_ONLY_KHR,
-                            query_count: (max_frames as u32).max(1),
+                            // One query per decoded AU (index = au count - 1);
+                            // size the pool for the full AU budget (including
+                            // the reorder margin) and round up for safety.
+                            query_count: ((au_budget as u32) + 3) & !3u32,
                             pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
                             _marker: Default::default(),
                         },
@@ -695,7 +718,7 @@ impl VideoDecoder {
                     self.handle_inband_parameter_set(ps)?;
                 }
                 ExtractedItem::AccessUnit(au) => {
-                    if access_unit_count >= max_frames {
+                    if access_unit_count >= au_budget {
                         break;
                     }
                     access_unit_count += 1;
@@ -834,6 +857,21 @@ impl VideoDecoder {
                             .unwrap_or(0)
                     };
 
+                    if super::vacc_debug() {
+                        let valid = self.dpb_manager
+                            .entries
+                            .iter()
+                            .filter(|e| e.is_valid)
+                            .count();
+                        eprintln!(
+                            "[H264-SLOT] au#{} poc={} slot={} valid={}",
+                            access_unit_count - 1,
+                            au.pic_order_cnt[0],
+                            output_slot,
+                            valid
+                        );
+                    }
+
                     let output_view = self.dpb_views[output_slot as usize];
                     let output_img = self.dpb_images[output_slot as usize];
 
@@ -947,6 +985,9 @@ impl VideoDecoder {
             }
         }
 
+        // Present in display order and drop the out-of-window margin frames.
+        let mut frames = Self::reorder_to_presentation(frames);
+        frames.truncate(max_frames);
         Ok(frames)
     }
     /// Updates cached parameter sets and calls vkUpdateVideoSessionParametersKHR.
@@ -2729,8 +2770,8 @@ impl VideoDecoder {
 
             self.vulkan
                 .device
-                .wait_for_fences(&[self.fence], true, 10_000_000_000)
-                .map_err(|e| VideoError::FenceWait(e.to_string()))?;
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| VideoError::FenceWait(format!("decode fence wait: {e:?}")))?;
         }
 
         Ok(())
@@ -4127,7 +4168,9 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
 
     // The Vulkan VP9 decode profile only supports Y'CbCr 4:2:0. Reject
     // 4:4:4 / 4:2:2 (and RGB) streams instead of silently downconverting.
-    if subsampling_x != 1 || subsampling_y != 1 {
+    if (subsampling_x != 1 || subsampling_y != 1)
+        && std::env::var("VACC_ALLOW_VP9_444").is_err()
+    {
         return Err(VideoError::DecoderInit(format!(
             "VP9 chroma subsampling {}x{} not supported by Vulkan decode (4:2:0 only)",
             subsampling_x, subsampling_y

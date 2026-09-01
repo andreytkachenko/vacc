@@ -60,17 +60,19 @@ use crate::vp9_qlookup::{VP9_AC_QLOOKUP, VP9_DC_QLOOKUP};
 /// This is required for export_prime to work on NVIDIA GPUs.
 #[derive(Clone, Copy, Default)]
 struct DmaBufSurfaceDescriptor {
-    /// 8-bit HEVC Rext 4:4:4 (Main444) on iHD: the driver only decodes into
-    /// packed XYUV (VUYX) surfaces. FFmpeg creates them with
-    /// VASurfaceAttribPixelFormat='XYUV' + MemoryType=VA; any other layout
-    /// (444P, DRM prime) makes vaEndPicture fail with INVALID_PARAMETER.
-    xyuv444: bool,
+    /// Explicit surface pixel format (fourcc). When set, the surface is
+    /// allocated with VA memory (not DRM prime) carrying a
+    /// VASurfaceAttribPixelFormat attribute. iHD only decodes chroma-rich
+    /// content (8-bit HEVC Rext 4:4:4, H.264 4:2:2) into these explicit
+    /// layouts; any other layout (DRM prime default, planar) makes
+    /// vaEndPicture fail with INVALID_PARAMETER.
+    pixel_format: Option<u32>,
 }
 
 impl libva::SurfaceMemoryDescriptor for DmaBufSurfaceDescriptor {
     fn add_attrs(&mut self, attrs: &mut Vec<libva::VASurfaceAttrib>) -> Option<Box<dyn std::any::Any>> {
-        if self.xyuv444 {
-            attrs.push(libva::VASurfaceAttrib::new_pixel_format(u32::from_ne_bytes(*b"XYUV")));
+        if let Some(fourcc) = self.pixel_format {
+            attrs.push(libva::VASurfaceAttrib::new_pixel_format(fourcc));
             attrs.push(libva::VASurfaceAttrib::new_memory_type(libva::MemoryType::Va));
             return None;
         }
@@ -93,6 +95,7 @@ impl libva::SurfaceMemoryDescriptor for DmaBufSurfaceDescriptor {
 fn rt_format_to_fourcc(rt_format: u32) -> Option<u32> {
     match rt_format {
         libva::VA_RT_FORMAT_YUV444 => Some(0x56555958), // XYUV
+        libva::VA_RT_FORMAT_YUV422 => Some(0x59565955), // UYVY
         _ => None,
     }
 }
@@ -172,7 +175,7 @@ fn h264_slice_type_to_vaapi(slice_type: u32) -> u8 {
     }
 }
 
-/// TEMP DEBUG (VACC_VA_DUMP=1): dump the exact VAPictureParameterBufferH264.
+/// Debug dump of the exact VAPictureParameterBufferH264 (set `VACC_VA_DUMP=1`).
 fn dump_va_pic(p: &PictureParameterBufferH264) {
     let pp = p.inner();
     let cp = &pp.CurrPic;
@@ -192,7 +195,7 @@ fn dump_va_pic(p: &PictureParameterBufferH264) {
     }
 }
 
-/// TEMP DEBUG (VACC_VA_DUMP=1): dump the exact VASliceParameterBufferH264.
+/// Debug dump of the exact VASliceParameterBufferH264 (set `VACC_VA_DUMP=1`).
 fn dump_va_slice(s: &SliceParameterBufferH264) {
     for sp in s.inner().iter() {
         let n0 = sp.num_ref_idx_l0_active_minus1 as usize + 1;
@@ -475,23 +478,67 @@ impl VaapiDecoder {
             type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
             value: stream.rt_format,
         }];
-        let config = display.create_config(
+        let mut config = display.create_config(
             cfg_attrs,
             stream.profile,
             libva::VAEntrypoint::VAEntrypointVLD,
         ).map_err(|e| Error::DecoderInit(e.to_string()))?;
 
+        // iHD (Gen12/MTL) accepts an H.264 config with RTFormat=YUV422 but its
+        // AVC decode pipeline only produces NV12, so 4:2:2 content fails at
+        // vaEndPicture with INVALID_PARAMETER. The surface pixfmts the driver
+        // offers for the config reveal this: reject early with a clear message
+        // instead of failing mid-decode.
+        if stream.codec == CoreVideoCodec::DecodeH264
+            && stream.rt_format == libva::VA_RT_FORMAT_YUV422
+        {
+            let pixfmts: Vec<u32> = config
+                .query_surface_attributes_by_type(
+                    libva::VASurfaceAttribType::VASurfaceAttribPixelFormat,
+                )
+                .map(|v| {
+                    v.into_iter()
+                        .map(|g| match g {
+                            libva::GenericValue::Integer(x) => x as u32,
+                            _ => 0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            const FOURCC_UYVY: u32 = 0x59565955;
+            const FOURCC_VYUY: u32 = 0x59555956;
+            if !pixfmts.iter().any(|&f| f == FOURCC_UYVY || f == FOURCC_VYUY) {
+                return Err(Error::DecoderInit(format!(
+                    "HW does not support H.264 4:2:2 decode on this VAAPI driver (config accepted RTFormat=YUV422 but offers no 4:2:2 surface pixfmt; got {} pixfmts)",
+                    pixfmts.len()
+                )));
+            }
+        }
+
         // Create surfaces (DPB + extra for rendering). The pool must hold every
         // DPB reference plus the picture currently being decoded, so keep +4
         // slack beyond the SPS max_num_ref_frames.
         let num_surfaces = (stream.max_dpb as usize).max(4) + 4;
-        // iHD HEVC Main444 (8-bit Rext 4:4:4) requires packed XYUV surfaces
-        // (see DmaBufSurfaceDescriptor); all other streams keep the prime path.
-        let xyuv444 = stream.h265_sps.as_ref().map_or(false, |sps| {
-            sps.profile_idc >= 4 && sps.chroma_format_idc == 3 && sps.bit_depth_luma_minus8 == 0
-        });
+        // iHD decodes chroma-rich content only into explicit surface layouts
+        // (see DmaBufSurfaceDescriptor): 8-bit HEVC Rext 4:4:4 -> packed XYUV;
+        // H.264 4:2:2 -> UYVY (only reached on drivers that actually support
+        // it; iHD is rejected earlier via the surface-pixfmt check). All other
+        // streams keep the prime path.
+        let pixel_format = if stream
+            .h265_sps
+            .as_ref()
+            .map_or(false, |sps| {
+                sps.profile_idc >= 4 && sps.chroma_format_idc == 3 && sps.bit_depth_luma_minus8 == 0
+            }) {
+            Some(u32::from_ne_bytes(*b"XYUV"))
+        } else if stream.codec == CoreVideoCodec::DecodeH264 && stream.rt_format == libva::VA_RT_FORMAT_YUV422
+        {
+            Some(0x59565955) // UYVY
+        } else {
+            None
+        };
         let descriptors: Vec<DmaBufSurfaceDescriptor> =
-            (0..num_surfaces).map(|_| DmaBufSurfaceDescriptor { xyuv444 }).collect();
+            (0..num_surfaces).map(|_| DmaBufSurfaceDescriptor { pixel_format }).collect();
 
          let surfaces = display.create_surfaces::<DmaBufSurfaceDescriptor>(
             stream.rt_format,
@@ -942,41 +989,9 @@ impl VaapiDecoder {
             if slice_data.last() == Some(&0) {
                 slice_data.pop();
             }
-            // TEMP EXPERIMENT: zero out slice data to test if driver reads it
-            if std::env::var("EXP_ZERO_SLICE").is_ok() {
-                for b in slice_data.iter_mut() { *b = 0; }
-            }
-            let hbs_debug = slice_header_opt
+            let hbs = slice_header_opt
                 .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.header_bit_size), _ => None });
-            let mut slice_data_bit_offset = hbs_debug.map(|h| h + 8).unwrap_or(0);
-            // TEMP EXPERIMENT: override bit offset
-            if let Ok(v) = std::env::var("EXP_BIT_OFF") {
-                if let Ok(n) = v.parse::<u16>() { slice_data_bit_offset = n; }
-            }
-            // TEMP EXPERIMENT: override for non-IDR slices only (IDR keeps hbs+8)
-            if let Ok(v) = std::env::var("EXP_BIT_OFF_NONIDR") {
-                let is_idr = slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.nal_unit_type), _ => None })
-                    == Some(5);
-                if !is_idr {
-                    if let Ok(n) = v.parse::<u16>() { slice_data_bit_offset = n; }
-                }
-            }
-            if std::env::var("DBG_H264").is_ok() {
-                eprintln!("[DBG-HBS] fn={} header_bit_size={:?} nal_len={}",
-                    frame_num, hbs_debug, slice_info.nal_data.len());
-            }
-
-            if std::env::var("DBG_H264").is_ok() {
-                let (st_, qp_d, fmb) = slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some((h.slice_type % 5, h.slice_qp_delta, h.first_mb_in_slice)), _ => None })
-                    .unwrap_or((0, 0, 0));
-                eprintln!("[DBG-SLICE] sid={} fn={} st={} pic_init_qp={} qp_delta={} first_mb={} data_len={} bit_off={} l0={} l1={} first8={:02x?}",
-                    surface_id, frame_num, st_, pps.pic_init_qp_minus26, qp_d, fmb,
-                    slice_data.len(), slice_data_bit_offset,
-                    num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1,
-                    &slice_data[..slice_data.len().min(8)]);
-            }
+            let slice_data_bit_offset = hbs.map(|h| h + 8).unwrap_or(0);
 
             // Build slice parameter buffer for this slice
 
@@ -1128,7 +1143,7 @@ impl VaapiDecoder {
         // Sync to ensure completion
         let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
             .sync()
-             .map_err(|e| Error::VaApi(e.0.to_string()))?;
+            .map_err(|e| Error::VaApi(e.0.to_string()))?;
 
         // Mark surface as ready
         self.surface_pool.mark_ready(surface_idx);
@@ -1969,7 +1984,7 @@ impl VaapiDecoder {
 
             let long_slice_flags = HevcLongSliceFlags::new(
                 is_last as u32,                       // last_slice_of_pic
-                0,                                     // dependent_slice_segment_flag
+                sh.dependent_slice_segment_flag as u32, // dependent_slice_segment_flag
                 match sh.slice_type { 0 => 2, 1 => 1, 2 => 0, n => n } as u32, // slice_type: VA wants de-facto ue values (B=0,P=1,I=2), not our 0=I/1=P/2=B convention
                 sh.colour_plane_id as u32,             // color_plane_id
                 sh.slice_sao_luma_flag as u32,
@@ -2435,8 +2450,8 @@ fn read_from_image(
 /// Read a P010/P012 VA image at native bit depth: planar Y/U/V with 16-bit
 /// samples right-aligned to the content bit depth (left-aligned in the
 /// surface). Matches the NVDEC P016 readback convention and ffmpeg's
-/// yuv420p10le/yuv420p12le rawvideo layout. Plane `width` is in BYTES per
-/// row (2 bytes per sample) so generic byte-row writers work unchanged.
+/// yuv420p10le/yuv420p12le rawvideo layout. Plane `width` is in samples,
+/// `pitch` in bytes (2 bytes per sample).
 fn read_from_image_p01x_native(
     image: Image,
     display_width: u32,
@@ -2513,19 +2528,19 @@ fn read_from_image_p01x_native(
         y: PixelPlane {
             data: out.as_ptr(),
             pitch: out_width * 2,
-            width: out_width * 2,
+            width: out_width,
             height: out_height,
         },
         u: PixelPlane {
             data: unsafe { out.as_ptr().add(y_samples * 2) },
             pitch: uv_width * 2,
-            width: uv_width * 2,
+            width: uv_width,
             height: uv_height,
         },
         v: Some(PixelPlane {
             data: unsafe { out.as_ptr().add((y_samples + uv_samples) * 2) },
             pitch: uv_width * 2,
-            width: uv_width * 2,
+            width: uv_width,
             height: uv_height,
         }),
         buffer: out,
@@ -3481,13 +3496,10 @@ impl VaapiDecoder {
                 .ok_or_else(|| Error::InvalidState("show-existing-frame: slot has no surface".to_string()))?;
             let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
             self.surface_pool.sync_surface(pool_idx)?;
-            let pixel_data = read_surface_pixels(
+            let pixel_data = read_output_surface_pixels(
                 &surface,
-                self.stream.width,
-                self.stream.height,
-                self.stream.display_width,
-                self.stream.display_height,
-                &[self.vp9_image_fourcc()],
+                &self.stream,
+                self.vp9_image_fourcc(),
             )?;
             let mut frame = DecodedFrame::new(
                 self.frame_count,
@@ -3598,13 +3610,10 @@ impl VaapiDecoder {
         }
 
         self.surface_pool.sync_surface(pool_idx)?;
-        let pixel_data = read_surface_pixels(
+        let pixel_data = read_output_surface_pixels(
             &surface,
-            self.stream.width,
-            self.stream.height,
-            self.stream.display_width,
-            self.stream.display_height,
-            &[self.vp9_image_fourcc()],
+            &self.stream,
+            self.vp9_image_fourcc(),
         )?;
 
         let mut frame = DecodedFrame::new(
@@ -3630,10 +3639,11 @@ fn av1_image_fourcc(stream: &StreamInfo) -> u32 {
     }
 }
 
-/// Read AV1 output pixels from a surface. 8-bit uses the shared NV12 path;
-/// 10/12-bit read back natively (P010/P012) so no precision is lost in the
-/// driver's down-convert.
-fn read_av1_surface_pixels(
+/// Read decoded output pixels from a surface. P010/P012 fourccs are read
+/// back at native bit depth (planar u16, bottom-justified) so no precision
+/// is lost in the driver's 8-bit down-convert; everything else uses the
+/// shared 8-bit / P016 path.
+fn read_output_surface_pixels(
     surface: &Surface<DmaBufSurfaceDescriptor>,
     stream: &StreamInfo,
     fourcc: u32,
@@ -3761,7 +3771,7 @@ impl VaapiDecoder {
             let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
             self.surface_pool.sync_surface(pool_idx)?;
             let pixel_data =
-                read_av1_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
+                read_output_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
             let mut frame = DecodedFrame::new(
                 self.frame_count,
                 timestamp as i64,
@@ -3912,7 +3922,7 @@ impl VaapiDecoder {
 
         self.surface_pool.sync_surface(pool_idx)?;
         let pixel_data =
-            read_av1_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
+            read_output_surface_pixels(&surface, &self.stream, av1_image_fourcc(&self.stream))?;
         let mut frame = DecodedFrame::new(
             self.frame_count,
             timestamp as i64,

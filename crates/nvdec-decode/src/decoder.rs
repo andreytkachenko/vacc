@@ -674,6 +674,33 @@ impl NvdecH264Decoder {
         let display_width = (display_right - display_left) as u32;
         let display_height = (display_bottom - display_top) as u32;
 
+        // Pre-check driver capabilities so unsupported streams (e.g. H.264
+        // High 10-bit or 4:2:2/4:4:4 on GPUs whose NVDEC only does 8-bit
+        // 4:2:0) fail with a clear message instead of an opaque cuvid 801.
+        let chroma_fmt = match sps.chroma_format_idc {
+            0 => cudaVideoChromaFormat::cudaVideoChromaFormat_Monochrome,
+            2 => cudaVideoChromaFormat::cudaVideoChromaFormat_422,
+            3 => cudaVideoChromaFormat::cudaVideoChromaFormat_444,
+            _ => cudaVideoChromaFormat::cudaVideoChromaFormat_420,
+        };
+        let caps = crate::device::query_decoder_caps(
+            cudaVideoCodec::cudaVideoCodec_H264,
+            chroma_fmt,
+            sps.bit_depth_luma_minus8 as u32,
+        )?;
+        if caps.bIsSupported == 0 {
+            let chroma_name = match chroma_fmt {
+                cudaVideoChromaFormat::cudaVideoChromaFormat_Monochrome => "4:0:0",
+                cudaVideoChromaFormat::cudaVideoChromaFormat_422 => "4:2:2",
+                cudaVideoChromaFormat::cudaVideoChromaFormat_444 => "4:4:4",
+                _ => "4:2:0",
+            };
+            return Err(NvdecError::DecoderCreationFailed(format!(
+                "HW does not support H.264 {}-bit {} decode on this NVDEC device (cuvidGetDecoderCaps reports unsupported)",
+                8 + sps.bit_depth_luma_minus8, chroma_name,
+            )));
+        }
+
         let output_format = if sps.bit_depth_luma_minus8 > 0 {
             cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_P016
         } else {
@@ -998,6 +1025,10 @@ impl NvdecH264Decoder {
         let display_width = info.display_size.width as usize;
         let display_height = info.display_size.height as usize;
 
+        // 10-bit content decodes into P016 surfaces (2 bytes per sample,
+        // left-justified values); 8-bit uses NV12.
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+
         let funcs = match get_funcs() {
             Ok(f) => f,
             Err(_) => return None,
@@ -1044,8 +1075,8 @@ impl NvdecH264Decoder {
 
         // Get (or grow) the cached pinned host buffer. One contiguous block
         // holds both the Y plane and the interleaved UV plane.
-        let y_size = display_width * display_height;
-        let interleaved_uv_size = display_width * (display_height / 2);
+        let y_size = display_width * display_height * bps;
+        let interleaved_uv_size = display_width * (display_height / 2) * bps;
         let total = y_size + interleaved_uv_size;
         let pinned_base = {
             let mut cache = self.pinned_cache.lock().unwrap();
@@ -1073,7 +1104,7 @@ impl NvdecH264Decoder {
 
         // Copy the Y plane with a single 2D memcpy (accounts for cropping).
         let mut copy_y = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: (crop_left as usize * bps) as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1088,8 +1119,8 @@ impl NvdecH264Decoder {
             dstHost: pinned_y,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: (display_width * bps) as u64,
+            WidthInBytes: (display_width * bps) as u64,
             Height: display_height as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_y) } {
@@ -1105,7 +1136,7 @@ impl NvdecH264Decoder {
         // a single 2D memcpy. UV rows start after `coded_height` Y rows.
         let coded_height = info.coded_size.height as u64;
         let mut copy_uv = CUDA_MEMCPY2D {
-            srcXInBytes: crop_left as u64,
+            srcXInBytes: (crop_left as usize * bps) as u64,
             srcY: coded_height + (crop_top as u64) / 2,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
             _reserved0: 0,
@@ -1120,8 +1151,8 @@ impl NvdecH264Decoder {
             dstHost: pinned_uv,
             dstDevice: 0,
             dstArray: 0,
-            dstPitch: display_width as u64,
-            WidthInBytes: display_width as u64,
+            dstPitch: (display_width * bps) as u64,
+            WidthInBytes: (display_width * bps) as u64,
             Height: (display_height / 2) as u64,
         };
         match unsafe { cu_memcpy_2d(&copy_uv) } {
@@ -1149,16 +1180,18 @@ impl NvdecH264Decoder {
             );
         }
 
-        // De-interleave NV12 UV to planar U and V
-        let uv_size = (display_width / 2) * (display_height / 2);
+        // De-interleave NV12/P016 UV to planar U and V (byte-based).
+        let uv_size = (display_width / 2) * (display_height / 2) * bps;
         let mut u_plane = vec![0u8; uv_size];
         let mut v_plane = vec![0u8; uv_size];
         for y in 0..(display_height / 2) {
             for x in 0..(display_width / 2) {
-                let src_idx = y * display_width + x * 2;
-                let dst_idx = y * (display_width / 2) + x;
-                u_plane[dst_idx] = interleaved_uv[src_idx];
-                v_plane[dst_idx] = interleaved_uv[src_idx + 1];
+                let src_idx = (y * display_width + x * 2) * bps;
+                let dst_idx = (y * (display_width / 2) + x) * bps;
+                u_plane[dst_idx..dst_idx + bps]
+                    .copy_from_slice(&interleaved_uv[src_idx..src_idx + bps]);
+                v_plane[dst_idx..dst_idx + bps]
+                    .copy_from_slice(&interleaved_uv[src_idx + bps..src_idx + 2 * bps]);
             }
         }
 
@@ -1173,22 +1206,24 @@ impl NvdecH264Decoder {
         let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
 
         let pixel_data = Some(PixelData {
-            format: "I420".to_string(),
+            // P016 samples stay left-justified (top-justified 10-bit in u16);
+            // the consumer normalizes to bottom-justified for bps=2 formats.
+            format: if bps == 2 { "I420_16BIT".to_string() } else { "I420".to_string() },
             y: PixelPlane {
                 data: y_ptr,
-                pitch: display_width,
+                pitch: display_width * bps,
                 width: display_width,
                 height: display_height,
             },
             u: PixelPlane {
                 data: u_ptr,
-                pitch: display_width / 2,
+                pitch: display_width / 2 * bps,
                 width: display_width / 2,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
                 data: v_ptr,
-                pitch: display_width / 2,
+                pitch: display_width / 2 * bps,
                 width: display_width / 2,
                 height: display_height / 2,
             }),

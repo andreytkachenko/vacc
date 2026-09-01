@@ -156,17 +156,12 @@ impl VideoDeviceBuilder {
     }
 
     pub fn build(self) -> VideoResult<VulkanDevice> {
-        eprintln!("[VideoDeviceBuilder] Creating entry...");
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
-        eprintln!("[VideoDeviceBuilder] Creating instance...");
         let (instance, has_validation) = Self::create_instance(&entry, &self)?;
-        eprintln!("[VideoDeviceBuilder] Selecting physical device...");
         let (physical_device, queue_families) = Self::select_physical_device(&instance, &self)?;
-        eprintln!("[VideoDeviceBuilder] Creating device...");
         let (device, enabled_extensions) =
             Self::create_device(&entry, &instance, &physical_device, &queue_families, &self)?;
-        eprintln!("[VideoDeviceBuilder] Getting memory properties...");
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         if std::env::var("VACC_DEBUG").is_ok() {
@@ -398,12 +393,12 @@ impl VideoDeviceBuilder {
         }
 
         // Find a physical device with video decode support
+        let diag = std::env::var("VACC_DEV_DIAG").is_ok();
         for &pd in &candidates {
             let queue_families_list =
                 unsafe { instance.get_physical_device_queue_family_properties(pd) };
 
-            // TEMP DIAGNOSTIC (iteration 5): which device, and does it have AV1?
-            {
+            if diag {
                 let props = unsafe { instance.get_physical_device_properties(pd) };
                 let name: String = props
                     .device_name
@@ -455,14 +450,16 @@ impl VideoDeviceBuilder {
             }
 
             if let Some(decode_qf) = decode_queue_family {
-                let props = unsafe { instance.get_physical_device_properties(pd) };
-                let name: String = props
-                    .device_name
-                    .iter()
-                    .take_while(|&&b| b != 0)
-                    .map(|b| *b as u8 as char)
-                    .collect();
-                eprintln!("[DEV-DIAG] SELECTED: {}", name);
+                if diag {
+                    let props = unsafe { instance.get_physical_device_properties(pd) };
+                    let name: String = props
+                        .device_name
+                        .iter()
+                        .take_while(|&&b| b != 0)
+                        .map(|b| *b as u8 as char)
+                        .collect();
+                    eprintln!("[DEV-DIAG] SELECTED: {}", name);
+                }
                 let queue_families = QueueFamilies {
                     graphics: graphics_queue_family,
                     compute: None,
@@ -506,10 +503,12 @@ impl VideoDeviceBuilder {
             })
             .collect();
 
-        eprintln!("[VideoDeviceBuilder] Available video extensions:");
-        for name in &available_names {
-            if name.contains("video") {
-                eprintln!("  - {}", name);
+        if std::env::var("VACC_DEV_DIAG").is_ok() {
+            eprintln!("[VideoDeviceBuilder] Available video extensions:");
+            for name in &available_names {
+                if name.contains("video") {
+                    eprintln!("  - {}", name);
+                }
             }
         }
 

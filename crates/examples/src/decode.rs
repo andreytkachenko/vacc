@@ -14,7 +14,7 @@
 //!   presentation-order frame index on an assumed 1/30 s timebase.
 //!
 //! Usage:
-//!   cargo run --release -p examples --example decode -- -b <backend> -i <file> [-n max_frames]
+//!   cargo run --release -p examples --example decode -- -b <backend> -i <file> [-n max_frames] [-o outdir]
 //!
 //! Backends: vaapi (H.264/H.265/VP9), vulkan (H.264/H.265/VP9/AV1),
 //! nvdec (H.264/H.265/VP9/AV1, requires an NVIDIA GPU).
@@ -70,6 +70,7 @@ struct Args {
     backend: Backend,
     input: String,
     max_frames: usize,
+    out_dir: Option<String>,
 }
 
 /// Upper bound used when the user does not pass -n. Large enough for any
@@ -88,7 +89,9 @@ fn usage() -> ! {
            -b, --backend <vaapi|vulkan|nvdec>   decode backend (required)\n\
            -i, --input <file>                   input file (required; IVF for VP9/AV1,\n\
                                                 raw Annex-B .h264/.h265 or .vp9 also accepted)\n\
-           -n, --max-frames <N>                 stop after N display frames (default: all)"
+           -n, --max-frames <N>                 stop after N display frames (default: all)\n\
+           -o, --out <dir>                      also write each frame's canonical planar YUV\n\
+                                                as <input_stem>__frame_<i>.yuv into <dir>"
     );
     std::process::exit(1);
 }
@@ -102,6 +105,7 @@ fn parse_args() -> Args {
     let mut backend = None;
     let mut input = None;
     let mut max_frames = MAX_FRAMES_DEFAULT;
+    let mut out_dir = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -123,6 +127,7 @@ fn parse_args() -> Args {
                 let value = args.next().unwrap_or_else(|| usage());
                 max_frames = value.parse().unwrap_or_else(|_| die(&format!("invalid -n value: {}", value)));
             }
+            "-o" | "--out" => out_dir = args.next(),
             "-h" | "--help" => usage(),
             other => die(&format!("unknown argument: {}", other)),
         }
@@ -132,6 +137,7 @@ fn parse_args() -> Args {
         backend: backend.unwrap_or_else(|| usage()),
         input: input.unwrap_or_else(|| usage()),
         max_frames,
+        out_dir,
     }
 }
 
@@ -429,18 +435,18 @@ fn copy_plane(out: &mut Vec<u8>, plane: &PixelPlane, bps: usize, top_justified: 
 /// Normalize a backend `PixelData` to canonical planar Y+U+V bytes:
 /// - semi-planar (NV12/P016, `v == None`): de-interleave U/V;
 /// - YV12: the u/v fields are swapped relative to I420;
-/// - 16-bit samples (P016 / *_16BIT) are always 10-bit content and are
-///   top-justified by both NVIDIA and iHD (value << 6); shift them to the
-///   bottom-justified yuv420p10le layout (matching ffmpeg);
+/// - 16-bit samples: cuvid P016 and iHD P016 surfaces store 10-bit values
+///   top-justified (value << 6) — shift to bottom-justified (matching
+///   ffmpeg's yuv420p10le layout); the `*_LE` / Y410P16 formats are already
+///   bottom-justified;
 /// - GRAY: luma only.
 fn canonical_core(pd: &PixelData) -> Vec<u8> {
-    let bps = if matches!(pd.format.as_str(), "P016" | "Y410P16") || pd.format.ends_with("_16BIT") {
-        2
-    } else {
-        1
+    // (bytes per sample, top-justified?)
+    let (bps, top_justified) = match pd.format.as_str() {
+        "P016" | "I420_16BIT" | "GRAY_16BIT" | "YUV444_16BIT" => (2, true),
+        "Y410P16" | "P010LE" | "P012LE" => (2, false),
+        _ => (1, false),
     };
-    // Every bps=2 core format carries top-justified 10-bit P016 samples.
-    let top_justified = bps == 2;
 
     let mut out = Vec::with_capacity(pd.buffer.len());
     copy_plane(&mut out, &pd.y, bps, top_justified);
@@ -598,9 +604,11 @@ fn main() {
         Some(ivf) => ivf.codec,
         None => detect_codec(&data, &args.input),
     };
-    if args.backend == Backend::Vaapi && codec == Codec::Av1 {
-        die("vaapi backend does not support AV1 (use vulkan or nvdec)");
-    }
+
+    let out_dir = args.out_dir.as_ref().map(|d| {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| die(&format!("cannot create {}: {}", d, e)));
+        std::path::PathBuf::from(d)
+    });
 
     let pts_table = ivf.as_ref().map(|i| ivf_display_pts(i)).unwrap_or_default();
 
@@ -692,14 +700,21 @@ fn main() {
         };
 
         match frame.canonical_pixels() {
-            Some(pixels) => println!(
-                "frame {}: pts={}ms size={}x{} hash={:016x}",
-                i,
-                fmt_ms(pts_ms),
-                w,
-                h,
-                fnv1a64(&pixels)
-            ),
+            Some(pixels) => {
+                if let Some(dir) = &out_dir {
+                    let stem = std::path::Path::new(&args.input).file_stem().unwrap().to_string_lossy();
+                    let path = dir.join(format!("{}__frame_{}.yuv", stem, i));
+                    std::fs::write(&path, &pixels).unwrap_or_else(|e| die(&format!("cannot write {}: {}", path.display(), e)));
+                }
+                println!(
+                    "frame {}: pts={}ms size={}x{} hash={:016x}",
+                    i,
+                    fmt_ms(pts_ms),
+                    w,
+                    h,
+                    fnv1a64(&pixels)
+                );
+            }
             None => println!("frame {}: pts={}ms size={}x{} hash=- (no pixel data)", i, fmt_ms(pts_ms), w, h),
         }
     }

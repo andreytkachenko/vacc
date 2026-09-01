@@ -712,6 +712,11 @@ pub fn extract_all_access_units(
 
         if is_slice {
             let is_new_frame;
+            // Set when the H.265 slice-header parse already handled a new
+            // frame (pushed the previous AU and filled real fields), so the
+            // NAL-type heuristic fallback below is skipped instead of
+            // double-running (double frame_num increment, field overwrites).
+            let mut h265_frame_handled = false;
 
             if codec == VideoCodec::H264 {
                 if let Some(H264OrH265Sps::H264(sps)) = sps {
@@ -919,9 +924,22 @@ pub fn extract_all_access_units(
                                 }
 
                                 in_frame = true;
+                                h265_frame_handled = true;
                             }
                         } else {
-                            is_new_frame = !in_frame || current_slice_offsets.is_empty() || is_irap;
+                            // parse_h265_slice_header returns None for
+                            // secondary slice segments (first_slice_segment_in_pic_flag
+                            // == 0) and for unparseable headers. Use the raw flag bit
+                            // (same test as the common parser) for grouping: a
+                            // secondary segment continues the current picture even
+                            // when its NAL type is IRAP — every segment of an IRAP
+                            // picture carries an IRAP NAL type, so keying on is_irap
+                            // would split one picture into one AU per segment.
+                            let first_slice_segment =
+                                nal_data.len() >= 3 && ((nal_data[2] >> 7) & 1) == 1;
+                            is_new_frame = !in_frame
+                                || current_slice_offsets.is_empty()
+                                || first_slice_segment;
                         }
                     } else {
                         is_new_frame = !in_frame || current_slice_offsets.is_empty();
@@ -931,7 +949,7 @@ pub fn extract_all_access_units(
                 }
             }
 
-            if is_new_frame && codec != VideoCodec::H264 {
+            if is_new_frame && codec != VideoCodec::H264 && !h265_frame_handled {
                 if in_frame && !current_au_data.is_empty() {
                     items.push(ExtractedItem::AccessUnit(AccessUnit {
                         data: current_au_data.clone(),

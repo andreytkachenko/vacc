@@ -87,6 +87,10 @@ pub struct SliceHeaderInfo {
 
     /// slice_segment_address (0 for first slice segments).
     pub slice_segment_address: u32,
+    /// dependent_slice_segment_flag (non-first segments when PPS enables
+    /// dependent slice segments; 0 otherwise). Dependent segments inherit all
+    /// other slice-level parameters from the preceding segment.
+    pub dependent_slice_segment_flag: bool,
     /// pic_output_flag (only when PPS output_flag_present_flag; 1 otherwise).
     pub pic_output_flag: bool,
     /// colour_plane_id (only when SPS separate_colour_plane_flag).
@@ -187,6 +191,7 @@ impl SliceHeaderInfo {
             slice_temporal_mvp_enabled_flag: false,
             num_bits_for_strps_in_slice: 0,
             slice_segment_address: 0,
+            dependent_slice_segment_flag: false,
             pic_output_flag: true,
             colour_plane_id: 0,
             slice_sao_luma_flag: false,
@@ -1498,6 +1503,7 @@ impl H265Parser {
             } else {
                 false
             };
+            info.dependent_slice_segment_flag = dependent_slice_segment_flag;
 
             // slice_segment_address: CeilLog2(PicSizeInCtbsY) bits
             let log2_ctb_size = sps.log2_min_luma_coding_block_size_minus3 as u32
@@ -1513,13 +1519,23 @@ impl H265Parser {
 
             // For dependent slices, most info is inherited from first slice
             if dependent_slice_segment_flag {
-                // Copy info from previous slice header if available
+                // A dependent slice segment inherits EVERY slice-level
+                // parameter from the preceding slice segment (spec 7.3.8):
+                // only its slice_segment_address is coded. Clone the previous
+                // header wholesale — a chain of dependent segments all
+                // transitively inherit the independent segment's values —
+                // and apply the parsed address.
+                let addr = info.slice_segment_address;
+                let dependent = info.dependent_slice_segment_flag;
                 if let Some(ref prev_info) = self.first_slice_header {
-                    info.slice_type = prev_info.slice_type;
-                    info.pic_order_cnt_lsb = prev_info.pic_order_cnt_lsb;
-                    info.curr_pic_order_cnt_val = prev_info.curr_pic_order_cnt_val;
-                    info.is_reference = prev_info.is_reference;
+                    info = prev_info.clone();
                 }
+                info.slice_segment_address = addr;
+                info.dependent_slice_segment_flag = dependent;
+                // The dependent segment's own coded header is short (flag
+                // bits + pps_id + [dependent flag] + address): its CABAC data
+                // starts here, not at the first segment's longer header end.
+                info.header_bit_size = r.position() as u16;
                 return Ok(info);
             }
         }
@@ -2159,20 +2175,29 @@ impl VideoParser for H265Parser {
                     }
                     last_slice_end = Some(off + sz);
 
-                    // Parse the first slice header of this frame
+                    // Parse this slice segment's OWN header. Non-first segments
+                    // carry their own slice_segment_address and CABAC data
+                    // offset (and, unless dependent, full prediction
+                    // parameters) — drivers need per-slice values, not a clone
+                    // of the first segment's. The first segment's header is
+                    // kept separately as picture-level state.
+                    let parsed_header = self.parse_slice_segment_header(&nal_data, nal_type);
                     if self.first_slice_header.is_none() {
-                        if let Ok(slice_info) = self.parse_slice_segment_header(&nal_data, nal_type)
-                        {
-                            self.first_slice_header = Some(slice_info);
+                        if let Ok(info) = &parsed_header {
+                            self.first_slice_header = Some(info.clone());
                         }
                     }
-
-                    // Collect slice NAL data
-                    slice_nals.push(crate::SliceEntry {
-                        slice_header: self
+                    let header = match &parsed_header {
+                        Ok(info) => Some(crate::SliceHeader::H265(info.clone())),
+                        Err(_) => self
                             .first_slice_header
                             .clone()
                             .map(crate::SliceHeader::H265),
+                    };
+
+                    // Collect slice NAL data
+                    slice_nals.push(crate::SliceEntry {
+                        slice_header: header,
                         nal_data,
                     });
                     i += 1;

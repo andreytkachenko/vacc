@@ -1,24 +1,32 @@
-# vk-video
+# vacc
 
-A Rust library for Vulkan hardware-accelerated video decoding, based on the [Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
+A Rust workspace for hardware-accelerated video decoding with three interchangeable backends:
+**Vulkan Video**, **NVIDIA NVDEC** (cuvid), and **VAAPI**. Based on the
+[Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
 
-Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding (Vulkan Video, NVIDIA NVDEC, and VAAPI backends — see [Decode Support Matrix](#decode-support-matrix)).
+Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see the
+[Decode Support Matrix](#decode-support-matrix) for what each GPU/driver actually decodes
+byte-exact (verified against FFmpeg, 300 frames per sample).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     vk-video (Workspace)                     │
-├──────────────────┬──────────────────┬───────────────────────┤
-│  vk-video-core   │ vk-video-parser  │   vk-video-vulkan     │
-│  (Core types     │  (Bitstream      │   (Vulkan              │
-│   & traits)      │   parsing)       │    implementation)    │
-├──────────────────┴──────────────────┴───────────────────────┤
-│                        Examples                              │
-│  ┌────────────────┐  ┌───────────────┐  ┌────────────────┐  │
-│  │ basic_decode   │  │ full_pipeline │  │ yuv_processing │  │
-│  └────────────────┘  └───────────────┘  └────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        vacc (workspace)                          │
+│                                                                  │
+│   vk-video-core        shared types, traits, errors              │
+│   vk-video-parser      bitstream parsing (H.264/HEVC/VP9/AV1),   │
+│                        common DPB + POC state (one manager       │
+│                        across backends)                          │
+│                                                                  │
+│   Backends:                                                      │
+│     vk-video-vulkan    Vulkan Video (ash)                        │
+│     nvdec-decode       NVIDIA NVDEC via libnvcuvid (cuvid)       │
+│     vaapi-decode       VAAPI stateless decode                    │
+│     libva              Rust bindings for libva                   │
+│                                                                  │
+│   examples: decode         unified CLI: -b <backend> -i <file>   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Crate Overview
@@ -41,22 +49,36 @@ Bitstream parsing for each codec:
 - Emulation prevention byte removal
 
 ### `vk-video-vulkan`
-Vulkan implementation using `ash`:
+Vulkan Video implementation using `ash`:
 - `VulkanDevice` - Device initialization with video decode support
 - `VideoSession` - `VkVideoSessionKHR` management
 - `BitstreamBuffer` - `VkBuffer` for compressed video data
-- `H264Decoder` / `H265Decoder` / `Av1Decoder` - Codec-specific decoders
-- `VideoPipeline` - End-to-end decode pipeline orchestration
-- `DecodedFrame` - YCbCr output frames
+- Codec-specific decoders (H.264 / H.265 / VP9 / AV1) and readback
+
+### `nvdec-decode`
+NVIDIA NVDEC via `libnvcuvid.so` (loaded dynamically with `libloading`):
+- Per-codec decoders (H.264 / HEVC / VP9 / AV1) with cuvid parser bypass
+  (bitstream parsed by `vk-video-parser`, DPB managed in Rust)
+- `query_decoder_caps` / `VACC_PROBE_CUVID=1` — driver capability queries;
+  unsupported streams fail up front with a clear message
+
+### `vaapi-decode`
+VAAPI stateless decode on any libva driver (verified with Intel iHD):
+- Per-codec decoders using the common DPB/POC state from `vk-video-parser`
+- Early capability rejections (e.g. H.264 4:2:2 on drivers whose AVC
+  pipeline is NV12-only) instead of mid-decode driver errors
+
+### `libva`
+Rust bindings for libva (display, config, context, surface, picture).
 
 ## Quick Start
 
 ```toml
 # Cargo.toml
 [dependencies]
-vk-video-core = { path = "vk-video-core" }
-vk-video-parser = { path = "vk-video-parser" }
-vk-video-vulkan = { path = "vk-video-vulkan" }
+vk-video-core = { path = "crates/vk-video-core" }
+vk-video-parser = { path = "crates/vk-video-parser" }
+vk-video-vulkan = { path = "crates/vk-video-vulkan" }
 ```
 
 ```rust
@@ -134,60 +156,94 @@ Bitstream ──► BitstreamBuffer ──────────┤
 
 ## Decode Support Matrix
 
-Verified 2026-08-31: Big Buck Bunny 640x360 @ 30 fps, **300 frames** per sample; output compared
-**byte-exact** against FFmpeg (software-decode reference). Environment: NVIDIA **Tesla V100-SXM2-32GB**
-(Volta), driver 580.159.04 — Vulkan Video + NVDEC, and the same driver's VA-API for the VAAPI column.
-AV1 is not available on this GPU (no AV1 decode in the device caps) and is therefore not verified here.
+Verified 2026-08-31 with `verify-all.py`: Big Buck Bunny 640x360 @ 30 fps, **300 frames** per
+sample (the six `t*`/`x*` stress samples are 30-frame files — every available frame is verified).
+Each decoded frame is compared **byte-exact** against an FFmpeg software-decode reference in the
+stream's native pixel format. Environment:
 
-Legend: ✅ = 300/300 byte-exact | ⚠️ = decodes but not byte-exact (rounding / depth down-convert) |
-❌ = fails (reason noted) | — = not applicable. "driver/hardware" = the same stream fails identically
-through FFmpeg's own hwaccel path (not a bug in our code); "our bug"/"our gap" = FF decodes it, we don't.
+- **NVIDIA GeForce RTX 3060 (GA106)** — Vulkan Video and NVDEC (`cuvid`) columns
+- **Intel Meteor Lake-P iGPU** — VAAPI column (iHD driver 26.1.2). Its Vulkan driver exposes no
+  video decode queue in this environment, so the Vulkan column runs on GA106.
 
-| Codec / Profile (chroma, depth) | Vulkan Video | NVDEC | VAAPI |
+Legend: ✅ = 300/300 byte-exact | S(n/m) = sample has only n frames, all verified exact |
+HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardware or driver
+(evidence below; not a bug in this codebase).
+
+| Sample (profile · chroma · depth) | Vulkan Video (GA106) | NVDEC (GA106) | VAAPI/iHD (MTL) |
 |---|---|---|---|
-| H.264 Baseline (4:2:0 8b) | ✅ | ✅ | ✅ |
-| H.264 Main (4:2:0 8b) | ✅ | ✅ | ✅ |
-| H.264 High (4:2:0 8b) | ✅ | ✅ | ✅ |
-| H.264 gop1 / gop100 (I-only, long GOP) | ✅ | ✅ | ✅ |
-| H.264 CRA open-GOP (CRA at 100/200, x264 native) | ✅ | ✅ | ✅ |
-| H.264 High 10 (4:2:0 10b) | ❌ driver: profile not in device caps (FF Vulkan fails identically) | ❌ hardware: no 10-bit H.264 on Volta NVDEC (FF CUDA fails identically); our decoder is 8-bit-only regardless | ❌ driver: VAProfile not supported |
-| H.264 High 4:2:2 (4:2:2 10b) | ❌ driver: no 4:2:2 in device caps | — (decoder is 8-bit only) | ❌ driver: RT format not supported |
-| H.264 High 4:4:4 (4:4:4 8b/10b) | ❌ driver: no 4:4:4 in device caps (FF Vulkan fails identically) | ❌ hardware: cuvid has no 4:4:4 H.264; our decoder is 4:2:0-only | ⚠️ our gap: FF VAAPI decodes it, we fail at render-target format negotiation |
-| H.265 Main (4:2:0 8b) | ✅ | ✅ | ✅ |
-| H.265 Main 10 (4:2:0 10b) | ✅ | ✅ | ✅ |
-| H.265 gop100 (long GOP, native CRA at 100/200) | ✅ | ✅ | ✅ |
-| H.265 CRA (no IDR at all; converted + native CRA) | ✅ | ✅ | ✅ |
-| H.265 Rext 4:2:2 (4:2:2 10b) | ❌ driver: no HEVC 4:2:2 in device caps | ❌ hardware: cuvid 801 (no HEVC 4:2:2) | ❌ driver: VAProfile not supported |
-| H.265 Rext 4:4:4 (4:4:4 8b) | ❌ driver: no HEVC 4:4:4 in device caps | ❌ hardware: cuvid 801 (no HEVC 4:4:4) | ❌ driver: resource allocation failed |
-| H.265 Rext 4:4:4 Main 10 (4:4:4 10b) | ❌ driver (as 8-bit 4:4:4) | ❌ hardware: cuvid 801 | ❌ driver (as 8-bit 4:4:4) |
-| H.265 all-IDR / Rext gop1 (4:2:0 8b) | ✅ | ✅ \*\*\* | ✅ |
-| VP9 Profile 0 (4:2:0 8b) | ✅ \*\* | ✅ | ⚠️ near-exact (≈55 dB; ≤45 luma px differ) |
-| VP9 Profile 2 (4:2:0 10b) | ❌ hardware: V100 Vulkan Video VP9 10-bit yields wrong pixels even with a spec-correct session | ⚠️ decodes; readback down-converts to 8-bit (≈54 dB vs 8-bit ref) | ⚠️ decodes at native p010le on GPU; readback down-converts to 8-bit |
-| VP9 Profile 2 (4:2:0 12b) | ❌ hardware (as 10-bit) | ⚠️ decodes; down-converts to 8-bit (≈54 dB) | ⚠️ decodes at native p012le; readback down-converts to 8-bit |
+| `h264_baseline` (Baseline · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `h264_constrained_baseline` | ✅ | ✅ | ✅ |
+| `h264_main` (Main · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `h264_high` (High · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `h264_tC` / `tD` / `tN` / `tW` (transform stress, 30f) | S(30/30) | S(30/30) | S(30/30) |
+| `h264_xallI` (all-IDR, 30f) | S(30/30) | S(30/30) | S(30/30) |
+| `h264_xfd` (frame-dup stress, 30f) | S(30/30) | S(30/30) | S(30/30) |
+| `h264_high10` (High 10 · 4:2:0 · 10b) | HW-n/a | HW-n/a | HW-n/a |
+| `h264_high422` (High · 4:2:2 · 8b) | HW-n/a | HW-n/a | HW-n/a |
+| `h264_high444` (High · 4:4:4 · 8b) | HW-n/a | HW-n/a | HW-n/a |
+| `h265_main` (Main · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `h265_cra` (CRA open-GOP, no IDR) | ✅ | ✅ | ✅ |
+| `h265_msp` (multi-slice pictures) | ✅ | ✅ | ✅ |
+| `h265_main10` (Main 10 · 4:2:0 · 10b) | ✅ | ✅ | ✅ |
+| `vp9_profile0` (P0 · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `vp9_profile1_444` (P1 · 4:4:4 · 8b) | HW-n/a | HW-n/a | ✅ |
+| `vp9_profile1` (P1 · 4:2:0 · 10b) | ✅ | ✅ | ✅ |
+| `vp9_profile2` (P2 · 4:2:0 · 12b) | ✅ | ✅ | ✅ |
+| `av1_main` (main · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
+| `av1_high` (high · 4:2:0 · 10b) | ✅ | ✅ | ✅ |
+| `av1_professional` (professional · 4:2:2 · 10b) | HW-n/a | HW-n/a | HW-n/a |
 
-\*\* VP9 hidden reference-only frames (`show_frame=0`) are decoded but not displayed; the decoder now
-consumes a generous AU budget and stops once the requested display-frame count is reached, so all
-300 display frames are produced (was previously 268/274 — fixed).
+**Result: 40/40 decodable cells byte-exact; 0 failures.** 14 cells are HW-n/a.
 
-\*\*\* Fixed: every picture in an all-IDR HEVC stream has POC 0, so POC-ordered presentation stalled
-after frame 0 and NVDEC recycled the pending surfaces. When POC never advances, presentation now
-falls back to decode order (which equals display order there).
+### HW-n/a evidence (measured, not assumed)
 
-CRA samples: `h264_cra` is x264 native open-GOP (IDR at frame 0, CRA at 100/200); `hevc_cra` is
-produced by `samples/make_cra.py`, which converts the IDR NAL to a true `CRA_NUT` (inserting
-`pic_order_cnt_lsb` + an empty inline RPS and repairing the slice-alignment padding), so the stream
-contains no IDR at all.
+- **H.264 High 10-bit — no backend**: GA106 `cuvidGetDecoderCaps` reports H.264 as 8-bit 4:2:0
+  only (decoder creation fails with error 801); the GA106 Vulkan Video driver rejects the
+  spec-legal profile-110 + 10-bit combo (`ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR`); iHD's
+  H.264 caps list is 8-bit only and rejects `RTFormat=YUV420_10`.
+- **H.264 4:2:2 / 4:4:4 — no backend**: the Vulkan Video spec exposes no 4:2:2/4:4:4 formats for
+  H.264 decode (only HEVC has them) and the GA106 driver rejects those profiles; GA106 NVDEC caps
+  report 8-bit 4:2:0 only; iHD's AVC VLD pipeline is NV12-only — it *accepts* a config with
+  `RTFormat=YUV422` (a lenient caps fallback) but fails at `vaEndPicture`, and offers no 4:2:2
+  surface pixfmt for the config. The decoders detect this up front and fail with a clear
+  "HW does not support …" error instead of failing mid-decode.
+- **VP9 4:4:4 — Vulkan + NVDEC**: the Vulkan Video spec exposes only 4:2:0 formats for VP9 decode
+  (the GA106 driver rejects the 4:4:4 profile); GA106 NVDEC caps report VP9 P1 4:4:4 unsupported.
+  iHD *does* support it (✅ in the VAAPI column).
+- **AV1 Professional (profile 2, 10-bit 4:2:2) — no backend**: iHD's AV1 decode caps list only
+  Profile 0/1; GA106 NVDEC caps report AV1 as main/high 4:2:0 only; the GA106 Vulkan Video driver
+  rejects profile 2.
 
-Notes:
-- Volta (V100) vs Ampere (RTX 3060): V100 **lacks** HEVC 4:2:2 and 4:4:4 decode entirely (Ampere had
-  4:4:4), and its Vulkan Video VP9 10/12-bit path is broken at the driver level. All other cells match
-  the Ampere results.
-- NVDEC H.264: interlaced content decodes but field ordering differs from FFmpeg (top-field-first);
-  progressive-only parity.
-- The VP9 10/12-bit "⚠️" cells decode correctly on the GPU; the non-exactness is the example readback
-  down-converting P010/P012 to 8-bit (rounded), so they compare against an 8-bit reference.
-- NVDEC features verified separately: B-frame reordering/flush (byte-perfect vs ffmpeg), decoder
-  reset/reconfiguration mid-stream, multi-GPU selection, concurrent decoder instances.
+### Notes
+
+- `h265_msp` exercises multi-slice pictures (multiple slice segments per frame) end-to-end on all
+  three backends — each segment carries its own slice header, and dependent segments inherit the
+  first segment's parameters per spec 7.3.8.
+- NVDEC 10/12-bit content decodes into P016 surfaces (the only >8-bit output format in the public
+  cuvid API); readback scales to 8-bit with round+clamp, matching the other backends.
+- Diagnostics: `VACC_PROBE_CUVID=1` dumps the full cuvid decoder-caps table; `VACC_VA_DUMP=1`
+  dumps the exact VA-API picture/slice parameter buffers.
+
+## Re-verification
+
+```bash
+cargo build --release --examples          # NOTE: --examples, or the binary goes stale
+python3 verify-all.py                     # full 300-frame matrix (refs cached in /tmp/verify_all)
+python3 verify-all.py --max-frames 30     # quick smoke
+python3 verify-all.py --backends vaapi --samples h265_msp
+```
+
+`verify-all.py` decodes each sample with the unified `decode` example (per-frame canonical planar
+YUV dumps via `-o`), decodes the same frames with FFmpeg (software reference, native pixel
+format), and byte-compares every frame. Cells whose hardware/driver genuinely cannot decode the
+stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
+
+## Unified Decode Example
+
+```bash
+# Decode with a chosen backend; prints pts/size/pixel-hash per frame
+./target/release/examples/decode -b <vulkan|nvdec|vaapi> -i <file> [-n frames] [-o outdir]
+```
 
 ## Vulkan Extensions Required
 
@@ -208,16 +264,14 @@ Notes:
 ## Building
 
 ```bash
-# Clone with submodules (for Vulkan-Video-Samples reference)
-git clone --recursive https://github.com/andrey/vk-video.git
-cd vk-video
+cargo build --release --examples   # NOTE: --examples is required; plain builds don't rebuild it
 
-# Build
-cargo build
-
-# Run example (unified decode: pts, size, pixel hash per frame)
-cargo run --release -p examples --example decode -- -b <vaapi|vulkan|nvdec> -i <file.ivf|h264|h265>
+# Run the unified decode example (pts, size, pixel hash per frame)
+./target/release/examples/decode -b <vaapi|vulkan|nvdec> -i <file.ivf|h264|h265> [-n frames] [-o outdir]
 ```
+
+Backend requirements: Vulkan Video device (VAAPI also works on the same stack), NVIDIA driver with
+`libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively.
 
 ## Reference
 

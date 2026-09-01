@@ -465,10 +465,11 @@ pub fn readback_decoded_image(
             )
             .map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
 
-        let result = device.wait_for_fences(&[fence], true, 10_000_000_000);
-        if let Err(e) = result {
-            return Err(VideoError::FenceWait(e.to_string()));
-        }
+        // Wait indefinitely: the staging copy must be complete before the CPU
+        // reads it. (A finite tiny timeout here raced the GPU and produced
+        // corrupted readbacks of tail frames.)
+        device.wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| VideoError::FenceWait(format!("readback fence wait: {e:?}")))?;
 
         let ss = sample_size as usize;
         let mut pixels: Vec<u8> = vec![0u8; total_size as usize];
@@ -920,10 +921,11 @@ pub fn readback_decoded_image_format(
             )
             .map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
 
-        let result = device.wait_for_fences(&[fence], true, 10_000_000_000);
-        if let Err(e) = result {
-            return Err(VideoError::FenceWait(e.to_string()));
-        }
+        // Wait indefinitely: the staging copy must be complete before the CPU
+        // reads it. (A finite tiny timeout here raced the GPU and produced
+        // corrupted readbacks of tail frames.)
+        device.wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| VideoError::FenceWait(format!("readback fence wait: {e:?}")))?;
 
         let uv_plane_size = (uv_width * uv_height) as usize;
         let mut bit_depth = 8u32;

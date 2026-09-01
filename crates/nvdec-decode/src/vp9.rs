@@ -1126,7 +1126,7 @@ impl NvdecVp9Decoder {
         let u_ptr = unsafe { buffer.as_ptr().add(out_y_size) };
         let v_ptr = unsafe { buffer.as_ptr().add(out_y_size + uv_size) };
 
-        // width/pitch in bytes (tightly packed, so width == pitch).
+        // Tightly packed: pitch (bytes) == width (samples) * ss.
         let y_pitch = display_width * ss;
         let uv_pitch = (display_width / 2) * ss;
         let pixel_data = Some(PixelData {
@@ -1138,19 +1138,19 @@ impl NvdecVp9Decoder {
             y: PixelPlane {
                 data: y_ptr,
                 pitch: y_pitch,
-                width: y_pitch,
+                width: display_width,
                 height: display_height,
             },
             u: PixelPlane {
                 data: u_ptr,
                 pitch: uv_pitch,
-                width: uv_pitch,
+                width: display_width / 2,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
                 data: v_ptr,
                 pitch: uv_pitch,
-                width: uv_pitch,
+                width: display_width / 2,
                 height: display_height / 2,
             }),
             buffer,

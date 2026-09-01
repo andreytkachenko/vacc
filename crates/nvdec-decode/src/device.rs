@@ -442,7 +442,41 @@ pub fn init_nvdec() -> NvdecResult<()> {
             .map_err(|_| NvdecError::LibLoadError("NVDEC already initialized".to_string()))?;
     }
 
+    if std::env::var("VACC_PROBE_CUVID").is_ok() {
+        probe_cuvid_caps();
+    }
+
     Ok(())
+}
+
+/// Diagnostic (set `VACC_PROBE_CUVID=1`): dump cuvid decoder caps for the
+/// codec/chroma/bit-depth combinations relevant to the verification matrix.
+fn probe_cuvid_caps() {
+    use crate::ffi::{cudaVideoChromaFormat as CF, cudaVideoCodec as CC};
+    let combos: &[(&str, cudaVideoCodec, cudaVideoChromaFormat, u32)] = &[
+        ("H264  8b 420", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_420, 0),
+        ("H264 10b 420", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_420, 2),
+        ("H264 8b 422", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_422, 0),
+        ("H264 8b 444", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_444, 0),
+        ("HEVC 8b 420", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_420, 0),
+        ("HEVC 10b 420", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_420, 2),
+        ("HEVC 10b 422", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_422, 2),
+        ("HEVC 10b 444", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_444, 2),
+        ("VP9 P0 8b 420", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_420, 0),
+        ("VP9 P1 8b 444", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_444, 0),
+        ("VP9 P3 10b 444", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_444, 2),
+        ("AV1 main 8b", CC::cudaVideoCodec_AV1, CF::cudaVideoChromaFormat_420, 0),
+        ("AV1 high 10b", CC::cudaVideoCodec_AV1, CF::cudaVideoChromaFormat_420, 2),
+    ];
+    for (name, codec, chroma, bdm8) in combos {
+        match query_decoder_caps(*codec, *chroma, *bdm8) {
+            Ok(c) => eprintln!(
+                "[PROBE-CUVID] {:<14} supported={} outmask={:#x} max={}x{}",
+                name, c.bIsSupported, c.nOutputFormatMask, c.nMaxWidth, c.nMaxHeight
+            ),
+            Err(e) => eprintln!("[PROBE-CUVID] {:<14} query error: {}", name, e),
+        }
+    }
 }
 
 /// Load and resolve NVDEC library.
