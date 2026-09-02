@@ -119,13 +119,18 @@ fn parse_args() -> Args {
                     "vaapi" => Backend::Vaapi,
                     "vulkan" => Backend::Vulkan,
                     "nvdec" => Backend::Nvdec,
-                    other => die(&format!("unknown backend '{}' (expected vaapi, vulkan or nvdec)", other)),
+                    other => die(&format!(
+                        "unknown backend '{}' (expected vaapi, vulkan or nvdec)",
+                        other
+                    )),
                 });
             }
             "-i" | "--input" => input = Some(args.next().unwrap_or_else(|| usage())),
             "-n" | "--max-frames" => {
                 let value = args.next().unwrap_or_else(|| usage());
-                max_frames = value.parse().unwrap_or_else(|_| die(&format!("invalid -n value: {}", value)));
+                max_frames = value
+                    .parse()
+                    .unwrap_or_else(|_| die(&format!("invalid -n value: {}", value)));
             }
             "-o" | "--out" => out_dir = args.next(),
             "-h" | "--help" => usage(),
@@ -163,7 +168,10 @@ fn parse_ivf(data: &[u8]) -> Option<Ivf> {
         b"VP90" => Codec::Vp9,
         b"AV01" => Codec::Av1,
         other => {
-            eprintln!("warning: unsupported IVF codec fourcc {:?}; treating as opaque", String::from_utf8_lossy(other));
+            eprintln!(
+                "warning: unsupported IVF codec fourcc {:?}; treating as opaque",
+                String::from_utf8_lossy(other)
+            );
             return None;
         }
     };
@@ -251,7 +259,7 @@ fn vp9_subframes(payload: &[u8]) -> Vec<&[u8]> {
 /// VP9: does this (sub)frame produce a display picture?
 /// Frame header byte 0: bit 7 = show_existing_frame, bit 6 = show_frame.
 fn vp9_shows(data: &[u8]) -> bool {
-    data.first().map_or(false, |&b| b & 0xC0 != 0)
+    data.first().is_some_and(|&b| b & 0xC0 != 0)
 }
 
 /// AV1: walk the OBU sequence of an IVF packet and report whether its Frame
@@ -264,8 +272,7 @@ fn av1_shows(payload: &[u8]) -> bool {
         let obu_type = (b >> 3) & 7;
         let has_size = b & 1 == 1;
         let mut start = i + 1;
-        let size: usize;
-        if has_size {
+        let size: usize = if has_size {
             let mut v = 0usize;
             let mut shift = 0u32;
             loop {
@@ -279,13 +286,13 @@ fn av1_shows(payload: &[u8]) -> bool {
                     break;
                 }
             }
-            size = v;
+            v
         } else {
             // Size-less OBU: assume it runs to the end of the packet.
-            size = payload.len() - start;
-        }
+            payload.len() - start
+        };
         if obu_type == 1 {
-            return payload.get(start).map_or(false, |&fb| fb & 0xC0 != 0);
+            return payload.get(start).is_some_and(|&fb| fb & 0xC0 != 0);
         }
         let next = start.saturating_add(size);
         if next <= i {
@@ -461,17 +468,26 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
         for row in 0..pd.u.height {
             let src = unsafe { pd.u.data.add(row * pd.u.pitch) };
             for col in 0..pd.u.width {
-                push_sample(&mut out, unsafe { src.add(col * 2 * bps) }, bps, top_justified);
+                push_sample(
+                    &mut out,
+                    unsafe { src.add(col * 2 * bps) },
+                    bps,
+                    top_justified,
+                );
             }
         }
         for row in 0..pd.u.height {
             let src = unsafe { pd.u.data.add(row * pd.u.pitch) };
             for col in 0..pd.u.width {
-                push_sample(&mut out, unsafe { src.add(col * 2 * bps + bps) }, bps, top_justified);
+                push_sample(
+                    &mut out,
+                    unsafe { src.add(col * 2 * bps + bps) },
+                    bps,
+                    top_justified,
+                );
             }
         }
-    } else {
-        let v = pd.v.as_ref().unwrap();
+    } else if let Some(v) = pd.v.as_ref() {
         if pd.format == "YV12" {
             // YV12 stores V before U.
             copy_plane(&mut out, v, bps, top_justified);
@@ -487,7 +503,17 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
 
 /// Copy a cropped region of a Vulkan readback plane (samples per row =
 /// `stride_samples`) into `out`.
-fn crop_plane(out: &mut Vec<u8>, plane: &[u8], stride_samples: usize, x0: usize, y0: usize, w: usize, h: usize, bps: usize) {
+#[allow(clippy::too_many_arguments)] // flat geometry args
+fn crop_plane(
+    out: &mut Vec<u8>,
+    plane: &[u8],
+    stride_samples: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    bps: usize,
+) {
     for y in y0..y0 + h {
         let start = (y * stride_samples + x0) * bps;
         out.extend_from_slice(&plane[start..start + w * bps]);
@@ -517,7 +543,9 @@ fn canonical_vk(frame: &vacc_vulkan::DecodedFrame) -> Vec<u8> {
     let h_sub = chroma_sub(frame.coded_width, frame.pixels.chroma_width);
     let v_sub = chroma_sub(frame.coded_height, frame.pixels.chroma_height);
 
-    let mut out = Vec::with_capacity(frame.pixels.y_plane.len() + frame.pixels.u_plane.len() + frame.pixels.v_plane.len());
+    let mut out = Vec::with_capacity(
+        frame.pixels.y_plane.len() + frame.pixels.u_plane.len() + frame.pixels.v_plane.len(),
+    );
     crop_plane(
         &mut out,
         &frame.pixels.y_plane,
@@ -597,7 +625,8 @@ fn main() {
         die("NVDEC not available on this system (NVIDIA GPU + CUDA driver required)");
     }
 
-    let data = std::fs::read(&args.input).unwrap_or_else(|e| die(&format!("failed to read {}: {}", args.input, e)));
+    let data = std::fs::read(&args.input)
+        .unwrap_or_else(|e| die(&format!("failed to read {}: {}", args.input, e)));
 
     let ivf = parse_ivf(&data);
     let codec = match &ivf {
@@ -610,7 +639,7 @@ fn main() {
         std::path::PathBuf::from(d)
     });
 
-    let pts_table = ivf.as_ref().map(|i| ivf_display_pts(i)).unwrap_or_default();
+    let pts_table = ivf.as_ref().map(ivf_display_pts).unwrap_or_default();
 
     match &ivf {
         Some(ivf) => println!(
@@ -633,8 +662,8 @@ fn main() {
     let start = Instant::now();
     let frames: Vec<Frame> = match args.backend {
         Backend::Vulkan => {
-            let mut decoder =
-                vulkan_decode::VulkanDecoder::new(data).unwrap_or_else(|e| die(&format!("vulkan decoder init: {}", e)));
+            let mut decoder = vulkan_decode::VulkanDecoder::new(data)
+                .unwrap_or_else(|e| die(&format!("vulkan decoder init: {}", e)));
             let frames = decoder
                 .decode_all(args.max_frames)
                 .unwrap_or_else(|e| die(&format!("vulkan decode: {}", e)));
@@ -644,8 +673,8 @@ fn main() {
                 .collect()
         }
         Backend::Vaapi => {
-            let mut decoder =
-                vaapi_decode::VaapiDecoder::new(data).unwrap_or_else(|e| die(&format!("vaapi decoder init: {}", e)));
+            let mut decoder = vaapi_decode::VaapiDecoder::new(data)
+                .unwrap_or_else(|e| die(&format!("vaapi decoder init: {}", e)));
             decode_all_core(&mut decoder, args.max_frames)
                 .into_iter()
                 .map(Frame::Core)
@@ -654,19 +683,23 @@ fn main() {
         Backend::Nvdec => {
             let frames = match codec {
                 Codec::H264 => {
-                    let mut d = nvdec_decode::NvdecH264Decoder::new(data).unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
+                    let mut d = nvdec_decode::NvdecH264Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::H265 => {
-                    let mut d = nvdec_decode::NvdecH265Decoder::new(data).unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
+                    let mut d = nvdec_decode::NvdecH265Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::Vp9 => {
-                    let mut d = nvdec_decode::NvdecVp9Decoder::new(data).unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
+                    let mut d = nvdec_decode::NvdecVp9Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::Av1 => {
-                    let mut d = nvdec_decode::NvdecAv1Decoder::new(data).unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
+                    let mut d = nvdec_decode::NvdecAv1Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
             };
@@ -702,9 +735,14 @@ fn main() {
         match frame.canonical_pixels() {
             Some(pixels) => {
                 if let Some(dir) = &out_dir {
-                    let stem = std::path::Path::new(&args.input).file_stem().unwrap().to_string_lossy();
+                    let stem = std::path::Path::new(&args.input)
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy();
                     let path = dir.join(format!("{}__frame_{}.yuv", stem, i));
-                    std::fs::write(&path, &pixels).unwrap_or_else(|e| die(&format!("cannot write {}: {}", path.display(), e)));
+                    std::fs::write(&path, &pixels).unwrap_or_else(|e| {
+                        die(&format!("cannot write {}: {}", path.display(), e))
+                    });
                 }
                 println!(
                     "frame {}: pts={}ms size={}x{} hash={:016x}",
@@ -715,7 +753,13 @@ fn main() {
                     fnv1a64(&pixels)
                 );
             }
-            None => println!("frame {}: pts={}ms size={}x{} hash=- (no pixel data)", i, fmt_ms(pts_ms), w, h),
+            None => println!(
+                "frame {}: pts={}ms size={}x{} hash=- (no pixel data)",
+                i,
+                fmt_ms(pts_ms),
+                w,
+                h
+            ),
         }
     }
 

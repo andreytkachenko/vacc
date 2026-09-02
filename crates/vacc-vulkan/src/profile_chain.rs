@@ -247,7 +247,6 @@ fn create_image_with_profile_chain(
             vp9_profile.std_profile = profile_idc;
             &vp9_profile as *const _ as *const std::ffi::c_void
         }
-        _ => std::ptr::null(),
     };
 
     let profile_info = vk::VideoProfileInfoKHR {

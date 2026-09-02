@@ -12,11 +12,8 @@
 //! 9. SAO conditional parsing
 //! 10. FFI struct sizes matching NVIDIA SDK
 
-use vacc_core::picture::{H265Pps, H265ShortTermRefPicSet, H265Sps};
-use vacc_parser::{
-    h265::{H265Parser, SliceHeaderInfo},
-    BitstreamPacket, ParseResult, VideoParser,
-};
+use vacc_core::picture::H265ShortTermRefPicSet;
+use vacc_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
 
 // ============================================================================
 // Test helpers
@@ -269,9 +266,11 @@ fn test_poc_after_reset() {
 fn test_used_by_curr_pic_filtering() {
     // Create an RPS with 2 negative pics and 2 positive pics,
     // but only some are used as references
-    let mut rps = H265ShortTermRefPicSet::default();
-    rps.num_negative_pics = 2;
-    rps.num_positive_pics = 2;
+    let mut rps = H265ShortTermRefPicSet {
+        num_negative_pics: 2,
+        num_positive_pics: 2,
+        ..H265ShortTermRefPicSet::default()
+    };
     // S0: pic at delta -1 (used), pic at delta -3 (not used)
     rps.delta_poc_s0_minus1[0] = 65535; // -1 as u16
     rps.delta_poc_s0_minus1[1] = 65533; // -3 as u16
@@ -403,7 +402,7 @@ fn test_predictive_rps_bit_count() {
             return 1;
         }
         let n = v + 1;
-        let k = (32 - n.leading_zeros()) as u32;
+        let k = 32 - n.leading_zeros();
         2 * k - 1
     }
 
@@ -489,7 +488,7 @@ fn test_dpb_state_uses_surface_indices() {
 fn test_range_extension_flags_parsed() {
     // We use the existing test SPS which has sps_extension_present_flag = false
     // Let's verify the parser handles the extension correctly
-    let mut parser = init_parser();
+    let parser = init_parser();
     let sps = parser.active_sps().expect("No active SPS");
 
     // The test SPS from big_buck_bunny does NOT have range extension
@@ -528,7 +527,7 @@ fn test_range_extension_flags_parsed() {
 /// causing bitstream position desync when the conditions were not met.
 #[test]
 fn test_sao_conditional_parsing() {
-    let mut parser = init_parser();
+    let parser = init_parser();
     let sps = parser.active_sps().expect("No active SPS");
     let pps = parser.active_pps().expect("No active PPS");
 

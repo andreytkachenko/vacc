@@ -15,7 +15,7 @@
 //!     order. L1 is the reverse (POC > currPOC ascending, then POC <= currPOC
 //!     descending, then long-term). If L0 == L1 and L1 has > 1 entry, swap
 //!     L1's first two.
-//!   Lists are truncated to `num_ref_idx_lN_active_minus1 + 1`.
+//!     Lists are truncated to `num_ref_idx_lN_active_minus1 + 1`.
 //! - **8.2.3.2 (reordering)**: each `ref_pic_list_modification` entry is
 //!   applied in order:
 //!   - idc 0/1: short-term reference with `FrameNum == picNumLX`, where
@@ -88,6 +88,7 @@ pub struct DpbRefState {
 /// - `mod_l0` / `mod_l1`: `ref_pic_list_modification` entries per list.
 ///
 /// I/SI slices produce empty lists.
+#[allow(clippy::too_many_arguments)] // one parameter per spec input (8.2.4)
 pub fn build_ref_pic_lists(
     slots: &[DpbRefState],
     slice_type: u32,
@@ -143,7 +144,7 @@ pub fn build_ref_pic_lists(
         is_long_term,
     };
 
-    let mut l0: Vec<RefPic> = Vec::new();
+    let mut l0: Vec<RefPic>;
     let mut l1: Vec<RefPic> = Vec::new();
 
     if is_b {
@@ -180,9 +181,7 @@ pub fn build_ref_pic_lists(
             && l0.len() == l1.len()
             && l0.iter().zip(l1.iter()).all(|(a, b)| a.slot == b.slot)
         {
-            let tmp = l1[0];
-            l1[0] = l1[1];
-            l1[1] = tmp;
+            l1.swap(0, 1);
         }
     } else {
         // P slices: short-term in descending PicNum, then long-term.
@@ -207,8 +206,22 @@ pub fn build_ref_pic_lists(
         list.truncate(active);
         list.resize_with(active, empty_ref);
     }
-    apply_reordering(&mut l0, slots, mod_l0, curr_frame_num, max_frame_num, active0);
-    apply_reordering(&mut l1, slots, mod_l1, curr_frame_num, max_frame_num, active1);
+    apply_reordering(
+        &mut l0,
+        slots,
+        mod_l0,
+        curr_frame_num,
+        max_frame_num,
+        active0,
+    );
+    apply_reordering(
+        &mut l1,
+        slots,
+        mod_l1,
+        curr_frame_num,
+        max_frame_num,
+        active1,
+    );
     backfill_default(&mut l0, default0);
     backfill_default(&mut l1, default1);
 
@@ -234,7 +247,7 @@ pub fn build_ref_pic_lists(
 ///
 /// `list` must be exactly `window`-sized (see `build_ref_pic_lists`).
 fn apply_reordering(
-    list: &mut Vec<RefPic>,
+    list: &mut [RefPic],
     slots: &[DpbRefState],
     mods: &[RefPicListModificationEntry],
     curr_frame_num: u32,
@@ -250,26 +263,24 @@ fn apply_reordering(
         let target: Option<usize> = match m.op {
             // idc 0: short-term subtract.
             0 => {
-                pic_num_pred =
-                    (pic_num_pred - (m.difference.max(0) as i32 + 1)).rem_euclid(max_pic_num);
-                slots.iter().position(|s| {
-                    s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32
-                })
+                pic_num_pred = (pic_num_pred - (m.difference.max(0) + 1)).rem_euclid(max_pic_num);
+                slots
+                    .iter()
+                    .position(|s| s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32)
             }
             // idc 1: short-term add (forward reference).
             1 => {
-                pic_num_pred =
-                    (pic_num_pred + (m.difference.max(0) as i32 + 1)).rem_euclid(max_pic_num);
-                slots.iter().position(|s| {
-                    s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32
-                })
+                pic_num_pred = (pic_num_pred + (m.difference.max(0) + 1)).rem_euclid(max_pic_num);
+                slots
+                    .iter()
+                    .position(|s| s.marking == MARKING_SHORT && s.frame_num == pic_num_pred as u32)
             }
             // idc 2: long-term with LongTermFrameIdx == long_term_pic_num.
             2 => {
                 let lt_idx = m.difference.max(0) as u32;
-                slots.iter().position(|s| {
-                    s.marking == MARKING_LONG && s.long_term_frame_idx == lt_idx
-                })
+                slots
+                    .iter()
+                    .position(|s| s.marking == MARKING_LONG && s.long_term_frame_idx == lt_idx)
             }
             // idc 3: end of reordering; 4/5 invalid per spec.
             _ => return,
@@ -315,7 +326,7 @@ fn backfill_default(list: &mut Vec<RefPic>, default_ref: Option<RefPic>) {
 /// FFmpeg-style in-window placement (see `apply_reordering`). The list is
 /// exactly window-sized; when the target is absent from [index, len) the tail
 /// entry is dropped (shift right) before writing at index.
-fn window_insert(list: &mut Vec<RefPic>, slot: usize, index: usize, slots: &[DpbRefState]) {
+fn window_insert(list: &mut [RefPic], slot: usize, index: usize, slots: &[DpbRefState]) {
     if index >= list.len() {
         return;
     }
@@ -428,7 +439,7 @@ mod tests {
     fn reorder_op2_long_term_by_idx() {
         let slots = [
             st(1, 1, 0, MARKING_SHORT, 0),
-            st(7, 7, 8, MARKING_LONG, 0), // LT FrameIdx 0
+            st(7, 7, 8, MARKING_LONG, 0),  // LT FrameIdx 0
             st(8, 8, 10, MARKING_LONG, 1), // LT FrameIdx 1
         ];
         // Initial L0 = [fn1, LT0(fn7), LT1(fn8)] (short desc, then LT asc by idx);
@@ -503,14 +514,15 @@ mod tests {
     #[test]
     fn long_term_after_short_term() {
         let slots = [
-            st(9, 9, 8, MARKING_LONG, 1), // slot 0: LT1
+            st(9, 9, 8, MARKING_LONG, 1),  // slot 0: LT1
             st(1, 1, 0, MARKING_SHORT, 0), // slot 1: PicNum 1
-            st(7, 7, 6, MARKING_LONG, 0), // slot 2: LT0
+            st(7, 7, 6, MARKING_LONG, 0),  // slot 2: LT0
             st(2, 2, 2, MARKING_SHORT, 0), // slot 3: PicNum 2
         ];
         let lists = build_ref_pic_lists(&slots, 0, 3, 0, &[], &[], 10, 0, 16);
         assert_eq!(
-            lists.l0
+            lists
+                .l0
                 .iter()
                 .map(|r| (r.slot, r.is_long_term))
                 .collect::<Vec<_>>(),
@@ -544,10 +556,7 @@ mod tests {
     /// initial [fn2, fn1] + empty -> [fn2, fn1, fn2].
     #[test]
     fn pads_to_active_with_default_backfill() {
-        let slots = [
-            st(1, 1, 0, MARKING_SHORT, 0),
-            st(2, 2, 2, MARKING_SHORT, 0),
-        ];
+        let slots = [st(1, 1, 0, MARKING_SHORT, 0), st(2, 2, 2, MARKING_SHORT, 0)];
         let lists = build_ref_pic_lists(&slots, 0, 2, 0, &[], &[], 3, 4, 16);
         assert_eq!(
             lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),
@@ -573,7 +582,12 @@ mod tests {
         // i=1: idc0 d=15 -> pred=(15-16)%16=15 -> fn15 @1 (dup, tail drop)
         // i=2: idc1 d=0 -> pred=(15+1)%16=0  -> fn0 @2
         // i=3: idc0 d=2 -> pred=(0-3)%16=13  -> fn13 @3
-        let mods = vec![entry(0, 0, 1), entry(1, 0, 15), entry(2, 1, 0), entry(3, 0, 2)];
+        let mods = vec![
+            entry(0, 0, 1),
+            entry(1, 0, 15),
+            entry(2, 1, 0),
+            entry(3, 0, 2),
+        ];
         let lists = build_ref_pic_lists(&slots, 0, 3, 0, &mods, &[], 1, 134, 16);
         assert_eq!(
             lists.l0.iter().map(|r| r.frame_num).collect::<Vec<_>>(),

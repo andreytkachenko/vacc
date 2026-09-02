@@ -285,11 +285,10 @@ impl Vp9Parser {
         self.parse_quantization_params(&mut r, &mut frame_data)?;
 
         // Lossless frame: all quantization values zero (FFmpeg convention).
-        frame_data.picture_info.lossless =
-            frame_data.picture_info.base_q_idx == 0
-                && frame_data.picture_info.delta_q_y_dc == 0
-                && frame_data.picture_info.delta_q_uv_dc == 0
-                && frame_data.picture_info.delta_q_uv_ac == 0;
+        frame_data.picture_info.lossless = frame_data.picture_info.base_q_idx == 0
+            && frame_data.picture_info.delta_q_y_dc == 0
+            && frame_data.picture_info.delta_q_uv_dc == 0
+            && frame_data.picture_info.delta_q_uv_ac == 0;
 
         // Parse segmentation parameters
         self.parse_segmentation_params(&mut r, &mut frame_data)?;
@@ -1043,7 +1042,10 @@ mod tests {
 
     impl BitWriter {
         fn new() -> Self {
-            Self { bytes: Vec::new(), bitpos: 0 }
+            Self {
+                bytes: Vec::new(),
+                bitpos: 0,
+            }
         }
 
         fn bits(&mut self, val: u32, n: u32) {
@@ -1115,8 +1117,8 @@ mod tests {
         bw.bits(0, 1); // error_resilient_mode
         bw.bits(0, 2); // reset_frame_context
         bw.bits(refresh_mask, 8);
-        for i in 0..3 {
-            bw.bits(refidx[i], 3);
+        for &ri in refidx.iter() {
+            bw.bits(ri, 3);
             bw.bits(0, 1); // sign bias
         }
         let mut inherited = false;
@@ -1218,18 +1220,50 @@ mod tests {
     // files on this machine; regenerate if the IVF set is re-encoded.
     // ------------------------------------------------------------------
 
-    const VP9_PROFILE0_FPS: [u16; 30] = [249, 28, 6, 21, 20, 65, 6, 35, 13, 19, 219, 9, 21, 10, 8, 19, 7, 16, 7, 35, 129, 9, 21, 20, 6, 23, 6, 20, 6, 34];
-    const VP9_PROFILE0_HDR: [u8; 30] = [18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 10, 10, 10, 10, 10, 10, 10, 10];
-    const VP9_PROFILE1_444_FPS: [u16; 30] = [210, 122, 43, 20, 6, 13, 14, 9, 3, 3, 94, 24, 15, 14, 5, 21, 5, 13, 3, 3, 75, 17, 14, 11, 11, 5, 3, 3, 3, 10];
-    const VP9_PROFILE1_444_HDR: [u8; 30] = [18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
-    const VP9_PROFILE1_FPS: [u16; 30] = [250, 23, 3, 30, 10, 56, 6, 63, 6, 42, 238, 9, 20, 21, 13, 6, 9, 19, 8, 15, 84, 11, 23, 18, 11, 5, 10, 13, 5, 13];
-    const VP9_PROFILE1_HDR: [u8; 30] = [18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
-    const VP9_PROFILE2_FPS: [u16; 30] = [252, 13, 4, 33, 19, 65, 9, 34, 10, 47, 201, 11, 17, 22, 12, 5, 3, 16, 8, 20, 99, 9, 25, 6, 11, 5, 12, 10, 21, 7];
-    const VP9_PROFILE2_HDR: [u8; 30] = [18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 10, 10, 10, 10, 10, 10, 10, 10];
+    const VP9_PROFILE0_FPS: [u16; 30] = [
+        249, 28, 6, 21, 20, 65, 6, 35, 13, 19, 219, 9, 21, 10, 8, 19, 7, 16, 7, 35, 129, 9, 21, 20,
+        6, 23, 6, 20, 6, 34,
+    ];
+    const VP9_PROFILE0_HDR: [u8; 30] = [
+        18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 10,
+        10, 10, 10, 10, 10, 10, 10,
+    ];
+    const VP9_PROFILE1_444_FPS: [u16; 30] = [
+        210, 122, 43, 20, 6, 13, 14, 9, 3, 3, 94, 24, 15, 14, 5, 21, 5, 13, 3, 3, 75, 17, 14, 11,
+        11, 5, 3, 3, 3, 10,
+    ];
+    const VP9_PROFILE1_444_HDR: [u8; 30] = [
+        18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        10, 10, 10, 10, 10, 10, 10,
+    ];
+    const VP9_PROFILE1_FPS: [u16; 30] = [
+        250, 23, 3, 30, 10, 56, 6, 63, 6, 42, 238, 9, 20, 21, 13, 6, 9, 19, 8, 15, 84, 11, 23, 18,
+        11, 5, 10, 13, 5, 13,
+    ];
+    const VP9_PROFILE1_HDR: [u8; 30] = [
+        18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        10, 10, 10, 10, 10, 10, 10,
+    ];
+    const VP9_PROFILE2_FPS: [u16; 30] = [
+        252, 13, 4, 33, 19, 65, 9, 34, 10, 47, 201, 11, 17, 22, 12, 5, 3, 16, 8, 20, 99, 9, 25, 6,
+        11, 5, 12, 10, 21, 7,
+    ];
+    const VP9_PROFILE2_HDR: [u8; 30] = [
+        18, 10, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 10,
+        10, 10, 10, 10, 10, 10, 10,
+    ];
 
     #[test]
     fn test_golden_headers_bundled_samples() {
-        let cases: [(&str, Vp9Profile, u8, &[u16; 30], &[u8; 30], &[u8]); 4] = [
+        type GoldenCase = (
+            &'static str,
+            Vp9Profile,
+            u8,
+            &'static [u16; 30],
+            &'static [u8; 30],
+            &'static [u8],
+        );
+        let cases: [GoldenCase; 4] = [
             (
                 "vp9_profile0.ivf",
                 Vp9Profile::Profile0,
@@ -1272,16 +1306,22 @@ mod tests {
             let mut parser = Vp9Parser::new();
             let mut i = 0u32;
             while off + 12 <= data.len() && i < 30 {
-                let size = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+                let size =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
                 off += 12;
                 let pkt = &data[off..off + size];
                 off += size;
 
-                let f = parser.parse_frame(pkt).unwrap_or_else(|e| panic!("{name} f{i}: {e:?}"));
-                assert_eq!(f.compressed_header_size, fps_golden[i as usize] as u32, "{name} f{i}: first_partition_size");
+                let f = parser
+                    .parse_frame(pkt)
+                    .unwrap_or_else(|e| panic!("{name} f{i}: {e:?}"));
                 assert_eq!(
-                    f.compressed_header_offset as u8,
-                    hdr_golden[i as usize],
+                    f.compressed_header_size, fps_golden[i as usize] as u32,
+                    "{name} f{i}: first_partition_size"
+                );
+                assert_eq!(
+                    f.compressed_header_offset as u8, hdr_golden[i as usize],
                     "{name} f{i}: frame_header_length"
                 );
                 if i == 0 {
@@ -1309,12 +1349,15 @@ mod tests {
         let mut i = 0u32;
         let mut key_positions: Vec<u32> = Vec::new();
         while off + 12 <= data.len() {
-            let size = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+            let size = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
             off += 12;
             let pkt = &data[off..off + size];
             off += size;
 
-            let f = parser.parse_frame(pkt).unwrap_or_else(|e| panic!("f{i}: {e:?}"));
+            let f = parser
+                .parse_frame(pkt)
+                .unwrap_or_else(|e| panic!("f{i}: {e:?}"));
             if f.frame_is_intra {
                 key_positions.push(i);
             }

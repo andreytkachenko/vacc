@@ -532,9 +532,7 @@ impl Av1Parser {
         let mut size_reader = BitReader::new(&data[header_bytes..], false);
 
         let obu_size: usize = if header.has_size_field {
-            let size = size_reader.read_leb128()? as usize;
-
-            size
+            size_reader.read_leb128()? as usize
         } else {
             obu_length
                 .ok_or(ParserError::InvalidBitstream)?
@@ -544,7 +542,7 @@ impl Av1Parser {
         };
 
         // Update Annex B state if applicable
-        if let StreamFormat::AnnexB(ref mut annexb_state) = self.stream_format {
+        if let StreamFormat::AnnexB(ref mut _annexb_state) = self.stream_format {
             // ...
         }
 
@@ -994,7 +992,7 @@ impl Av1Parser {
         let remaining = remaining_bits - 1;
         if remaining > 0 {
             let remaining_u8 = (remaining.min(31)) as u8;
-            let trailing_zeros = r.read_bits(remaining_u8)?;
+            let _trailing_zeros = r.read_bits(remaining_u8)?;
             // Be lenient: don't fail on non-zero trailing bits
             // Some encoders may use the remaining bits for other purposes
         }
@@ -1132,9 +1130,8 @@ impl Av1Parser {
 
         // 8. frame_id (if frame_id_numbers_present)
         if sps.frame_id_numbers_present_flag {
-            let id_len = sps.additional_frame_id_length_minus1 as u8
-                + sps.delta_frame_id_length_minus2 as u8
-                + 3;
+            let id_len =
+                sps.additional_frame_id_length_minus1 + sps.delta_frame_id_length_minus2 + 3;
             let _frame_id = r.read_bits(id_len)?;
         }
 
@@ -1210,7 +1207,7 @@ impl Av1Parser {
         }
 
         // Helper closure: read superres + render_size (shared by frame_size paths)
-        let mut read_superres_render =
+        let read_superres_render =
             |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
                 if sps.enable_superres {
                     fh.use_superres = r.read_bit()?;
@@ -1225,18 +1222,17 @@ impl Av1Parser {
                 }
                 Ok(())
             };
-        let mut read_render_size =
-            |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
-                fh.render_and_frame_size_different = r.read_bit()?;
-                if fh.render_and_frame_size_different {
-                    fh.render_width = r.read_bits(16)? + 1;
-                    fh.render_height = r.read_bits(16)? + 1;
-                } else {
-                    fh.render_width = fh.frame_width;
-                    fh.render_height = fh.frame_height;
-                }
-                Ok(())
-            };
+        let read_render_size = |fh: &mut Av1FrameHeader, r: &mut BitReader| -> ParserResult<()> {
+            fh.render_and_frame_size_different = r.read_bit()?;
+            if fh.render_and_frame_size_different {
+                fh.render_width = r.read_bits(16)? + 1;
+                fh.render_height = r.read_bits(16)? + 1;
+            } else {
+                fh.render_width = fh.frame_width;
+                fh.render_height = fh.frame_height;
+            }
+            Ok(())
+        };
         let inherit_size = |fh: &mut Av1FrameHeader,
                             primary_ref: u8,
                             dpb: &crate::av1_dpb::Av1Dpb,
@@ -1476,7 +1472,7 @@ impl Av1Parser {
         self.update_ref_frames(&fh);
 
         // Size of the uncompressed frame header in bytes (rounded up from bits).
-        fh.frame_header_size = ((r.position() + 7) / 8) as u32;
+        fh.frame_header_size = r.position().div_ceil(8) as u32;
 
         Ok(fh)
     }
@@ -1495,11 +1491,14 @@ impl Av1Parser {
         };
         let ohb = sps.order_hint_bits_minus1 as u32;
         // AV1 spec 7.4.1 reference-list derivation (common DPB implementation).
-        let ref_idx = self
-            .dpb
-            .set_frame_refs(last_frame_idx as i32, golden_frame_idx as i32, order_hint, ohb);
-        for i in 0..7 {
-            fh.ref_frame_idx[i] = ref_idx[i] as u8;
+        let ref_idx = self.dpb.set_frame_refs(
+            last_frame_idx as i32,
+            golden_frame_idx as i32,
+            order_hint,
+            ohb,
+        );
+        for (i, &ri) in ref_idx.iter().enumerate() {
+            fh.ref_frame_idx[i] = ri as u8;
         }
     }
 
@@ -1636,10 +1635,10 @@ impl Av1Parser {
 
         let uniform = r.read_bit()?;
         fh.uniform_tile_spacing_flag = uniform;
-        let mut log2_tile_cols = 0u32;
-        let mut log2_tile_rows = 0u32;
-        let mut tile_cols = 0u32;
-        let mut tile_rows = 0u32;
+        let mut log2_tile_cols;
+        let mut log2_tile_rows;
+        let tile_cols;
+        let tile_rows;
 
         if uniform {
             log2_tile_cols = min_log2_tile_cols;
@@ -1650,7 +1649,7 @@ impl Av1Parser {
                 log2_tile_cols += 1;
             }
             let tile_width_sb = (sb_cols + (1 << log2_tile_cols) - 1) >> log2_tile_cols;
-            tile_cols = (sb_cols + tile_width_sb - 1) / tile_width_sb;
+            tile_cols = sb_cols.div_ceil(tile_width_sb);
             let min_log2_tile_rows = std::cmp::max(min_log2_tiles - log2_tile_cols, 0);
             log2_tile_rows = min_log2_tile_rows;
             while log2_tile_rows < max_log2_tile_rows {
@@ -1660,7 +1659,7 @@ impl Av1Parser {
                 log2_tile_rows += 1;
             }
             let tile_height_sb = (sb_rows + (1 << log2_tile_rows) - 1) >> log2_tile_rows;
-            tile_rows = (sb_rows + tile_height_sb - 1) / tile_height_sb;
+            tile_rows = sb_rows.div_ceil(tile_height_sb);
 
             // Derive per-tile sizes + MI starts (mirrors C++ VulkanAV1Decoder.cpp:1222-1245).
             for c in 0..tile_cols {
@@ -2053,15 +2052,15 @@ impl Av1Parser {
             for pl in 0..n_planes {
                 fh.loop_restoration_size[pl] = sb_size as u16;
             }
-            let mut lr_unit_shift = 0u16;
-            if sps.use_128x128_superblock {
-                lr_unit_shift = 1 + r.read_bit()? as u16;
+            let lr_unit_shift = if sps.use_128x128_superblock {
+                1 + r.read_bit()? as u16
             } else {
-                lr_unit_shift = r.read_bit()? as u16;
-                if lr_unit_shift != 0 {
-                    lr_unit_shift += r.read_bit()? as u16;
+                let mut shift = r.read_bit()? as u16;
+                if shift != 0 {
+                    shift += r.read_bit()? as u16;
                 }
-            }
+                shift
+            };
             fh.loop_restoration_size[0] = 1 + lr_unit_shift;
         } else {
             for pl in 0..n_planes {
@@ -2081,8 +2080,7 @@ impl Av1Parser {
         }
         // Match the NVIDIA reference decoder exactly: shift the luma size
         // (not the already-adjusted chroma size) by uv_shift twice.
-        fh.loop_restoration_size[1] =
-            (fh.loop_restoration_size[0] >> lr_uv_shift) >> lr_uv_shift;
+        fh.loop_restoration_size[1] = (fh.loop_restoration_size[0] >> lr_uv_shift) >> lr_uv_shift;
         Ok(())
     }
 
@@ -2107,8 +2105,7 @@ impl Av1Parser {
         };
 
         let allow_hp = fh.allow_high_precision_mv;
-        for i in 0..7 {
-            let (ref_type, ref_params) = prev[i];
+        for (i, &(ref_type, ref_params)) in prev.iter().enumerate() {
             let _ = ref_type;
             let gm_type = r.read_bit()?;
             let gm_type = if gm_type {

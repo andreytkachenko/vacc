@@ -23,8 +23,16 @@ fn ivf_packets(data: &[u8]) -> Vec<&[u8]> {
 #[test]
 fn inter_frames_carry_keyframe_color_config() {
     for (name, bit_depth, data) in [
-        ("vp9_profile1.ivf", 10u8, include_bytes!("../../../assets/samples/vp9_profile1.ivf") as &[u8]), // profile 2, 10-bit
-        ("vp9_profile2.ivf", 12u8, include_bytes!("../../../assets/samples/vp9_profile2.ivf") as &[u8]), // profile 2, 12-bit
+        (
+            "vp9_profile1.ivf",
+            10u8,
+            include_bytes!("../../../assets/samples/vp9_profile1.ivf") as &[u8],
+        ), // profile 2, 10-bit
+        (
+            "vp9_profile2.ivf",
+            12u8,
+            include_bytes!("../../../assets/samples/vp9_profile2.ivf") as &[u8],
+        ), // profile 2, 12-bit
     ] {
         let packets = ivf_packets(data);
         assert!(packets.len() >= 10, "{name}: too few packets");
@@ -32,9 +40,9 @@ fn inter_frames_carry_keyframe_color_config() {
         let mut parser = Vp9Parser::new();
         let mut checked_inter = 0usize;
         for (i, pkt) in packets.iter().take(10).enumerate() {
-            let fd = parser.parse_frame(pkt).unwrap_or_else(|e| {
-                panic!("{name}: parse frame {i}: {e}")
-            });
+            let fd = parser
+                .parse_frame(pkt)
+                .unwrap_or_else(|e| panic!("{name}: parse frame {i}: {e}"));
             if fd.picture_info.frame_type == Vp9FrameType::Key {
                 assert_eq!(
                     fd.color_config.bit_depth, bit_depth,
@@ -50,6 +58,9 @@ fn inter_frames_carry_keyframe_color_config() {
                 checked_inter += 1;
             }
         }
-        assert!(checked_inter >= 5, "{name}: expected inter frames in first 10");
+        assert!(
+            checked_inter >= 5,
+            "{name}: expected inter frames in first 10"
+        );
     }
 }

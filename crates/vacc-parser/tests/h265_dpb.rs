@@ -96,11 +96,9 @@ fn h265_dpb_full_stream_no_missing_refs() {
                 if pic < gt.len() {
                     let g = &gt[pic];
                     assert_eq!(
-                        info.curr_pic_order_cnt_val,
-                        g.poc,
+                        info.curr_pic_order_cnt_val, g.poc,
                         "pic {pic}: POC mismatch (parser={} gt={})",
-                        info.curr_pic_order_cnt_val,
-                        g.poc
+                        info.curr_pic_order_cnt_val, g.poc
                     );
                     let resolved = resolve_refs(sps, info);
                     assert_eq!(

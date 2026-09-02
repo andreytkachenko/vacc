@@ -4,31 +4,18 @@
 //! Implements `vacc_core::Decoder` and `vacc_core::DecoderDevice` traits
 //! by wrapping the vacc-vulkan crate.
 
-pub mod device;
 pub mod decoder;
+pub mod device;
 
-pub use device::VulkanDecoderDevice;
 pub use decoder::VulkanDecoder;
+pub use device::VulkanDecoderDevice;
 
 /// Re-export common types from vacc-vulkan.
 pub use vacc_vulkan::{
-    VideoCodec,
-    VideoSession,
-    VideoSessionParams,
-    VideoSessionParameters,
-    CodecProfileInfo,
-    BitstreamBuffer,
-    BitstreamBufferPool,
-    DpbManager,
-    DpbEntry,
-    LastAccessType,
-    AccessUnit,
-    H264OrH265Sps,
-    H264OrH265Pps,
-    VideoCodec as AccessUnitCodec,
+    readback_decoded_image, AccessUnit, BitstreamBuffer, BitstreamBufferPool, CodecProfileInfo,
+    DecodedPixels, DpbEntry, DpbManager, H264OrH265Pps, H264OrH265Sps, LastAccessType, VideoCodec,
+    VideoCodec as AccessUnitCodec, VideoSession, VideoSessionParameters, VideoSessionParams,
     Vp9Frame,
-    DecodedPixels,
-    readback_decoded_image,
 };
 
 /// Result type for Vulkan video operations.

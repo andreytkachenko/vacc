@@ -11,7 +11,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 /// Find the next start code in a byte stream.
@@ -31,10 +31,12 @@ fn find_start_code(data: &[u8], start: usize) -> Option<(usize, usize)> {
             if i == 0 || remaining[i - 1] != 0 {
                 return Some((start + i, 4));
             }
-        } else if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1 {
-            if i == 0 || remaining[i - 1] != 0 {
-                return Some((start + i, 3));
-            }
+        } else if remaining[i] == 0
+            && remaining[i + 1] == 0
+            && remaining[i + 2] == 1
+            && (i == 0 || remaining[i - 1] != 0)
+        {
+            return Some((start + i, 3));
         }
         i += 1;
     }
@@ -135,24 +137,24 @@ fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vacc_parser::h264::SliceHeade
 // ============================================================================
 
 /// H.264 default 4x4 Intra quantization matrix (raster order)
-const DEFAULT_QM4x4_INTRA: [u8; 16] = [
+const DEFAULT_QM4X4_INTRA: [u8; 16] = [
     6, 13, 20, 28, 20, 28, 28, 32, 26, 27, 37, 42, 40, 48, 57, 69,
 ];
 
 /// H.264 default 4x4 Inter quantization matrix (raster order)
-const DEFAULT_QM4x4_INTER: [u8; 16] = [
+const DEFAULT_QM4X4_INTER: [u8; 16] = [
     8, 13, 20, 28, 20, 28, 28, 32, 26, 27, 37, 42, 40, 48, 57, 69,
 ];
 
 /// H.264 default 8x8 Intra quantization matrix (raster order)
-const DEFAULT_QM8x8_INTRA: [u8; 64] = [
+const DEFAULT_QM8X8_INTRA: [u8; 64] = [
     6, 13, 20, 28, 20, 28, 32, 40, 13, 20, 28, 32, 32, 37, 42, 48, 20, 28, 32, 37, 37, 42, 48, 57,
     28, 32, 37, 42, 48, 57, 69, 83, 20, 28, 32, 42, 48, 57, 69, 83, 28, 32, 42, 48, 57, 69, 83,
     100, 32, 37, 48, 57, 69, 83, 100, 117, 40, 42, 57, 69, 83, 100, 117, 135,
 ];
 
 /// H.264 default 8x8 Inter quantization matrix (raster order)
-const DEFAULT_QM8x8_INTER: [u8; 64] = [
+const DEFAULT_QM8X8_INTER: [u8; 64] = [
     8, 13, 20, 28, 20, 28, 32, 40, 13, 20, 28, 32, 32, 37, 42, 48, 20, 28, 32, 37, 37, 42, 48, 57,
     28, 32, 37, 42, 48, 57, 69, 83, 20, 28, 32, 42, 48, 57, 69, 83, 28, 32, 42, 48, 57, 69, 83,
     100, 32, 37, 48, 57, 69, 83, 100, 117, 40, 42, 57, 69, 83, 100, 117, 135,
@@ -176,12 +178,12 @@ fn get_weight_scale_4x4(sps: &vacc_core::picture::H264Sps) -> [[u8; 16]; 6] {
         // Indices 3-4: inter luma (all same default)
         // Index 5: chroma (same as inter)
         [
-            DEFAULT_QM4x4_INTRA, // intra Y
-            DEFAULT_QM4x4_INTRA, // intra Y (repeated for CUVID)
-            DEFAULT_QM4x4_INTRA, // intra Y (repeated for CUVID)
-            DEFAULT_QM4x4_INTER, // inter Y
-            DEFAULT_QM4x4_INTER, // inter Y (repeated for CUVID)
-            DEFAULT_QM4x4_INTER, // inter Cb/Cr
+            DEFAULT_QM4X4_INTRA, // intra Y
+            DEFAULT_QM4X4_INTRA, // intra Y (repeated for CUVID)
+            DEFAULT_QM4X4_INTRA, // intra Y (repeated for CUVID)
+            DEFAULT_QM4X4_INTER, // inter Y
+            DEFAULT_QM4X4_INTER, // inter Y (repeated for CUVID)
+            DEFAULT_QM4X4_INTER, // inter Cb/Cr
         ]
     }
 }
@@ -200,7 +202,7 @@ fn get_weight_scale_8x8(sps: &vacc_core::picture::H264Sps) -> [[u8; 64]; 2] {
         sps.scaling_list_8x8
     } else {
         // Default H.264 matrices
-        [DEFAULT_QM8x8_INTRA, DEFAULT_QM8x8_INTER]
+        [DEFAULT_QM8X8_INTRA, DEFAULT_QM8X8_INTER]
     }
 }
 
@@ -325,7 +327,7 @@ fn test_picparams_from_born_trailer_sps_pps() {
         "entropy_coding_mode_flag mismatch"
     );
     assert_eq!(
-        picparams.pic_init_qp_minus26, pps.pic_init_qp_minus26 as i32,
+        picparams.pic_init_qp_minus26, pps.pic_init_qp_minus26,
         "pic_init_qp_minus26 mismatch"
     );
 
@@ -352,19 +354,19 @@ fn test_picparams_from_born_trailer_sps_pps() {
     // non-lossy, no custom scaling lists -> default matrices, NOT identity)
     // WeightScale4x4[0-2] = intra, [3-5] = inter
     assert_eq!(
-        picparams.WeightScale4x4[0], DEFAULT_QM4x4_INTRA,
+        picparams.WeightScale4x4[0], DEFAULT_QM4X4_INTRA,
         "WeightScale4x4 intra should use default"
     );
     assert_eq!(
-        picparams.WeightScale4x4[3], DEFAULT_QM4x4_INTER,
+        picparams.WeightScale4x4[3], DEFAULT_QM4X4_INTER,
         "WeightScale4x4 inter should use default"
     );
     assert_eq!(
-        picparams.WeightScale8x8[0], DEFAULT_QM8x8_INTRA,
+        picparams.WeightScale8x8[0], DEFAULT_QM8X8_INTRA,
         "WeightScale8x8 intra should use default"
     );
     assert_eq!(
-        picparams.WeightScale8x8[1], DEFAULT_QM8x8_INTER,
+        picparams.WeightScale8x8[1], DEFAULT_QM8X8_INTER,
         "WeightScale8x8 inter should use default"
     );
 }
@@ -514,7 +516,7 @@ fn test_picparams_sps_frame_mbs_only_flag() {
     // Verify MbaffFrameFlag is derived correctly from frame_mbs_only_flag
     let expected_mbaff = if !sps.frame_mbs_only_flag { 1 } else { 0 };
     assert_eq!(
-        picparams.MbaffFrameFlag, expected_mbaff as i32,
+        picparams.MbaffFrameFlag, expected_mbaff,
         "MbaffFrameFlag should be !frame_mbs_only_flag"
     );
 }
@@ -731,7 +733,7 @@ fn test_picparams_pps_pic_init_qp_minus26() {
     let picparams = build_cuvid_h264_picparams(sps, pps, slh, 0, slh.nal_ref_idc > 0);
 
     assert_eq!(
-        picparams.pic_init_qp_minus26, pps.pic_init_qp_minus26 as i32,
+        picparams.pic_init_qp_minus26, pps.pic_init_qp_minus26,
         "pic_init_qp_minus26 must match PPS value"
     );
 
@@ -827,7 +829,7 @@ fn test_picparams_pps_chroma_qp_index_offset() {
     let picparams = build_cuvid_h264_picparams(sps, pps, slh, 0, slh.nal_ref_idc > 0);
 
     assert_eq!(
-        picparams.chroma_qp_index_offset, pps.chroma_qp_index_offset as i32,
+        picparams.chroma_qp_index_offset, pps.chroma_qp_index_offset,
         "chroma_qp_index_offset must match PPS value"
     );
 
@@ -856,7 +858,7 @@ fn test_picparams_pps_second_chroma_qp_index_offset() {
     let picparams = build_cuvid_h264_picparams(sps, pps, slh, 0, slh.nal_ref_idc > 0);
 
     assert_eq!(
-        picparams.second_chroma_qp_index_offset, pps.second_chroma_qp_index_offset as i32,
+        picparams.second_chroma_qp_index_offset, pps.second_chroma_qp_index_offset,
         "second_chroma_qp_index_offset must match PPS value"
     );
 
@@ -1076,24 +1078,24 @@ fn test_picparams_weight_scale_matrices() {
     // Verify default matrices are used
     for i in 0..3 {
         assert_eq!(
-            picparams.WeightScale4x4[i], DEFAULT_QM4x4_INTRA,
+            picparams.WeightScale4x4[i], DEFAULT_QM4X4_INTRA,
             "WeightScale4x4[{}] (intra) should use default intra matrix",
             i
         );
     }
     for i in 3..6 {
         assert_eq!(
-            picparams.WeightScale4x4[i], DEFAULT_QM4x4_INTER,
+            picparams.WeightScale4x4[i], DEFAULT_QM4X4_INTER,
             "WeightScale4x4[{}] (inter) should use default inter matrix",
             i
         );
     }
     assert_eq!(
-        picparams.WeightScale8x8[0], DEFAULT_QM8x8_INTRA,
+        picparams.WeightScale8x8[0], DEFAULT_QM8X8_INTRA,
         "WeightScale8x8[0] (intra) should use default intra matrix"
     );
     assert_eq!(
-        picparams.WeightScale8x8[1], DEFAULT_QM8x8_INTER,
+        picparams.WeightScale8x8[1], DEFAULT_QM8X8_INTER,
         "WeightScale8x8[1] (inter) should use default inter matrix"
     );
 }

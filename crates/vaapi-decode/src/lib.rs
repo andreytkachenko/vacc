@@ -3,12 +3,12 @@
 //! VAAPI Video Decode implementation using cros-libva.
 //! Implements `vacc_core::Decoder` and `vacc_core::DecoderDevice` traits.
 
-pub mod device;
 pub mod decoder;
+pub mod device;
 mod vp9_qlookup;
 
-pub use device::VaapiDecoderDevice;
 pub use decoder::VaapiDecoder;
+pub use device::VaapiDecoderDevice;
 
 /// Result type for VAAPI operations.
 pub type Result<T> = std::result::Result<T, Error>;

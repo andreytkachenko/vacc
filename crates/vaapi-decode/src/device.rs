@@ -1,8 +1,8 @@
 //! VAAPI decoder device - implements DecoderDevice trait.
 
-use std::rc::Rc;
-use libva::{Config, Display};
 use libva::VAProfile::Type as VAProfileType;
+use libva::{Config, Display};
+use std::rc::Rc;
 use vacc_core::{
     codec::VideoCodec as CoreVideoCodec,
     device::{DecodeCapabilities, DecoderDevice},
@@ -23,11 +23,15 @@ impl VaapiDecoderDevice {
     /// If the `NVD_GPU` environment variable is set (0-based index), opens
     /// `/dev/dri/renderD{128+idx}`; otherwise opens the first available DRM device.
     pub fn new() -> Result<Self> {
-        let display = match std::env::var("NVD_GPU").ok().and_then(|v| v.parse::<u32>().ok()) {
+        let display = match std::env::var("NVD_GPU")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
             Some(idx) => {
                 let path = format!("/dev/dri/renderD{}", 128 + idx);
-                Display::open_drm_display(&path)
-                    .map_err(|e| Error::VaApi(format!("Failed to open VA display on {}: {}", path, e)))?
+                Display::open_drm_display(&path).map_err(|e| {
+                    Error::VaApi(format!("Failed to open VA display on {}: {}", path, e))
+                })?
             }
             None => Display::open()
                 .ok_or_else(|| Error::VaApi("No VA display available".to_string()))?,
@@ -64,9 +68,7 @@ impl VaapiDecoderDevice {
                 libva::VAProfile::VAProfileVP9Profile0,
                 libva::VAProfile::VAProfileVP9Profile2,
             ],
-            CoreVideoCodec::DecodeAv1 => vec![
-                libva::VAProfile::VAProfileAV1Profile0,
-            ],
+            CoreVideoCodec::DecodeAv1 => vec![libva::VAProfile::VAProfileAV1Profile0],
             _ => vec![],
         }
     }
@@ -140,22 +142,39 @@ impl DecoderDevice for VaapiDecoderDevice {
             max_dpb_slots: 16,
             max_active_reference_pictures: 16,
             supported_formats: vec![
-                VideoFormat::new(codec, ChromaSubsampling::_420, ComponentBitDepth::Bit8, ComponentBitDepth::Bit8),
-                VideoFormat::new(codec, ChromaSubsampling::_420, ComponentBitDepth::Bit10, ComponentBitDepth::Bit10),
+                VideoFormat::new(
+                    codec,
+                    ChromaSubsampling::_420,
+                    ComponentBitDepth::Bit8,
+                    ComponentBitDepth::Bit8,
+                ),
+                VideoFormat::new(
+                    codec,
+                    ChromaSubsampling::_420,
+                    ComponentBitDepth::Bit10,
+                    ComponentBitDepth::Bit10,
+                ),
             ],
         })
     }
 
-    fn query_supported_formats(
-        &self,
-        codec: CoreVideoCodec,
-    ) -> Result<Vec<VideoFormat>> {
+    fn query_supported_formats(&self, codec: CoreVideoCodec) -> Result<Vec<VideoFormat>> {
         // Verify codec is supported
         let _config = self.try_create_config(codec)?;
 
         Ok(vec![
-            VideoFormat::new(codec, ChromaSubsampling::_420, ComponentBitDepth::Bit8, ComponentBitDepth::Bit8),
-            VideoFormat::new(codec, ChromaSubsampling::_420, ComponentBitDepth::Bit10, ComponentBitDepth::Bit10),
+            VideoFormat::new(
+                codec,
+                ChromaSubsampling::_420,
+                ComponentBitDepth::Bit8,
+                ComponentBitDepth::Bit8,
+            ),
+            VideoFormat::new(
+                codec,
+                ChromaSubsampling::_420,
+                ComponentBitDepth::Bit10,
+                ComponentBitDepth::Bit10,
+            ),
         ])
     }
 }

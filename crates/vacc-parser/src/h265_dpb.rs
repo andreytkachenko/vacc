@@ -106,8 +106,7 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
 
     // --- Short-term references (STRPS from SPS or in-slice) ---
     let strps: &H265ShortTermRefPicSet = if info.short_term_ref_pic_set_sps_flag {
-        &sps
-            .short_term_ref_pic_sets
+        sps.short_term_ref_pic_sets
             .get(info.short_term_ref_pic_set_idx as usize)
             .expect("SPS STRPS index out of range")
     } else {
@@ -120,7 +119,11 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
     // u16 two's complement): ref POC = curr POC + DeltaPoc.
     for i in 0..strps.num_negative_pics as usize {
         let stored = strps.delta_poc_s0_minus1[i] as i32;
-        let delta = if stored > 32767 { stored - 65536 } else { stored };
+        let delta = if stored > 32767 {
+            stored - 65536
+        } else {
+            stored
+        };
         out.st_curr_before.push(H265StRef {
             poc: info.curr_pic_order_cnt_val + delta,
             used: (strps.used_by_curr_pic_s0_flag >> i) & 1 == 1,
@@ -158,8 +161,7 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
             if i != 0 && i != nb_sps {
                 cycle += prev_delta;
             }
-            poc = poc_lsb as i64
-                + info.curr_pic_order_cnt_val as i64
+            poc = poc_lsb as i64 + info.curr_pic_order_cnt_val as i64
                 - cycle * max_poc_lsb
                 - info.pic_order_cnt_lsb as i64;
         }
@@ -182,34 +184,52 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
         let mut l1: Vec<H265RefEntry> = Vec::new();
         for r in &out.st_curr_before {
             if r.used {
-                l0.push(H265RefEntry { poc: r.poc, lsb_match: false });
+                l0.push(H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: false,
+                });
             }
         }
         for r in &out.st_curr_after {
             if r.used {
-                l0.push(H265RefEntry { poc: r.poc, lsb_match: false });
+                l0.push(H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: false,
+                });
             }
         }
         for r in &out.long_term {
             if r.used {
-                l0.push(H265RefEntry { poc: r.poc, lsb_match: !r.msb_present });
+                l0.push(H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: !r.msb_present,
+                });
             }
         }
         if info.slice_type == 2 {
             // B slice: L1 starts with S1 (future) refs.
             for r in &out.st_curr_after {
                 if r.used {
-                    l1.push(H265RefEntry { poc: r.poc, lsb_match: false });
+                    l1.push(H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: false,
+                    });
                 }
             }
             for r in &out.st_curr_before {
                 if r.used {
-                    l1.push(H265RefEntry { poc: r.poc, lsb_match: false });
+                    l1.push(H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: false,
+                    });
                 }
             }
             for r in &out.long_term {
                 if r.used {
-                    l1.push(H265RefEntry { poc: r.poc, lsb_match: !r.msb_present });
+                    l1.push(H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: !r.msb_present,
+                    });
                 }
             }
         } else {
@@ -374,12 +394,6 @@ impl H265Dpb {
         self.max_num_reorder_frames = v;
     }
 
-    /// NoRaslOutputFlag per H.265 8.3.1: 1 for IDR (always), otherwise equal
-    /// to no_output_of_prior_pics_flag (0 for non-IRAP).
-    fn no_rasl_output(info: &SliceHeaderInfo) -> bool {
-        info.is_idr || info.no_output_of_prior_pics_flag
-    }
-
     /// Stage the current picture and return the slot it will be stored into.
     ///
     /// Applies, in order (spec 8.3.2):
@@ -389,12 +403,7 @@ impl H265Dpb {
     ///   marks its DPB slot as referenced by the current access unit;
     /// - eviction: unmarked slots that are not pending output are freed;
     /// - allocation: the first empty slot is reserved for the current picture.
-    pub fn picture_start(
-        &mut self,
-        sps: &H265Sps,
-        info: &SliceHeaderInfo,
-        is_ref: bool,
-    ) -> usize {
+    pub fn picture_start(&mut self, sps: &H265Sps, info: &SliceHeaderInfo, is_ref: bool) -> usize {
         let resolved = resolve_refs(sps, info);
         let cur_poc = info.curr_pic_order_cnt_val;
 
@@ -412,19 +421,43 @@ impl H265Dpb {
         let states = self.slot_states();
         let log2 = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
         for r in &resolved.st_curr_before {
-            if let Some(i) = match_entry(&states, &H265RefEntry { poc: r.poc, lsb_match: false }, log2, None) {
+            if let Some(i) = match_entry(
+                &states,
+                &H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: false,
+                },
+                log2,
+                None,
+            ) {
                 self.slots[i].referenced_by_curr = true;
                 self.slots[i].is_long_term = false;
             }
         }
         for r in &resolved.st_curr_after {
-            if let Some(i) = match_entry(&states, &H265RefEntry { poc: r.poc, lsb_match: false }, log2, None) {
+            if let Some(i) = match_entry(
+                &states,
+                &H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: false,
+                },
+                log2,
+                None,
+            ) {
                 self.slots[i].referenced_by_curr = true;
                 self.slots[i].is_long_term = false;
             }
         }
         for r in &resolved.long_term {
-            if let Some(i) = match_entry(&states, &H265RefEntry { poc: r.poc, lsb_match: !r.msb_present }, log2, None) {
+            if let Some(i) = match_entry(
+                &states,
+                &H265RefEntry {
+                    poc: r.poc,
+                    lsb_match: !r.msb_present,
+                },
+                log2,
+                None,
+            ) {
                 self.slots[i].referenced_by_curr = true;
                 self.slots[i].is_long_term = true;
             }
@@ -438,24 +471,18 @@ impl H265Dpb {
         }
 
         // 4. Reserve the first empty slot for the current picture.
-        let slot = self
-            .slots
-            .iter()
-            .position(|s| !s.valid)
-            .unwrap_or_else(|| {
-                // DPB full (non-conforming stream or undersized backend):
-                // recycle the oldest referenced slot rather than stall.
-                eprintln!(
-                    "[H265DPB] WARNING: no free slot for poc={cur_poc}, recycling oldest"
-                );
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.valid)
-                    .min_by_key(|(_, s)| s.poc)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            });
+        let slot = self.slots.iter().position(|s| !s.valid).unwrap_or_else(|| {
+            // DPB full (non-conforming stream or undersized backend):
+            // recycle the oldest referenced slot rather than stall.
+            eprintln!("[H265DPB] WARNING: no free slot for poc={cur_poc}, recycling oldest");
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.valid)
+                .min_by_key(|(_, s)| s.poc)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
 
         self.cur = Some(H265CurPic {
             poc: cur_poc,
@@ -506,7 +533,10 @@ impl H265Dpb {
             before.push(
                 match_entry(
                     &states,
-                    &H265RefEntry { poc: r.poc, lsb_match: false },
+                    &H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: false,
+                    },
                     cur.log2_max_poc_lsb,
                     Some(cur.poc),
                 )
@@ -519,7 +549,10 @@ impl H265Dpb {
             after.push(
                 match_entry(
                     &states,
-                    &H265RefEntry { poc: r.poc, lsb_match: false },
+                    &H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: false,
+                    },
                     cur.log2_max_poc_lsb,
                     Some(cur.poc),
                 )
@@ -532,7 +565,10 @@ impl H265Dpb {
             lt.push(
                 match_entry(
                     &states,
-                    &H265RefEntry { poc: r.poc, lsb_match: !r.msb_present },
+                    &H265RefEntry {
+                        poc: r.poc,
+                        lsb_match: !r.msb_present,
+                    },
                     cur.log2_max_poc_lsb,
                     Some(cur.poc),
                 )
@@ -572,13 +608,22 @@ impl H265Dpb {
             }
         };
         for r in &cur.resolved.st_curr_before {
-            add(&H265RefEntry { poc: r.poc, lsb_match: false });
+            add(&H265RefEntry {
+                poc: r.poc,
+                lsb_match: false,
+            });
         }
         for r in &cur.resolved.st_curr_after {
-            add(&H265RefEntry { poc: r.poc, lsb_match: false });
+            add(&H265RefEntry {
+                poc: r.poc,
+                lsb_match: false,
+            });
         }
         for r in &cur.resolved.long_term {
-            add(&H265RefEntry { poc: r.poc, lsb_match: !r.msb_present });
+            add(&H265RefEntry {
+                poc: r.poc,
+                lsb_match: !r.msb_present,
+            });
         }
         out
     }
@@ -747,10 +792,22 @@ mod tests {
         rps.used_by_curr_pic_s0_flag = 0b11;
         info.num_ref_idx_l0_active_minus1 = 2; // 3 refs in L0
         info.num_ref_idx_l1_active_minus1 = 2; // 3 refs in L1
-        // Swap L0 positions 0 and 2.
-        info.ref_pic_lists_modification_l0.push(H265ListModification { flag: true, ref_idx: 0 });
-        info.ref_pic_lists_modification_l0.push(H265ListModification { flag: false, ref_idx: 0 });
-        info.ref_pic_lists_modification_l0.push(H265ListModification { flag: true, ref_idx: 0 });
+                                               // Swap L0 positions 0 and 2.
+        info.ref_pic_lists_modification_l0
+            .push(H265ListModification {
+                flag: true,
+                ref_idx: 0,
+            });
+        info.ref_pic_lists_modification_l0
+            .push(H265ListModification {
+                flag: false,
+                ref_idx: 0,
+            });
+        info.ref_pic_lists_modification_l0
+            .push(H265ListModification {
+                flag: true,
+                ref_idx: 0,
+            });
 
         let r = resolve_refs(&sps, &info);
         // L0 initial = [9, 7] (S0 used, S1 unused) -> padded to 3: [9, 7, 9].
@@ -785,8 +842,8 @@ mod tests {
         use_in_slice_rps(&mut info);
         info.slice_strps = Some(H265ShortTermRefPicSet::default()); // no ST refs
         info.num_ref_idx_l0_active_minus1 = 2; // 3 refs in L0
-        // SPS LT ref (poc_lsb=8, used, msb cycle 1) + slice LT ref (poc_lsb=10,
-        // unused, msb cycle 1 -> cumulative 2).
+                                               // SPS LT ref (poc_lsb=8, used, msb cycle 1) + slice LT ref (poc_lsb=10,
+                                               // unused, msb cycle 1 -> cumulative 2).
         info.num_long_term_sps = 1;
         info.num_long_term_pics = 2;
         info.long_term_refs.push(H265LtRef {
@@ -829,7 +886,7 @@ mod tests {
         assert_eq!(r.long_term[1].poc_lsb, 10);
         assert!(!r.long_term[1].used);
         assert_eq!(r.long_term[1].delta_poc_msb_cycle_lt, 1);
-        assert_eq!(r.long_term[1].poc, 10 + 300 - 1 * 256 - 44);
+        assert_eq!(r.long_term[1].poc, 10 + 300 - 256 - 44);
 
         // LT[2] (second slice-level entry): cumulative = 1 + 3 = 4.
         assert_eq!(r.long_term[2].delta_poc_msb_cycle_lt, 4);
@@ -998,7 +1055,7 @@ mod tests {
         let slot = dpb.picture_start(&sps, &info, true);
         dpb.commit_current(slot);
 
-        let mut mk_p = |poc: i32| {
+        let mk_p = |poc: i32| {
             let mut info = SliceHeaderInfo::new();
             info.slice_type = 1;
             info.curr_pic_order_cnt_val = poc;
@@ -1026,9 +1083,7 @@ mod tests {
         assert_eq!(lists.l0[0].poc, 1);
         dpb.commit_current(slot);
 
-        let pocs: Vec<i32> = (0..8)
-            .filter_map(|i| dpb.slot_poc(i))
-            .collect();
+        let pocs: Vec<i32> = (0..8).filter_map(|i| dpb.slot_poc(i)).collect();
         assert!(!pocs.contains(&0), "POC 0 should be evicted: {pocs:?}");
         assert!(pocs.contains(&1));
         assert!(pocs.contains(&2));

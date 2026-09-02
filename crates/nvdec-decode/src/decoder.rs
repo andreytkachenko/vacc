@@ -530,13 +530,8 @@ impl NvdecH264Decoder {
 
                     // Keep bitstream_data and slice_offsets alive during decode
                     let procparams = crate::ffi::default_procparams();
-                    let result = unsafe {
-                        (funcs.decode_picture)(
-                            decoder_handle as *mut std::ffi::c_void,
-                            &picparams,
-                            &procparams,
-                        )
-                    };
+                    let result =
+                        unsafe { (funcs.decode_picture)(decoder_handle, &picparams, &procparams) };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(
                             "cuvidDecodePicture failed: {}",
@@ -559,11 +554,10 @@ impl NvdecH264Decoder {
                         reserved: [0; 31],
                         pReserved: [std::ptr::null_mut(); 8],
                     };
-                    let mut status_result: u32 = 0;
                     for _ in 0..100 {
-                        status_result = unsafe {
+                        let _ = unsafe {
                             (funcs.get_decode_status)(
-                                decoder_handle as *mut std::ffi::c_void,
+                                decoder_handle,
                                 curr_pic_idx as std::os::raw::c_int,
                                 &mut decode_status,
                             )
@@ -710,10 +704,7 @@ impl NvdecH264Decoder {
         // Number of decode/output surfaces: enough to hold all DPB references
         // plus frames held back by B-frame reordering, with headroom. Clamped
         // to a sane range. The DPB manager wraps CurrPicIdx at this value.
-        let num_surfaces = std::cmp::max(
-            5u32,
-            std::cmp::min(32u32, sps.max_num_ref_frames.saturating_add(4)),
-        );
+        let num_surfaces = sps.max_num_ref_frames.saturating_add(4).clamp(5u32, 32u32);
 
         let create_info = CUVIDDECODECREATEINFO {
             ulWidth: coded_width as _,
@@ -960,12 +951,7 @@ impl NvdecH264Decoder {
     /// Pictures still held back when the stream ends are drained by
     /// [`flush`](Self::flush) in ascending POC order.
     fn extract_ready_frames(&mut self, current_uw_poc: i32) {
-        loop {
-            let (&key, &(min_idx, min_seq)) = match self.reorder.iter().next() {
-                Some(x) => x,
-                None => break,
-            };
-
+        while let Some((&key, &(min_idx, min_seq))) = self.reorder.iter().next() {
             // Hold back until the just-decoded picture overtakes the oldest
             // pending one; until then a lower-POC picture may still arrive.
             if key.0 >= current_uw_poc {
@@ -1027,7 +1013,11 @@ impl NvdecH264Decoder {
 
         // 10-bit content decodes into P016 surfaces (2 bytes per sample,
         // left-justified values); 8-bit uses NV12.
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
+            2
+        } else {
+            1
+        };
 
         let funcs = match get_funcs() {
             Ok(f) => f,
@@ -1103,7 +1093,7 @@ impl NvdecH264Decoder {
         let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
         // Copy the Y plane with a single 2D memcpy (accounts for cropping).
-        let mut copy_y = CUDA_MEMCPY2D {
+        let copy_y = CUDA_MEMCPY2D {
             srcXInBytes: (crop_left as usize * bps) as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1135,7 +1125,7 @@ impl NvdecH264Decoder {
         // Copy the UV plane (NV12: interleaved UV rows follow the Y rows) with
         // a single 2D memcpy. UV rows start after `coded_height` Y rows.
         let coded_height = info.coded_size.height as u64;
-        let mut copy_uv = CUDA_MEMCPY2D {
+        let copy_uv = CUDA_MEMCPY2D {
             srcXInBytes: (crop_left as usize * bps) as u64,
             srcY: coded_height + (crop_top as u64) / 2,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1208,7 +1198,11 @@ impl NvdecH264Decoder {
         let pixel_data = Some(PixelData {
             // P016 samples stay left-justified (top-justified 10-bit in u16);
             // the consumer normalizes to bottom-justified for bps=2 formats.
-            format: if bps == 2 { "I420_16BIT".to_string() } else { "I420".to_string() },
+            format: if bps == 2 {
+                "I420_16BIT".to_string()
+            } else {
+                "I420".to_string()
+            },
             y: PixelPlane {
                 data: y_ptr,
                 pitch: display_width * bps,
@@ -1337,62 +1331,59 @@ impl NvdecH264Decoder {
             return;
         }
 
-        let host = unsafe { cu_mem_host_alloc(total) };
-        match host {
-            Ok(p) => {
-                // Copy Y plane (full coded size, no cropping, matching C-ref).
-                let mut copy_y = CUDA_MEMCPY2D {
-                    srcXInBytes: 0,
-                    srcY: 0,
-                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                    _reserved0: 0,
-                    srcHost: std::ptr::null(),
-                    srcDevice: dev_ptr,
-                    srcArray: 0,
-                    srcPitch: pitch as u64,
-                    dstXInBytes: 0,
-                    dstY: 0,
-                    dstMemoryType: CU_MEMORYTYPE_HOST,
-                    _reserved1: 0,
-                    dstHost: p,
-                    dstDevice: 0,
-                    dstArray: 0,
-                    dstPitch: coded_w as u64,
-                    WidthInBytes: coded_w as u64,
-                    Height: coded_h as u64,
-                };
-                let _ = unsafe { cu_memcpy_2d(&copy_y) };
-                // Copy interleaved UV plane (NV12: UV rows follow Y rows).
-                let mut copy_uv = CUDA_MEMCPY2D {
-                    srcXInBytes: 0,
-                    srcY: coded_h as u64,
-                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                    _reserved0: 0,
-                    srcHost: std::ptr::null(),
-                    srcDevice: dev_ptr,
-                    srcArray: 0,
-                    srcPitch: pitch as u64,
-                    dstXInBytes: 0,
-                    dstY: 0,
-                    dstMemoryType: CU_MEMORYTYPE_HOST,
-                    _reserved1: 0,
-                    dstHost: unsafe { (p as *mut u8).add(y_size) as *mut std::ffi::c_void },
-                    dstDevice: 0,
-                    dstArray: 0,
-                    dstPitch: coded_w as u64,
-                    WidthInBytes: coded_w as u64,
-                    Height: (coded_h / 2) as u64,
-                };
-                let _ = unsafe { cu_memcpy_2d(&copy_uv) };
-                let mut buf = vec![0u8; total];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
-                }
-                let file_path = format!("{}_{}.yuv", path.to_string_lossy(), count);
-                let _ = std::fs::write(&file_path, &buf);
-                let _ = unsafe { cu_mem_free_host(p) };
+        let host = cu_mem_host_alloc(total);
+        if let Ok(p) = host {
+            // Copy Y plane (full coded size, no cropping, matching C-ref).
+            let copy_y = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                _reserved0: 0,
+                srcHost: std::ptr::null(),
+                srcDevice: dev_ptr,
+                srcArray: 0,
+                srcPitch: pitch as u64,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_HOST,
+                _reserved1: 0,
+                dstHost: p,
+                dstDevice: 0,
+                dstArray: 0,
+                dstPitch: coded_w as u64,
+                WidthInBytes: coded_w as u64,
+                Height: coded_h as u64,
+            };
+            let _ = unsafe { cu_memcpy_2d(&copy_y) };
+            // Copy interleaved UV plane (NV12: UV rows follow Y rows).
+            let copy_uv = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: coded_h as u64,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                _reserved0: 0,
+                srcHost: std::ptr::null(),
+                srcDevice: dev_ptr,
+                srcArray: 0,
+                srcPitch: pitch as u64,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_HOST,
+                _reserved1: 0,
+                dstHost: unsafe { (p as *mut u8).add(y_size) as *mut std::ffi::c_void },
+                dstDevice: 0,
+                dstArray: 0,
+                dstPitch: coded_w as u64,
+                WidthInBytes: coded_w as u64,
+                Height: (coded_h / 2) as u64,
+            };
+            let _ = unsafe { cu_memcpy_2d(&copy_uv) };
+            let mut buf = vec![0u8; total];
+            unsafe {
+                std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
             }
-            Err(_) => {}
+            let file_path = format!("{}_{}.yuv", path.to_string_lossy(), count);
+            let _ = std::fs::write(&file_path, &buf);
+            let _ = unsafe { cu_mem_free_host(p) };
         }
         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
     }
@@ -1577,14 +1568,6 @@ impl Drop for NvdecH264Decoder {
             }
         }
     }
-}
-
-/// Greatest common divisor of two non-negative integers.
-fn gcd(mut a: i32, mut b: i32) -> i32 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
 }
 
 /// Dump the exact [`CUVIDPICPARAMS`] being submitted to `cuvidDecodePicture`

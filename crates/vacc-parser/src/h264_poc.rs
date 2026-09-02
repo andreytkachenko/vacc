@@ -3,8 +3,8 @@
 //! Moved from `nvdec-decode` so all three backends (Vulkan, NVDEC, VAAPI) can
 //! share one implementation.
 
-use vacc_core::picture::H264Sps;
 use crate::h264::SliceHeader;
+use vacc_core::picture::H264Sps;
 
 /// H.264 Picture Order Count calculator.
 ///

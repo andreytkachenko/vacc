@@ -3,13 +3,13 @@
 //! Common Vulkan device initialization, queue management, and utility types.
 //! Used by vulkan-decode and other Vulkan-based crates.
 
+pub mod debug;
 pub mod device;
 pub mod queue;
-pub mod debug;
 
-pub use device::{VulkanDevice, DeviceBuilder, VideoCodec, QueueFamilies};
-pub use queue::QueueHandle;
 pub use debug::DebugMessenger;
+pub use device::{DeviceBuilder, QueueFamilies, VideoCodec, VulkanDevice};
+pub use queue::QueueHandle;
 
 /// Result type for Vulkan operations.
 pub type Result<T> = std::result::Result<T, Error>;

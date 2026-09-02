@@ -1456,8 +1456,7 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
 
     let mut frames = Vec::new();
     let mut frame_count: u32 = 0;
-    let mut pkt_idx = 0usize;
-    for packet in &raw_packets {
+    for (pkt_idx, packet) in raw_packets.iter().enumerate() {
         let n_obus = extract_frame_obus_from_packet(packet);
         if frame_count < 16 && crate::vacc_debug() {
             eprintln!(
@@ -1482,7 +1481,6 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
                 return frames;
             }
         }
-        pkt_idx += 1;
     }
     frames
 }

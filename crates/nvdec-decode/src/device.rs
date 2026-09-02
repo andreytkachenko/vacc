@@ -107,8 +107,8 @@ struct CudaFuncs {
     cu_init: unsafe extern "C" fn(u32) -> u32,
     cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> u32,
     cu_ctx_create_v2: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> u32,
-    cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> u32,
-    cu_device_primary_ctx_release: unsafe extern "C" fn(i32) -> u32,
+    _cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> u32,
+    _cu_device_primary_ctx_release: unsafe extern "C" fn(i32) -> u32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_ctx_synchronize: unsafe extern "C" fn() -> u32,
     cu_memcpy_2d: unsafe extern "C" fn(*const CUDA_MEMCPY2D) -> u32,
@@ -370,7 +370,9 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             })?;
 
         let cu_mem_alloc_v2 = *lib
-            .get::<unsafe extern "C" fn(*mut crate::ffi::CUdeviceptr, usize) -> u32>(b"cuMemAlloc_v2\0")
+            .get::<unsafe extern "C" fn(*mut crate::ffi::CUdeviceptr, usize) -> u32>(
+                b"cuMemAlloc_v2\0",
+            )
             .map_err(|e| {
                 NvdecError::LibLoadError(format!("Failed to resolve cuMemAlloc_v2: {}", e))
             })?;
@@ -389,8 +391,8 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             cu_init,
             cu_device_get,
             cu_ctx_create_v2,
-            cu_device_primary_ctx_retain,
-            cu_device_primary_ctx_release,
+            _cu_device_primary_ctx_retain: cu_device_primary_ctx_retain,
+            _cu_device_primary_ctx_release: cu_device_primary_ctx_release,
             cu_ctx_set_current,
             cu_ctx_synchronize,
             cu_memcpy_2d,
@@ -454,19 +456,84 @@ pub fn init_nvdec() -> NvdecResult<()> {
 fn probe_cuvid_caps() {
     use crate::ffi::{cudaVideoChromaFormat as CF, cudaVideoCodec as CC};
     let combos: &[(&str, cudaVideoCodec, cudaVideoChromaFormat, u32)] = &[
-        ("H264  8b 420", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_420, 0),
-        ("H264 10b 420", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_420, 2),
-        ("H264 8b 422", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_422, 0),
-        ("H264 8b 444", CC::cudaVideoCodec_H264, CF::cudaVideoChromaFormat_444, 0),
-        ("HEVC 8b 420", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_420, 0),
-        ("HEVC 10b 420", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_420, 2),
-        ("HEVC 10b 422", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_422, 2),
-        ("HEVC 10b 444", CC::cudaVideoCodec_HEVC, CF::cudaVideoChromaFormat_444, 2),
-        ("VP9 P0 8b 420", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_420, 0),
-        ("VP9 P1 8b 444", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_444, 0),
-        ("VP9 P3 10b 444", CC::cudaVideoCodec_VP9, CF::cudaVideoChromaFormat_444, 2),
-        ("AV1 main 8b", CC::cudaVideoCodec_AV1, CF::cudaVideoChromaFormat_420, 0),
-        ("AV1 high 10b", CC::cudaVideoCodec_AV1, CF::cudaVideoChromaFormat_420, 2),
+        (
+            "H264  8b 420",
+            CC::cudaVideoCodec_H264,
+            CF::cudaVideoChromaFormat_420,
+            0,
+        ),
+        (
+            "H264 10b 420",
+            CC::cudaVideoCodec_H264,
+            CF::cudaVideoChromaFormat_420,
+            2,
+        ),
+        (
+            "H264 8b 422",
+            CC::cudaVideoCodec_H264,
+            CF::cudaVideoChromaFormat_422,
+            0,
+        ),
+        (
+            "H264 8b 444",
+            CC::cudaVideoCodec_H264,
+            CF::cudaVideoChromaFormat_444,
+            0,
+        ),
+        (
+            "HEVC 8b 420",
+            CC::cudaVideoCodec_HEVC,
+            CF::cudaVideoChromaFormat_420,
+            0,
+        ),
+        (
+            "HEVC 10b 420",
+            CC::cudaVideoCodec_HEVC,
+            CF::cudaVideoChromaFormat_420,
+            2,
+        ),
+        (
+            "HEVC 10b 422",
+            CC::cudaVideoCodec_HEVC,
+            CF::cudaVideoChromaFormat_422,
+            2,
+        ),
+        (
+            "HEVC 10b 444",
+            CC::cudaVideoCodec_HEVC,
+            CF::cudaVideoChromaFormat_444,
+            2,
+        ),
+        (
+            "VP9 P0 8b 420",
+            CC::cudaVideoCodec_VP9,
+            CF::cudaVideoChromaFormat_420,
+            0,
+        ),
+        (
+            "VP9 P1 8b 444",
+            CC::cudaVideoCodec_VP9,
+            CF::cudaVideoChromaFormat_444,
+            0,
+        ),
+        (
+            "VP9 P3 10b 444",
+            CC::cudaVideoCodec_VP9,
+            CF::cudaVideoChromaFormat_444,
+            2,
+        ),
+        (
+            "AV1 main 8b",
+            CC::cudaVideoCodec_AV1,
+            CF::cudaVideoChromaFormat_420,
+            0,
+        ),
+        (
+            "AV1 high 10b",
+            CC::cudaVideoCodec_AV1,
+            CF::cudaVideoChromaFormat_420,
+            2,
+        ),
     ];
     for (name, codec, chroma, bdm8) in combos {
         match query_decoder_caps(*codec, *chroma, *bdm8) {
@@ -518,15 +585,15 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
                 NvdecError::LibLoadError(format!("Failed to resolve cuvidDestroyDecoder: {}", e))
             })?;
 
-        let decode_picture =
-            *lib.get::<unsafe extern "C" fn(
+        let decode_picture = *lib
+            .get::<unsafe extern "C" fn(
                 *mut std::ffi::c_void,
                 *const crate::ffi::CUVIDPICPARAMS,
                 *const crate::ffi::CUVIDPROCPARAMS,
             ) -> u32>(b"cuvidDecodePicture\0")
-                .map_err(|e| {
-                    NvdecError::LibLoadError(format!("Failed to resolve cuvidDecodePicture: {}", e))
-                })?;
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuvidDecodePicture: {}", e))
+            })?;
 
         let map_video_frame64 = *lib
             .get::<unsafe extern "C" fn(
@@ -573,10 +640,7 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
                 *const crate::ffi::CUVIDPARSERPARAMS,
             ) -> u32>(b"cuvidCreateVideoParser\0")
             .map_err(|e| {
-                NvdecError::LibLoadError(format!(
-                    "Failed to resolve cuvidCreateVideoParser: {}",
-                    e
-                ))
+                NvdecError::LibLoadError(format!("Failed to resolve cuvidCreateVideoParser: {}", e))
             })?;
 
         let parse_video_data = *lib
@@ -589,9 +653,7 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
             })?;
 
         let destroy_video_parser = *lib
-            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(
-                b"cuvidDestroyVideoParser\0",
-            )
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(b"cuvidDestroyVideoParser\0")
             .map_err(|e| {
                 NvdecError::LibLoadError(format!(
                     "Failed to resolve cuvidDestroyVideoParser: {}",
@@ -932,6 +994,11 @@ pub fn cu_mem_alloc_device(size: usize) -> NvdecResult<crate::ffi::CUdeviceptr> 
 }
 
 /// Free device memory allocated with [`cu_mem_alloc_device`].
+///
+/// # Safety
+///
+/// `ptr` must be a valid device pointer previously returned by
+/// [`cu_mem_alloc_device`] and not yet freed.
 pub unsafe fn cu_mem_free_device(ptr: crate::ffi::CUdeviceptr) -> NvdecResult<u32> {
     let (_, funcs) = CUDA_LIB
         .get()

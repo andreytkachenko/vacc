@@ -95,8 +95,8 @@ impl Drop for Context {
         let status =
             va_check(unsafe { bindings::vaDestroyContext(self.display.handle(), self.id) });
 
-        if status.is_err() {
-            error!("vaDestroyContext failed: {}", status.unwrap_err());
+        if let Err(e) = status {
+            error!("vaDestroyContext failed: {}", e);
         }
     }
 }

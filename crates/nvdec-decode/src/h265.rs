@@ -13,7 +13,7 @@ use vacc_core::{
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
-    picture::{H265Pps, H265Sps},
+    picture::H265Sps,
     session::Extent2D,
 };
 use vacc_parser::h265_dpb::{resolve_refs, H265Dpb};
@@ -28,13 +28,17 @@ use crate::{
     ffi::{
         cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags, cudaVideoDeinterlaceMode,
         cudaVideoSurfaceFormat, CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
-        CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
+        CUVIDPROCPARAMS, CUVIDRECT,
     },
     picparams::{build_cuvid_hevc_picparams, dump_cuvid_hevc_picparams, H265DpbState},
 };
 
 /// Number of decode surfaces / DPB slots (matches the C reference).
 const NUM_SURFACES: i32 = 16;
+
+/// One pending reorder entry: display key `(uw_poc, seq)` and
+/// `(pic_index, seq, poc)` value.
+type ReorderEntry = ((i32, i32), (i32, i32, i32));
 
 /// HEVC decoded-picture-buffer context: the common spec-compliant DPB (the
 /// single source of truth shared with the other backends) plus the mapping
@@ -78,7 +82,7 @@ impl H265DpbCtx {
     /// frame.
     fn choose_surface(&self) -> i32 {
         for s in 0..NUM_SURFACES as usize {
-            if self.slot_surfaces.iter().any(|o| *o == Some(s as i32)) {
+            if self.slot_surfaces.contains(&Some(s as i32)) {
                 continue;
             }
             if self.surface_pending[s] {
@@ -88,7 +92,7 @@ impl H265DpbCtx {
         }
         // Fallback: lowest-index non-reference surface.
         for s in 0..NUM_SURFACES as usize {
-            if !self.slot_surfaces.iter().any(|o| *o == Some(s as i32)) {
+            if !self.slot_surfaces.contains(&Some(s as i32)) {
                 return s as i32;
             }
         }
@@ -271,14 +275,12 @@ impl NvdecH265Decoder {
                                 + h265_sps.log2_diff_max_min_luma_coding_block_size as u32
                                 + 2;
                             let ctb_size = 1u32 << log2_ctb_size;
-                            let coded_width =
-                                ((h265_sps.pic_width_in_luma_samples as u32 + ctb_size - 1)
-                                    / ctb_size)
-                                    * ctb_size;
-                            let coded_height =
-                                ((h265_sps.pic_height_in_luma_samples as u32 + ctb_size - 1)
-                                    / ctb_size)
-                                    * ctb_size;
+                            let coded_width = (h265_sps.pic_width_in_luma_samples as u32)
+                                .div_ceil(ctb_size)
+                                * ctb_size;
+                            let coded_height = (h265_sps.pic_height_in_luma_samples as u32)
+                                .div_ceil(ctb_size)
+                                * ctb_size;
                             let resolution_changed =
                                 prev_w != coded_width || prev_h != coded_height;
                             if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
@@ -302,11 +304,9 @@ impl NvdecH265Decoder {
                             self.poc_period =
                                 1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
                             // Reorder delay for the common DPB's display logic.
-                            self.dpb
-                                .lock()
-                                .unwrap()
-                                .dpb
-                                .set_max_num_reorder_frames(h265_sps.max_num_reorder_pics[0] as u32);
+                            self.dpb.lock().unwrap().dpb.set_max_num_reorder_frames(
+                                h265_sps.max_num_reorder_pics[0] as u32,
+                            );
                         }
                     }
                 }
@@ -517,9 +517,9 @@ impl NvdecH265Decoder {
                             } else {
                                 dpb_state.num_poc_st_curr_after
                             };
-                            for j in 0..n as usize {
-                                let slot = arr[j] as usize;
-                                let surf = dpb_state.ref_pic_idx[slot] as i32;
+                            for &slot_u8 in arr.iter().take(n as usize) {
+                                let slot = slot_u8 as usize;
+                                let surf = dpb_state.ref_pic_idx[slot];
                                 let ref_poc = dpb_state.pic_order_cnt_val[slot];
                                 let path = format!(
                                     "/tmp/refdump_p{}_{}_s{}_poc{}.yuv",
@@ -531,13 +531,8 @@ impl NvdecH265Decoder {
                     }
 
                     let procparams = crate::ffi::default_procparams();
-                    let result = unsafe {
-                        (funcs.decode_picture)(
-                            decoder_handle as *mut std::ffi::c_void,
-                            &picparams,
-                            &procparams,
-                        )
-                    };
+                    let result =
+                        unsafe { (funcs.decode_picture)(decoder_handle, &picparams, &procparams) };
                     if result != CUDA_SUCCESS {
                         return Err(NvdecError::DecodeFailed(format!(
                             "cuvidDecodePicture failed: {}",
@@ -562,7 +557,7 @@ impl NvdecH265Decoder {
                     for _ in 0..100 {
                         status_result = unsafe {
                             (funcs.get_decode_status)(
-                                decoder_handle as *mut std::ffi::c_void,
+                                decoder_handle,
                                 curr_pic_idx as std::os::raw::c_int,
                                 &mut decode_status,
                             )
@@ -640,8 +635,8 @@ impl NvdecH265Decoder {
         let pic_height = sps.pic_height_in_luma_samples as u32;
 
         // Decoder surfaces must be CTB-aligned (matches CUVID).
-        let coded_width = ((pic_width + ctb_size - 1) / ctb_size) * ctb_size;
-        let coded_height = ((pic_height + ctb_size - 1) / ctb_size) * ctb_size;
+        let coded_width = pic_width.div_ceil(ctb_size) * ctb_size;
+        let coded_height = pic_height.div_ceil(ctb_size) * ctb_size;
 
         // Display area: the actual picture region within the CTB-padded surface.
         // The surface is CTB-aligned (coded_width x coded_height), but the real
@@ -883,11 +878,7 @@ impl NvdecH265Decoder {
         if std::env::var("NVDEC_SKIP_EXTRACT").is_ok() {
             return;
         }
-        loop {
-            let (&key, &(min_idx, min_seq, min_poc)) = match self.reorder.iter().next() {
-                Some(x) => x,
-                None => break,
-            };
+        while let Some((&key, &(min_idx, min_seq, min_poc))) = self.reorder.iter().next() {
             let max_uw = match self.reorder.iter().next_back() {
                 Some((k, _)) => k.0,
                 None => break,
@@ -994,7 +985,11 @@ impl NvdecH265Decoder {
         let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
         let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
         // P016/YUV444_16Bit: 2 bytes per sample.
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
+            2
+        } else {
+            1
+        };
         let row_bytes = display_width * bps;
         let y_size = row_bytes * display_height;
         // NV12/P016: one interleaved UV plane at half resolution.
@@ -1006,7 +1001,13 @@ impl NvdecH265Decoder {
         } else {
             row_bytes * (display_height / 2)
         };
-        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let num_uv_planes = if is_mono {
+            0
+        } else if is_444 {
+            2
+        } else {
+            1
+        };
         let interleaved_uv_size = uv_plane_size * num_uv_planes;
         let total = y_size + interleaved_uv_size;
         let pinned_base = {
@@ -1032,7 +1033,7 @@ impl NvdecH265Decoder {
         };
         let pinned_y = pinned_base;
 
-        let mut copy_y = CUDA_MEMCPY2D {
+        let copy_y = CUDA_MEMCPY2D {
             srcXInBytes: crop_left as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1065,15 +1066,21 @@ impl NvdecH265Decoder {
             let coded_height = info.coded_size.height as u64;
             for plane in 0..num_uv_planes {
                 let (src_y, rows) = if is_444 {
-                    (coded_height * (plane as u64 + 1) + crop_top as u64, display_height as u64)
+                    (
+                        coded_height * (plane as u64 + 1) + crop_top as u64,
+                        display_height as u64,
+                    )
                 } else {
-                    (coded_height + (crop_top as u64) / 2, (display_height / 2) as u64)
+                    (
+                        coded_height + (crop_top as u64) / 2,
+                        (display_height / 2) as u64,
+                    )
                 };
                 let dst = unsafe {
                     (pinned_base as *mut u8).add(y_size + plane * uv_plane_size)
                         as *mut std::ffi::c_void
                 };
-                let mut copy_uv = CUDA_MEMCPY2D {
+                let copy_uv = CUDA_MEMCPY2D {
                     srcXInBytes: crop_left as u64,
                     srcY: src_y,
                     srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1280,7 +1287,11 @@ impl NvdecH265Decoder {
         let coded_h = info.coded_size.height as usize;
         let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
         let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
+            2
+        } else {
+            1
+        };
         let row_bytes = coded_w * bps;
         let y_size = row_bytes * coded_h;
         let uv_plane_size = if is_mono {
@@ -1290,7 +1301,13 @@ impl NvdecH265Decoder {
         } else {
             row_bytes * (coded_h / 2)
         };
-        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let num_uv_planes = if is_mono {
+            0
+        } else if is_444 {
+            2
+        } else {
+            1
+        };
         let total = y_size + uv_plane_size * num_uv_planes;
 
         let funcs = match get_funcs() {
@@ -1325,73 +1342,74 @@ impl NvdecH265Decoder {
         if map_result != CUDA_SUCCESS {
             return;
         }
-        let host = unsafe { cu_mem_host_alloc(total) };
-        match host {
-            Ok(p) => {
-                let mut copy_y = CUDA_MEMCPY2D {
-                    srcXInBytes: 0,
-                    srcY: 0,
-                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                    _reserved0: 0,
-                    srcHost: std::ptr::null(),
-                    srcDevice: dev_ptr,
-                    srcArray: 0,
-                    srcPitch: pitch as u64,
-                    dstXInBytes: 0,
-                    dstY: 0,
-                    dstMemoryType: CU_MEMORYTYPE_HOST,
-                    _reserved1: 0,
-                    dstHost: p,
-                    dstDevice: 0,
-                    dstArray: 0,
-                    dstPitch: row_bytes as u64,
-                    WidthInBytes: row_bytes as u64,
-                    Height: coded_h as u64,
-                };
-                let _ = unsafe { cu_memcpy_2d(&copy_y) };
-                if !is_mono {
-                    for plane in 0..num_uv_planes {
-                        let src_y = if is_444 {
-                            (coded_h * (plane + 1)) as u64
-                        } else {
-                            coded_h as u64
-                        };
-                        let rows = if is_444 { coded_h as u64 } else { (coded_h / 2) as u64 };
-                        let mut copy_uv = CUDA_MEMCPY2D {
-                            srcXInBytes: 0,
-                            srcY: src_y,
-                            srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                            _reserved0: 0,
-                            srcHost: std::ptr::null(),
-                            srcDevice: dev_ptr,
-                            srcArray: 0,
-                            srcPitch: pitch as u64,
-                            dstXInBytes: 0,
-                            dstY: 0,
-                            dstMemoryType: CU_MEMORYTYPE_HOST,
-                            _reserved1: 0,
-                            dstHost: unsafe {
-                                (p as *mut u8).add(y_size + plane * uv_plane_size)
-                                    as *mut std::ffi::c_void
-                            },
-                            dstDevice: 0,
-                            dstArray: 0,
-                            dstPitch: row_bytes as u64,
-                            WidthInBytes: row_bytes as u64,
-                            Height: rows,
-                        };
-                        let _ = unsafe { cu_memcpy_2d(&copy_uv) };
-                    }
+        let host = cu_mem_host_alloc(total);
+        if let Ok(p) = host {
+            let copy_y = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                _reserved0: 0,
+                srcHost: std::ptr::null(),
+                srcDevice: dev_ptr,
+                srcArray: 0,
+                srcPitch: pitch as u64,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_HOST,
+                _reserved1: 0,
+                dstHost: p,
+                dstDevice: 0,
+                dstArray: 0,
+                dstPitch: row_bytes as u64,
+                WidthInBytes: row_bytes as u64,
+                Height: coded_h as u64,
+            };
+            let _ = unsafe { cu_memcpy_2d(&copy_y) };
+            if !is_mono {
+                for plane in 0..num_uv_planes {
+                    let src_y = if is_444 {
+                        (coded_h * (plane + 1)) as u64
+                    } else {
+                        coded_h as u64
+                    };
+                    let rows = if is_444 {
+                        coded_h as u64
+                    } else {
+                        (coded_h / 2) as u64
+                    };
+                    let copy_uv = CUDA_MEMCPY2D {
+                        srcXInBytes: 0,
+                        srcY: src_y,
+                        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                        _reserved0: 0,
+                        srcHost: std::ptr::null(),
+                        srcDevice: dev_ptr,
+                        srcArray: 0,
+                        srcPitch: pitch as u64,
+                        dstXInBytes: 0,
+                        dstY: 0,
+                        dstMemoryType: CU_MEMORYTYPE_HOST,
+                        _reserved1: 0,
+                        dstHost: unsafe {
+                            (p as *mut u8).add(y_size + plane * uv_plane_size)
+                                as *mut std::ffi::c_void
+                        },
+                        dstDevice: 0,
+                        dstArray: 0,
+                        dstPitch: row_bytes as u64,
+                        WidthInBytes: row_bytes as u64,
+                        Height: rows,
+                    };
+                    let _ = unsafe { cu_memcpy_2d(&copy_uv) };
                 }
-                let mut buf = vec![0u8; total];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
-                }
-                let file_path = format!("{}_{}.yuv", path.to_string_lossy(), count);
-                let _ = std::fs::write(&file_path, &buf);
-                let _ = unsafe { cu_mem_free_host(p) };
             }
-            Err(_) => {}
+            let mut buf = vec![0u8; total];
+            unsafe {
+                std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
+            }
+            let file_path = format!("{}_{}.yuv", path.to_string_lossy(), count);
+            let _ = std::fs::write(&file_path, &buf);
+            let _ = unsafe { cu_mem_free_host(p) };
         }
         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
     }
@@ -1421,7 +1439,11 @@ impl NvdecH265Decoder {
         let h = info.coded_size.height as usize;
         let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
         let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 { 2 } else { 1 };
+        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
+            2
+        } else {
+            1
+        };
         let row_bytes = w * bps;
         let uv_plane_size = if is_mono {
             0
@@ -1430,7 +1452,13 @@ impl NvdecH265Decoder {
         } else {
             row_bytes * (h / 2)
         };
-        let num_uv_planes = if is_mono { 0 } else if is_444 { 2 } else { 1 };
+        let num_uv_planes = if is_mono {
+            0
+        } else if is_444 {
+            2
+        } else {
+            1
+        };
         let total = row_bytes * h + uv_plane_size * num_uv_planes;
         let funcs = match get_funcs() {
             Ok(f) => f,
@@ -1463,10 +1491,10 @@ impl NvdecH265Decoder {
         {
             return;
         }
-        let host = unsafe { cu_mem_host_alloc(total) };
+        let host = cu_mem_host_alloc(total);
         if let Ok(p) = host {
             let y_size = row_bytes * h;
-            let mut cy = CUDA_MEMCPY2D {
+            let cy = CUDA_MEMCPY2D {
                 srcXInBytes: 0,
                 srcY: 0,
                 srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1489,9 +1517,13 @@ impl NvdecH265Decoder {
             let _ = unsafe { cu_memcpy_2d(&cy) };
             if !is_mono {
                 for plane in 0..num_uv_planes {
-                    let src_y = if is_444 { (h * (plane + 1)) as u64 } else { h as u64 };
+                    let src_y = if is_444 {
+                        (h * (plane + 1)) as u64
+                    } else {
+                        h as u64
+                    };
                     let rows = if is_444 { h as u64 } else { (h / 2) as u64 };
-                    let mut cuv = CUDA_MEMCPY2D {
+                    let cuv = CUDA_MEMCPY2D {
                         srcXInBytes: 0,
                         srcY: src_y,
                         srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1566,8 +1598,7 @@ impl Decoder for NvdecH265Decoder {
             let mut pending = self.pending_frames.lock().unwrap();
             pending.drain(..).collect()
         };
-        let remaining: Vec<((i32, i32), (i32, i32, i32))> =
-            self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
+        let remaining: Vec<ReorderEntry> = self.reorder.iter().map(|(k, v)| (*k, *v)).collect();
         for (key, (pic_index, seq, poc)) in remaining {
             if let Some(frame) = self.extract_frame(pic_index, seq, poc) {
                 self.last_presented_unwrapped = Some(key.0);

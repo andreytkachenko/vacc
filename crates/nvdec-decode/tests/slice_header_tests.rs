@@ -19,9 +19,7 @@
 //! - deblocking filter parameters
 //! - Real-world parsing from born_trailer.h264
 
-use vacc_parser::{
-    h264::H264Parser, BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser,
-};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -29,7 +27,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 // ============================================================================
@@ -44,9 +42,7 @@ fn encode_ue_bits(value: u32) -> Vec<u8> {
     } else {
         let v = value + 1;
         let leading_zeros = 32 - v.leading_zeros() - 1;
-        for _ in 0..leading_zeros {
-            bits.push(0);
-        }
+        bits.extend(std::iter::repeat_n(0, leading_zeros as usize));
         bits.push(1);
         for i in (0..leading_zeros).rev() {
             bits.push(((v >> i) & 1) as u8);
@@ -94,7 +90,7 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
     }
 
     if bit_count > 0 {
-        current_byte <<= (8 - bit_count);
+        current_byte <<= 8 - bit_count;
         bytes.push(current_byte);
     }
 
@@ -122,24 +118,11 @@ fn build_sps(
     frame_mbs_only_flag: bool,
     max_num_ref_frames: u32,
 ) -> Vec<u8> {
-    let mut bytes = Vec::new();
     // Start code
-    bytes.push(0);
-    bytes.push(0);
-    bytes.push(0);
-    bytes.push(1);
-
-    let mut bits = Vec::new();
+    let mut bytes = vec![0, 0, 0, 1];
 
     // NAL header: forbidden=0, nal_ref_idc=3, nal_unit_type=7 (SPS)
-    bits.push(0);
-    bits.push(1);
-    bits.push(1);
-    bits.push(0);
-    bits.push(0);
-    bits.push(1);
-    bits.push(1);
-    bits.push(1);
+    let mut bits = vec![0, 1, 1, 0, 0, 1, 1, 1];
 
     // profile_idc = 66 (Baseline)
     append_bits(&mut bits, 66, 8);
@@ -214,6 +197,8 @@ fn build_sps(
 // ============================================================================
 
 /// Build a minimal PPS NAL unit with specified parameters (with start code).
+// Test helper builder: mirrors the PPS bitstream field order.
+#[allow(clippy::too_many_arguments)]
 fn build_pps(
     pic_parameter_set_id: u32,
     seq_parameter_set_id: u32,
@@ -226,24 +211,11 @@ fn build_pps(
     num_ref_idx_l0_default_active_minus1: u32,
     num_ref_idx_l1_default_active_minus1: u32,
 ) -> Vec<u8> {
-    let mut bytes = Vec::new();
     // Start code
-    bytes.push(0);
-    bytes.push(0);
-    bytes.push(0);
-    bytes.push(1);
-
-    let mut bits = Vec::new();
+    let mut bytes = vec![0, 0, 0, 1];
 
     // NAL header: forbidden=0, nal_ref_idc=3, nal_unit_type=8 (PPS)
-    bits.push(0);
-    bits.push(1);
-    bits.push(1);
-    bits.push(0);
-    bits.push(1);
-    bits.push(0);
-    bits.push(0);
-    bits.push(0);
+    let mut bits = vec![0, 1, 1, 0, 1, 0, 0, 0];
 
     // pic_parameter_set_id
     bits.extend(encode_ue_bits(pic_parameter_set_id));
@@ -302,6 +274,8 @@ fn build_pps(
 // ============================================================================
 
 /// Build a slice NAL unit with a custom slice header.
+// Test helper builder: mirrors the slice header bitstream field order.
+#[allow(clippy::too_many_arguments)]
 fn build_slice_nal(
     nal_unit_type: u8,
     nal_ref_idc: u8,
@@ -1918,7 +1892,7 @@ fn test_slice_header_slice_qp_delta() {
         None,
         None,
         None,
-        5, // slice_qp_delta=5
+        5,       // slice_qp_delta=5
         Some(0), // disable_deblocking_filter_idc
         Some(0), // slice_alpha_c0_offset_div2
         Some(0), // slice_beta_offset_div2
@@ -1955,7 +1929,7 @@ fn test_slice_header_slice_qp_delta() {
         None,
         None,
         None,
-        -3, // slice_qp_delta=-3
+        -3,      // slice_qp_delta=-3
         Some(0), // disable_deblocking_filter_idc
         Some(0), // slice_alpha_c0_offset_div2
         Some(0), // slice_beta_offset_div2
@@ -2243,16 +2217,11 @@ fn test_slice_header_from_born_trailer() {
                                 slh.slice_type
                             );
                             assert_eq!(slh.pic_parameter_set_id, 0, "pps_id should be 0");
-                            assert!(slh.frame_num >= 0, "frame_num should be non-negative");
                             assert!(slh.header_bit_size > 0, "header_bit_size should be > 0");
                         }
 
                         // Verify slice_type is valid
-                        assert!(
-                            slh.slice_type < 5 || (slh.slice_type >= 5 && slh.slice_type < 10),
-                            "slice_type={} invalid",
-                            slh.slice_type
-                        );
+                        assert!(slh.slice_type < 10, "slice_type={} invalid", slh.slice_type);
 
                         // Verify deblocking filter parameters are in valid range
                         assert!(

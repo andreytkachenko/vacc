@@ -380,7 +380,7 @@ impl VideoSession {
         unsafe {
             eprintln!(
                 "[SESSION-CREATE]   pStdHeaderVersion->extensionName = \"{}\"",
-                std::ffi::CStr::from_ptr((*std_header_version).extension_name.as_ptr())
+                std::ffi::CStr::from_ptr(std_header_version.extension_name.as_ptr())
                     .to_string_lossy()
             );
             eprintln!(

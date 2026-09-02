@@ -197,6 +197,9 @@ pub enum ParseResult {
 }
 
 /// Codec-specific slice header.
+// The H.264 variant is large (per-reference lists); boxing would add a heap
+// allocation per slice without meaningful benefit at decoder throughput.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum SliceHeader {
     /// H.264 slice header.

@@ -65,9 +65,6 @@ const IVF_HEADER_SIZE: usize = 32;
 /// uninitialized.
 const BITSTREAM_PADDING: usize = 4096;
 
-
-
-
 // ============================================================================
 // OBU extraction
 // ============================================================================
@@ -153,8 +150,10 @@ fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
                 }
             }
             let is_frame = obu_type == 6;
-            let is_show_existing =
-                obu_type == 3 && size > 0 && size_pos < packet.len() && (packet[size_pos] & 0x80) != 0;
+            let is_show_existing = obu_type == 3
+                && size > 0
+                && size_pos < packet.len()
+                && (packet[size_pos] & 0x80) != 0;
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
@@ -232,7 +231,7 @@ pub fn build_cuvid_av1_picparams(
         0
     };
     let mut seq_flags: u32 = 0;
-    seq_flags |= (sps.profile as u32 & 0x7) << 0;
+    seq_flags |= sps.profile as u32 & 0x7;
     seq_flags |= (sps.use_128x128_superblock as u32 & 1) << 3;
     seq_flags |= (sps.subsampling_x as u32 & 1) << 4;
     seq_flags |= (sps.subsampling_y as u32 & 1) << 5;
@@ -256,7 +255,7 @@ pub fn build_cuvid_av1_picparams(
 
     // Frame header bitfields.
     let mut frame_flags: u32 = 0;
-    frame_flags |= (fh.frame_type as u32 & 0x3) << 0;
+    frame_flags |= fh.frame_type as u32 & 0x3;
     frame_flags |= (fh.show_frame as u32 & 1) << 2;
     frame_flags |= (fh.disable_cdf_update as u32 & 1) << 3;
     frame_flags |= (fh.allow_screen_content_tools as u32 & 1) << 4;
@@ -287,9 +286,9 @@ pub fn build_cuvid_av1_picparams(
     av1.frame_flags = frame_flags;
 
     // Tiling.
-    av1.tile_info = ((fh.tile_cols as u32 & 0xFF) << 0)
-        | ((fh.tile_rows as u32 & 0xFF) << 8)
-        | ((fh.context_update_tile_id as u32 & 0xFFFF) << 16);
+    av1.tile_info = (fh.tile_cols & 0xFF)
+        | ((fh.tile_rows & 0xFF) << 8)
+        | ((fh.context_update_tile_id & 0xFFFF) << 16);
     // cuvid expects the tile width/height in superblocks (the actual count),
     // whereas the parser stores `*_in_sbs_minus_1` (count minus 1). Verified
     // against the NVIDIA cuvid-parser baseline: 1920x1080 (64px superblocks,
@@ -317,17 +316,17 @@ pub fn build_cuvid_av1_picparams(
     // cdef_damping_minus_3=1, which the previous `saturating_sub(3)` clamped
     // to 0, corrupting every CDEF-filtered block.)
     let cdef_damping_minus_3 = fh.cdef_damping;
-    av1.cdef_flags = ((cdef_damping_minus_3 & 0x3) << 0) | ((fh.cdef_bits & 0x3) << 2);
+    av1.cdef_flags = (cdef_damping_minus_3 & 0x3) | ((fh.cdef_bits & 0x3) << 2);
     // Zero CDEF units not re-coded this frame (match the NVIDIA cuvid-parser
     // baseline: it only carries the refreshed units, zeroing the rest). With
     // this, picparams are byte-identical to the baseline.
     let recoded = 1usize << (fh.cdef_bits & 0x3);
     for i in 0..8 {
         if i < recoded {
-            av1.cdef_y_strength[i] = (fh.cdef_y_pri_strength[i] & 0xF)
-                | ((fh.cdef_y_sec_strength[i] & 0xF) << 4);
-            av1.cdef_uv_strength[i] = (fh.cdef_uv_pri_strength[i] & 0xF)
-                | ((fh.cdef_uv_sec_strength[i] & 0xF) << 4);
+            av1.cdef_y_strength[i] =
+                (fh.cdef_y_pri_strength[i] & 0xF) | ((fh.cdef_y_sec_strength[i] & 0xF) << 4);
+            av1.cdef_uv_strength[i] =
+                (fh.cdef_uv_pri_strength[i] & 0xF) | ((fh.cdef_uv_sec_strength[i] & 0xF) << 4);
         } else {
             av1.cdef_y_strength[i] = 0;
             av1.cdef_uv_strength[i] = 0;
@@ -350,7 +349,7 @@ pub fn build_cuvid_av1_picparams(
 
     // Segmentation.
     let mut segmentation_flags: u8 = 0;
-    segmentation_flags |= (fh.segmentation_enabled as u8 & 1) << 0;
+    segmentation_flags |= fh.segmentation_enabled as u8 & 1;
     segmentation_flags |= (fh.segmentation_update_map as u8 & 1) << 1;
     segmentation_flags |= (fh.segmentation_update_data as u8 & 1) << 2;
     segmentation_flags |= (fh.segmentation_temporal_update as u8 & 1) << 3;
@@ -371,28 +370,28 @@ pub fn build_cuvid_av1_picparams(
     av1.loop_filter_ref_deltas = fh.loop_filter_ref_deltas;
     av1.loop_filter_mode_deltas = fh.loop_filter_mode_deltas;
     let mut loop_filter_flags: u8 = 0;
-    loop_filter_flags |= (fh.loop_filter_delta_enabled as u8 & 1) << 0;
+    loop_filter_flags |= fh.loop_filter_delta_enabled as u8 & 1;
     loop_filter_flags |= (fh.loop_filter_delta_update as u8 & 1) << 1;
     loop_filter_flags |= (fh.delta_lf_present as u8 & 1) << 2;
-    loop_filter_flags |= (fh.delta_lf_res as u8 & 0x3) << 3;
+    loop_filter_flags |= (fh.delta_lf_res & 0x3) << 3;
     loop_filter_flags |= (fh.delta_lf_multi as u8 & 1) << 5;
     av1.loop_filter_flags = loop_filter_flags;
 
-        // Loop restoration. The parser stores the spec codes directly
-        // (0: 32px, 1: 64px, 2: 128px, 3: 256px) — the same numbering
-        // cuviddec.h documents for `lr_unit_size`.
-        for i in 0..3 {
-            av1.lr_unit_size[i] = fh.loop_restoration_size[i] as u8;
-            av1.lr_type[i] = fh.loop_restoration_type[i];
-        }
+    // Loop restoration. The parser stores the spec codes directly
+    // (0: 32px, 1: 64px, 2: 128px, 3: 256px) — the same numbering
+    // cuviddec.h documents for `lr_unit_size`.
+    for i in 0..3 {
+        av1.lr_unit_size[i] = fh.loop_restoration_size[i] as u8;
+        av1.lr_type[i] = fh.loop_restoration_type[i];
+    }
 
     // Reference mapping (from the pre-decode DPB state). The common DPB
     // reports `-1` for an empty frame buffer; cuvid's sentinel is 255.
     for fb in 0..AV1_NUM_FRAME_BUFFERS {
         av1.ref_frame_map[fb] = dpb.slot_of_frame_buffer(fb) as u8;
     }
-    for i in 0..7 {
-        let fb = effective_ref_frame_idx[i] as usize;
+    for (i, &eff) in effective_ref_frame_idx.iter().enumerate() {
+        let fb = eff as usize;
         let slot = if fb < AV1_NUM_FRAME_BUFFERS {
             dpb.slot_of_frame_buffer(fb)
         } else {
@@ -442,14 +441,14 @@ pub fn build_cuvid_av1_picparams(
             fh.global_motion_params[i]
         };
         av1.global_motion[i] = CUVIDAV1GLOBALMOTION {
-            flags: (gm_type as u8 & 0x3) << 1,
+            flags: (gm_type & 0x3) << 1,
             reserved24Bits: [0; 3],
             wmmat: gm_params,
         };
     }
 
     // Film grain (only apply_grain is signalled by the parser).
-    av1.film_grain_flags = (fh.apply_grain as u16 & 1) << 0;
+    av1.film_grain_flags = fh.apply_grain as u16 & 1;
 
     // 4. Common CUVIDPICPARAMS.
     let mut params = unsafe { std::mem::zeroed::<CUVIDPICPARAMS>() };
@@ -776,9 +775,7 @@ impl NvdecAv1Decoder {
         // num/den onto the 90 kHz clock).
         let (rate_num, rate_den) = self.ivf_timebase;
         let ts_90k = if rate_den > 0 {
-            packet_pts
-                .saturating_mul(90_000u64 * rate_num as u64)
-                / rate_den as u64
+            packet_pts.saturating_mul(90_000u64 * rate_num as u64) / rate_den as u64
         } else {
             0
         };
@@ -817,13 +814,7 @@ impl NvdecAv1Decoder {
         let _ = cu_ctx_set_current();
 
         let procparams = crate::ffi::default_procparams();
-        let result = unsafe {
-            (funcs.decode_picture)(
-                decoder_handle as *mut std::ffi::c_void,
-                &params,
-                &procparams,
-            )
-        };
+        let result = unsafe { (funcs.decode_picture)(decoder_handle, &params, &procparams) };
         if result != CUDA_SUCCESS {
             return Err(NvdecError::DecodeFailed(format!(
                 "cuvidDecodePicture failed: {}",
@@ -835,9 +826,11 @@ impl NvdecAv1Decoder {
 
         // Commit this frame's refresh to the common DPB (now that the decode
         // is submitted).
-        self.parser
-            .dpb_mut()
-            .commit_decoded(params.CurrPicIdx as u32, &fh, sps.order_hint_bits_minus1 as u32);
+        self.parser.dpb_mut().commit_decoded(
+            params.CurrPicIdx as u32,
+            &fh,
+            sps.order_hint_bits_minus1 as u32,
+        );
 
         if fh.show_frame {
             if let Some(frame) = self.extract_frame(params.CurrPicIdx) {
@@ -1027,9 +1020,7 @@ impl NvdecAv1Decoder {
                     },
                     reserved2: [0; 11],
                 };
-                let res = unsafe {
-                    reconfigure(decoder_handle as *mut std::ffi::c_void, &reconfig)
-                };
+                let res = unsafe { reconfigure(decoder_handle, &reconfig) };
                 if res == CUDA_SUCCESS {
                     reconfigured = true;
                 } else {
@@ -1151,7 +1142,11 @@ impl NvdecAv1Decoder {
         let (crop_left, crop_top, _, _) = display_area;
 
         // P016 (10/12-bit) surfaces use 2-byte little-endian samples.
-        let ss = if info.luma_bit_depth == ComponentBitDepth::Bit8 { 1 } else { 2 };
+        let ss = if info.luma_bit_depth == ComponentBitDepth::Bit8 {
+            1
+        } else {
+            2
+        };
 
         let y_size = display_width * display_height * ss;
         let interleaved_uv_size = display_width * (display_height / 2) * ss;
@@ -1180,7 +1175,7 @@ impl NvdecAv1Decoder {
         let pinned_y = pinned_base;
         let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
-        let mut copy_y = CUDA_MEMCPY2D {
+        let copy_y = CUDA_MEMCPY2D {
             srcXInBytes: crop_left as u64 * ss as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1255,13 +1250,13 @@ impl NvdecAv1Decoder {
         // P016 surfaces store samples left-aligned with zeroed LSBs (10-bit:
         // << 6, 12-bit: << 4). Shift back to native bit depth.
         if ss == 2 {
-            let shift = 16u32 - info.luma_bit_depth.bit_depth() as u32;
+            let shift = 16u32 - info.luma_bit_depth.bit_depth();
             for chunk in y_plane.chunks_exact_mut(2) {
-                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                let s = u16::from_le_bytes([chunk[0], chunk[1]]) >> shift;
                 chunk.copy_from_slice(&s.to_le_bytes());
             }
             for chunk in interleaved_uv.chunks_exact_mut(2) {
-                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                let s = u16::from_le_bytes([chunk[0], chunk[1]]) >> shift;
                 chunk.copy_from_slice(&s.to_le_bytes());
             }
         }
@@ -1505,15 +1500,40 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     let _ = writeln!(f, "field_pic_flag = {}", p.field_pic_flag);
     let _ = writeln!(f, "bottom_field_flag = {}", p.bottom_field_flag);
     let _ = writeln!(f, "second_field = {}", p.second_field);
-    let _ = writeln!(f, "Reserved = [{}]", p.Reserved.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
+    let _ = writeln!(
+        f,
+        "Reserved = [{}]",
+        p.Reserved
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     // First/last 32 bytes of the actual bitstream passed to cuvidDecodePicture
     // (it lives in the pinned host buffer, so read it directly).
     let total = p.nBitstreamDataLen as usize;
     let bs = unsafe { std::slice::from_raw_parts(p.pBitstreamData, total) };
     let first_len = total.min(32);
-    let _ = writeln!(f, "BITSTREAM[0..{}) = {}", first_len, bs[..first_len].iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    let _ = writeln!(
+        f,
+        "BITSTREAM[0..{}) = {}",
+        first_len,
+        bs[..first_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
     let last_start = total.saturating_sub(32);
-    let _ = writeln!(f, "BITSTREAM[{}..{}] = {}", last_start, total, bs[last_start..].iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    let _ = writeln!(
+        f,
+        "BITSTREAM[{}..{}] = {}",
+        last_start,
+        total,
+        bs[last_start..]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
     let _ = writeln!(f, "ref_pic_flag = {}", p.ref_pic_flag);
     let _ = writeln!(f, "intra_pic_flag = {}", p.intra_pic_flag);
     let _ = writeln!(f, "width = {}", av1.width);
@@ -1553,20 +1573,53 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     let _ = writeln!(
         f,
         "num_tile_cols = {} num_tile_rows = {} context_update_tile_id = {}",
-        av1.num_tile_cols(), av1.num_tile_rows(), av1.context_update_tile_id()
+        av1.num_tile_cols(),
+        av1.num_tile_rows(),
+        av1.context_update_tile_id()
     );
-    let _ = writeln!(f, "tile_widths = [{}]", av1.tile_widths.iter().take(16).map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
-    let _ = writeln!(f, "tile_heights = [{}]", av1.tile_heights.iter().take(16).map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
-    let _ = writeln!(f, "cdef_damping_minus_3 = {} cdef_bits = {}", av1.cdef_damping_minus_3(), av1.cdef_bits());
+    let _ = writeln!(
+        f,
+        "tile_widths = [{}]",
+        av1.tile_widths
+            .iter()
+            .take(16)
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        f,
+        "tile_heights = [{}]",
+        av1.tile_heights
+            .iter()
+            .take(16)
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        f,
+        "cdef_damping_minus_3 = {} cdef_bits = {}",
+        av1.cdef_damping_minus_3(),
+        av1.cdef_bits()
+    );
     let _ = writeln!(
         f,
         "base_qindex = {} qp_y_dc = {} qp_u_dc = {} qp_v_dc = {} qp_u_ac = {} qp_v_ac = {}",
-        av1.base_qindex, av1.qp_y_dc_delta_q, av1.qp_u_dc_delta_q, av1.qp_v_dc_delta_q, av1.qp_u_ac_delta_q, av1.qp_v_ac_delta_q
+        av1.base_qindex,
+        av1.qp_y_dc_delta_q,
+        av1.qp_u_dc_delta_q,
+        av1.qp_v_dc_delta_q,
+        av1.qp_u_ac_delta_q,
+        av1.qp_v_ac_delta_q
     );
     let _ = writeln!(
         f,
         "segmentation: enabled={} update_map={} update_data={} temporal_update={}",
-        av1.segmentation_enabled(), av1.segmentation_update_map(), av1.segmentation_update_data(), av1.segmentation_temporal_update()
+        av1.segmentation_enabled(),
+        av1.segmentation_update_map(),
+        av1.segmentation_update_data(),
+        av1.segmentation_temporal_update()
     );
     let _ = writeln!(
         f,
@@ -1574,13 +1627,35 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
         av1.loop_filter_level[0], av1.loop_filter_level[1], av1.loop_filter_level_u, av1.loop_filter_level_v, av1.loop_filter_sharpness,
         av1.loop_filter_delta_enabled(), av1.loop_filter_delta_update(), av1.delta_lf_present(), av1.delta_lf_res(), av1.delta_lf_multi()
     );
-    let _ = writeln!(f, "loop_filter_ref_deltas = [{}]", av1.loop_filter_ref_deltas.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
+    let _ = writeln!(
+        f,
+        "loop_filter_ref_deltas = [{}]",
+        av1.loop_filter_ref_deltas
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let _ = writeln!(f, "primary_ref_frame = {}", av1.primary_ref_frame);
-    let _ = writeln!(f, "ref_frame_map = [{}]", av1.ref_frame_map.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
+    let _ = writeln!(
+        f,
+        "ref_frame_map = [{}]",
+        av1.ref_frame_map
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let _ = writeln!(
         f,
         "ref_frame = [{}]",
-        (0..7).map(|r| format!("({}x{} idx={})", av1.ref_frame[r].width, av1.ref_frame[r].height, av1.ref_frame[r].index)).collect::<Vec<_>>().join(" ")
+        (0..7)
+            .map(|r| format!(
+                "({}x{} idx={})",
+                av1.ref_frame[r].width, av1.ref_frame[r].height, av1.ref_frame[r].index
+            ))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     // Full raw byte dump of the CUVIDAV1PICPARAMS for byte-exact diffing.
     let raw = unsafe {
@@ -1589,7 +1664,11 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
             std::mem::size_of::<crate::ffi::CUVIDAV1PICPARAMS>(),
         )
     };
-    let _ = writeln!(f, "RAW = {}", raw.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    let _ = writeln!(
+        f,
+        "RAW = {}",
+        raw.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    );
     // Full bitstream MD5 for content verification (matches the cuvid baseline tool).
     let bs_len = p.nBitstreamDataLen as usize;
     if bs_len > 0 && !p.pBitstreamData.is_null() {

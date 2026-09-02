@@ -468,6 +468,11 @@ impl NvdecDpbManager {
         self.entries.len()
     }
 
+    /// Returns true if the DPB contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Get a reference to the entry at the given index.
     pub fn get_entry(&self, idx: usize) -> Option<&NvdecDpbEntry> {
         self.entries.get(idx)
@@ -508,11 +513,13 @@ impl NvdecDpbManager {
         let mut oldest_poc = i32::MAX;
 
         for (i, entry) in self.entries.iter().enumerate() {
-            if entry.is_valid && entry.is_reference && !entry.is_long_term {
-                if entry.pic_order_cnt < oldest_poc {
-                    oldest_poc = entry.pic_order_cnt;
-                    oldest_idx = Some(i);
-                }
+            if entry.is_valid
+                && entry.is_reference
+                && !entry.is_long_term
+                && entry.pic_order_cnt < oldest_poc
+            {
+                oldest_poc = entry.pic_order_cnt;
+                oldest_idx = Some(i);
             }
         }
 
@@ -968,19 +975,19 @@ mod tests {
         dpb.apply_mmco(2, &slh, true, false);
 
         let cuvid = dpb.to_cuvid_dpb_entries();
-        for i in 0..16 {
+        for (i, entry) in cuvid.iter().enumerate() {
             assert_eq!(
-                cuvid[i].PicIdx, -1,
+                entry.PicIdx, -1,
                 "Entry {} should be empty after IDR reset",
                 i
             );
             assert_eq!(
-                cuvid[i].not_existing, 0,
+                entry.not_existing, 0,
                 "Entry {} should have not_existing=0 after IDR reset",
                 i
             );
             assert_eq!(
-                cuvid[i].used_for_reference, 0,
+                entry.used_for_reference, 0,
                 "Entry {} should have used_for_reference=0 after IDR reset",
                 i
             );
@@ -999,9 +1006,9 @@ mod tests {
 
         // Only 2 reference frames should be in CUVID DPB
         let mut ref_count = 0;
-        for i in 0..16 {
-            if cuvid[i].PicIdx != -1 {
-                assert_eq!(cuvid[i].used_for_reference, 3);
+        for entry in &cuvid {
+            if entry.PicIdx != -1 {
+                assert_eq!(entry.used_for_reference, 3);
                 ref_count += 1;
             }
         }

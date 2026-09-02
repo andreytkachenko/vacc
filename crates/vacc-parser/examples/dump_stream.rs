@@ -51,15 +51,25 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn mmco_vec(mmco: &[(u32, u32)]) -> Vec<H264MmcoCommand> {
-    mmco
-        .iter()
+    mmco.iter()
         .map(|(op, value)| match *op {
-            1 => H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1: *value },
-            2 => H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx: *value },
-            3 => H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1: 0, long_term_frame_idx: *value },
-            4 => H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: *value },
+            1 => H264MmcoCommand::UnmarkShortTerm {
+                difference_of_pic_nums_minus1: *value,
+            },
+            2 => H264MmcoCommand::UnmarkLongTerm {
+                long_term_frame_idx: *value,
+            },
+            3 => H264MmcoCommand::AssignLongTerm {
+                difference_of_pic_nums_minus1: 0,
+                long_term_frame_idx: *value,
+            },
+            4 => H264MmcoCommand::SetMaxLongTermFrameIdx {
+                max_long_term_frame_idx_plus1: *value,
+            },
             5 => H264MmcoCommand::UnmarkAll,
-            6 => H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx: *value },
+            6 => H264MmcoCommand::AssignLongTermToCurrent {
+                long_term_frame_idx: *value,
+            },
             _ => H264MmcoCommand::UnmarkAll,
         })
         .collect()
@@ -79,9 +89,19 @@ fn dump_h264(data: &[u8], max_frames: usize) {
 
     loop {
         match parser.parse(&packet) {
-            Ok(ParseResult::ParameterSet { sps: s, pps, sps_nal, pps_nal, .. }) => {
+            Ok(ParseResult::ParameterSet {
+                sps: s,
+                pps,
+                sps_nal,
+                pps_nal,
+                ..
+            }) => {
                 if let Some(s) = s {
-                    sps = Some(s.downcast_ref::<vacc_core::picture::H264Sps>().cloned().unwrap());
+                    sps = Some(
+                        s.downcast_ref::<vacc_core::picture::H264Sps>()
+                            .cloned()
+                            .unwrap(),
+                    );
                     let sps = sps.as_ref().unwrap();
                     println!(
                         "SPS profile={} level={} chroma={} luma_bd={} log2_mfn_minus4={} poc_type={} \
@@ -102,7 +122,10 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                     }
                 }
                 if let (Some(p), Some(nal)) = (pps, pps_nal) {
-                    let pps = p.downcast_ref::<vacc_core::picture::H264Pps>().cloned().unwrap();
+                    let pps = p
+                        .downcast_ref::<vacc_core::picture::H264Pps>()
+                        .cloned()
+                        .unwrap();
                     println!(
                         "PPS id={} sps_id={} entropy={} nr0={} nr1={} weighted={} redundant={}",
                         pps.pic_parameter_set_id,
@@ -128,19 +151,27 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                 let is_ref = slh.nal_ref_idc != 0;
                 if slh.nal_unit_type == 5 {
                     poc_calc.reset();
-                    let num_ref_frames = sps.max_num_ref_frames.min(16).max(1);
+                    let num_ref_frames = sps.max_num_ref_frames.clamp(1, 16);
                     dpb = Some(H264Dpb::new(16, 16, num_ref_frames, sps.max_frame_num));
                 }
                 let poc = poc_calc.calculate(&sps, slh, is_ref);
-                let mmco: Vec<(u32, u32)> =
-                    slh.dec_ref_pic_marking.iter().map(|e| (e.memory_management_control_operation, e.value)).collect();
+                let mmco: Vec<(u32, u32)> = slh
+                    .dec_ref_pic_marking
+                    .iter()
+                    .map(|e| (e.memory_management_control_operation, e.value))
+                    .collect();
                 let cmds = mmco_vec(&mmco);
                 let no_output = slh.no_output_of_prior_pics_flag;
                 let is_idr = slh.nal_unit_type == 5;
                 let dpb = dpb.as_mut().expect("dpb");
                 dpb.picture_start(
-                    slh.frame_num, poc, is_ref, is_idr, no_output,
-                    !cmds.is_empty(), cmds,
+                    slh.frame_num,
+                    poc,
+                    is_ref,
+                    is_idr,
+                    no_output,
+                    !cmds.is_empty(),
+                    cmds,
                 );
                 let lists = dpb.build_ref_lists(
                     slh.slice_type % 5,
@@ -165,8 +196,7 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                 };
                 let l0: Vec<i32> = lists.l0.iter().map(|r| r.poc).collect();
                 let l1: Vec<i32> = lists.l1.iter().map(|r| r.poc).collect();
-                let mmco_s: Vec<String> =
-                    mmco.iter().map(|(o, v)| format!("{o}:{v}")).collect();
+                let mmco_s: Vec<String> = mmco.iter().map(|(o, v)| format!("{o}:{v}")).collect();
                 println!(
                     "PIC {pic}\n  fn={} poc={} slt={} pps={} idr={} poc_lsb={} nal_ref={} \
                      nr0={} nr1={} nopp={} mmco=[{}] rplm0=[{}] rplm1=[{}] hbs={}\n  L0 [{}]\n  L1 [{}]",
@@ -187,7 +217,7 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                     l0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
                     l1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
                 );
-                let header_bytes = ((slh.header_bit_size as usize) + 7) / 8;
+                let header_bytes = (slh.header_bit_size as usize).div_ceil(8);
                 let raw = &first.nal_data[..header_bytes.min(first.nal_data.len())];
                 println!("  RAW {}", hex(raw));
             }
@@ -211,9 +241,15 @@ fn dump_h265(data: &[u8], max_frames: usize) {
 
     loop {
         match parser.parse(&packet) {
-            Ok(ParseResult::ParameterSet { sps: s, pps, vps, .. }) => {
+            Ok(ParseResult::ParameterSet {
+                sps: s, pps, vps, ..
+            }) => {
                 if let Some(s) = s {
-                    sps = Some(s.downcast_ref::<vacc_core::picture::H265Sps>().cloned().unwrap());
+                    sps = Some(
+                        s.downcast_ref::<vacc_core::picture::H265Sps>()
+                            .cloned()
+                            .unwrap(),
+                    );
                     let sps = sps.as_ref().unwrap();
                     println!(
                         "SPS profile={} level={} chroma={} luma_bd={} log2_mpc_lsb={} max_ref={} w={} h={} reorder={}",
@@ -230,7 +266,10 @@ fn dump_h265(data: &[u8], max_frames: usize) {
                     dpb.set_max_num_reorder_frames(sps.max_num_reorder_pics[0] as u32);
                 }
                 if let Some(p) = pps {
-                    let pps = p.downcast_ref::<vacc_core::picture::H265Pps>().cloned().unwrap();
+                    let pps = p
+                        .downcast_ref::<vacc_core::picture::H265Pps>()
+                        .cloned()
+                        .unwrap();
                     println!(
                         "PPS id={} sps_id={} nr0={} nr1={} output_flag_present={}",
                         pps.pps_pic_parameter_set_id,
@@ -247,7 +286,8 @@ fn dump_h265(data: &[u8], max_frames: usize) {
             }
             Ok(ParseResult::Slice { slices, .. }) => {
                 let first = &slices[0];
-                let SliceHeader::H265(info) = first.slice_header.as_ref().expect("h265 info") else {
+                let SliceHeader::H265(info) = first.slice_header.as_ref().expect("h265 info")
+                else {
                     panic!();
                 };
                 let sps = sps.clone().expect("sps");
@@ -265,10 +305,12 @@ fn dump_h265(data: &[u8], max_frames: usize) {
 
                 let rplm = |v: &[vacc_parser::h265::H265ListModification]| -> String {
                     v.iter()
-                        .map(|e| if e.flag {
-                            format!("1:{}", e.ref_idx)
-                        } else {
-                            "0".to_string()
+                        .map(|e| {
+                            if e.flag {
+                                format!("1:{}", e.ref_idx)
+                            } else {
+                                "0".to_string()
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(",")
@@ -296,7 +338,7 @@ fn dump_h265(data: &[u8], max_frames: usize) {
                     l0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
                     l1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
                 );
-                let header_bytes = 2 + (info.header_bit_size as usize + 7) / 8;
+                let header_bytes = 2 + (info.header_bit_size as usize).div_ceil(8);
                 let raw = &first.nal_data[..header_bytes.min(first.nal_data.len())];
                 println!("  RAW {}", hex(raw));
             }
@@ -312,7 +354,7 @@ fn dump_h265(data: &[u8], max_frames: usize) {
     while let Some((start, code_len)) = vacc_parser::nal::find_next_start_code(data, offset) {
         let next = vacc_parser::nal::find_next_start_code(data, start + code_len);
         let end = match next {
-            Some((s, cl)) if cl == 4 => s + 1,
+            Some((s, 4)) => s + 1,
             Some((s, _)) => s,
             None => data.len(),
         };
@@ -343,7 +385,10 @@ fn dump_h265(data: &[u8], max_frames: usize) {
 
 /// Minimal IVF demuxer (header + fixed-size packets).
 fn ivf_packets(data: &[u8]) -> Vec<Vec<u8>> {
-    assert!(data.len() >= 32 && &data[0..4] == b"DKIF", "not an IVF file");
+    assert!(
+        data.len() >= 32 && &data[0..4] == b"DKIF",
+        "not an IVF file"
+    );
     let mut out = Vec::new();
     let mut off = 32usize;
     while off + 12 <= data.len() {
@@ -370,8 +415,14 @@ fn dump_vp9(data: &[u8], max_frames: usize) {
             break;
         }
         let payload = vacc_parser::vp9::Vp9Parser::skip_superframe_index(&pkt);
-        let fd = parser.parse_frame(payload).unwrap_or_else(|e| panic!("frame {i}: {e}"));
-        let r3 = [fd.ref_frame_idx[0], fd.ref_frame_idx[1], fd.ref_frame_idx[2]];
+        let fd = parser
+            .parse_frame(payload)
+            .unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        let r3 = [
+            fd.ref_frame_idx[0],
+            fd.ref_frame_idx[1],
+            fd.ref_frame_idx[2],
+        ];
         let refs = dpb.reference_slots(fd.frame_is_intra, &r3);
         let slot = if fd.show_existing_frame {
             -1
@@ -389,8 +440,15 @@ fn dump_vp9(data: &[u8], max_frames: usize) {
             fd.picture_info.frame_context_idx,
             fd.picture_info.refresh_frame_flags,
             fd.picture_info.ref_frame_sign_bias_mask,
-            fd.ref_frame_idx.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
-            refs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
+            fd.ref_frame_idx
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            refs.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
             slot,
         );
         if !fd.show_existing_frame {
@@ -507,7 +565,11 @@ fn dump_av1(data: &[u8], max_frames: usize) {
                             sps.order_hint_bits_minus1,
                             fh.refresh_frame_flags,
                             u32::from(fh.show_frame),
-                            fh.ref_frame_idx.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
+                            fh.ref_frame_idx
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" "),
                             u32::from(ok),
                         );
                         if ok {

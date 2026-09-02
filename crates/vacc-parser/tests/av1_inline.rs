@@ -85,7 +85,7 @@ fn parse_all(data: &[u8]) -> (vacc_core::picture::Av1Sps, Vec<Av1FrameHeader>) {
     let mut sps = None;
     let mut frames = Vec::new();
     for pkt in ivf_packets(data) {
-        for (obu_type, payload) in walk_obus(&pkt) {
+        for (obu_type, payload) in walk_obus(pkt) {
             match obu_type {
                 1 => {
                     if sps.is_none() {
@@ -155,10 +155,10 @@ fn test_first_frames() {
     let expected: &[(u8, u32, u8, bool, [u8; 7])] = &[
         (1, 32, 2, false, [0, 0, 0, 0, 0, 0, 0]), // PIC1
         (1, 16, 4, false, [0, 0, 0, 0, 0, 0, 1]), // PIC2
-        (1, 8, 8, false, [0, 0, 0, 0, 2, 0, 1]), // PIC3
+        (1, 8, 8, false, [0, 0, 0, 0, 2, 0, 1]),  // PIC3
         (1, 4, 16, false, [0, 0, 0, 0, 3, 2, 1]), // PIC4
         (1, 2, 32, false, [0, 0, 2, 0, 4, 3, 1]), // PIC5
-        (1, 1, 64, true, [0, 3, 2, 0, 5, 4, 1]), // PIC6
+        (1, 1, 64, true, [0, 3, 2, 0, 5, 4, 1]),  // PIC6
     ];
     for (i, (ftype, oh, refresh, show, refs)) in expected.iter().enumerate() {
         let f = &frames[1 + i];
@@ -203,14 +203,12 @@ fn test_full_stream_order_hints() {
 
     for (i, f) in frames.iter().take(300).enumerate() {
         let e = &EXPECTED_FIRST_300[i * 3..i * 3 + 3];
-        assert_eq!(f.frame_type, e[0] as u8, "PIC{i} frame type");
+        assert_eq!(f.frame_type, e[0], "PIC{i} frame type");
         assert_eq!(f.order_hint, e[1] as u32, "PIC{i} order hint");
         assert_eq!(
-            f.refresh_frame_flags,
-            e[2],
+            f.refresh_frame_flags, e[2],
             "PIC{i} refresh flags (type={} oh={})",
-            f.frame_type,
-            f.order_hint
+            f.frame_type, f.order_hint
         );
     }
 

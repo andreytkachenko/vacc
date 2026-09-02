@@ -107,7 +107,12 @@ struct CurrentPic {
 }
 
 impl H264Dpb {
-    pub fn new(num_slots: usize, max_dpb_size: usize, num_ref_frames: u32, max_frame_num: u32) -> Self {
+    pub fn new(
+        num_slots: usize,
+        max_dpb_size: usize,
+        num_ref_frames: u32,
+        max_frame_num: u32,
+    ) -> Self {
         Self {
             slots: (0..num_slots).map(|_| H264DpbSlot::empty()).collect(),
             max_dpb_size: max_dpb_size.min(num_slots),
@@ -148,6 +153,7 @@ impl H264Dpb {
 
     /// Stage the current picture (C++ dpb_picture_start). Must be called before
     /// `get_references` / `prepare_current`.
+    #[allow(clippy::too_many_arguments)] // mirrors the slice-header fields it consumes
     pub fn picture_start(
         &mut self,
         frame_num: u32,
@@ -257,7 +263,11 @@ impl H264Dpb {
                 frame_num: cur.frame_num,
                 frame_num_wrap,
                 poc: cur.poc,
-                marking: if cur.is_ref { MARKING_SHORT } else { MARKING_UNUSED },
+                marking: if cur.is_ref {
+                    MARKING_SHORT
+                } else {
+                    MARKING_UNUSED
+                },
                 needed_for_output: true,
             };
         }
@@ -266,7 +276,6 @@ impl H264Dpb {
         if self.reordering_delay() > self.max_num_reorder_frames {
             self.display_bump();
         }
-
     }
 
     /// Number of full-frame pictures pending output (C++ dpb_reordering_delay).
@@ -309,7 +318,7 @@ impl H264Dpb {
     fn apply_sliding_window(&mut self, cur: &CurrentPic) {
         // FrameNum-conflict unmarking (C++ sliding_window:4138-4149): a short-term ref
         // with the same FrameNum as the current is unmarked (non-conforming stream).
-        for (i, s) in self.slots.iter_mut().enumerate() {
+        for s in self.slots.iter_mut() {
             if s.is_ref() && s.frame_num == cur.frame_num {
                 s.marking = MARKING_UNUSED;
             }
@@ -340,7 +349,9 @@ impl H264Dpb {
     fn apply_mmco(&mut self, cur: &CurrentPic) {
         for cmd in &cur.mmco_commands {
             match cmd {
-                H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1 } => {
+                H264MmcoCommand::UnmarkShortTerm {
+                    difference_of_pic_nums_minus1,
+                } => {
                     let pic_num_x = self.pic_num_x(cur.frame_num, *difference_of_pic_nums_minus1);
                     for s in &mut self.slots {
                         if s.is_ref() && s.frame_num == pic_num_x {
@@ -396,7 +407,11 @@ impl H264Dpb {
                 frame_num: s.frame_num,
                 frame_num_wrap: s.frame_num_wrap,
                 poc: s.poc,
-                marking: if s.state == 0 { MARKING_UNUSED } else { s.marking },
+                marking: if s.state == 0 {
+                    MARKING_UNUSED
+                } else {
+                    s.marking
+                },
                 long_term_frame_idx: 0, // long-term refs are not tracked by this DPB yet
             })
             .collect();

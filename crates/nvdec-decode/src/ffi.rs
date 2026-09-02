@@ -1066,7 +1066,7 @@ pub struct CUVIDAV1GLOBALMOTION {
 
 impl CUVIDAV1GLOBALMOTION {
     pub fn invalid(&self) -> u32 {
-        (self.flags as u32 >> 0) & 1
+        (self.flags as u32) & 1
     }
     pub fn wmtype(&self) -> u32 {
         (self.flags as u32 >> 1) & 0b11

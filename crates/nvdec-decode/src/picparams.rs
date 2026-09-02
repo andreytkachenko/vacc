@@ -100,11 +100,10 @@ pub fn build_cuvid_h264_picparams(
         deblocking_filter_control_present_flag: pps.deblocking_filter_control_present_flag as c_int,
         redundant_pic_cnt_present_flag: pps.redundant_pic_cnt_present_flag as c_int,
         transform_8x8_mode_flag: pps.transform_8x8_mode_flag as c_int,
-        MbaffFrameFlag: if sps.frame_mbs_only_flag {
-            0
-        } else if slh.field_pic_flag {
-            0
-        } else if sps.mb_adaptive_frame_field_flag {
+        MbaffFrameFlag: if !sps.frame_mbs_only_flag
+            && !slh.field_pic_flag
+            && sps.mb_adaptive_frame_field_flag
+        {
             1
         } else {
             0
@@ -152,6 +151,8 @@ pub fn build_cuvid_h264_picparams(
 ///
 /// The caller must ensure `bitstream_data` and `slice_offsets` live at least
 /// as long as the pointers stored in the returned [`CUVIDPICPARAMS`].
+// FFI-mirror constructor: field count mirrors CUVIDPICPARAMS inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn build_cuvid_picparams(
     sps: &H264Sps,
     pps: &H264Pps,
@@ -273,6 +274,8 @@ impl Default for H265DpbState {
 ///
 /// The caller must keep `bitstream_data` and `slice_offsets` alive at least as
 /// long as the pointers stored in the returned [`CUVIDPICPARAMS`].
+// FFI-mirror constructor: field count mirrors CUVIDPICPARAMS inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn build_cuvid_hevc_picparams(
     sps: &H265Sps,
     pps: &H265Pps,

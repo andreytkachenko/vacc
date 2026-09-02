@@ -21,7 +21,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load the born_trailer.h264 test file.
 fn load_born_trailer() -> Vec<u8> {
     let path = format!("{}/assets/born_trailer.h264", PROJECT_ROOT);
-    std::fs::read(&path).expect(&format!("Failed to read test file: {}", path))
+    std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {}", path))
 }
 
 /// Load only the SPS/PPS portion of the stream (first ~650 bytes).
@@ -82,9 +82,7 @@ fn test_decoder_info_coded_size() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         expected_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
                         expected_height = if h264_sps.frame_mbs_only_flag {
                             (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
@@ -135,9 +133,7 @@ fn test_decoder_info_display_size() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
                         let coded_height = if h264_sps.frame_mbs_only_flag {
                             (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
@@ -209,9 +205,7 @@ fn test_decoder_info_chroma_subsampling() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         expected_chroma = match h264_sps.chroma_format_idc {
                             0 => ChromaSubsampling::Monochrome,
                             1 => ChromaSubsampling::_420,
@@ -259,9 +253,7 @@ fn test_decoder_info_bit_depth() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         let bit_depth_minus8 = h264_sps.bit_depth_luma_minus8;
                         expected_luma_depth = match bit_depth_minus8 {
                             0 => ComponentBitDepth::Bit8,
@@ -319,9 +311,7 @@ fn test_decoder_info_profile_idc() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         expected_profile_idc = Some(h264_sps.profile_idc as u32);
                     }
                 }
@@ -362,9 +352,7 @@ fn test_decoder_info_dpb_slots() {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
-                    if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
-                    {
+                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
                         expected_dpb_slots = h264_sps.max_num_ref_frames + 1;
                     }
                 }

@@ -19,7 +19,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 /// Find the next start code in a byte stream.
@@ -39,10 +39,12 @@ fn find_start_code(data: &[u8], start: usize) -> Option<(usize, usize)> {
             if i == 0 || remaining[i - 1] != 0 {
                 return Some((start + i, 4));
             }
-        } else if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1 {
-            if i == 0 || remaining[i - 1] != 0 {
-                return Some((start + i, 3));
-            }
+        } else if remaining[i] == 0
+            && remaining[i + 1] == 0
+            && remaining[i + 2] == 1
+            && (i == 0 || remaining[i - 1] != 0)
+        {
+            return Some((start + i, 3));
         }
         i += 1;
     }
@@ -803,7 +805,7 @@ fn test_poc_from_born_trailer_matches_cuvid() {
 
     for slh in &slices {
         if seen_frames.insert(slh.frame_num) {
-            let poc = calc.calculate(&sps, slh, false);
+            let poc = calc.calculate(sps, slh, false);
             frame_pocs.push((slh.frame_num, slh.pic_order_cnt_lsb, poc));
         }
     }
@@ -870,7 +872,7 @@ fn test_poc_field_order_cnt_for_cuvid_picparams() {
             continue;
         }
 
-        let poc = calc.calculate(&sps, slh, false);
+        let poc = calc.calculate(sps, slh, false);
 
         // For frame pictures (frame_mbs_only_flag=1 or !field_pic_flag),
         // both CurrFieldOrderCnt[0] and CurrFieldOrderCnt[1] should equal POC

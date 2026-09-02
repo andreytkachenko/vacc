@@ -18,7 +18,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 /// Extract raw NAL data (with start code) from the first NAL unit of given type.

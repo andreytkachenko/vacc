@@ -470,10 +470,7 @@ fn test_dpb_manager_invalidate_slot() {
     // Verify access reset. `current_layout` is intentionally preserved on
     // single-slot invalidation (the image's Vulkan layout is physical state;
     // see DpbManager::invalidate_slot docs).
-    assert_eq!(
-        dpb.entries[1].current_layout,
-        ash::vk::ImageLayout::GENERAL
-    );
+    assert_eq!(dpb.entries[1].current_layout, ash::vk::ImageLayout::GENERAL);
     assert_eq!(
         dpb.entries[1].last_access,
         vacc_vulkan::LastAccessType::None
@@ -644,8 +641,7 @@ fn test_dpb_manager_full_decode_flow() {
 
 #[test]
 fn test_dpb_manager_get_references() {
-    let mut dpb =
-        create_dpb_with_entries(8, &[(0, 1, [10, 10]), (1, 2, [20, 20]), (3, 4, [40, 40])]);
+    let dpb = create_dpb_with_entries(8, &[(0, 1, [10, 10]), (1, 2, [20, 20]), (3, 4, [40, 40])]);
 
     let refs = dpb.get_references();
     assert_eq!(refs.len(), 3);

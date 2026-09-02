@@ -69,6 +69,5 @@ pub trait DecoderDevice {
     ) -> Result<DecodeCapabilities, Self::Error>;
 
     /// Query supported output formats for a codec.
-    fn query_supported_formats(&self, codec: VideoCodec)
-        -> Result<Vec<VideoFormat>, Self::Error>;
+    fn query_supported_formats(&self, codec: VideoCodec) -> Result<Vec<VideoFormat>, Self::Error>;
 }

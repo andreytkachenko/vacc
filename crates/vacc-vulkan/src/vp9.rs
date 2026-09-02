@@ -206,7 +206,11 @@ impl Vp9Decoder {
         // In image-array mode the DPB slot index IS the array layer of the
         // shared image (the per-slot views are view-relative, layer 0).
         fn base_layer(dpb_use_image_array: bool, slot: i32) -> u32 {
-            if dpb_use_image_array && slot >= 0 { slot as u32 } else { 0 }
+            if dpb_use_image_array && slot >= 0 {
+                slot as u32
+            } else {
+                0
+            }
         }
 
         // Build reference slots for BeginVideoCoding (setup + references)

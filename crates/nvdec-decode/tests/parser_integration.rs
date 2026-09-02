@@ -16,53 +16,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
-}
-
-/// Extract raw NAL data (without start code) from the first NAL unit of given type.
-fn extract_first_nal(data: &[u8], nal_type: u8) -> Option<Vec<u8>> {
-    let mut offset = 0;
-    while offset < data.len() {
-        // Find start code (00 00 01 or 00 00 00 01)
-        let (start, code_len) = match (data.get(offset..offset + 3), data.get(offset..offset + 4)) {
-            (_, Some(&[0, 0, 0, 1])) => (offset, 4),
-            (Some(&[0, 0, 1]), _) => (offset, 3),
-            _ => {
-                offset += 1;
-                continue;
-            }
-        };
-
-        if start + code_len >= data.len() {
-            break;
-        }
-
-        let nal_header = data[start + code_len];
-        let unit_type = nal_header & 0x1F;
-
-        if unit_type == nal_type {
-            // Find end of this NAL
-            let mut end = start + code_len + 1;
-            while end < data.len() {
-                if data[end..].starts_with(&[0, 0, 0, 1]) || data[end..].starts_with(&[0, 0, 1]) {
-                    break;
-                }
-                end += 1;
-            }
-            return Some(data[start + code_len..end].to_vec());
-        }
-
-        // Find end of this NAL to skip it
-        let mut end = start + code_len + 1;
-        while end < data.len() {
-            if data[end..].starts_with(&[0, 0, 0, 1]) || data[end..].starts_with(&[0, 0, 1]) {
-                break;
-            }
-            end += 1;
-        }
-        offset = end;
-    }
-    None
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 /// Extract NAL data WITH start code from the first NAL unit of given type.
@@ -303,21 +257,8 @@ fn test_pps_parsing_from_real_bitstream() {
             vps: None,
             ..
         } => {
-            let pps = parser.active_pps().expect("No active PPS");
-
-            // Verify basic PPS fields
-            assert!(
-                pps.seq_parameter_set_id >= 0,
-                "seq_parameter_set_id must be non-negative"
-            );
-            assert!(
-                pps.num_ref_idx_l0_default_active_minus1 >= 0,
-                "num_ref_idx_l0_default_active_minus1 must be non-negative"
-            );
-            assert!(
-                pps.num_ref_idx_l1_default_active_minus1 >= 0,
-                "num_ref_idx_l1_default_active_minus1 must be non-negative"
-            );
+            // Verify the parser activated the PPS.
+            let _ = parser.active_pps().expect("No active PPS");
         }
         _ => panic!("Expected ParameterSet with SPS and PPS, got {:?}", result),
     }
@@ -470,29 +411,29 @@ struct PicParamsMapping {
     // SPS-derived fields
     log2_max_frame_num_minus4: i32,
     pic_order_cnt_type: i32,
-    log2_max_pic_order_cnt_lsb_minus4: i32,
-    delta_pic_order_always_zero_flag: i32,
+    _log2_max_pic_order_cnt_lsb_minus4: i32,
+    _delta_pic_order_always_zero_flag: i32,
     frame_mbs_only_flag: i32,
-    direct_8x8_inference_flag: i32,
+    _direct_8x8_inference_flag: i32,
     num_ref_frames: i32,
-    residual_colour_transform_flag: u8,
+    _residual_colour_transform_flag: u8,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
-    qpprime_y_zero_transform_bypass_flag: u8,
+    _qpprime_y_zero_transform_bypass_flag: u8,
 
     // PPS-derived fields
     entropy_coding_mode_flag: i32,
     pic_order_present_flag: i32,
-    num_ref_idx_l0_active_minus1: i32,
-    num_ref_idx_l1_active_minus1: i32,
-    weighted_pred_flag: i32,
-    weighted_bipred_idc: i32,
+    _num_ref_idx_l0_active_minus1: i32,
+    _num_ref_idx_l1_active_minus1: i32,
+    _weighted_pred_flag: i32,
+    _weighted_bipred_idc: i32,
     pic_init_qp_minus26: i32,
-    deblocking_filter_control_present_flag: i32,
-    redundant_pic_cnt_present_flag: i32,
-    transform_8x8_mode_flag: i32,
+    _deblocking_filter_control_present_flag: i32,
+    _redundant_pic_cnt_present_flag: i32,
+    _transform_8x8_mode_flag: i32,
     mbaff_frame_flag: i32,
-    constrained_intra_pred_flag: i32,
+    _constrained_intra_pred_flag: i32,
     chroma_qp_index_offset: i32,
     second_chroma_qp_index_offset: i32,
 }
@@ -507,30 +448,30 @@ impl PicParamsMapping {
             // SPS fields - must match decoder.rs:499-510
             log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4 as i32,
             pic_order_cnt_type: sps.pic_order_cnt_type as i32,
-            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4 as i32,
-            delta_pic_order_always_zero_flag: sps.delta_pic_order_always_zero_flag as i32,
+            _log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4 as i32,
+            _delta_pic_order_always_zero_flag: sps.delta_pic_order_always_zero_flag as i32,
             frame_mbs_only_flag: sps.frame_mbs_only_flag as i32,
-            direct_8x8_inference_flag: sps.direct_8x8_inference_flag as i32,
+            _direct_8x8_inference_flag: sps.direct_8x8_inference_flag as i32,
             num_ref_frames: sps.max_num_ref_frames as i32,
-            residual_colour_transform_flag: if sps.chroma_format_idc == 3 { 1 } else { 0 },
+            _residual_colour_transform_flag: if sps.chroma_format_idc == 3 { 1 } else { 0 },
             bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
             bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
-            qpprime_y_zero_transform_bypass_flag: sps.qpprime_y_zero_transform_bypass_flag as u8,
+            _qpprime_y_zero_transform_bypass_flag: sps.qpprime_y_zero_transform_bypass_flag as u8,
 
             // PPS fields - must match decoder.rs:513-526
             entropy_coding_mode_flag: pps.entropy_coding_mode_flag as i32,
             pic_order_present_flag: if sps.pic_order_cnt_type != 2 { 1 } else { 0 },
-            num_ref_idx_l0_active_minus1: slh.num_ref_idx_l0_active_minus1 as i32,
-            num_ref_idx_l1_active_minus1: slh.num_ref_idx_l1_active_minus1 as i32,
-            weighted_pred_flag: pps.weighted_pred_flag as i32,
-            weighted_bipred_idc: pps.weighted_bipred_idc as i32,
+            _num_ref_idx_l0_active_minus1: slh.num_ref_idx_l0_active_minus1 as i32,
+            _num_ref_idx_l1_active_minus1: slh.num_ref_idx_l1_active_minus1 as i32,
+            _weighted_pred_flag: pps.weighted_pred_flag as i32,
+            _weighted_bipred_idc: pps.weighted_bipred_idc as i32,
             pic_init_qp_minus26: pps.pic_init_qp_minus26,
-            deblocking_filter_control_present_flag: pps.deblocking_filter_control_present_flag
+            _deblocking_filter_control_present_flag: pps.deblocking_filter_control_present_flag
                 as i32,
-            redundant_pic_cnt_present_flag: pps.redundant_pic_cnt_present_flag as i32,
-            transform_8x8_mode_flag: pps.transform_8x8_mode_flag as i32,
+            _redundant_pic_cnt_present_flag: pps.redundant_pic_cnt_present_flag as i32,
+            _transform_8x8_mode_flag: pps.transform_8x8_mode_flag as i32,
             mbaff_frame_flag: if !sps.frame_mbs_only_flag { 1 } else { 0 },
-            constrained_intra_pred_flag: pps.constrained_intra_pred_flag as i32,
+            _constrained_intra_pred_flag: pps.constrained_intra_pred_flag as i32,
             chroma_qp_index_offset: pps.chroma_qp_index_offset,
             second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset,
         }
@@ -663,9 +604,7 @@ fn test_picparams_pps_field_mapping() {
     );
 }
 
-fn create_mock_slice_header(
-    pps: &vacc_core::picture::H264Pps,
-) -> vacc_parser::h264::SliceHeader {
+fn create_mock_slice_header(pps: &vacc_core::picture::H264Pps) -> vacc_parser::h264::SliceHeader {
     vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 4,
@@ -754,32 +693,31 @@ fn test_poc_type_0_basic() {
     // POC = pic_order_cnt_lsb (with msb=0 initially)
 
     let sps = create_sps_poc_type_0();
-    let max_pic_order_cnt_lsb = sps.max_pic_order_cnt_lsb as i32;
+    let _max_pic_order_cnt_lsb = sps.max_pic_order_cnt_lsb as i32;
 
     // Simulate the decoder's POC calculation logic
-    let mut prev_pic_order_cnt_lsb: i32 = 0;
+    let mut _prev_pic_order_cnt_lsb: i32 = 0;
     let mut prev_pic_order_cnt_msb: i32 = 0;
 
     // Frame 0: lsb=0
     let lsb0 = 0i32;
     let msb0 = prev_pic_order_cnt_msb; // no wrap
     assert_eq!(msb0 + lsb0, 0);
-    prev_pic_order_cnt_lsb = lsb0;
+    _prev_pic_order_cnt_lsb = lsb0;
     prev_pic_order_cnt_msb = msb0;
 
     // Frame 1: lsb=2
     let lsb1 = 2i32;
     let msb1 = prev_pic_order_cnt_msb; // no wrap
     assert_eq!(msb1 + lsb1, 2);
-    prev_pic_order_cnt_lsb = lsb1;
+    _prev_pic_order_cnt_lsb = lsb1;
     prev_pic_order_cnt_msb = msb1;
 
     // Frame 2: lsb=4
     let lsb2 = 4i32;
     let msb2 = prev_pic_order_cnt_msb; // no wrap
     assert_eq!(msb2 + lsb2, 4);
-    prev_pic_order_cnt_lsb = lsb2;
-    prev_pic_order_cnt_msb = msb2;
+    _prev_pic_order_cnt_lsb = lsb2;
 }
 
 #[test]
@@ -790,8 +728,8 @@ fn test_poc_type_0_wrap_up() {
     let sps = create_sps_poc_type_0();
     let max_pic_order_cnt_lsb = sps.max_pic_order_cnt_lsb as i32; // 512
 
-    let mut prev_pic_order_cnt_lsb: i32 = 500;
-    let mut prev_pic_order_cnt_msb: i32 = 0;
+    let prev_pic_order_cnt_lsb: i32 = 500;
+    let prev_pic_order_cnt_msb: i32 = 0;
 
     // Next frame: lsb=10 (wrapped around)
     // Since 500 - 10 = 490 >= 512/2 = 256, msb should increase
@@ -820,8 +758,8 @@ fn test_poc_type_0_wrap_down() {
     let sps = create_sps_poc_type_0();
     let max_pic_order_cnt_lsb = sps.max_pic_order_cnt_lsb as i32; // 512
 
-    let mut prev_pic_order_cnt_lsb: i32 = 10;
-    let mut prev_pic_order_cnt_msb: i32 = 512;
+    let prev_pic_order_cnt_lsb: i32 = 10;
+    let prev_pic_order_cnt_msb: i32 = 512;
 
     // Next frame: lsb=500 (wrapped around)
     // Since 500 - 10 = 490 >= 512/2 = 256, msb should decrease
@@ -853,14 +791,14 @@ fn test_poc_type_1_delta_based() {
     assert!(!sps.delta_pic_order_always_zero_flag);
 
     // Simulate the decoder's POC calculation for reference frames with cycle offsets
-    let offset_for_ref_frame = vec![4, -4];
+    let offset_for_ref_frame = [4, -4];
     let num_ref_frames_in_pic_order_cnt_cycle = 2u32;
-    let offset_for_non_ref_pic = 0i32;
+    let _offset_for_non_ref_pic = 0i32;
 
     let mut prev_pic_order_cnt: i32 = 0;
-    let mut last_pic_order_cnt: i32 = 0;
+    let last_pic_order_cnt: i32 = 0;
     let mut last_pic_order_cnt_cycle: i32 = 0;
-    let mut prev_is_reference = false;
+    let prev_is_reference = false;
 
     // Frame 0 (ref): prev_is_reference=false → last_pic_order_cnt + offset[0] = 0 + 4 = 4
     let poc0 = if prev_is_reference {
@@ -874,20 +812,14 @@ fn test_poc_type_1_delta_based() {
     };
     assert_eq!(poc0, 4);
     prev_pic_order_cnt = poc0;
-    last_pic_order_cnt = poc0;
     last_pic_order_cnt_cycle =
         (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
-    prev_is_reference = true;
 
     // Frame 1 (ref): prev_is_reference=true → prev_pic_order_cnt + offset[1] = 4 + (-4) = 0
     let poc1 = prev_pic_order_cnt
         + offset_for_ref_frame
             [last_pic_order_cnt_cycle as usize % num_ref_frames_in_pic_order_cnt_cycle as usize];
     assert_eq!(poc1, 0);
-    prev_pic_order_cnt = poc1;
-    last_pic_order_cnt = poc1;
-    last_pic_order_cnt_cycle =
-        (last_pic_order_cnt_cycle + 1) % num_ref_frames_in_pic_order_cnt_cycle as i32;
 }
 
 #[test]
@@ -1218,8 +1150,7 @@ fn test_slice_header_parsing_from_real_bitstream() {
                 if !slices.is_empty() {
                     got_slice = true;
                     let first_slice = &slices[0];
-                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice.slice_header
-                    {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice.slice_header {
                         // Verify slice header fields are reasonable
                         assert!(
                             slh.slice_type <= 9,
@@ -1263,8 +1194,6 @@ fn test_idr_slice_detection() {
                         if is_idr {
                             // IDR slice should have nal_ref_idc > 0
                             assert!(slh.nal_ref_idc > 0, "IDR slice must have nal_ref_idc > 0");
-                            // IDR should have idr_pic_id present
-                            assert!(slh.idr_pic_id >= 0, "IDR slice should have idr_pic_id");
                             return;
                         }
                     }
@@ -1310,8 +1239,8 @@ fn test_interlaced_stream_sps() {
     // SPS NAL (with start code) from an x264 --tff stream (formerly
     // assets/test_interlaced.h264), embedded to keep the test self-contained.
     const INTERLACED_SPS: &[u8] = &[
-        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1e, 0xac, 0xe4, 0x02, 0xd0, 0x93, 0x60,
-        0x22, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x3e, 0x28, 0x54, 0x90,
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1e, 0xac, 0xe4, 0x02, 0xd0, 0x93, 0x60, 0x22,
+        0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x3e, 0x28, 0x54, 0x90,
     ];
     let sps_data = INTERLACED_SPS.to_vec();
 

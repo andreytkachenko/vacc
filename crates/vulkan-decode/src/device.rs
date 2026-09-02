@@ -18,7 +18,7 @@ pub struct VulkanDecoderDevice {
 impl VulkanDecoderDevice {
     /// Create a new Vulkan decoder device using the builder.
     pub fn build(builder: vacc_vulkan::VideoDeviceBuilder) -> Result<Self> {
-        let inner = builder.build().map_err(|e| Error::Vulkan(e))?;
+        let inner = builder.build().map_err(Error::Vulkan)?;
         Ok(Self { inner })
     }
 
@@ -55,14 +55,16 @@ impl VulkanDecoderDevice {
         chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
         luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
         chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
-    ) -> Result<vk::VideoCapabilitiesKHR> {
-        self.inner.query_video_capabilities(
-            codec,
-            profile_idc,
-            chroma_subsampling,
-            luma_bit_depth,
-            chroma_bit_depth,
-        ).map_err(|e| Error::Vulkan(e))
+    ) -> Result<vk::VideoCapabilitiesKHR<'_>> {
+        self.inner
+            .query_video_capabilities(
+                codec,
+                profile_idc,
+                chroma_subsampling,
+                luma_bit_depth,
+                chroma_bit_depth,
+            )
+            .map_err(Error::Vulkan)
     }
 }
 
@@ -74,7 +76,7 @@ impl DecoderDevice for VulkanDecoderDevice {
     }
 
     fn supports_codec(&self, codec: CoreVideoCodec) -> bool {
-        let vk_codec = match codec {
+        let _vk_codec = match codec {
             CoreVideoCodec::DecodeH264 => vacc_vulkan::VideoCodec::DecodeH264,
             CoreVideoCodec::DecodeH265 => vacc_vulkan::VideoCodec::DecodeH265,
             CoreVideoCodec::DecodeAv1 => vacc_vulkan::VideoCodec::DecodeAv1,
@@ -89,7 +91,8 @@ impl DecoderDevice for VulkanDecoderDevice {
         };
 
         let queue_props = unsafe {
-            self.inner.instance
+            self.inner
+                .instance
                 .get_physical_device_queue_family_properties(self.inner.physical_device)
         };
 
@@ -129,7 +132,11 @@ impl DecoderDevice for VulkanDecoderDevice {
             CoreVideoCodec::DecodeH265 => vacc_vulkan::VideoCodec::DecodeH265,
             CoreVideoCodec::DecodeAv1 => vacc_vulkan::VideoCodec::DecodeAv1,
             CoreVideoCodec::DecodeVp9 => vacc_vulkan::VideoCodec::DecodeVp9,
-            _ => return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(format!("{:?}", codec)))),
+            _ => {
+                return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(
+                    format!("{:?}", codec),
+                )))
+            }
         };
 
         let chroma = match chroma_subsampling {
@@ -157,7 +164,8 @@ impl DecoderDevice for VulkanDecoderDevice {
 
         Ok(DecodeCapabilities {
             codec_operations: codec,
-            min_bitstream_buffer_offset_alignment: caps.min_bitstream_buffer_offset_alignment as u32,
+            min_bitstream_buffer_offset_alignment: caps.min_bitstream_buffer_offset_alignment
+                as u32,
             min_bitstream_buffer_size_alignment: caps.min_bitstream_buffer_size_alignment as u32,
             picture_access_granularity: Extent2D {
                 width: caps.picture_access_granularity.width,
@@ -177,16 +185,17 @@ impl DecoderDevice for VulkanDecoderDevice {
         })
     }
 
-    fn query_supported_formats(
-        &self,
-        codec: CoreVideoCodec,
-    ) -> Result<Vec<VideoFormat>> {
+    fn query_supported_formats(&self, codec: CoreVideoCodec) -> Result<Vec<VideoFormat>> {
         let vk_codec = match codec {
             CoreVideoCodec::DecodeH264 => vacc_vulkan::VideoCodec::DecodeH264,
             CoreVideoCodec::DecodeH265 => vacc_vulkan::VideoCodec::DecodeH265,
             CoreVideoCodec::DecodeAv1 => vacc_vulkan::VideoCodec::DecodeAv1,
             CoreVideoCodec::DecodeVp9 => vacc_vulkan::VideoCodec::DecodeVp9,
-            _ => return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(format!("{:?}", codec)))),
+            _ => {
+                return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(
+                    format!("{:?}", codec),
+                )))
+            }
         };
 
         let formats = self.inner.query_supported_formats(vk_codec);

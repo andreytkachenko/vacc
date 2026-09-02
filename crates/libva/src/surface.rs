@@ -364,10 +364,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
         )
     }
 
-    fn export_prime_with_flags(
-        &self,
-        flags: u32,
-    ) -> Result<DrmPrimeSurfaceDescriptor, VaError> {
+    fn export_prime_with_flags(&self, flags: u32) -> Result<DrmPrimeSurfaceDescriptor, VaError> {
         let mut desc: bindings::VADRMPRIMESurfaceDescriptor = Default::default();
 
         va_check(unsafe {

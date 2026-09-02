@@ -251,6 +251,11 @@ impl CodedBufferVP9Status {
             va_reserved: Default::default(),
         }))
     }
+
+    /// Returns the inner FFI type.
+    pub fn inner(&self) -> &bindings::VACodedBufferVP9Status {
+        self.0.as_ref()
+    }
 }
 
 pub struct EncSequenceParameterBufferVP9(Box<bindings::VAEncSequenceParameterBufferVP9>);

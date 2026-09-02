@@ -98,10 +98,18 @@ impl<T> __IncompleteArrayField<T> {
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut _ as *mut T
     }
+    /// # Safety
+    ///
+    /// `len` must not exceed the number of elements actually present in the
+    /// incomplete array field.
     #[inline]
     pub unsafe fn as_slice(&self, len: usize) -> &[T] {
         ::std::slice::from_raw_parts(self.as_ptr(), len)
     }
+    /// # Safety
+    ///
+    /// `len` must not exceed the number of elements actually present in the
+    /// incomplete array field.
     #[inline]
     pub unsafe fn as_mut_slice(&mut self, len: usize) -> &mut [T] {
         ::std::slice::from_raw_parts_mut(self.as_mut_ptr(), len)

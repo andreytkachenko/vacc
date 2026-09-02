@@ -10,7 +10,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 // ============================================================================
@@ -453,17 +453,17 @@ fn test_nal_unit_extraction_from_born_trailer() {
     // born_trailer.h264 contains SPS(7), PPS(8), and IDR slice(5)
     // SEI(6) may appear before SPS/PPS
     assert!(
-        nal_types.iter().any(|&t| t == 7),
+        nal_types.contains(&7),
         "born_trailer.h264 should contain SPS (type 7)"
     );
     assert!(
-        nal_types.iter().any(|&t| t == 8),
+        nal_types.contains(&8),
         "born_trailer.h264 should contain PPS (type 8)"
     );
 
     // Verify at least one IDR slice exists
     assert!(
-        nal_types.iter().any(|&t| t == 5),
+        nal_types.contains(&5),
         "born_trailer.h264 should contain IDR slice (type 5)"
     );
 }
@@ -573,7 +573,7 @@ fn test_sei_payload_multi_byte_type_and_size() {
     // Test multi-byte payload_type and payload_size encoding
     // Per H.264 spec D.1: each byte is 0xFF except the last which is not 0xFF.
     // For size=65280 (0xFF00): encoded as 0xFF, 0x00 (multi-byte with continuation)
-    let sei_data = vec![
+    let sei_data = [
         0x06, // NAL header: type=6 (SEI)
         0x01, // payload_type = 1 (single byte)
         0xFF,
@@ -600,7 +600,6 @@ fn test_sei_payload_multi_byte_type_and_size() {
     }
     if i < payload.len() {
         payload_size = (payload_size << 8) | (payload[i] as u32);
-        i += 1;
     }
 
     assert_eq!(payload_type, 1, "Expected payload_type=1");

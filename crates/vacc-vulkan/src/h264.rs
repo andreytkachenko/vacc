@@ -1,8 +1,8 @@
 //! H.264/AVC Vulkan video decoder.
 
 use ash::vk;
-use ash::vk::Handle;
 use ash::vk::native::*;
+use ash::vk::Handle;
 
 use super::dpb::LastAccessType;
 use super::{VideoError, VideoResult};
@@ -630,9 +630,7 @@ impl H264Decoder {
                 query_count: 1,
             }
         } else {
-            super::inline_queries::empty_inline_queries(
-                &h264_decode_info as *const _ as *const _,
-            )
+            super::inline_queries::empty_inline_queries(&h264_decode_info as *const _ as *const _)
         };
 
         let decode_info = vk::VideoDecodeInfoKHR {
@@ -795,15 +793,12 @@ impl H264Decoder {
         query_count: u32,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdResetQueryPool".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdResetQueryPool".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
+                type FnType = unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, query_pool, first_query, query_count);
             }
@@ -1032,9 +1027,12 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
         );
         eprintln!(
             "[H264-SESS-DUMP] w_mbs_minus1={} h_map_units_minus1={} crop=(L={},R={},T={},B={})",
-            out.pic_width_in_mbs_minus1, out.pic_height_in_map_units_minus1,
-            out.frame_crop_left_offset, out.frame_crop_right_offset,
-            out.frame_crop_top_offset, out.frame_crop_bottom_offset
+            out.pic_width_in_mbs_minus1,
+            out.pic_height_in_map_units_minus1,
+            out.frame_crop_left_offset,
+            out.frame_crop_right_offset,
+            out.frame_crop_top_offset,
+            out.frame_crop_bottom_offset
         );
         eprintln!(
             "[H264-SESS-DUMP] pOffsetForRefFrame={:?} pScalingLists={:?} pVui={:?}",

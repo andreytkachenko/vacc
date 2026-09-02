@@ -247,7 +247,7 @@ impl StdVideoDecodeAV1PictureInfoFlags {
 
     // Bit positions per vulkan_video_codec_av1std_decode.h
     pub fn set_error_resilient_mode(&mut self, val: u32) {
-        self.bits = (self.bits & !(1 << 0)) | ((val & 1) << 0);
+        self.bits = (self.bits & !(1 << 0)) | (val & 1);
     }
     pub fn set_disable_cdf_update(&mut self, val: u32) {
         self.bits = (self.bits & !(1 << 1)) | ((val & 1) << 1);
@@ -896,31 +896,31 @@ impl Av1Decoder {
         // execution time the slot is INACTIVE; the decode's pSetupReferenceSlot
         // (real index) then associates it. Declaring the actual (inactive) index
         // makes the NVIDIA driver trap in vkCmdDecodeVideoKHR. Matches FFmpeg.
-        let setup_slot_decode_ptr: *const vk::VideoReferenceSlotInfoKHR<'static> =
-            if has_setup_slot {
-                let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
-                    std::ptr::null()
-                } else {
-                    setup_slot_info_khr_ptr as *const _
-                };
-                slots.push(vk::VideoReferenceSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                    p_next: setup_p_next,
-                    slot_index: -1,
-                    p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
-                    _marker: Default::default(),
-                });
-                // Separate copy with the actual index for decode's pSetupReferenceSlot.
-                Box::leak(Box::new(vk::VideoReferenceSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                    p_next: setup_p_next,
-                    slot_index: output_slot_index,
-                    p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
-                    _marker: Default::default(),
-                }))
-            } else {
+        let setup_slot_decode_ptr: *const vk::VideoReferenceSlotInfoKHR<'static> = if has_setup_slot
+        {
+            let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
                 std::ptr::null()
+            } else {
+                setup_slot_info_khr_ptr as *const _
             };
+            slots.push(vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: setup_p_next,
+                slot_index: -1,
+                p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
+                _marker: Default::default(),
+            });
+            // Separate copy with the actual index for decode's pSetupReferenceSlot.
+            Box::leak(Box::new(vk::VideoReferenceSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: setup_p_next,
+                slot_index: output_slot_index,
+                p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
+                _marker: Default::default(),
+            }))
+        } else {
+            std::ptr::null()
+        };
 
         // Finalize: leak the single array for Vulkan's raw pointer usage
         let slots_ptr = if slots.is_empty() {
@@ -1045,7 +1045,7 @@ impl Av1Decoder {
             eprintln!(
                 "[RUST-PI-F3] fc={} type={} oh={} primref={} refresh={:08x} interp={} txmode={} dqres={} dlres={} coded_denom={}",
                 self.frame_count, pi.frame_type, pi.OrderHint, pi.primary_ref_frame, pi.refresh_frame_flags,
-                pi.interpolation_filter as u32, pi.TxMode as u32, pi.delta_q_res, pi.delta_lf_res, pi.coded_denom
+                { pi.interpolation_filter }, { pi.TxMode }, pi.delta_q_res, pi.delta_lf_res, pi.coded_denom
             );
             eprintln!(
                 "[RUST-PI-F3] flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} grain={}",
@@ -1098,9 +1098,9 @@ impl Av1Decoder {
             let lr = &picture_info_container.loop_restoration;
             eprintln!(
                 "[RUST-PI-F3] lr: type=[{},{},{}] size=[{},{},{}]",
-                lr.FrameRestorationType[0] as u32,
-                lr.FrameRestorationType[1] as u32,
-                lr.FrameRestorationType[2] as u32,
+                { lr.FrameRestorationType[0] },
+                { lr.FrameRestorationType[1] },
+                { lr.FrameRestorationType[2] },
                 lr.LoopRestorationSize[0],
                 lr.LoopRestorationSize[1],
                 lr.LoopRestorationSize[2]
@@ -1469,20 +1469,18 @@ impl Av1Decoder {
                     eprintln!("  {}", chunk.join(" "));
                 }
                 // Dump pNext chain (VideoDecodeAV1PictureInfoKHR + StdVideoDecodeAV1PictureInfo)
-                unsafe {
-                    if !decode_info.p_next.is_null() {
-                        let pnext = decode_info.p_next as *const u8;
-                        let pnext_size = std::cmp::min(200u64, 200);
-                        let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
-                        let pnext_hex: Vec<String> =
-                            pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
-                        eprintln!(
-                            "[RAW-PNEXT] fc2: first {} bytes of pNext chain:",
-                            pnext_size
-                        );
-                        for chunk in pnext_hex.chunks(32) {
-                            eprintln!("  {}", chunk.join(" "));
-                        }
+                if !decode_info.p_next.is_null() {
+                    let pnext = decode_info.p_next as *const u8;
+                    let pnext_size = std::cmp::min(200u64, 200);
+                    let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
+                    let pnext_hex: Vec<String> =
+                        pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
+                    eprintln!(
+                        "[RAW-PNEXT] fc2: first {} bytes of pNext chain:",
+                        pnext_size
+                    );
+                    for chunk in pnext_hex.chunks(32) {
+                        eprintln!("  {}", chunk.join(" "));
                     }
                 }
             }

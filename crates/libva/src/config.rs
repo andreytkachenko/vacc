@@ -130,8 +130,8 @@ impl Drop for Config {
         // Safe because `self` represents a valid Config.
         let status = va_check(unsafe { bindings::vaDestroyConfig(self.display.handle(), self.id) });
 
-        if status.is_err() {
-            error!("vaDestroyConfig failed: {}", status.unwrap_err());
+        if let Err(e) = status {
+            error!("vaDestroyConfig failed: {}", e);
         }
     }
 }

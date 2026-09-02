@@ -302,8 +302,8 @@ impl Drop for Buffer {
             bindings::vaDestroyBuffer(self.context.display().handle(), self.id)
         });
 
-        if status.is_err() {
-            error!("vaDestroyBuffer failed: {}", status.unwrap_err());
+        if let Err(e) = status {
+            error!("vaDestroyBuffer failed: {}", e);
         }
     }
 }
@@ -543,8 +543,8 @@ impl<'p> Drop for MappedCodedBuffer<'p> {
             bindings::vaUnmapBuffer(self.buffer.0.context.display().handle(), self.buffer.id())
         });
 
-        if status.is_err() {
-            error!("vaUnmapBuffer failed: {}", status.unwrap_err());
+        if let Err(e) = status {
+            error!("vaUnmapBuffer failed: {}", e);
         }
     }
 }
@@ -568,4 +568,3 @@ pub enum EncMiscParameter {
     /// Wrapper over `VAEncMiscParameterBuffer` with `VAEncMiscParameterQuantization`.
     Quantization(EncMiscParameterQuantization),
 }
-

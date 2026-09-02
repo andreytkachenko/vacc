@@ -22,7 +22,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load the born_trailer.h264 test file.
 fn load_born_trailer() -> Vec<u8> {
     let path = format!("{}/assets/born_trailer.h264", PROJECT_ROOT);
-    std::fs::read(&path).expect(&format!("Failed to read test file: {}", path))
+    std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {}", path))
 }
 
 /// Load only the SPS/PPS portion of the stream (first ~650 bytes).
@@ -808,9 +808,9 @@ fn test_error_cuda_error_message() {
 #[test]
 fn test_error_result_type_alias() {
     let success: NvdecResult<u32> = Ok(42);
-    assert_eq!(success.unwrap(), 42);
+    assert!(matches!(success, Ok(42)));
 
     let failure: NvdecResult<u32> = Err(NvdecError::EndOfStream);
     assert!(failure.is_err());
-    assert!(matches!(failure.unwrap_err(), NvdecError::EndOfStream));
+    assert!(matches!(failure, Err(NvdecError::EndOfStream)));
 }

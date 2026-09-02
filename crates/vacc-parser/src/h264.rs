@@ -44,6 +44,24 @@ pub struct H264Parser {
     nal_cursor: usize,
 }
 
+/// Fields of a prediction weight table (H.264 spec 7.4.4), in bitstream order.
+type PredWeightTable = (
+    u8,
+    u8, // luma_log2_weight_denom, chroma_log2_weight_denom
+    u8,
+    [i16; 32],
+    [i16; 32], // luma_weight_l0_flag, luma_weight_l0, luma_offset_l0
+    u8,
+    [[i16; 2]; 32],
+    [[i16; 2]; 32], // chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0
+    u8,
+    [i16; 32],
+    [i16; 32], // luma_weight_l1_flag, luma_weight_l1, luma_offset_l1
+    u8,
+    [[i16; 2]; 32],
+    [[i16; 2]; 32], // chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1
+);
+
 impl Default for H264Parser {
     fn default() -> Self {
         Self::new()
@@ -307,7 +325,7 @@ impl H264Parser {
                                 }
                                 continue; // Skip the copy at the end
                             } else {
-                                (final_pred_idx - 6) as usize
+                                final_pred_idx - 6
                             };
                             scaling_8x8_ext[dst_idx] = scaling_8x8_ext[src_idx];
                         }
@@ -350,15 +368,7 @@ impl H264Parser {
                 }
 
                 // Copy the relevant 8x8 matrices (0-1 for non-4:4:4, 0-5 for 4:4:4)
-                for i in 0..2 {
-                    scaling_list_8x8[i] = scaling_8x8_ext[i];
-                }
-                if chroma_format_idc == 3 {
-                    for i in 0..6 {
-                        // Store in extended array; picparams will handle mapping
-                        scaling_8x8_ext[i] = scaling_8x8_ext[i];
-                    }
-                }
+                scaling_list_8x8.copy_from_slice(&scaling_8x8_ext[..2]);
             }
         }
 
@@ -988,22 +998,7 @@ impl H264Parser {
         slice_type: u32,
         num_ref_idx_l0_active_minus1: u32,
         num_ref_idx_l1_active_minus1: u32,
-    ) -> ParserResult<(
-        u8,
-        u8, // luma_log2_weight_denom, chroma_log2_weight_denom
-        u8,
-        [i16; 32],
-        [i16; 32], // luma_weight_l0_flag, luma_weight_l0, luma_offset_l0
-        u8,
-        [[i16; 2]; 32],
-        [[i16; 2]; 32], // chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0
-        u8,
-        [i16; 32],
-        [i16; 32], // luma_weight_l1_flag, luma_weight_l1, luma_offset_l1
-        u8,
-        [[i16; 2]; 32],
-        [[i16; 2]; 32], // chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1
-    )> {
+    ) -> ParserResult<PredWeightTable> {
         let is_b = slice_type == 1; // B-slice after modulo 5
         let luma_log2_weight_denom = r.read_ue()? as u8;
 
@@ -1171,7 +1166,7 @@ impl H264Parser {
                         2 => r.read_ue()?, // long_term_pic_num
                         3 => {
                             let diff = r.read_ue()?; // difference_of_pic_nums_minus1
-                            let _lt = r.read_ue()?;  // long_term_pic_num (sync only)
+                            let _lt = r.read_ue()?; // long_term_pic_num (sync only)
                             diff
                         }
                         4 => r.read_ue()?, // max_long_term_frame_idx_plus1
@@ -1299,10 +1294,9 @@ impl VideoParser for H264Parser {
                             let sps_id = sps.seq_parameter_set_id;
                             self.sps_cache.insert(sps_id, sps.clone());
                             self.active_sps = Some(sps);
-                            result_sps =
-                                Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_sps.clone().unwrap(),
-                                ));
+                            result_sps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                                self.active_sps.clone().unwrap(),
+                            ));
                             result_sps_nal = Some(nal_data);
                             // Mark this NAL as processed
                             self.processed_up_to = off + sz;
@@ -1326,10 +1320,9 @@ impl VideoParser for H264Parser {
                             let pps_id = pps.pic_parameter_set_id;
                             self.pps_cache.insert(pps_id, pps.clone());
                             self.active_pps = Some(pps);
-                            result_pps =
-                                Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_pps.clone().unwrap(),
-                                ));
+                            result_pps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                                self.active_pps.clone().unwrap(),
+                            ));
                             result_pps_nal = Some(nal_data);
                             // Mark this NAL as processed
                             self.processed_up_to = off + sz;
@@ -1353,7 +1346,7 @@ impl VideoParser for H264Parser {
                     // ends before the &mut self calls below.
                     let nal_data = nal.data.clone();
                     let (off, sz) = (nal.offset, nal.size);
-                    let (is_trailing, nal_ref_idc, nal_unit_type) =
+                    let (_is_trailing, nal_ref_idc, nal_unit_type) =
                         nal::parse_h264_nal_header(&nal_data).unwrap_or((false, 0, 0));
 
                     if self.first_slice_header.is_none() {

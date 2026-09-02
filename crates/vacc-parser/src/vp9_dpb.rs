@@ -101,8 +101,8 @@ impl Vp9Dpb {
 
         // Scan all slots for the oldest non-live one.
         let mut best: Option<usize> = None;
-        for s in 0..n {
-            if live[s] {
+        for (s, &is_live) in live.iter().enumerate() {
+            if is_live {
                 continue;
             }
             best = match best {
@@ -200,7 +200,11 @@ mod tests {
         let s1 = d.choose_output_slot();
         assert_ne!(s1, s0, "frame 1 must not reuse a live slot");
         let refs = d.reference_slots(false, &[0, 1, 2]);
-        assert_eq!(refs, [s0, s0, s0], "all 3 refs still point at the key frame");
+        assert_eq!(
+            refs,
+            [s0, s0, s0],
+            "all 3 refs still point at the key frame"
+        );
         d.commit_frame(0x01, s1);
 
         // Now LAST (fb0) -> s1; GOLDEN/ALTREF (fb1/fb2) still -> s0.

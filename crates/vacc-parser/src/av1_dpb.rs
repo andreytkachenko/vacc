@@ -209,21 +209,27 @@ impl Av1Dpb {
         // unused, hint<cur, MAX hint
         for name in [1i32, 2, 4, 5, 6] {
             if ref_idx[name as usize] < 0 {
-                pick_below(&mut ref_idx, &mut used, &shifted, cur_frame_hint, name as usize);
+                pick_below(
+                    &mut ref_idx,
+                    &mut used,
+                    &shifted,
+                    cur_frame_hint,
+                    name as usize,
+                );
             }
         }
         // Final: fill remaining with argmin over ALL i of shifted
         let mut fill = 0i32;
         let mut fill_hint = i32::MAX;
-        for i in 0..AV1_NUM_FRAME_BUFFERS {
-            if shifted[i] < fill_hint {
+        for (i, &sh) in shifted.iter().enumerate() {
+            if sh < fill_hint {
                 fill = i as i32;
-                fill_hint = shifted[i];
+                fill_hint = sh;
             }
         }
-        for i in 0..AV1_NUM_REF_NAMES {
-            if ref_idx[i] < 0 {
-                ref_idx[i] = fill;
+        for ri in ref_idx.iter_mut() {
+            if *ri < 0 {
+                *ri = fill;
             }
         }
         ref_idx
@@ -231,7 +237,10 @@ impl Av1Dpb {
 
     /// DPB slot for each of the 7 reference names (pre-decode state).
     /// `-1` when the referenced frame buffer is empty.
-    pub fn reference_name_slots(&self, ref_frame_idx: &[u8; AV1_NUM_REF_NAMES]) -> [i32; AV1_NUM_REF_NAMES] {
+    pub fn reference_name_slots(
+        &self,
+        ref_frame_idx: &[u8; AV1_NUM_REF_NAMES],
+    ) -> [i32; AV1_NUM_REF_NAMES] {
         let mut result = [-1i32; AV1_NUM_REF_NAMES];
         for i in 0..AV1_NUM_REF_NAMES {
             let fb = ref_frame_idx[i] as usize;
@@ -260,8 +269,8 @@ impl Av1Dpb {
         }
         self.available_slots
             .retain(|&s| (s as usize) < n && !in_use[s as usize]);
-        for s in 0..n {
-            if !in_use[s] && !self.available_slots.contains(&(s as u32)) {
+        for (s, &is_in_use) in in_use.iter().enumerate() {
+            if !is_in_use && !self.available_slots.contains(&(s as u32)) {
                 self.available_slots.push_back(s as u32);
             }
         }
@@ -288,9 +297,7 @@ impl Av1Dpb {
 
     /// Frame buffer index stored in DPB slot, if any.
     pub fn frame_buffer_for_slot(&self, slot: i32) -> Option<usize> {
-        self.frame_buffers
-            .iter()
-            .position(|b| b.slot == slot)
+        self.frame_buffers.iter().position(|b| b.slot == slot)
     }
 
     // ------------------------------------------------------------------
@@ -345,9 +352,8 @@ impl Av1Dpb {
         for i in 0..AV1_NUM_FRAME_BUFFERS {
             if fh.refresh_frame_flags >> i & 1 != 0 {
                 let fb = &mut self.frame_buffers[i];
-                fb.global_motion = std::array::from_fn(|j| {
-                    (fh.global_motion_type[j], fh.global_motion_params[j])
-                });
+                fb.global_motion =
+                    std::array::from_fn(|j| (fh.global_motion_type[j], fh.global_motion_params[j]));
                 fb.segment_feature_enabled = fh.segment_feature_enabled;
                 fb.segment_feature_data = fh.segment_feature_data;
                 fb.loop_filter_ref_deltas = fh.loop_filter_ref_deltas;
@@ -405,12 +411,13 @@ fn pick(
 ) {
     let mut best = -1i32;
     let mut best_hint = if max_hint { i32::MIN } else { i32::MAX };
-    for i in 0..AV1_NUM_FRAME_BUFFERS {
-        if !used[i] && shifted[i] >= cur_frame_hint {
-            if best < 0 || (max_hint && shifted[i] >= best_hint) || (!max_hint && shifted[i] < best_hint) {
-                best = i as i32;
-                best_hint = shifted[i];
-            }
+    for (i, (&u, &sh)) in used.iter().zip(shifted.iter()).enumerate() {
+        if !u
+            && sh >= cur_frame_hint
+            && (best < 0 || (max_hint && sh >= best_hint) || (!max_hint && sh < best_hint))
+        {
+            best = i as i32;
+            best_hint = sh;
         }
     }
     if best >= 0 {

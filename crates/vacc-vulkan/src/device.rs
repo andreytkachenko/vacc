@@ -166,7 +166,11 @@ impl VideoDeviceBuilder {
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         if std::env::var("VACC_DEBUG").is_ok() {
             for (i, mt) in memory_properties.memory_types.iter().enumerate() {
-                eprintln!("[MEMTYPE] type={} flags=0x{:x}", i, mt.property_flags.as_raw());
+                eprintln!(
+                    "[MEMTYPE] type={} flags=0x{:x}",
+                    i,
+                    mt.property_flags.as_raw()
+                );
             }
         }
 
@@ -385,7 +389,10 @@ impl VideoDeviceBuilder {
 
         // NVD_GPU (0-based index) selects the GPU from the enumerated device list.
         let mut candidates: Vec<vk::PhysicalDevice> = physical_devices;
-        if let Some(idx) = std::env::var("NVD_GPU").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(idx) = std::env::var("NVD_GPU")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             if idx < candidates.len() {
                 let pd = candidates.remove(idx);
                 candidates.insert(0, pd);

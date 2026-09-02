@@ -453,9 +453,7 @@ impl VideoDecoder {
             let mut parser = vacc_parser::vp9::Vp9Parser::new();
             vacc_parser::VideoParser::init(
                 &mut parser,
-                &vacc_parser::DetectedVideoFormat::new(
-                    vacc_core::codec::VideoCodec::DecodeVp9,
-                ),
+                &vacc_parser::DetectedVideoFormat::new(vacc_core::codec::VideoCodec::DecodeVp9),
             )
             .map_err(|e| VideoError::DecoderInit(format!("VP9 parser init error: {e}")))?;
             Some(parser)
@@ -467,9 +465,7 @@ impl VideoDecoder {
             let mut parser = vacc_parser::av1::Av1Parser::new();
             vacc_parser::VideoParser::init(
                 &mut parser,
-                &vacc_parser::DetectedVideoFormat::new(
-                    vacc_core::codec::VideoCodec::DecodeAv1,
-                ),
+                &vacc_parser::DetectedVideoFormat::new(vacc_core::codec::VideoCodec::DecodeAv1),
             )
             .map_err(|e| VideoError::DecoderInit(format!("AV1 parser init error: {e}")))?;
             // Parse SPS from first frame data
@@ -615,8 +611,7 @@ impl VideoDecoder {
                     vacc_core::codec::VideoCodec::DecodeH265,
                 ))
                 .map_err(|e| VideoError::DecoderInit(format!("H265 parser init: {e}")))?;
-            let mut dpb =
-                vacc_parser::h265_dpb::H265Dpb::new(self.dpb_manager.entries.len());
+            let mut dpb = vacc_parser::h265_dpb::H265Dpb::new(self.dpb_manager.entries.len());
             if let Some(H264OrH265Sps::H265(sps)) = &self.parsed.sps {
                 dpb.set_max_num_reorder_frames(sps.max_num_reorder_pics[0] as u32);
             }
@@ -827,7 +822,13 @@ impl VideoDecoder {
                             .into_iter()
                             .map(|(s, p)| (s as u32, p))
                             .collect();
-                        Some(H265FrameCtx { info, lists, rps_slots, in_use, slot: slot as u32 })
+                        Some(H265FrameCtx {
+                            info,
+                            lists,
+                            rps_slots,
+                            in_use,
+                            slot: slot as u32,
+                        })
                     } else {
                         None
                     };
@@ -840,7 +841,8 @@ impl VideoDecoder {
                     } else {
                         // H.264: ref_pocs from access_unit is empty (no RPS concept).
                         // Use all valid DPB entries as protected references since any could be needed.
-                        let protected_pocs: Vec<i32> = self.dpb_manager
+                        let protected_pocs: Vec<i32> = self
+                            .dpb_manager
                             .entries
                             .iter()
                             .filter(|e| e.is_valid)
@@ -858,7 +860,8 @@ impl VideoDecoder {
                     };
 
                     if super::vacc_debug() {
-                        let valid = self.dpb_manager
+                        let valid = self
+                            .dpb_manager
                             .entries
                             .iter()
                             .filter(|e| e.is_valid)
@@ -1257,7 +1260,7 @@ impl VideoDecoder {
                 &picture_info_container,
                 &vp9_decode_info,
                 is_first_frame,
-                output_slot as i32,
+                output_slot,
                 output_slot_old_layout,
                 self.dpb_use_image_array,
             );
@@ -1366,7 +1369,9 @@ impl VideoDecoder {
         if let Some(parser) = self.av1_parser.as_mut() {
             parser.set_dpb_slots(num_dpb_slots);
         } else {
-            return Err(VideoError::DecoderInit("AV1 parser not initialized".to_string()));
+            return Err(VideoError::DecoderInit(
+                "AV1 parser not initialized".to_string(),
+            ));
         }
 
         let sps = self
@@ -1479,7 +1484,7 @@ impl VideoDecoder {
                         decode_output_format(self.parsed.luma_bit_depth),
                     )?;
                     if super::vacc_debug() {
-                        let n = pixels.y_plane.len().min(1000).max(1);
+                        let n = pixels.y_plane.len().clamp(1, 1000);
                         let my = pixels
                             .y_plane
                             .iter()
@@ -1998,9 +2003,9 @@ impl VideoDecoder {
                 Some(5), // ALTREF2 (6)
                 Some(6), // ALTREF (7)
             ];
-            for i in 0..8usize {
+            for (i, &ref_idx) in ref_name_to_ref_idx.iter().enumerate() {
                 pic_info.expectedFrameId[i] = 0; // frame_id_numbers = false
-                if let Some(ri) = ref_name_to_ref_idx[i] {
+                if let Some(ri) = ref_idx {
                     let fb = effective_ref_frame_idx[ri] as usize;
                     if fb < 8 {
                         pic_info.OrderHints[i] =
@@ -2148,7 +2153,7 @@ impl VideoDecoder {
                 eprintln!(
                     "[RUST-PI-ALL] fc={} type={} oh={} primref={} refresh={:08x} refidx={:?}",
                     frame_idx,
-                    pi.frame_type as u32,
+                    { pi.frame_type },
                     pi.OrderHint,
                     pi.primary_ref_frame,
                     pi.refresh_frame_flags,
@@ -2622,7 +2627,7 @@ impl VideoDecoder {
                 .set_slot_layout(output_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
             if super::vacc_debug() {
-                let n = pixels.y_plane.len().min(1000).max(1);
+                let n = pixels.y_plane.len().clamp(1, 1000);
                 let my = pixels
                     .y_plane
                     .iter()
@@ -2868,9 +2873,16 @@ impl VideoDecoder {
                 }
                 line.push_str(&format!("] mmco_n={}", slh.dec_ref_pic_marking.len()));
                 for m in &slh.dec_ref_pic_marking {
-                    line.push_str(&format!(" {}:{}/-", m.memory_management_control_operation, m.value));
+                    line.push_str(&format!(
+                        " {}:{}/-",
+                        m.memory_management_control_operation, m.value
+                    ));
                 }
-                let db = if slh.disable_deblocking_filter_idc == 1 { 0 } else { 1 };
+                let db = if slh.disable_deblocking_filter_idc == 1 {
+                    0
+                } else {
+                    1
+                };
                 line.push_str(&format!(
                     "] cabac={} qp_delta={} db={} alpha={} beta={} hbs={}",
                     slh.cabac_init_idc,
@@ -2880,8 +2892,11 @@ impl VideoDecoder {
                     slh.slice_beta_offset_div2 * 2,
                     slh.header_bit_size,
                 ));
-                eprintln!("{}
-", line.trim_end());
+                eprintln!(
+                    "{}
+",
+                    line.trim_end()
+                );
                 for (name, refs) in [("l0", &lists.l0), ("l1", &lists.l1)] {
                     let mut rl = format!(
                         "GT-REFLST fn={} poc={} {}=[",
@@ -3275,7 +3290,10 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
         }
         let nal_type = data[start] & 0x1F;
         if std::env::var("DETECT_DBG").is_ok() && i < 64 {
-            eprintln!("DBG2 i={} start={} byte={:#04x} nal_type={}", i, start, data[start], nal_type);
+            eprintln!(
+                "DBG2 i={} start={} byte={:#04x} nal_type={}",
+                i, start, data[start], nal_type
+            );
         }
         // H.264: slice types (1-5), SEI (6), filler (9)
         if (1..=6).contains(&nal_type) || nal_type == 9 {
@@ -3333,28 +3351,31 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
         .unwrap_or(0);
 
     // Compute crop offsets from SPS conformance window (H.264 A.11)
-    let (display_width, display_height, crop_left, crop_top) = sps.as_ref().map(|s| {
-        let crop_left = s.frame_crop_left_offset as i32 * 2;
-        let crop_right = s.frame_crop_right_offset as i32 * 2;
-        let crop_top = if s.frame_mbs_only_flag {
-            s.frame_crop_top_offset as i32 * 2
-        } else {
-            s.frame_crop_top_offset as i32 * 4
-        };
-        let crop_bottom = if s.frame_mbs_only_flag {
-            s.frame_crop_bottom_offset as i32 * 2
-        } else {
-            s.frame_crop_bottom_offset as i32 * 4
-        };
-        let disp_w = coded_width as i32 - crop_left - crop_right;
-        let disp_h = coded_height as i32 - crop_top - crop_bottom;
-        (
-            disp_w.max(0) as u32,
-            disp_h.max(0) as u32,
-            crop_left.max(0) as u32,
-            crop_top.max(0) as u32,
-        )
-    }).unwrap_or((coded_width, coded_height, 0, 0));
+    let (display_width, display_height, crop_left, crop_top) = sps
+        .as_ref()
+        .map(|s| {
+            let crop_left = s.frame_crop_left_offset as i32 * 2;
+            let crop_right = s.frame_crop_right_offset as i32 * 2;
+            let crop_top = if s.frame_mbs_only_flag {
+                s.frame_crop_top_offset as i32 * 2
+            } else {
+                s.frame_crop_top_offset as i32 * 4
+            };
+            let crop_bottom = if s.frame_mbs_only_flag {
+                s.frame_crop_bottom_offset as i32 * 2
+            } else {
+                s.frame_crop_bottom_offset as i32 * 4
+            };
+            let disp_w = coded_width as i32 - crop_left - crop_right;
+            let disp_h = coded_height as i32 - crop_top - crop_bottom;
+            (
+                disp_w.max(0) as u32,
+                disp_h.max(0) as u32,
+                crop_left.max(0) as u32,
+                crop_top.max(0) as u32,
+            )
+        })
+        .unwrap_or((coded_width, coded_height, 0, 0));
     let raw_profile_idc = sps.as_ref().map(|s| s.profile_idc as u32).unwrap_or(100);
     let profile_idc = match raw_profile_idc {
         41 => 66,
@@ -3696,9 +3717,9 @@ fn select_h264_picture_format(
         parsed.chroma_bit_depth,
     )?;
 
-    let high_depth = parsed
-        .luma_bit_depth
-        .intersects(vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12);
+    let high_depth = parsed.luma_bit_depth.intersects(
+        vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12,
+    );
     let preferred: &[vk::Format] = match parsed.chroma_subsampling {
         vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME if !high_depth => &[vk::Format::R8_UNORM],
         vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME => &[vk::Format::R16_UNORM],
@@ -3771,9 +3792,9 @@ fn select_h265_picture_format(
         parsed.chroma_bit_depth,
     )?;
 
-    let high_depth = parsed
-        .luma_bit_depth
-        .intersects(vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12);
+    let high_depth = parsed.luma_bit_depth.intersects(
+        vk::VideoComponentBitDepthFlagsKHR::TYPE_10 | vk::VideoComponentBitDepthFlagsKHR::TYPE_12,
+    );
     let preferred: &[vk::Format] = match parsed.chroma_subsampling {
         vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME if !high_depth => &[vk::Format::R8_UNORM],
         vk::VideoChromaSubsamplingFlagsKHR::MONOCHROME => &[vk::Format::R16_UNORM],
@@ -3889,10 +3910,7 @@ fn create_video_session(
         chroma_bit_depth: parsed.chroma_bit_depth,
         // H264/H265 use a real result-status query pool per frame; AV1/VP9 use
         // no queries (see VideoSessionParams::inline_queries).
-        inline_queries: matches!(
-            codec,
-            VideoCodec::DecodeH264 | VideoCodec::DecodeH265
-        ),
+        inline_queries: matches!(codec, VideoCodec::DecodeH264 | VideoCodec::DecodeH265),
     };
 
     let std_header_version = build_std_header_version(std_header_name);
@@ -4168,9 +4186,7 @@ fn parse_vp9_init(data: &[u8]) -> VideoResult<(ParsedInfo, VulkanDevice, u32, u3
 
     // The Vulkan VP9 decode profile only supports Y'CbCr 4:2:0. Reject
     // 4:4:4 / 4:2:2 (and RGB) streams instead of silently downconverting.
-    if (subsampling_x != 1 || subsampling_y != 1)
-        && std::env::var("VACC_ALLOW_VP9_444").is_err()
-    {
+    if (subsampling_x != 1 || subsampling_y != 1) && std::env::var("VACC_ALLOW_VP9_444").is_err() {
         return Err(VideoError::DecoderInit(format!(
             "VP9 chroma subsampling {}x{} not supported by Vulkan decode (4:2:0 only)",
             subsampling_x, subsampling_y
@@ -4415,8 +4431,7 @@ fn parse_av1_sps_from_data(
     let packet = BitstreamPacket::new(frame_data);
     match parser.parse(&packet) {
         Ok(ParseResult::ParameterSet { sps: s, .. }) => {
-            let result =
-                s.and_then(|sp| sp.downcast_ref::<vacc_core::picture::Av1Sps>().cloned());
+            let result = s.and_then(|sp| sp.downcast_ref::<vacc_core::picture::Av1Sps>().cloned());
             if let Some(ref sps) = result {
                 if super::vacc_debug() {
                     eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
@@ -4607,8 +4622,8 @@ fn parse_av1_sps_from_data(
             }
             result
         }
-        Ok(r) => None,
-        Err(e) => None,
+        Ok(_r) => None,
+        Err(_e) => None,
     }
 }
 
@@ -4734,8 +4749,8 @@ fn build_av1_dpb_picture_resources(
                 fb_map.push_str(&format!("{}:{} ", fb, slot));
             }
             let mut active_str = String::new();
-            for slot in 0..8 {
-                if active_references[slot] > 0 {
+            for (slot, &count) in active_references[..8].iter().enumerate() {
+                if count > 0 {
                     active_str.push_str(&format!("{} ", slot));
                 }
             }
@@ -4830,7 +4845,7 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
     // In low-overhead format, the first OBU is typically the Frame OBU
 
     // Parse OBU header
-    if data.len() < 1 {
+    if data.is_empty() {
         return 0;
     }
 
@@ -4882,7 +4897,6 @@ fn find_av1_frame_header_offset(data: &[u8]) -> u32 {
             // Read leb128 size
             while size_offset < data.len() {
                 if data[size_offset] & 0x80 == 0 {
-                    size_offset += 1;
                     break;
                 }
                 size_offset += 1;
@@ -4924,7 +4938,10 @@ mod detect_tests {
     #[test]
     fn probe_detect_h265() {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/samples/");
-        let mut files = std::fs::read_dir(base).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let mut files = std::fs::read_dir(base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         files.sort();
         for f in &files {
             let d = std::fs::read(format!("{base}{f}")).expect("read sample");

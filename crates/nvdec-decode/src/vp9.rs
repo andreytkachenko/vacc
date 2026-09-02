@@ -57,10 +57,6 @@ use crate::{
     },
 };
 
-/// Number of VP9 frame buffers (frame contexts).
-const VP9_NUM_FRAME_BUFFERS: usize = 8;
-
-
 /// Common VP9 DPB manager shared by ALL backends (Vulkan / NVDEC / VAAPI).
 /// For NVDEC, a DPB slot IS a cuvid surface index (`PicIdx`), so the common
 /// slot indices can be used directly as `CurrPicIdx` / `*RefIdx` values.
@@ -104,7 +100,11 @@ pub fn build_cuvid_vp9_picparams(
     let ref_lookup = if is_key {
         [0u8, 1, 2]
     } else {
-        [fd.ref_frame_idx[0], fd.ref_frame_idx[1], fd.ref_frame_idx[2]]
+        [
+            fd.ref_frame_idx[0],
+            fd.ref_frame_idx[1],
+            fd.ref_frame_idx[2],
+        ]
     };
 
     let mut last_ref = 255i32;
@@ -112,9 +112,9 @@ pub fn build_cuvid_vp9_picparams(
     let mut alt_ref = 255i32;
     if !is_key {
         let slots = dpb.reference_slots(false, &ref_lookup);
-        last_ref = slots[0].max(0) as i32;
-        golden_ref = slots[1].max(0) as i32;
-        alt_ref = slots[2].max(0) as i32;
+        last_ref = slots[0].max(0);
+        golden_ref = slots[1].max(0);
+        alt_ref = slots[2].max(0);
     }
 
     // 2. Output surface (live set computed from the pre-decode fb state).
@@ -408,8 +408,11 @@ fn dump_cuvid_vp9_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     ));
     s.push_str(&format!(
         "  [vp9] activeRefIdx=[{}, {}, {}] resetFrameContext={} mcomp_filter_type={}\n",
-        v.activeRefIdx[0], v.activeRefIdx[1], v.activeRefIdx[2],
-        v.resetFrameContext, v.mcomp_filter_type
+        v.activeRefIdx[0],
+        v.activeRefIdx[1],
+        v.activeRefIdx[2],
+        v.resetFrameContext,
+        v.mcomp_filter_type
     ));
     s.push_str(&format!(
         "  [vp9] frameTagSize={} offsetToDctParts={}\n",
@@ -636,13 +639,7 @@ impl NvdecVp9Decoder {
         let _ = cu_ctx_set_current();
 
         let procparams = crate::ffi::default_procparams();
-        let result = unsafe {
-            (funcs.decode_picture)(
-                decoder_handle as *mut std::ffi::c_void,
-                &params,
-                &procparams,
-            )
-        };
+        let result = unsafe { (funcs.decode_picture)(decoder_handle, &params, &procparams) };
         if result != CUDA_SUCCESS {
             return Err(NvdecError::DecodeFailed(format!(
                 "cuvidDecodePicture failed: {}",
@@ -839,9 +836,7 @@ impl NvdecVp9Decoder {
                     },
                     reserved2: [0; 11],
                 };
-                let res = unsafe {
-                    reconfigure(decoder_handle as *mut std::ffi::c_void, &reconfig)
-                };
+                let res = unsafe { reconfigure(decoder_handle, &reconfig) };
                 if res == CUDA_SUCCESS {
                     reconfigured = true;
                 } else {
@@ -1003,7 +998,7 @@ impl NvdecVp9Decoder {
         let pinned_y = pinned_base;
         let pinned_uv = unsafe { (pinned_base as *mut u8).add(y_size) as *mut std::ffi::c_void };
 
-        let mut copy_y = CUDA_MEMCPY2D {
+        let copy_y = CUDA_MEMCPY2D {
             srcXInBytes: (crop_left as u64) * bps as u64,
             srcY: crop_top as u64,
             srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1095,13 +1090,13 @@ impl NvdecVp9Decoder {
         } else {
             // P016: 16-bit LE samples, left-aligned (10-bit: 6 LSBs zero,
             // 12-bit: 4 LSBs zero). Shift back to native bit depth.
-            let shift = 16u32 - luma_bd as u32;
+            let shift = 16u32 - luma_bd;
             for chunk in raw_y.chunks_exact_mut(2) {
-                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                let s = u16::from_le_bytes([chunk[0], chunk[1]]) >> shift;
                 chunk.copy_from_slice(&s.to_le_bytes());
             }
             for chunk in raw_uv.chunks_exact_mut(2) {
-                let s = (u16::from_le_bytes([chunk[0], chunk[1]]) >> shift) as u16;
+                let s = u16::from_le_bytes([chunk[0], chunk[1]]) >> shift;
                 chunk.copy_from_slice(&s.to_le_bytes());
             }
             y_plane.copy_from_slice(&raw_y);
@@ -1456,29 +1451,289 @@ mod tests {
 
     const EXPECTED: [Expected; 20] = [
         //  F0 (key)
-        Expected { curr_pic_idx: 0, last_ref: 255, golden_ref: 255, alt_ref: 255, active_ref_idx: [0, 0, 0], frame_type: 0, frame_tag_size: 18, offset_to_dct_parts: 487, mcomp_filter_type: 0, qp_y_ac: 46, loop_filter_level: 3, allow_high_precision_mv: 0 },
+        Expected {
+            curr_pic_idx: 0,
+            last_ref: 255,
+            golden_ref: 255,
+            alt_ref: 255,
+            active_ref_idx: [0, 0, 0],
+            frame_type: 0,
+            frame_tag_size: 18,
+            offset_to_dct_parts: 487,
+            mcomp_filter_type: 0,
+            qp_y_ac: 46,
+            loop_filter_level: 3,
+            allow_high_precision_mv: 0,
+        },
         //  F1..F10
-        Expected { curr_pic_idx: 1, last_ref: 0, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 72, mcomp_filter_type: 4, qp_y_ac: 92, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 2, last_ref: 1, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 20, mcomp_filter_type: 4, qp_y_ac: 165, loop_filter_level: 5, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 3, last_ref: 2, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 73, mcomp_filter_type: 4, qp_y_ac: 104, loop_filter_level: 6, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 4, last_ref: 3, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 93, mcomp_filter_type: 4, qp_y_ac: 98, loop_filter_level: 8, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 5, last_ref: 4, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 164, mcomp_filter_type: 4, qp_y_ac: 91, loop_filter_level: 6, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 6, last_ref: 5, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 30, mcomp_filter_type: 4, qp_y_ac: 102, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 7, last_ref: 6, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 92, mcomp_filter_type: 4, qp_y_ac: 80, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 8, last_ref: 7, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 19, mcomp_filter_type: 4, qp_y_ac: 106, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 9, last_ref: 8, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 115, mcomp_filter_type: 4, qp_y_ac: 91, loop_filter_level: 6, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 10, last_ref: 9, golden_ref: 0, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 333, mcomp_filter_type: 4, qp_y_ac: 49, loop_filter_level: 5, allow_high_precision_mv: 1 },
+        Expected {
+            curr_pic_idx: 1,
+            last_ref: 0,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 72,
+            mcomp_filter_type: 4,
+            qp_y_ac: 92,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 2,
+            last_ref: 1,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 20,
+            mcomp_filter_type: 4,
+            qp_y_ac: 165,
+            loop_filter_level: 5,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 3,
+            last_ref: 2,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 73,
+            mcomp_filter_type: 4,
+            qp_y_ac: 104,
+            loop_filter_level: 6,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 4,
+            last_ref: 3,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 93,
+            mcomp_filter_type: 4,
+            qp_y_ac: 98,
+            loop_filter_level: 8,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 5,
+            last_ref: 4,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 164,
+            mcomp_filter_type: 4,
+            qp_y_ac: 91,
+            loop_filter_level: 6,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 6,
+            last_ref: 5,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 30,
+            mcomp_filter_type: 4,
+            qp_y_ac: 102,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 7,
+            last_ref: 6,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 92,
+            mcomp_filter_type: 4,
+            qp_y_ac: 80,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 8,
+            last_ref: 7,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 19,
+            mcomp_filter_type: 4,
+            qp_y_ac: 106,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 9,
+            last_ref: 8,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 115,
+            mcomp_filter_type: 4,
+            qp_y_ac: 91,
+            loop_filter_level: 6,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 10,
+            last_ref: 9,
+            golden_ref: 0,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 333,
+            mcomp_filter_type: 4,
+            qp_y_ac: 49,
+            loop_filter_level: 5,
+            allow_high_precision_mv: 1,
+        },
         //  F11..F15 (GOLDEN refreshed at F10 -> golden_ref 10)
-        Expected { curr_pic_idx: 11, last_ref: 10, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 49, mcomp_filter_type: 4, qp_y_ac: 123, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 12, last_ref: 11, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 97, mcomp_filter_type: 4, qp_y_ac: 76, loop_filter_level: 6, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 13, last_ref: 12, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 23, mcomp_filter_type: 4, qp_y_ac: 96, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 14, last_ref: 13, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 55, mcomp_filter_type: 4, qp_y_ac: 95, loop_filter_level: 6, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 15, last_ref: 14, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 19, mcomp_filter_type: 4, qp_y_ac: 111, loop_filter_level: 7, allow_high_precision_mv: 1 },
+        Expected {
+            curr_pic_idx: 11,
+            last_ref: 10,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 49,
+            mcomp_filter_type: 4,
+            qp_y_ac: 123,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 12,
+            last_ref: 11,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 97,
+            mcomp_filter_type: 4,
+            qp_y_ac: 76,
+            loop_filter_level: 6,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 13,
+            last_ref: 12,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 23,
+            mcomp_filter_type: 4,
+            qp_y_ac: 96,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 14,
+            last_ref: 13,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 55,
+            mcomp_filter_type: 4,
+            qp_y_ac: 95,
+            loop_filter_level: 6,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 15,
+            last_ref: 14,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 19,
+            mcomp_filter_type: 4,
+            qp_y_ac: 111,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
         //  F16..F19 (wraparound: surface 0 is live as ALTREF, skipped)
-        Expected { curr_pic_idx: 1, last_ref: 15, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 56, mcomp_filter_type: 4, qp_y_ac: 91, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 2, last_ref: 1, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 24, mcomp_filter_type: 4, qp_y_ac: 121, loop_filter_level: 5, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 3, last_ref: 2, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 69, mcomp_filter_type: 4, qp_y_ac: 93, loop_filter_level: 7, allow_high_precision_mv: 1 },
-        Expected { curr_pic_idx: 4, last_ref: 3, golden_ref: 10, alt_ref: 0, active_ref_idx: [0, 1, 2], frame_type: 1, frame_tag_size: 10, offset_to_dct_parts: 22, mcomp_filter_type: 4, qp_y_ac: 128, loop_filter_level: 7, allow_high_precision_mv: 1 },
+        Expected {
+            curr_pic_idx: 1,
+            last_ref: 15,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 56,
+            mcomp_filter_type: 4,
+            qp_y_ac: 91,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 2,
+            last_ref: 1,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 24,
+            mcomp_filter_type: 4,
+            qp_y_ac: 121,
+            loop_filter_level: 5,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 3,
+            last_ref: 2,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 69,
+            mcomp_filter_type: 4,
+            qp_y_ac: 93,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
+        Expected {
+            curr_pic_idx: 4,
+            last_ref: 3,
+            golden_ref: 10,
+            alt_ref: 0,
+            active_ref_idx: [0, 1, 2],
+            frame_type: 1,
+            frame_tag_size: 10,
+            offset_to_dct_parts: 22,
+            mcomp_filter_type: 4,
+            qp_y_ac: 128,
+            loop_filter_level: 7,
+            allow_high_precision_mv: 1,
+        },
     ];
 
     #[test]
@@ -1500,7 +1755,11 @@ mod tests {
             assert_eq!(p.bottom_field_flag, 0, "F{i} bottom_field_flag");
             assert_eq!(p.second_field, 0, "F{i} second_field");
             assert_eq!(p.nNumSlices, 1, "F{i} nNumSlices");
-            assert_eq!(unsafe { *p.pSliceDataOffsets }, 0, "F{i} pSliceDataOffsets[0]");
+            assert_eq!(
+                unsafe { *p.pSliceDataOffsets },
+                0,
+                "F{i} pSliceDataOffsets[0]"
+            );
             assert_eq!(p.ref_pic_flag, 0, "F{i} ref_pic_flag");
             let intra = if i == 0 { 1 } else { 0 };
             assert_eq!(p.intra_pic_flag, intra, "F{i} intra_pic_flag");
@@ -1530,7 +1789,10 @@ mod tests {
             assert_eq!(v.refFrameSignBias, [0, 0, 0, 0], "F{i} refFrameSignBias");
             assert_eq!(v.bitDepthMinus8Luma, 0, "F{i} bitDepthMinus8Luma");
             assert_eq!(v.bitDepthMinus8Chroma, 0, "F{i} bitDepthMinus8Chroma");
-            assert_eq!(v.loopFilterLevel, e.loop_filter_level, "F{i} loopFilterLevel");
+            assert_eq!(
+                v.loopFilterLevel, e.loop_filter_level,
+                "F{i} loopFilterLevel"
+            );
             assert_eq!(v.loopFilterSharpness, 0, "F{i} loopFilterSharpness");
             assert_eq!(v.modeRefLfEnabled, 1, "F{i} modeRefLfEnabled");
             assert_eq!(v.log2_tile_columns, 2, "F{i} log2_tile_columns");
@@ -1539,7 +1801,11 @@ mod tests {
             // Segmentation (disabled for this stream).
             assert_eq!(v.segment_enabled(), 0, "F{i} segmentEnabled");
             assert_eq!(v.segment_map_update(), 0, "F{i} segmentMapUpdate");
-            assert_eq!(v.segment_map_temporal_update(), 0, "F{i} segmentMapTemporalUpdate");
+            assert_eq!(
+                v.segment_map_temporal_update(),
+                0,
+                "F{i} segmentMapTemporalUpdate"
+            );
             assert_eq!(v.segment_feature_mode(), 0, "F{i} segmentFeatureMode");
             assert!(
                 v.segmentFeatureEnable.iter().all(|r| r == &[0, 0, 0, 0]),
@@ -1549,7 +1815,10 @@ mod tests {
                 v.segmentFeatureData.iter().all(|r| r == &[0, 0, 0, 0]),
                 "F{i} segmentFeatureData"
             );
-            assert_eq!(v.mb_segment_tree_probs, [0; 7], "F{i} mb_segment_tree_probs");
+            assert_eq!(
+                v.mb_segment_tree_probs, [0; 7],
+                "F{i} mb_segment_tree_probs"
+            );
             assert_eq!(v.segment_pred_probs, [0, 0, 0], "F{i} segment_pred_probs");
 
             // Quantization.
@@ -1561,7 +1830,10 @@ mod tests {
             // References.
             assert_eq!(v.activeRefIdx, e.active_ref_idx, "F{i} activeRefIdx");
             assert_eq!(v.resetFrameContext, 0, "F{i} resetFrameContext");
-            assert_eq!(v.mcomp_filter_type, e.mcomp_filter_type, "F{i} mcomp_filter_type");
+            assert_eq!(
+                v.mcomp_filter_type, e.mcomp_filter_type,
+                "F{i} mcomp_filter_type"
+            );
             // [1, 0, -1, -1] sign-extended.
             assert_eq!(
                 v.mbRefLfDelta,
@@ -1572,7 +1844,10 @@ mod tests {
 
             // Header offsets.
             assert_eq!(v.frameTagSize, e.frame_tag_size, "F{i} frameTagSize");
-            assert_eq!(v.offsetToDctParts, e.offset_to_dct_parts, "F{i} offsetToDctParts");
+            assert_eq!(
+                v.offsetToDctParts, e.offset_to_dct_parts,
+                "F{i} offsetToDctParts"
+            );
         }
     }
 

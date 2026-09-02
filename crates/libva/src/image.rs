@@ -122,7 +122,7 @@ impl<'a> Image<'a> {
         mut format: bindings::VAImageFormat,
         coded_resolution: (u32, u32),
         visible_rect: (u32, u32),
-    ) -> Result<Image, VaError> {
+    ) -> Result<Image<'a>, VaError> {
         // An all-zero byte-pattern is a valid initial value for `VAImage`.
         let mut image: bindings::VAImage = Default::default();
         let dpy = surface.display().handle();

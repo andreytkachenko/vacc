@@ -84,7 +84,6 @@ pub struct SliceHeaderInfo {
 
     // --- Fields beyond the RPS block (H.265 7.3.6.1), parsed in FFmpeg
     // n8.1.2 hls_slice_header order; needed by VAAPI slice buffers ---
-
     /// slice_segment_address (0 for first slice segments).
     pub slice_segment_address: u32,
     /// dependent_slice_segment_flag (non-first segments when PPS enables
@@ -151,7 +150,6 @@ pub struct SliceHeaderInfo {
     pub chroma_offset_l1: [[i16; 2]; 15],
 
     // --- Range-extension / SCC slice fields (VASliceParameterBufferHEVCRext)
-
     /// cu_chroma_qp_offset_enabled_flag (when PPS chroma_qp_offset_list_enabled).
     pub cu_chroma_qp_offset_enabled_flag: bool,
     /// use_integer_mv_flag (when SPS motion_vector_resolution_control_idc == 2).
@@ -228,6 +226,12 @@ impl SliceHeaderInfo {
             slice_act_cr_qp_offset: 0,
             header_bit_size: 0,
         }
+    }
+}
+
+impl Default for SliceHeaderInfo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -345,7 +349,7 @@ impl H265Parser {
 
         // Padding bits: (8 - MaxNumSubLayersMinus1 - 1) * 2 per H.265 spec
         if max_sub_layers > 0 && max_sub_layers < 8 {
-            let _ = r.read_bits(((8 - max_sub_layers - 1) * 2) as u8)?;
+            let _ = r.read_bits((8 - max_sub_layers - 1) * 2)?;
         }
 
         // --- Sub-layer level info (SubLayerLevelPresentFlag) ---
@@ -500,7 +504,7 @@ impl H265Parser {
             }
         }
 
-        for i in 0..=max_num_sublayers_minus1 as usize {
+        for _i in 0..=max_num_sublayers_minus1 as usize {
             let fixed_pic_rate_general_flag = r.read_bit()?;
             let mut fixed_pic_rate_within_cvs_flag = false;
             if !fixed_pic_rate_general_flag {
@@ -624,7 +628,7 @@ impl H265Parser {
                     strps.used_by_curr_pic_s0_flag |= 1 << i;
                 }
                 // Compute cumulative POC offset (negative for S0)
-                cum_delta_poc_s0 -= (raw_delta + 1);
+                cum_delta_poc_s0 -= raw_delta + 1;
                 // Store directly like C++: (uint16_t)DeltaPocS0[i]
                 strps.delta_poc_s0_minus1[i as usize] = cum_delta_poc_s0 as u16;
             }
@@ -640,7 +644,7 @@ impl H265Parser {
                     strps.used_by_curr_pic_s1_flag |= 1 << i;
                 }
                 // Compute cumulative POC offset (positive for S1)
-                cum_delta_poc_s1 += (raw_delta + 1);
+                cum_delta_poc_s1 += raw_delta + 1;
                 // Store directly like C++: (uint16_t)DeltaPocS1[i]
                 strps.delta_poc_s1_minus1[i as usize] = cum_delta_poc_s1 as u16;
             }
@@ -698,7 +702,7 @@ impl H265Parser {
         // Matches C++: VulkanH265Parser.cpp:1758-1769
         let mut used_by_curr_pic_flag: Vec<bool> = Vec::with_capacity(num_ref_entries + 1);
         let mut use_delta_flag: Vec<bool> = Vec::with_capacity(num_ref_entries + 1);
-        for j in 0..=num_ref_entries {
+        for _j in 0..=num_ref_entries {
             let used = r.read_bit()?;
             used_by_curr_pic_flag.push(used);
             if used {
@@ -847,9 +851,9 @@ impl H265Parser {
 
         // layer_id_included_flag[layer_set_idx][layer_id]
         vps.layer_id_included_flag.clear();
-        for i in 1..vps.vps_num_layer_sets {
+        for _i in 1..vps.vps_num_layer_sets {
             let mut layer_flags = Vec::new();
-            for j in 0..=(vps.vps_max_layer_id) {
+            for _j in 0..=(vps.vps_max_layer_id) {
                 layer_flags.push(r.read_bit()?);
             }
             vps.layer_id_included_flag.push(layer_flags);
@@ -925,10 +929,10 @@ impl H265Parser {
         // Parse conformance_window_flag and offsets
         sps.conformance_window_flag = r.read_bit()?;
         if sps.conformance_window_flag {
-            sps.conf_win_left_offset = r.read_ue()? as u32;
-            sps.conf_win_right_offset = r.read_ue()? as u32;
-            sps.conf_win_top_offset = r.read_ue()? as u32;
-            sps.conf_win_bottom_offset = r.read_ue()? as u32;
+            sps.conf_win_left_offset = r.read_ue()?;
+            sps.conf_win_right_offset = r.read_ue()?;
+            sps.conf_win_top_offset = r.read_ue()?;
+            sps.conf_win_bottom_offset = r.read_ue()?;
         }
 
         sps.bit_depth_luma_minus8 = r.read_ue()? as u8;
@@ -1011,7 +1015,7 @@ impl H265Parser {
 
             let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
             for i in 0..num_long_term_ref_pics_sps {
-                sps.lt_ref_pic_poc_lsb_sps[i as usize] = r.read_bits(poc_lsb_bits as u8)? as u32;
+                sps.lt_ref_pic_poc_lsb_sps[i as usize] = r.read_bits(poc_lsb_bits as u8)?;
                 let used_by_curr_pic_lt_sps_flag = r.read_bit()?;
                 if used_by_curr_pic_lt_sps_flag {
                     sps.used_by_curr_pic_lt_sps_flag |= 1 << i;
@@ -1165,7 +1169,7 @@ impl H265Parser {
                                 sps.bit_depth_chroma_minus8 + 8
                             };
                             for _i in 0..count {
-                                let _ = r.read_bits(bit_depth as u8)?;
+                                let _ = r.read_bits(bit_depth)?;
                             }
                         }
                     }
@@ -1195,8 +1199,8 @@ impl H265Parser {
 
         let mut pps = vacc_core::picture::H265Pps::new();
 
-        pps.pps_pic_parameter_set_id = r.read_ue()? as u32;
-        pps.pps_seq_parameter_set_id = r.read_ue()? as u32;
+        pps.pps_pic_parameter_set_id = r.read_ue()?;
+        pps.pps_seq_parameter_set_id = r.read_ue()?;
         pps.dependent_slice_segments_enabled_flag = r.read_bit()?;
         pps.output_flag_present_flag = r.read_bit()?;
         // num_extra_slice_header_bits is u(3), not ue(v) per H.265 spec 7.3.6
@@ -1376,16 +1380,17 @@ impl H265Parser {
                                         let mut max_diff: u32 = 0;
                                         let mut min_diff_minus1: i32 = -1;
                                         if num_val_delta_dlt > 1 {
-                                            max_diff = r.read_bits(bit_depth_for_depth_layers as u8)?;
+                                            max_diff =
+                                                r.read_bits(bit_depth_for_depth_layers as u8)?;
                                         }
                                         if num_val_delta_dlt > 2 && max_diff > 0 {
                                             let len = max_diff.ilog2() + 1;
-                                            min_diff_minus1 =
-                                                r.read_bits(len as u8)? as i32;
+                                            min_diff_minus1 = r.read_bits(len as u8)? as i32;
                                         }
                                         if (max_diff as i32) > min_diff_minus1 + 1 {
-                                            let len =
-                                                (max_diff - (min_diff_minus1 + 1) as u32).ilog2() + 1;
+                                            let len = (max_diff - (min_diff_minus1 + 1) as u32)
+                                                .ilog2()
+                                                + 1;
                                             for _k in 1..num_val_delta_dlt {
                                                 let _ = r.read_bits(len as u8)?;
                                             }
@@ -1425,7 +1430,11 @@ impl H265Parser {
                         };
                         let num_comps = if monochrome { 1 } else { 3 };
                         for comp in 0..num_comps {
-                            let depth = if comp == 0 { luma_depth } else { chroma_depth.unwrap() };
+                            let depth = if comp == 0 {
+                                luma_depth
+                            } else {
+                                chroma_depth.unwrap()
+                            };
                             for _i in 0..count {
                                 let _ = r.read_bits(depth as u8)?;
                             }
@@ -1478,8 +1487,8 @@ impl H265Parser {
         // - VCL NAL types 0-15: odd types (1,3,5,7,9,11,13,15) are reference
         // - IRAP NAL types 16-23: all are reference pictures
         // Based on VulkanH265Parser.cpp:2783-2791 for sub-layer non-ref determination
-        info.is_reference = (nal_unit_type >= 16 && nal_unit_type <= 23)
-            || (nal_unit_type < 16 && (nal_unit_type & 1) == 1);
+        info.is_reference =
+            (16..=23).contains(&nal_unit_type) || (nal_unit_type < 16 && (nal_unit_type & 1) == 1);
 
         // --- slice_segment_header parsing (per VulkanH265Parser.cpp:2130-2133) ---
 
@@ -1598,14 +1607,14 @@ impl H265Parser {
             if self.has_prev_pic {
                 if ((info.pic_order_cnt_lsb as i32) < self.prev_pic_order_cnt_lsb)
                     && (self.prev_pic_order_cnt_lsb - info.pic_order_cnt_lsb as i32
-                        >= max_pic_order_cnt_lsb as i32 / 2)
+                        >= max_pic_order_cnt_lsb / 2)
                 {
-                    pic_order_cnt_msb = self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb as i32;
+                    pic_order_cnt_msb = self.prev_pic_order_cnt_msb + max_pic_order_cnt_lsb;
                 } else if (info.pic_order_cnt_lsb as i32 > self.prev_pic_order_cnt_lsb)
                     && (info.pic_order_cnt_lsb as i32 - self.prev_pic_order_cnt_lsb
-                        > max_pic_order_cnt_lsb as i32 / 2)
+                        > max_pic_order_cnt_lsb / 2)
                 {
-                    pic_order_cnt_msb = self.prev_pic_order_cnt_msb - max_pic_order_cnt_lsb as i32;
+                    pic_order_cnt_msb = self.prev_pic_order_cnt_msb - max_pic_order_cnt_lsb;
                 } else {
                     pic_order_cnt_msb = self.prev_pic_order_cnt_msb;
                 }
@@ -1684,13 +1693,13 @@ impl H265Parser {
                         lt_ref.used_by_curr_pic =
                             (sps.used_by_curr_pic_lt_sps_flag >> lt_ref.sps_idx) & 1 == 1;
                     } else {
-                        let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u8 + 4;
-                        lt_ref.poc_lsb = r.read_bits(poc_lsb_bits)? as u32; // poc_lsb_lt
+                        let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
+                        lt_ref.poc_lsb = r.read_bits(poc_lsb_bits)?; // poc_lsb_lt
                         lt_ref.used_by_curr_pic = r.read_bit()?; // used_by_curr_pic_lt_flag
                     }
                     lt_ref.delta_poc_msb_present = r.read_bit()?;
                     if lt_ref.delta_poc_msb_present {
-                        lt_ref.delta_poc_msb_cycle = r.read_ue()? as u32;
+                        lt_ref.delta_poc_msb_cycle = r.read_ue()?;
                     }
                     info.long_term_refs.push(lt_ref);
                 }
@@ -1700,7 +1709,6 @@ impl H265Parser {
             if sps.sps_temporal_mvp_enabled_flag {
                 info.slice_temporal_mvp_enabled_flag = r.read_bit()?;
             }
-
         } else {
             // IDR pictures carry no RPS: short_term_ref_pic_set_sps_flag is
             // absent from the bitstream and must be signaled as 0 to the
@@ -1737,11 +1745,9 @@ impl H265Parser {
                     info.num_ref_idx_l1_active_minus1 = r.read_ue()? as u8;
                 }
             } else {
-                info.num_ref_idx_l0_active_minus1 =
-                    pps.num_ref_idx_l0_default_active_minus1 as u8;
+                info.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
                 if info.slice_type == 2 {
-                    info.num_ref_idx_l1_active_minus1 =
-                        pps.num_ref_idx_l1_default_active_minus1 as u8;
+                    info.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
                 }
             }
 
@@ -1764,19 +1770,21 @@ impl H265Parser {
                 // L0: P and B slices
                 if r.read_bit()? {
                     for _i in 0..n0 {
-                        info.ref_pic_lists_modification_l0.push(H265ListModification {
-                            flag: true,
-                            ref_idx: r.read_bits(idx_bits)? as u8,
-                        });
+                        info.ref_pic_lists_modification_l0
+                            .push(H265ListModification {
+                                flag: true,
+                                ref_idx: r.read_bits(idx_bits)? as u8,
+                            });
                     }
                 }
                 // L1: B slices only
                 if info.slice_type == 2 && r.read_bit()? {
                     for _i in 0..n1 {
-                        info.ref_pic_lists_modification_l1.push(H265ListModification {
-                            flag: true,
-                            ref_idx: r.read_bits(idx_bits)? as u8,
-                        });
+                        info.ref_pic_lists_modification_l1
+                            .push(H265ListModification {
+                                flag: true,
+                                ref_idx: r.read_bits(idx_bits)? as u8,
+                            });
                     }
                 }
             }
@@ -1795,7 +1803,11 @@ impl H265Parser {
             // collocated_from_l0_flag is B-only; collocated_ref_idx is present
             // when the collocated list has > 1 active reference.
             if info.slice_temporal_mvp_enabled_flag {
-                let from_l0 = if info.slice_type == 2 { r.read_bit()? } else { true };
+                let from_l0 = if info.slice_type == 2 {
+                    r.read_bit()?
+                } else {
+                    true
+                };
                 info.collocated_from_l0_flag = from_l0;
                 if (if from_l0 { n0 } else { n1 }) > 1 {
                     info.collocated_ref_idx = r.read_ue()? as u8;
@@ -1946,8 +1958,7 @@ impl H265Parser {
             if info.num_entry_point_offsets > 0 {
                 info.entry_point_offset_length = (r.read_ue()? + 1) as u16;
                 for _ in 0..info.num_entry_point_offsets {
-                    info
-                        .entry_point_offsets
+                    info.entry_point_offsets
                         .push(r.read_bits(info.entry_point_offset_length as u8)?);
                 }
             }
@@ -2063,14 +2074,10 @@ impl VideoParser for H265Parser {
                     // Copy the NAL data out so the borrow of self.cached_nals
                     // ends before the &mut self calls below.
                     let nal_data = nal.data.clone();
-                    match self.parse_vps(&nal_data) {
-                        Ok(_vps) => {
-                            result_vps =
-                                Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_vps.clone().unwrap(),
-                                ));
-                        }
-                        Err(_) => {}
+                    if let Ok(_vps) = self.parse_vps(&nal_data) {
+                        result_vps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                            self.active_vps.clone().unwrap(),
+                        ));
                     }
                     i += 1;
                 }
@@ -2079,12 +2086,11 @@ impl VideoParser for H265Parser {
                         break;
                     }
                     let nal_data = nal.data.clone();
-                    match self.parse_sps(&nal_data) {
-                        Ok(sps) => {
-                            result_sps =
-                                Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_sps.clone().unwrap(),
-                                ));
+                    if let Ok(sps) = self.parse_sps(&nal_data) {
+                        {
+                            result_sps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                                self.active_sps.clone().unwrap(),
+                            ));
                             // Update detected format from SPS
                             self.detected_format.coded_width = sps.pic_width_in_luma_samples as u32;
                             self.detected_format.coded_height =
@@ -2125,7 +2131,6 @@ impl VideoParser for H265Parser {
                             self.detected_format.codec_profile = sps.profile_idc as u32;
                             self.detected_format.progressive_sequence = !sps.vui.field_seq_flag;
                         }
-                        Err(_) => {}
                     }
                     i += 1;
                 }
@@ -2134,14 +2139,10 @@ impl VideoParser for H265Parser {
                         break;
                     }
                     let nal_data = nal.data.clone();
-                    match self.parse_pps(&nal_data) {
-                        Ok(_pps) => {
-                            result_pps =
-                                Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                                    self.active_pps.clone().unwrap(),
-                                ));
-                        }
-                        Err(_) => {}
+                    if let Ok(_pps) = self.parse_pps(&nal_data) {
+                        result_pps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                            self.active_pps.clone().unwrap(),
+                        ));
                     }
                     i += 1;
                 }
@@ -2294,130 +2295,124 @@ mod tests {
 
     /// PIC0: IDR_W_RADL (19), poc 0.
     const SLICE_IDR: &[u8] = &[
-        0x26, 0x01, 0xaf, 0x1f, 0x08, 0x84, 0x32, 0xb7, 0x30, 0x15, 0xed, 0xbd,
-        0xae, 0xda, 0x6d, 0xc8, 0xaf, 0xb2, 0x70, 0x60, 0x2e, 0xbe, 0xb5, 0xb1,
-        0xbd, 0xf7, 0xf4, 0xc1, 0xb1, 0x0c, 0x71, 0x4c, 0x27, 0x86, 0xe1, 0x2c,
-        0xd8, 0x38, 0xe0,
+        0x26, 0x01, 0xaf, 0x1f, 0x08, 0x84, 0x32, 0xb7, 0x30, 0x15, 0xed, 0xbd, 0xae, 0xda, 0x6d,
+        0xc8, 0xaf, 0xb2, 0x70, 0x60, 0x2e, 0xbe, 0xb5, 0xb1, 0xbd, 0xf7, 0xf4, 0xc1, 0xb1, 0x0c,
+        0x71, 0x4c, 0x27, 0x86, 0xe1, 0x2c, 0xd8, 0x38, 0xe0,
     ];
 
     /// PIC1: TRAIL_R (1), lsb 5.
     const SLICE_P1: &[u8] = &[
-        0x02, 0x01, 0xd0, 0x29, 0x4b, 0xe1, 0x0c, 0x70, 0x44, 0x6d, 0xae, 0x25,
-        0x0e, 0xc5, 0x76, 0x2d, 0x2b, 0xb1, 0x9f, 0x66, 0x90, 0x2d, 0xe3, 0x75,
-        0xb1, 0x44, 0xf4, 0x37, 0x57, 0xcd, 0x42, 0x5f, 0xcf, 0x6a, 0x56, 0xc4,
+        0x02, 0x01, 0xd0, 0x29, 0x4b, 0xe1, 0x0c, 0x70, 0x44, 0x6d, 0xae, 0x25, 0x0e, 0xc5, 0x76,
+        0x2d, 0x2b, 0xb1, 0x9f, 0x66, 0x90, 0x2d, 0xe3, 0x75, 0xb1, 0x44, 0xf4, 0x37, 0x57, 0xcd,
+        0x42, 0x5f, 0xcf, 0x6a, 0x56, 0xc4,
     ];
 
     /// PIC2: TRAIL_R (1), lsb 3.
     const SLICE_P2: &[u8] = &[
-        0x02, 0x01, 0xe0, 0x64, 0x9d, 0x78, 0x68, 0x11, 0x13, 0x1a, 0x56, 0x20,
-        0xce, 0x27, 0xb4, 0xc9, 0x60, 0x9e, 0xab, 0x9e, 0x3b, 0xda, 0xb4, 0x98,
-        0x7a, 0x85, 0x19,
+        0x02, 0x01, 0xe0, 0x64, 0x9d, 0x78, 0x68, 0x11, 0x13, 0x1a, 0x56, 0x20, 0xce, 0x27, 0xb4,
+        0xc9, 0x60, 0x9e, 0xab, 0x9e, 0x3b, 0xda, 0xb4, 0x98, 0x7a, 0x85, 0x19,
     ];
 
     /// PIC3: TRAIL_N (0), lsb 1.
     const SLICE_P3: &[u8] = &[
-        0x00, 0x01, 0xe0, 0x24, 0xf5, 0x5f, 0xa2, 0xc9, 0x08, 0x9e, 0xbc, 0xf9,
-        0x71, 0x62, 0x47, 0x92, 0xfa, 0x0b, 0x76, 0xee, 0x21, 0x53, 0x83, 0x26,
+        0x00, 0x01, 0xe0, 0x24, 0xf5, 0x5f, 0xa2, 0xc9, 0x08, 0x9e, 0xbc, 0xf9, 0x71, 0x62, 0x47,
+        0x92, 0xfa, 0x0b, 0x76, 0xee, 0x21, 0x53, 0x83, 0x26,
     ];
 
     /// PIC4: TRAIL_N (0), lsb 2.
     const SLICE_P4: &[u8] = &[
-        0x00, 0x01, 0xe0, 0x44, 0xd7, 0x5f, 0xa2, 0xc8, 0x08, 0x9f, 0x75, 0xda,
-        0x93, 0x5f, 0xc7, 0x66, 0xf2, 0x55, 0xb9, 0x6d, 0x75, 0x4f, 0x6e, 0xc6,
+        0x00, 0x01, 0xe0, 0x44, 0xd7, 0x5f, 0xa2, 0xc8, 0x08, 0x9f, 0x75, 0xda, 0x93, 0x5f, 0xc7,
+        0x66, 0xf2, 0x55, 0xb9, 0x6d, 0x75, 0x4f, 0x6e, 0xc6,
     ];
 
     /// PIC5: TRAIL_N (0), lsb 4.
     const SLICE_P5: &[u8] = &[
-        0x00, 0x01, 0xe0, 0x86, 0xb7, 0xfd, 0x46, 0x48, 0x44, 0x44, 0xcb, 0x32,
-        0xca, 0x4a, 0x83, 0x39, 0x9a, 0x42, 0xd3, 0x39, 0xd2, 0x0c, 0x3b, 0xa2,
-        0x3a, 0xec,
+        0x00, 0x01, 0xe0, 0x86, 0xb7, 0xfd, 0x46, 0x48, 0x44, 0x44, 0xcb, 0x32, 0xca, 0x4a, 0x83,
+        0x39, 0x9a, 0x42, 0xd3, 0x39, 0xd2, 0x0c, 0x3b, 0xa2, 0x3a, 0xec,
     ];
 
     /// PIC247: CRA_NUT (21), poc 250, no_output_of_prior_pics 0.
     const SLICE_CRA: &[u8] = &[
-        0x2a, 0x01, 0xaf, 0xe8, 0x59, 0x08, 0xc9, 0xc2, 0xa0, 0x88, 0x45, 0x86,
-        0x04, 0xc5, 0xc4, 0x63, 0x56, 0x30, 0xf6, 0xdb, 0x06, 0x4d, 0x50, 0x06,
-        0x4e, 0xab, 0x65, 0xc2, 0x08, 0xc3, 0x13, 0xdc, 0x75, 0x88, 0xbc, 0x30,
-        0x9e, 0x07, 0x4d, 0xda, 0x46, 0x6d, 0xfa, 0xd9, 0xea,
+        0x2a, 0x01, 0xaf, 0xe8, 0x59, 0x08, 0xc9, 0xc2, 0xa0, 0x88, 0x45, 0x86, 0x04, 0xc5, 0xc4,
+        0x63, 0x56, 0x30, 0xf6, 0xdb, 0x06, 0x4d, 0x50, 0x06, 0x4e, 0xab, 0x65, 0xc2, 0x08, 0xc3,
+        0x13, 0xdc, 0x75, 0x88, 0xbc, 0x30, 0x9e, 0x07, 0x4d, 0xda, 0x46, 0x6d, 0xfa, 0xd9, 0xea,
     ];
 
     /// PIC248: RASL_R (9), poc 248 (reference picture).
     const SLICE_RASL_R: &[u8] = &[
-        0x12, 0x01, 0xff, 0x02, 0x25, 0x52, 0xd7, 0xdc, 0x63, 0xe1, 0x11, 0x92,
-        0xee, 0xc8, 0x2c, 0x00, 0xda, 0x0b, 0x66, 0x79, 0xe6, 0xda, 0xae, 0xf2,
-        0x66, 0xf8, 0x10, 0xe9, 0x48, 0xb8, 0xe3, 0x75, 0xd4, 0x98, 0xf5, 0xf0,
+        0x12, 0x01, 0xff, 0x02, 0x25, 0x52, 0xd7, 0xdc, 0x63, 0xe1, 0x11, 0x92, 0xee, 0xc8, 0x2c,
+        0x00, 0xda, 0x0b, 0x66, 0x79, 0xe6, 0xda, 0xae, 0xf2, 0x66, 0xf8, 0x10, 0xe9, 0x48, 0xb8,
+        0xe3, 0x75, 0xd4, 0x98, 0xf5, 0xf0,
     ];
 
     /// PIC249: RASL_N (8), poc 247 (non-reference).
     const SLICE_RASL_N1: &[u8] = &[
-        0x10, 0x01, 0xfe, 0xe6, 0xf5, 0xd7, 0xd2, 0x2c, 0x6c, 0x22, 0x2d, 0x95,
-        0x28, 0x53, 0xd4, 0x97, 0x0b, 0xf8, 0xca, 0x20, 0x87, 0x55, 0xce, 0xd2,
-        0xe9, 0x85, 0x13, 0x1c, 0xc4, 0x46, 0x8c, 0x8a, 0x9e,
+        0x10, 0x01, 0xfe, 0xe6, 0xf5, 0xd7, 0xd2, 0x2c, 0x6c, 0x22, 0x2d, 0x95, 0x28, 0x53, 0xd4,
+        0x97, 0x0b, 0xf8, 0xca, 0x20, 0x87, 0x55, 0xce, 0xd2, 0xe9, 0x85, 0x13, 0x1c, 0xc4, 0x46,
+        0x8c, 0x8a, 0x9e,
     ];
 
     /// PIC250: RASL_N (8), poc 249 (non-reference).
     const SLICE_RASL_N2: &[u8] = &[
-        0x10, 0x01, 0xff, 0x22, 0x2d, 0x57, 0xf7, 0x18, 0xd8, 0x44, 0x5a, 0xf3,
-        0x5e, 0xc9, 0x89, 0x39, 0x19, 0x21, 0xaa, 0x47, 0x52, 0x6c, 0x92, 0xc2,
-        0xd7, 0x27, 0x16, 0x5a, 0xe9, 0xd7, 0x2b, 0x52, 0x44,
+        0x10, 0x01, 0xff, 0x22, 0x2d, 0x57, 0xf7, 0x18, 0xd8, 0x44, 0x5a, 0xf3, 0x5e, 0xc9, 0x89,
+        0x39, 0x19, 0x21, 0xaa, 0x47, 0x52, 0x6c, 0x92, 0xc2, 0xd7, 0x27, 0x16, 0x5a, 0xe9, 0xd7,
+        0x2b, 0x52, 0x44,
     ];
 
     /// PIC251: TRAIL_R (1), poc 254 — first tid0 frame after the RASL run.
     const SLICE_P_AFTER_CRA: &[u8] = &[
-        0x02, 0x01, 0xd7, 0xf1, 0x49, 0xe1, 0x0c, 0x61, 0x18, 0x44, 0x7d, 0x06,
-        0x5a, 0x28, 0x94, 0x17, 0xa8, 0x5f, 0x4d, 0x9f, 0x84, 0x56, 0xf7, 0x16,
-        0x3e, 0x4e, 0x17, 0xbc, 0xef, 0x55, 0xec, 0xad, 0x6c, 0xe7, 0x1d, 0xc3,
-        0x9f, 0x78, 0xb6, 0xb3, 0x7c,
+        0x02, 0x01, 0xd7, 0xf1, 0x49, 0xe1, 0x0c, 0x61, 0x18, 0x44, 0x7d, 0x06, 0x5a, 0x28, 0x94,
+        0x17, 0xa8, 0x5f, 0x4d, 0x9f, 0x84, 0x56, 0xf7, 0x16, 0x3e, 0x4e, 0x17, 0xbc, 0xef, 0x55,
+        0xec, 0xad, 0x6c, 0xe7, 0x1d, 0xc3, 0x9f, 0x78, 0xb6, 0xb3, 0x7c,
     ];
 
     /// PIC252: TRAIL_R (1), lsb 252 — start of the POC wraparound window.
     const SLICE_W0: &[u8] = &[
-        0x02, 0x01, 0xff, 0x84, 0x95, 0x78, 0x63, 0xe1, 0x11, 0x9a, 0x1b, 0x23,
-        0x30, 0xad, 0x0f, 0x6e, 0x78, 0x7d, 0x28, 0x64, 0xd5, 0x97, 0xb9, 0x5e,
-        0x75, 0xcb, 0xab, 0x5e, 0x0b, 0xe2, 0xdb, 0x83, 0x36, 0x50,
+        0x02, 0x01, 0xff, 0x84, 0x95, 0x78, 0x63, 0xe1, 0x11, 0x9a, 0x1b, 0x23, 0x30, 0xad, 0x0f,
+        0x6e, 0x78, 0x7d, 0x28, 0x64, 0xd5, 0x97, 0xb9, 0x5e, 0x75, 0xcb, 0xab, 0x5e, 0x0b, 0xe2,
+        0xdb, 0x83, 0x36, 0x50,
     ];
 
     /// PIC253: TRAIL_N (0), lsb 251.
     const SLICE_W1: &[u8] = &[
-        0x00, 0x01, 0xff, 0x64, 0xfd, 0x7e, 0x8b, 0x1a, 0x08, 0x8b, 0x5e, 0x88,
-        0xf1, 0x03, 0xa3, 0x82, 0x60, 0x2c, 0x08, 0xb2, 0x08, 0x8c, 0x98, 0xda,
-        0x8a, 0xd7, 0xfa, 0xa5, 0x45, 0x61, 0x09, 0xf7,
+        0x00, 0x01, 0xff, 0x64, 0xfd, 0x7e, 0x8b, 0x1a, 0x08, 0x8b, 0x5e, 0x88, 0xf1, 0x03, 0xa3,
+        0x82, 0x60, 0x2c, 0x08, 0xb2, 0x08, 0x8c, 0x98, 0xda, 0x8a, 0xd7, 0xfa, 0xa5, 0x45, 0x61,
+        0x09, 0xf7,
     ];
 
     /// PIC254: TRAIL_N (0), lsb 253.
     const SLICE_W2: &[u8] = &[
-        0x00, 0x01, 0xff, 0xa6, 0xb5, 0xfd, 0x46, 0x34, 0x11, 0x16, 0xa9, 0x93,
-        0x2a, 0x65, 0x4e, 0xe6, 0x94, 0x59, 0x12, 0xd4, 0x67, 0x23, 0xb0, 0x25,
-        0x35, 0xb2, 0xd4, 0x5e, 0x47, 0xc7, 0xf5, 0x37,
+        0x00, 0x01, 0xff, 0xa6, 0xb5, 0xfd, 0x46, 0x34, 0x11, 0x16, 0xa9, 0x93, 0x2a, 0x65, 0x4e,
+        0xe6, 0x94, 0x59, 0x12, 0xd4, 0x67, 0x23, 0xb0, 0x25, 0x35, 0xb2, 0xd4, 0x5e, 0x47, 0xc7,
+        0xf5, 0x37,
     ];
 
     /// PIC255: TRAIL_R (1), lsb 2 — first frame past the 256 wrap (poc 258).
     const SLICE_W3: &[u8] = &[
-        0x02, 0x01, 0xd0, 0x10, 0x92, 0x55, 0x7d, 0xc4, 0x30, 0x18, 0x44, 0x11,
-        0x1f, 0x45, 0x7a, 0xa3, 0xed, 0x43, 0x2a, 0xc4, 0x14, 0x89, 0x62, 0x4c,
-        0xc3, 0x7e, 0x99, 0x55, 0x8b, 0xdf, 0x4b, 0x5d, 0x76, 0x9b, 0x5c, 0x79,
-        0x17, 0xf0, 0x92, 0xdb, 0xa1, 0xa9, 0x91,
+        0x02, 0x01, 0xd0, 0x10, 0x92, 0x55, 0x7d, 0xc4, 0x30, 0x18, 0x44, 0x11, 0x1f, 0x45, 0x7a,
+        0xa3, 0xed, 0x43, 0x2a, 0xc4, 0x14, 0x89, 0x62, 0x4c, 0xc3, 0x7e, 0x99, 0x55, 0x8b, 0xdf,
+        0x4b, 0x5d, 0x76, 0x9b, 0x5c, 0x79, 0x17, 0xf0, 0x92, 0xdb, 0xa1, 0xa9, 0x91,
     ];
 
     /// PIC256: TRAIL_R (1), lsb 0 (poc 256).
     const SLICE_W4: &[u8] = &[
-        0x02, 0x01, 0xe0, 0x02, 0x25, 0x55, 0x5f, 0x71, 0x8f, 0x04, 0x46, 0x57,
-        0xa4, 0x21, 0x3e, 0x7b, 0xbb, 0x31, 0x61, 0xd8, 0x1b, 0x3a, 0xdb, 0xc8,
-        0xd4, 0x9d, 0xc4, 0x5d, 0xb6, 0xf4, 0x16, 0xc7, 0x5f, 0x0c, 0x4a, 0x40,
+        0x02, 0x01, 0xe0, 0x02, 0x25, 0x55, 0x5f, 0x71, 0x8f, 0x04, 0x46, 0x57, 0xa4, 0x21, 0x3e,
+        0x7b, 0xbb, 0x31, 0x61, 0xd8, 0x1b, 0x3a, 0xdb, 0xc8, 0xd4, 0x9d, 0xc4, 0x5d, 0xb6, 0xf4,
+        0x16, 0xc7, 0x5f, 0x0c, 0x4a, 0x40,
     ];
 
     /// PIC257: TRAIL_N (0), lsb 255 (poc 255).
     const SLICE_W5: &[u8] = &[
-        0x00, 0x01, 0xff, 0xe6, 0xf5, 0xd7, 0xd2, 0x2c, 0x68, 0x22, 0x2d, 0x82,
-        0x24, 0x65, 0x28, 0xad, 0x8b, 0x68, 0xad, 0x21, 0xa5, 0xfd, 0xf1, 0xca,
-        0x17, 0x9f, 0x03, 0x1c, 0xb3, 0xa1, 0x79, 0x28, 0x62,
+        0x00, 0x01, 0xff, 0xe6, 0xf5, 0xd7, 0xd2, 0x2c, 0x68, 0x22, 0x2d, 0x82, 0x24, 0x65, 0x28,
+        0xad, 0x8b, 0x68, 0xad, 0x21, 0xa5, 0xfd, 0xf1, 0xca, 0x17, 0x9f, 0x03, 0x1c, 0xb3, 0xa1,
+        0x79, 0x28, 0x62,
     ];
 
     /// PIC258: TRAIL_N (0), lsb 1 (poc 257).
     const SLICE_W6: &[u8] = &[
-        0x00, 0x01, 0xe0, 0x22, 0x2d, 0x57, 0xf7, 0x18, 0xd8, 0x44, 0x5a, 0xd5,
-        0x3c, 0xa9, 0x31, 0x1f, 0x16, 0xf1, 0x82, 0x46, 0xcd, 0x94, 0x3c, 0xb2,
-        0x73, 0xa2, 0xb3, 0xd3, 0x89, 0xc1, 0x29, 0xce, 0x14,
+        0x00, 0x01, 0xe0, 0x22, 0x2d, 0x57, 0xf7, 0x18, 0xd8, 0x44, 0x5a, 0xd5, 0x3c, 0xa9, 0x31,
+        0x1f, 0x16, 0xf1, 0x82, 0x46, 0xcd, 0x94, 0x3c, 0xb2, 0x73, 0xa2, 0xb3, 0xd3, 0x89, 0xc1,
+        0x29, 0xce, 0x14,
     ];
 
     /// Parse several start-code-prefixed slice NALs in ONE packet and return
@@ -2790,7 +2785,7 @@ mod tests {
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, false).unwrap();
         assert_eq!(profile, 1, "SPS profile_idc");
         assert_eq!(level, 120, "SPS level_idc");
-        assert_eq!(tier, false, "SPS tier_flag");
+        assert!(!tier, "SPS tier_flag");
 
         // Test VPS PTL (max_sub_layers=0, sub_layer_level_present=true)
         let vps_ptl_data: Vec<u8> = vec![
@@ -2804,7 +2799,7 @@ mod tests {
         let (profile, level, tier) = H265Parser::parse_ptl(&mut r, 0, true).unwrap();
         assert_eq!(profile, 1, "VPS profile_idc");
         assert_eq!(level, 120, "VPS level_idc");
-        assert_eq!(tier, false, "VPS tier_flag");
+        assert!(!tier, "VPS tier_flag");
     }
 
     #[test]
@@ -2943,7 +2938,7 @@ mod tests {
 
         // Verify bit extraction
         assert_eq!(
-            (rps.used_by_curr_pic_s0_flag >> 0) & 1,
+            rps.used_by_curr_pic_s0_flag & 1,
             1,
             "S0 bit 0 should be set"
         );
@@ -2958,7 +2953,7 @@ mod tests {
             "S0 bit 2 should be set"
         );
         assert_eq!(
-            (rps.used_by_curr_pic_s1_flag >> 0) & 1,
+            rps.used_by_curr_pic_s1_flag & 1,
             0,
             "S1 bit 0 should be clear"
         );
@@ -3007,8 +3002,7 @@ mod tests {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].pic_order_cnt_lsb, 5);
         assert_eq!(
-            infos[0].curr_pic_order_cnt_val,
-            5,
+            infos[0].curr_pic_order_cnt_val, 5,
             "First picture POC should be 5 (msb=0, lsb=5)"
         );
     }
@@ -3027,7 +3021,10 @@ mod tests {
         );
         assert_eq!(infos.len(), 6);
         assert_eq!(
-            infos[..5].iter().map(|i| i.curr_pic_order_cnt_val).collect::<Vec<_>>(),
+            infos[..5]
+                .iter()
+                .map(|i| i.curr_pic_order_cnt_val)
+                .collect::<Vec<_>>(),
             [5i32, 3, 1, 2, 4],
             "pre-IDR POCs must match the stream"
         );
@@ -3068,7 +3065,10 @@ mod tests {
         assert!(r1.is_reference, "RASL_R (type 9) is a reference picture");
         assert_eq!(r1.curr_pic_order_cnt_val, 248);
 
-        assert!(!r2.is_reference, "RASL_N (type 8) is not a reference picture");
+        assert!(
+            !r2.is_reference,
+            "RASL_N (type 8) is not a reference picture"
+        );
         assert_eq!(r2.curr_pic_order_cnt_val, 247);
 
         assert!(!r3.is_reference);
@@ -3088,7 +3088,9 @@ mod tests {
         let mut parser = init_parser();
         let infos = parse_many(
             &mut parser,
-            &[SLICE_W0, SLICE_W1, SLICE_W2, SLICE_W3, SLICE_W4, SLICE_W5, SLICE_W6],
+            &[
+                SLICE_W0, SLICE_W1, SLICE_W2, SLICE_W3, SLICE_W4, SLICE_W5, SLICE_W6,
+            ],
         );
         assert_eq!(infos.len(), 7);
         let expected = [252i32, 251, 253, 258, 256, 255, 257];
@@ -3116,7 +3118,7 @@ mod tests {
         // the PPS should not contain SAO offset scale fields.
         //
         // The existing test SPS has SAO enabled, so we verify the positive case.
-        let mut parser = init_parser();
+        let parser = init_parser();
         let sps = parser.active_sps().expect("No active SPS");
 
         // Verify SAO conditions for the test SPS
@@ -3141,7 +3143,7 @@ mod tests {
     /// pps_extension_present_flag -> pps_range_extension_flag -> SAO fields
     #[test]
     fn test_pps_range_extension_sao_parsing() {
-        let mut parser = init_parser();
+        let parser = init_parser();
         let pps = parser.active_pps().expect("No active PPS");
 
         // The test PPS from big_buck_bunny has pps_extension_present_flag = false
@@ -3285,17 +3287,15 @@ mod tests {
 
                             // FFmpeg invariant: the first bit after the coded slice
                             // header must be 1.
-                            let align_bit = r
-                                .read_bit()
-                                .unwrap_or_else(|e| panic!("picture {} slice {}: {e:?}", pictures, i));
+                            let align_bit = r.read_bit().unwrap_or_else(|e| {
+                                panic!("picture {} slice {}: {e:?}", pictures, i)
+                            });
                             assert!(
                                 align_bit,
                                 "picture {} slice {} (header_bit_size={}): \
                                  alignment bit after coded header is 0 — header parse \
                                  is misaligned",
-                                pictures,
-                                i,
-                                info.header_bit_size
+                                pictures, i, info.header_bit_size
                             );
 
                             slices += 1;
@@ -3304,7 +3304,6 @@ mod tests {
                 }
                 ParseResult::Nothing | ParseResult::EndOfStream => break,
                 ParseResult::ParameterSet { .. } => {}
-                other => panic!("unexpected result: {other:?}"),
             }
         }
 

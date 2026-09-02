@@ -1,8 +1,8 @@
 //! H.265/HEVC Vulkan video decoder.
 
 use ash::vk;
-use ash::vk::Handle;
 use ash::vk::native::*;
+use ash::vk::Handle;
 
 use super::{VideoError, VideoResult};
 
@@ -200,8 +200,18 @@ impl H265Decoder {
             );
             eprintln!(
                 "[PIC-INFO] begin_slots: setup={} refs={:?}",
-                dpb_setup_picture.as_ref().map(|s| s.slot_index).unwrap_or(u32::MAX),
-                dpb_ref_pictures.iter().map(|r| (r.slot_index, r.pic_order_cnt, r.used_for_long_term_reference)).collect::<Vec<_>>()
+                dpb_setup_picture
+                    .as_ref()
+                    .map(|s| s.slot_index)
+                    .unwrap_or(u32::MAX),
+                dpb_ref_pictures
+                    .iter()
+                    .map(|r| (
+                        r.slot_index,
+                        r.pic_order_cnt,
+                        r.used_for_long_term_reference
+                    ))
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -287,7 +297,9 @@ impl H265Decoder {
                 let mut ref_std_info =
                     unsafe { std::mem::zeroed::<StdVideoDecodeH265ReferenceInfo>() };
                 ref_std_info.PicOrderCntVal = info.pic_order_cnt;
-                ref_std_info.flags.set_used_for_long_term_reference(*lt_flag);
+                ref_std_info
+                    .flags
+                    .set_used_for_long_term_reference(*lt_flag);
                 ref_std_info.flags.set_unused_for_reference(0);
                 ref_std_info
             })
@@ -523,9 +535,7 @@ impl H265Decoder {
                 query_count: 1,
             }
         } else {
-            super::inline_queries::empty_inline_queries(
-                &h265_decode_info as *const _ as *const _,
-            )
+            super::inline_queries::empty_inline_queries(&h265_decode_info as *const _ as *const _)
         };
 
         let decode_info = vk::VideoDecodeInfoKHR {
@@ -593,8 +603,7 @@ impl H265Decoder {
                 .short_term_ref_pic_sets
                 .get(info.short_term_ref_pic_set_idx as usize)
                 .expect("SPS STRPS index out of range");
-            pic_info.NumDeltaPocsOfRefRpsIdx =
-                (rps.num_negative_pics + rps.num_positive_pics) as u8;
+            pic_info.NumDeltaPocsOfRefRpsIdx = rps.num_negative_pics + rps.num_positive_pics;
             pic_info.NumBitsForSTRefPicSetInSlice = 0;
         } else if !info.is_idr {
             pic_info.NumDeltaPocsOfRefRpsIdx = 0;
@@ -632,15 +641,12 @@ impl H265Decoder {
         query_count: u32,
     ) {
         let fn_ptr = unsafe {
-            self.instance.get_device_proc_addr(
-                self.device.handle(),
-                c"vkCmdResetQueryPool".as_ptr(),
-            )
+            self.instance
+                .get_device_proc_addr(self.device.handle(), c"vkCmdResetQueryPool".as_ptr())
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
+                type FnType = unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
                 let f: FnType = std::mem::transmute(ptr);
                 f(cmd_buffer, query_pool, first_query, query_count);
             }
@@ -700,11 +706,10 @@ impl H265Decoder {
         };
         if let Some(ptr) = fn_ptr {
             unsafe {
-                type FnType =
-                    unsafe extern "system" fn(
-                        vk::CommandBuffer,
-                        *const vk::VideoDecodeInfoKHR<'_>,
-                    ) -> i64;
+                type FnType = unsafe extern "system" fn(
+                    vk::CommandBuffer,
+                    *const vk::VideoDecodeInfoKHR<'_>,
+                ) -> i64;
                 let f: FnType = std::mem::transmute(ptr);
                 let rc = f(cmd_buffer, info);
                 if std::env::var("VACC_DBG_H265").is_ok() {
@@ -738,7 +743,9 @@ impl H265Decoder {
                 eprintln!("[H265] issued codec RESET (vkCmdControlVideoCodingKHR)");
             }
         } else {
-            eprintln!("[H265] WARNING: vkCmdControlVideoCodingKHR not found; skipping mandatory reset");
+            eprintln!(
+                "[H265] WARNING: vkCmdControlVideoCodingKHR not found; skipping mandatory reset"
+            );
         }
     }
 

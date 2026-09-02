@@ -61,9 +61,9 @@ impl VulkanDevice {
     }
 
     pub fn graphics_queue(&self, index: u32) -> Option<vk::Queue> {
-        self.queue_families.graphics.map(|qf| {
-            unsafe { self.device.get_device_queue(qf, index) }
-        })
+        self.queue_families
+            .graphics
+            .map(|qf| unsafe { self.device.get_device_queue(qf, index) })
     }
 
     pub fn transfer_queue(&self, index: u32) -> vk::Queue {
@@ -126,14 +126,11 @@ impl DeviceBuilder {
     pub fn build(self) -> Result<VulkanDevice> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Init(e.to_string()))?;
         let instance = Self::create_instance(&entry, &self)?;
-        let (physical_device, queue_families) =
-            Self::select_physical_device(&instance, &self)?;
-        let (device, enabled_extensions) = Self::create_device(
-            &entry, &instance, &physical_device, &queue_families, &self,
-        )?;
-        let memory_properties = unsafe {
-            instance.get_physical_device_memory_properties(physical_device)
-        };
+        let (physical_device, queue_families) = Self::select_physical_device(&instance, &self)?;
+        let (device, enabled_extensions) =
+            Self::create_device(&entry, &instance, &physical_device, &queue_families, &self)?;
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
         Ok(VulkanDevice {
             entry,
@@ -146,12 +143,8 @@ impl DeviceBuilder {
         })
     }
 
-    fn create_instance(
-        entry: &ash::Entry,
-        builder: &DeviceBuilder,
-    ) -> Result<ash::Instance> {
-        let app_info = vk::ApplicationInfo::default()
-            .api_version(vk::API_VERSION_1_2);
+    fn create_instance(entry: &ash::Entry, builder: &DeviceBuilder) -> Result<ash::Instance> {
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
 
         let mut instance_extensions: Vec<CString> = vec![
             CString::new("VK_KHR_surface").unwrap(),
@@ -174,8 +167,7 @@ impl DeviceBuilder {
             .enabled_extension_names(&ext_ptrs)
             .enabled_layer_names(&layer_ptrs);
 
-        unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| Error::Init(e.to_string()))
+        unsafe { entry.create_instance(&create_info, None) }.map_err(|e| Error::Init(e.to_string()))
     }
 
     fn select_physical_device(
@@ -239,14 +231,16 @@ impl DeviceBuilder {
         queue_families: &QueueFamilies,
         builder: &DeviceBuilder,
     ) -> Result<(ash::Device, Vec<String>)> {
-        let available_extensions = unsafe {
-            instance.enumerate_device_extension_properties(*physical_device)
-        }.map_err(|e| Error::Device(e.to_string()))?;
+        let available_extensions =
+            unsafe { instance.enumerate_device_extension_properties(*physical_device) }
+                .map_err(|e| Error::Device(e.to_string()))?;
 
         let available_names: Vec<String> = available_extensions
             .iter()
             .map(|ext| {
-                let name_bytes: Vec<u8> = ext.extension_name.iter()
+                let name_bytes: Vec<u8> = ext
+                    .extension_name
+                    .iter()
                     .take_while(|&&b| b != 0)
                     .map(|&b| b as u8)
                     .collect();
@@ -268,25 +262,41 @@ impl DeviceBuilder {
             }
         }
 
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h264") {
-                extensions.push("VK_KHR_video_decode_h264");
-            }
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+            && available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_h264")
+        {
+            extensions.push("VK_KHR_video_decode_h264");
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_h265") {
-                extensions.push("VK_KHR_video_decode_h265");
-            }
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
+            && available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_h265")
+        {
+            extensions.push("VK_KHR_video_decode_h265");
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_av1") {
-                extensions.push("VK_KHR_video_decode_av1");
-            }
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
+            && available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_av1")
+        {
+            extensions.push("VK_KHR_video_decode_av1");
         }
-        if builder.video_codecs.contains(vk::VideoCodecOperationFlagsKHR::from_raw(0x00000008)) {
-            if available_names.iter().any(|n| n.as_str() == "VK_KHR_video_decode_vp9") {
-                extensions.push("VK_KHR_video_decode_vp9");
-            }
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::from_raw(0x00000008))
+            && available_names
+                .iter()
+                .any(|n| n.as_str() == "VK_KHR_video_decode_vp9")
+        {
+            extensions.push("VK_KHR_video_decode_vp9");
         }
 
         let c_extensions: Vec<CString> = extensions
@@ -296,18 +306,24 @@ impl DeviceBuilder {
         let ext_ptrs: Vec<*const std::os::raw::c_char> =
             c_extensions.iter().map(|c| c.as_ptr()).collect();
 
-        let mut sync2_features = vk::PhysicalDeviceSynchronization2FeaturesKHR::default();
-        sync2_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
-        sync2_features.synchronization2 = 1;
+        let mut sync2_features = vk::PhysicalDeviceSynchronization2FeaturesKHR {
+            s_type: vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+            synchronization2: 1,
+            ..Default::default()
+        };
 
-        let mut sampler_ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-        sampler_ycbcr_features.s_type = vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
-        sampler_ycbcr_features.p_next = &mut sync2_features as *mut _ as *mut _;
-        sampler_ycbcr_features.sampler_ycbcr_conversion = 1;
+        let mut sampler_ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures {
+            s_type: vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+            p_next: &mut sync2_features as *mut _ as *mut _,
+            sampler_ycbcr_conversion: 1,
+            ..Default::default()
+        };
 
-        let mut features2 = vk::PhysicalDeviceFeatures2::default();
-        features2.s_type = vk::StructureType::PHYSICAL_DEVICE_FEATURES_2;
-        features2.p_next = &mut sampler_ycbcr_features as *mut _ as *mut std::ffi::c_void;
+        let features2 = vk::PhysicalDeviceFeatures2 {
+            s_type: vk::StructureType::PHYSICAL_DEVICE_FEATURES_2,
+            p_next: &mut sampler_ycbcr_features as *mut _ as *mut std::ffi::c_void,
+            ..Default::default()
+        };
 
         let queue_priorities = vec![1.0f32; builder.num_decode_queues];
         let mut queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = Vec::new();
@@ -342,6 +358,8 @@ impl DeviceBuilder {
             }
         }
 
+        // ash still requires the (now-deprecated) layer fields in the literal.
+        #[allow(deprecated)]
         let device_create_info = vk::DeviceCreateInfo {
             s_type: vk::StructureType::DEVICE_CREATE_INFO,
             p_next: &features2 as *const _ as *const _,
@@ -356,11 +374,8 @@ impl DeviceBuilder {
             _marker: Default::default(),
         };
 
-        let device = unsafe {
-            instance
-                .create_device(*physical_device, &device_create_info, None)
-        }
-        .map_err(|e| Error::Device(e.to_string()))?;
+        let device = unsafe { instance.create_device(*physical_device, &device_create_info, None) }
+            .map_err(|e| Error::Device(e.to_string()))?;
 
         let ext_names: Vec<String> = c_extensions
             .iter()

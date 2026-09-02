@@ -701,13 +701,13 @@ mod tests {
         // Actual PPS RBSP from bframe_test.h264: eb e3 cb 22 c0
         let data = [0xeb, 0xe3, 0xcb, 0x22, 0xc0];
         let mut r = BitReader::new(&data, false);
-        let pps_id = r.read_ue().unwrap();
-        let sps_id = r.read_ue().unwrap();
-        let entropy = r.read_bits(1).unwrap();
-        let bottom = r.read_bits(1).unwrap();
-        let nsg = r.read_ue().unwrap();
-        let nr0 = r.read_ue().unwrap();
-        let nr1 = r.read_ue().unwrap();
+        let _pps_id = r.read_ue().unwrap();
+        let _sps_id = r.read_ue().unwrap();
+        let _entropy = r.read_bits(1).unwrap();
+        let _bottom = r.read_bits(1).unwrap();
+        let _nsg = r.read_ue().unwrap();
+        let _nr0 = r.read_ue().unwrap();
+        let _nr1 = r.read_ue().unwrap();
         let wp = r.read_bits(1).unwrap();
         let wbi = r.read_bits(2).unwrap();
         // Dump the next 24 bits (starting at pq) for inspection

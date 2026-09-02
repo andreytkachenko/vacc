@@ -6,49 +6,47 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use libva::{
-    Buffer, BufferType, Config, Context, Display, IQMatrix, IQMatrixBufferH264,
-    IQMatrixBufferHEVC, PictureParameter, PictureParameterBufferH264,
-    PictureParameterBufferHEVC, PictureParameterBufferHEVCRext,
-    PictureParameterBufferHEVCExtension, HevcRangeExtensionPicFields,
-    PictureH264, PictureHEVC, H264SeqFields,
-    H264PicFields, HevcPicFields, HevcSliceParsingFields, HevcLongSliceFlags,
-    SliceParameter, SliceParameterBufferH264, SliceParameterBufferHEVC,
-    SliceParameterBufferHEVCRext, SliceParameterBufferHEVCExtension, HevcSliceExtFlags,
-    Picture, PictureNew, PictureEnd, PictureRender, PictureSync, Surface, Image,
-    PictureParameterBufferVP9, SegmentParameterVP9, SliceParameterBufferVP9,
-    VP9PicFields, VP9SegmentFlags,
-    AV1FilmGrain, AV1FilmGrainFields, AV1LoopFilterFields, AV1LoopRestorationFields,
-    AV1ModeControlFields, AV1PicInfoFields, AV1QMatrixFields, AV1SeqFields,
-    AV1Segmentation, AV1SegmentInfoFields, AV1WarpedMotionParams,
-    PictureParameterBufferAV1, SliceParameterBufferAV1,
-};
 use libva::VAProfile::Type as VAProfileType;
 use libva::{
-    VA_INVALID_ID, VA_SLICE_DATA_FLAG_ALL,
-    VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-    VA_PICTURE_H264_LONG_TERM_REFERENCE, VA_PICTURE_H264_TOP_FIELD,
-    VA_PICTURE_H264_BOTTOM_FIELD,
-    VA_PICTURE_HEVC_INVALID, VA_PICTURE_HEVC_LONG_TERM_REFERENCE,
-    VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE, VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
-    VA_PICTURE_HEVC_RPS_LT_CURR,
+    AV1FilmGrain, AV1FilmGrainFields, AV1LoopFilterFields, AV1LoopRestorationFields,
+    AV1ModeControlFields, AV1PicInfoFields, AV1QMatrixFields, AV1SegmentInfoFields,
+    AV1Segmentation, AV1SeqFields, AV1WarpedMotionParams, Buffer, BufferType, Config, Context,
+    Display, H264PicFields, H264SeqFields, HevcLongSliceFlags, HevcPicFields,
+    HevcRangeExtensionPicFields, HevcSliceExtFlags, HevcSliceParsingFields, IQMatrix,
+    IQMatrixBufferH264, IQMatrixBufferHEVC, Image, Picture, PictureEnd, PictureH264, PictureHEVC,
+    PictureNew, PictureParameter, PictureParameterBufferAV1, PictureParameterBufferH264,
+    PictureParameterBufferHEVC, PictureParameterBufferHEVCExtension,
+    PictureParameterBufferHEVCRext, PictureParameterBufferVP9, PictureRender, PictureSync,
+    SegmentParameterVP9, SliceParameter, SliceParameterBufferAV1, SliceParameterBufferH264,
+    SliceParameterBufferHEVC, SliceParameterBufferHEVCExtension, SliceParameterBufferHEVCRext,
+    SliceParameterBufferVP9, Surface, VP9PicFields, VP9SegmentFlags,
+};
+use libva::{
+    VA_INVALID_ID, VA_PICTURE_H264_BOTTOM_FIELD, VA_PICTURE_H264_INVALID,
+    VA_PICTURE_H264_LONG_TERM_REFERENCE, VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+    VA_PICTURE_H264_TOP_FIELD, VA_PICTURE_HEVC_INVALID, VA_PICTURE_HEVC_LONG_TERM_REFERENCE,
+    VA_PICTURE_HEVC_RPS_LT_CURR, VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
+    VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE, VA_SLICE_DATA_FLAG_ALL,
 };
 
 use vacc_core::{
     codec::VideoCodec as CoreVideoCodec,
     decoder::{Decoder, DecoderInfo},
-    frame::{DecodedFrame, PixelData, PixelPlane},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
+    frame::{DecodedFrame, PixelData, PixelPlane},
+    picture::{Av1Sps, H264Pps, H264Sps, H265Pps, H265Sps, Vp9FrameData},
     session::Extent2D,
-    picture::{Av1Sps, H264Sps, H264Pps, H265Sps, H265Pps, Vp9FrameData},
 };
 use vacc_parser::{
     av1::Av1Parser,
-    bitstream::BitstreamPacket, h264::H264Parser, h265::H265Parser,
-    h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG},
-    h265_dpb::H265Dpb,
+    bitstream::BitstreamPacket,
+    h264::H264Parser,
+    h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG, MARKING_SHORT},
     h264_poc::PocCalculator,
-    vp9::Vp9Parser, vp9_dpb::Vp9Dpb,
+    h265::H265Parser,
+    h265_dpb::H265Dpb,
+    vp9::Vp9Parser,
+    vp9_dpb::Vp9Dpb,
     DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
 };
 
@@ -70,16 +68,23 @@ struct DmaBufSurfaceDescriptor {
 }
 
 impl libva::SurfaceMemoryDescriptor for DmaBufSurfaceDescriptor {
-    fn add_attrs(&mut self, attrs: &mut Vec<libva::VASurfaceAttrib>) -> Option<Box<dyn std::any::Any>> {
+    fn add_attrs(
+        &mut self,
+        attrs: &mut Vec<libva::VASurfaceAttrib>,
+    ) -> Option<Box<dyn std::any::Any>> {
         if let Some(fourcc) = self.pixel_format {
             attrs.push(libva::VASurfaceAttrib::new_pixel_format(fourcc));
-            attrs.push(libva::VASurfaceAttrib::new_memory_type(libva::MemoryType::Va));
+            attrs.push(libva::VASurfaceAttrib::new_memory_type(
+                libva::MemoryType::Va,
+            ));
             return None;
         }
         // NVIDIA NVDEC requires surfaces to be allocated with DRM_PRIME_2 memory type
         // for vaExportSurfaceHandle to succeed. Without it the driver returns
         // VA_ERROR_INVALID_SURFACE ("invalid VASurfaceID") on export.
-        attrs.push(libva::VASurfaceAttrib::new_memory_type(libva::MemoryType::DrmPrime2));
+        attrs.push(libva::VASurfaceAttrib::new_memory_type(
+            libva::MemoryType::DrmPrime2,
+        ));
         None
     }
 }
@@ -190,7 +195,10 @@ fn dump_va_pic(p: &PictureParameterBufferH264) {
     );
     for (i, r) in pp.ReferenceFrames.iter().enumerate() {
         if r.flags != libva::VA_PICTURE_H264_INVALID {
-            eprintln!("VADUMP  REF[{}]=(id={},fidx={},fl={},top={},bot={})", i, r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt, r.BottomFieldOrderCnt);
+            eprintln!(
+                "VADUMP  REF[{}]=(id={},fidx={},fl={},top={},bot={})",
+                i, r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt, r.BottomFieldOrderCnt
+            );
         }
     }
 }
@@ -200,8 +208,24 @@ fn dump_va_slice(s: &SliceParameterBufferH264) {
     for sp in s.inner().iter() {
         let n0 = sp.num_ref_idx_l0_active_minus1 as usize + 1;
         let n1 = sp.num_ref_idx_l1_active_minus1 as usize + 1;
-        let l0: Vec<String> = sp.RefPicList0[..n0.min(32)].iter().map(|r| format!("(id={},fidx={},fl={},top={})", r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt)).collect();
-        let l1: Vec<String> = sp.RefPicList1[..n1.min(32)].iter().map(|r| format!("(id={},fidx={},fl={},top={})", r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt)).collect();
+        let l0: Vec<String> = sp.RefPicList0[..n0.min(32)]
+            .iter()
+            .map(|r| {
+                format!(
+                    "(id={},fidx={},fl={},top={})",
+                    r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt
+                )
+            })
+            .collect();
+        let l1: Vec<String> = sp.RefPicList1[..n1.min(32)]
+            .iter()
+            .map(|r| {
+                format!(
+                    "(id={},fidx={},fl={},top={})",
+                    r.picture_id, r.frame_idx, r.flags, r.TopFieldOrderCnt
+                )
+            })
+            .collect();
         println!(
             "VADUMP SLICE size={} off={} flag={} bitoff={} firstmb={} stype={} dsp={} nrl0={} nrl1={} cabac={} qpdel={} disdeb={} alpha={} beta={} lwd={} cwd={} lw0f={} cw0f={} lw1f={} cw1f={}",
             sp.slice_data_size, sp.slice_data_offset, sp.slice_data_flag, sp.slice_data_bit_offset,
@@ -213,24 +237,17 @@ fn dump_va_slice(s: &SliceParameterBufferH264) {
         );
         eprintln!("VADUMP  L0[{}]", l0.join(","));
         eprintln!("VADUMP  L1[{}]", l1.join(","));
-        eprintln!("VADUMP  LW0={:?} LO0={:?} CW0={:?}", &sp.luma_weight_l0[..n0.min(32)], &sp.luma_offset_l0[..n0.min(32)], &sp.chroma_weight_l0[..n0.min(32)]);
+        eprintln!(
+            "VADUMP  LW0={:?} LO0={:?} CW0={:?}",
+            &sp.luma_weight_l0[..n0.min(32)],
+            &sp.luma_offset_l0[..n0.min(32)],
+            &sp.chroma_weight_l0[..n0.min(32)]
+        );
     }
 }
 
 /// Maximum reference frames for H.264.
 const MAX_H264_REFS: usize = 16;
-
-/// Reference picture entry for DPB management.
-#[derive(Debug, Clone)]
-struct RefPic {
-    surface_id: libva::VASurfaceID,
-    frame_num: u32,
-    frame_num_offset: u32,
-    long_term: bool,
-    long_term_pic_num: Option<u32>,
-    top_field_order_cnt: i32,
-    bottom_field_order_cnt: i32,
-}
 
 /// Surface state tracking.
 #[derive(Debug, Clone, PartialEq)]
@@ -244,7 +261,6 @@ enum SurfaceState {
 struct SurfaceEntry {
     surface: Rc<Surface<DmaBufSurfaceDescriptor>>,
     state: SurfaceState,
-    ref_pic: Option<RefPic>,
 }
 
 /// Surface pool for managing decode surfaces.
@@ -254,31 +270,14 @@ struct SurfacePool {
 
 impl SurfacePool {
     fn new(surfaces: Vec<Surface<DmaBufSurfaceDescriptor>>) -> Self {
-        let entries = surfaces.into_iter().map(|s| SurfaceEntry {
-            surface: Rc::new(s),
-            state: SurfaceState::Free,
-            ref_pic: None,
-        }).collect();
+        let entries = surfaces
+            .into_iter()
+            .map(|s| SurfaceEntry {
+                surface: Rc::new(s),
+                state: SurfaceState::Free,
+            })
+            .collect();
         Self { entries }
-    }
-
-    fn alloc(&mut self, refs: &[RefPic]) -> Option<(usize, Rc<Surface<DmaBufSurfaceDescriptor>>)> {
-        let ref_ids: std::collections::HashSet<_> = refs.iter().map(|r| r.surface_id).collect();
-        for (i, entry) in self.entries.iter_mut().enumerate() {
-            // Free surfaces: available if not used by DPB refs
-            // Ready surfaces: available if no longer needed as DPB refs
-            let is_reusable = match entry.state {
-                SurfaceState::Free => true,
-                SurfaceState::Ready(_) => true,
-                SurfaceState::Pending(_) => false,
-            };
-            if is_reusable && !ref_ids.contains(&entry.surface.id()) {
-                entry.state = SurfaceState::Pending(entry.surface.id());
-                entry.ref_pic = None;
-                return Some((i, Rc::clone(&entry.surface)));
-            }
-        }
-        None
     }
 
     /// Allocate a free surface whose pool index is NOT in `used_pool`.
@@ -301,7 +300,6 @@ impl SurfacePool {
             };
             if is_reusable {
                 entry.state = SurfaceState::Pending(entry.surface.id());
-                entry.ref_pic = None;
                 return Some((i, Rc::clone(&entry.surface)));
             }
         }
@@ -319,13 +317,15 @@ impl SurfacePool {
     fn free(&mut self, idx: usize) {
         if let Some(entry) = self.entries.get_mut(idx) {
             entry.state = SurfaceState::Free;
-            entry.ref_pic = None;
         }
     }
 
     fn sync_surface(&self, idx: usize) -> Result<()> {
         if let Some(entry) = self.entries.get(idx) {
-            entry.surface.sync().map_err(|e| Error::VaApi(e.to_string()))?;
+            entry
+                .surface
+                .sync()
+                .map_err(|e| Error::VaApi(e.to_string()))?;
             Ok(())
         } else {
             Err(Error::InvalidState("Invalid surface index".to_string()))
@@ -352,8 +352,6 @@ struct StreamInfo {
     vp9_profile: u8,
     /// Luma/chroma bit depth from the first VP9 frame; 8 for other codecs.
     vp9_bit_depth: u8,
-    /// AV1 sequence header profile (0/1); 0 for other codecs.
-    av1_profile: u8,
     /// AV1 bit depth from the sequence header; 8 for other codecs.
     av1_bit_depth: u8,
     /// H.264 specific
@@ -478,11 +476,13 @@ impl VaapiDecoder {
             type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
             value: stream.rt_format,
         }];
-        let mut config = display.create_config(
-            cfg_attrs,
-            stream.profile,
-            libva::VAEntrypoint::VAEntrypointVLD,
-        ).map_err(|e| Error::DecoderInit(e.to_string()))?;
+        let mut config = display
+            .create_config(
+                cfg_attrs,
+                stream.profile,
+                libva::VAEntrypoint::VAEntrypointVLD,
+            )
+            .map_err(|e| Error::DecoderInit(e.to_string()))?;
 
         // iHD (Gen12/MTL) accepts an H.264 config with RTFormat=YUV422 but its
         // AVC decode pipeline only produces NV12, so 4:2:2 content fails at
@@ -507,7 +507,10 @@ impl VaapiDecoder {
                 .unwrap_or_default();
             const FOURCC_UYVY: u32 = 0x59565955;
             const FOURCC_VYUY: u32 = 0x59555956;
-            if !pixfmts.iter().any(|&f| f == FOURCC_UYVY || f == FOURCC_VYUY) {
+            if !pixfmts
+                .iter()
+                .any(|&f| f == FOURCC_UYVY || f == FOURCC_VYUY)
+            {
                 return Err(Error::DecoderInit(format!(
                     "HW does not support H.264 4:2:2 decode on this VAAPI driver (config accepted RTFormat=YUV422 but offers no 4:2:2 surface pixfmt; got {} pixfmts)",
                     pixfmts.len()
@@ -524,44 +527,49 @@ impl VaapiDecoder {
         // H.264 4:2:2 -> UYVY (only reached on drivers that actually support
         // it; iHD is rejected earlier via the surface-pixfmt check). All other
         // streams keep the prime path.
-        let pixel_format = if stream
-            .h265_sps
-            .as_ref()
-            .map_or(false, |sps| {
-                sps.profile_idc >= 4 && sps.chroma_format_idc == 3 && sps.bit_depth_luma_minus8 == 0
-            }) {
+        let pixel_format = if stream.h265_sps.as_ref().is_some_and(|sps| {
+            sps.profile_idc >= 4 && sps.chroma_format_idc == 3 && sps.bit_depth_luma_minus8 == 0
+        }) {
             Some(u32::from_ne_bytes(*b"XYUV"))
-        } else if stream.codec == CoreVideoCodec::DecodeH264 && stream.rt_format == libva::VA_RT_FORMAT_YUV422
+        } else if stream.codec == CoreVideoCodec::DecodeH264
+            && stream.rt_format == libva::VA_RT_FORMAT_YUV422
         {
             Some(0x59565955) // UYVY
         } else {
             None
         };
-        let descriptors: Vec<DmaBufSurfaceDescriptor> =
-            (0..num_surfaces).map(|_| DmaBufSurfaceDescriptor { pixel_format }).collect();
+        let descriptors: Vec<DmaBufSurfaceDescriptor> = (0..num_surfaces)
+            .map(|_| DmaBufSurfaceDescriptor { pixel_format })
+            .collect();
 
-         let surfaces = display.create_surfaces::<DmaBufSurfaceDescriptor>(
-            stream.rt_format,
-            rt_format_to_fourcc(stream.rt_format),
-            stream.width,
-            stream.height,
-            None,
-            descriptors,
-        ).map_err(|e| Error::DecoderInit(e.to_string()))?;
+        let surfaces = display
+            .create_surfaces::<DmaBufSurfaceDescriptor>(
+                stream.rt_format,
+                rt_format_to_fourcc(stream.rt_format),
+                stream.width,
+                stream.height,
+                None,
+                descriptors,
+            )
+            .map_err(|e| Error::DecoderInit(e.to_string()))?;
 
         // Create context WITHOUT surfaces (like FFmpeg - surfaces are assigned per-picture)
-        let context = display.create_context::<DmaBufSurfaceDescriptor>(
-            &config,
-            stream.width,
-            stream.height,
-            Some(&surfaces), // register all DPB surfaces as render targets (NVIDIA NVDEC requires this)
-            true, // progressive
-        ).map_err(|e| Error::DecoderInit(e.to_string()))?;
+        let context = display
+            .create_context::<DmaBufSurfaceDescriptor>(
+                &config,
+                stream.width,
+                stream.height,
+                Some(&surfaces), // register all DPB surfaces as render targets (NVIDIA NVDEC requires this)
+                true,            // progressive
+            )
+            .map_err(|e| Error::DecoderInit(e.to_string()))?;
 
         let surface_pool = SurfacePool::new(surfaces);
 
         let h264_ctx = if stream.codec == CoreVideoCodec::DecodeH264 {
-            let sps = stream.sps.as_ref()
+            let sps = stream
+                .sps
+                .as_ref()
                 .ok_or_else(|| Error::DecoderInit("H264 SPS not available".to_string()))?;
             // Common DPB manager: one slot per surface, so a surface can always
             // be mapped to a slot. num_ref_frames is clamped to the slot count.
@@ -608,7 +616,9 @@ impl VaapiDecoder {
         };
 
         let h265_ctx = if stream.codec == CoreVideoCodec::DecodeH265 {
-            let sps = stream.h265_sps.as_ref()
+            let sps = stream
+                .h265_sps
+                .as_ref()
                 .ok_or_else(|| Error::DecoderInit("H265 SPS not available".to_string()))?;
             // One slot per surface so a surface can always be mapped to a slot.
             let num_slots = num_surfaces;
@@ -690,11 +700,19 @@ impl VaapiDecoder {
             return Ok(None);
         }
 
-        let ctx = self.h264_ctx.as_mut()
+        let ctx = self
+            .h264_ctx
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H264 context not initialized".to_string()))?;
-        let sps = self.stream.sps.as_ref()
+        let sps = self
+            .stream
+            .sps
+            .as_ref()
             .ok_or_else(|| Error::InvalidState("H264 SPS not available".to_string()))?;
-        let pps = self.stream.pps.as_ref()
+        let pps = self
+            .stream
+            .pps
+            .as_ref()
             .ok_or_else(|| Error::InvalidState("H264 PPS not available".to_string()))?;
 
         // Use first slice's header for frame-level parameters
@@ -702,10 +720,52 @@ impl VaapiDecoder {
         let slice_header = first_slice.slice_header.as_ref();
 
         // Extract parameters from first slice header
-        let (nal_unit_type, nal_ref_idc, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, field_pic_flag, bottom_field, idr_pic_id, no_output_of_prior_pics_flag, frame_num, slice_type, mmco, mod_l0, mod_l1) = if let Some(SliceHeader::H264(h264_slh)) = slice_header {
-            (h264_slh.nal_unit_type, h264_slh.nal_ref_idc, h264_slh.num_ref_idx_l0_active_minus1, h264_slh.num_ref_idx_l1_active_minus1, h264_slh.field_pic_flag, h264_slh.bottom_field, h264_slh.idr_pic_id, h264_slh.no_output_of_prior_pics_flag, h264_slh.frame_num, h264_slh.slice_type % 5, &h264_slh.dec_ref_pic_marking[..], &h264_slh.ref_pic_list_modification_l0[..], &h264_slh.ref_pic_list_modification_l1[..])
+        let (
+            nal_unit_type,
+            nal_ref_idc,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+            field_pic_flag,
+            bottom_field,
+            idr_pic_id,
+            no_output_of_prior_pics_flag,
+            frame_num,
+            slice_type,
+            mmco,
+            mod_l0,
+            mod_l1,
+        ) = if let Some(SliceHeader::H264(h264_slh)) = slice_header {
+            (
+                h264_slh.nal_unit_type,
+                h264_slh.nal_ref_idc,
+                h264_slh.num_ref_idx_l0_active_minus1,
+                h264_slh.num_ref_idx_l1_active_minus1,
+                h264_slh.field_pic_flag,
+                h264_slh.bottom_field,
+                h264_slh.idr_pic_id,
+                h264_slh.no_output_of_prior_pics_flag,
+                h264_slh.frame_num,
+                h264_slh.slice_type % 5,
+                &h264_slh.dec_ref_pic_marking[..],
+                &h264_slh.ref_pic_list_modification_l0[..],
+                &h264_slh.ref_pic_list_modification_l1[..],
+            )
         } else {
-            (1, 3, pps.num_ref_idx_l0_default_active_minus1, pps.num_ref_idx_l1_default_active_minus1, false, false, 0, false, 0, 2, &[] as &[vacc_parser::h264::DecRefPicMarkingEntry], &[] as &[vacc_parser::h264::RefPicListModificationEntry], &[] as &[vacc_parser::h264::RefPicListModificationEntry])
+            (
+                1,
+                3,
+                pps.num_ref_idx_l0_default_active_minus1,
+                pps.num_ref_idx_l1_default_active_minus1,
+                false,
+                false,
+                0,
+                false,
+                0,
+                2,
+                &[] as &[vacc_parser::h264::DecRefPicMarkingEntry],
+                &[] as &[vacc_parser::h264::RefPicListModificationEntry],
+                &[] as &[vacc_parser::h264::RefPicListModificationEntry],
+            )
         };
 
         let is_idr = nal_unit_type == 5 || idr_pic_id > 0;
@@ -722,7 +782,11 @@ impl VaapiDecoder {
         // direct-mode and implicit-weight POC math (a zero there corrupts
         // B-frame prediction).
         let (top_field_order_cnt, bottom_field_order_cnt) = if field_pic_flag {
-            if bottom_field { (0, poc) } else { (poc, 0) }
+            if bottom_field {
+                (0, poc)
+            } else {
+                (poc, 0)
+            }
         } else {
             (poc, poc)
         };
@@ -741,17 +805,29 @@ impl VaapiDecoder {
 
         // Convert the slice header's dec_ref_pic_marking into common-DPB MMCO
         // commands (H.264 8.2.5).
-        let mmco_commands: Vec<H264MmcoCommand> = mmco.iter().map(|op| {
-            match op.memory_management_control_operation {
-                1 => H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1: op.value },
-                2 => H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx: op.value },
-                3 => H264MmcoCommand::AssignLongTerm { difference_of_pic_nums_minus1: 0, long_term_frame_idx: op.value },
-                4 => H264MmcoCommand::SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: op.value },
+        let mmco_commands: Vec<H264MmcoCommand> = mmco
+            .iter()
+            .map(|op| match op.memory_management_control_operation {
+                1 => H264MmcoCommand::UnmarkShortTerm {
+                    difference_of_pic_nums_minus1: op.value,
+                },
+                2 => H264MmcoCommand::UnmarkLongTerm {
+                    long_term_frame_idx: op.value,
+                },
+                3 => H264MmcoCommand::AssignLongTerm {
+                    difference_of_pic_nums_minus1: 0,
+                    long_term_frame_idx: op.value,
+                },
+                4 => H264MmcoCommand::SetMaxLongTermFrameIdx {
+                    max_long_term_frame_idx_plus1: op.value,
+                },
                 5 => H264MmcoCommand::UnmarkAll,
-                6 => H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx: op.value },
+                6 => H264MmcoCommand::AssignLongTermToCurrent {
+                    long_term_frame_idx: op.value,
+                },
                 _ => H264MmcoCommand::UnmarkAll,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Stage the current picture in the common DPB. The reference marking
         // process (MMCO / sliding window) is applied only AFTER this picture
@@ -775,23 +851,40 @@ impl VaapiDecoder {
         // Pre-extract per-slot (surface_id, frame_num, poc, marking) from the
         // PRE-marking DPB state, so the array-building closures below do not
         // need to borrow `self`.
-        let slot_info: Vec<(Option<libva::VASurfaceID>, u32, i32, u8)> =
-            ctx.slot_surfaces.iter().enumerate().map(|(i, s)| {
+        let slot_info: Vec<(Option<libva::VASurfaceID>, u32, i32, u8)> = ctx
+            .slot_surfaces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
                 let sid = s.map(|pool_idx| self.surface_pool.entries[pool_idx].surface.id());
                 let dslot = &ctx.dpb.slots[i];
-                (sid, dslot.frame_num, dslot.poc, if dslot.state == 0 { 0 } else { dslot.marking })
-            }).collect();
+                (
+                    sid,
+                    dslot.frame_num,
+                    dslot.poc,
+                    if dslot.state == 0 { 0 } else { dslot.marking },
+                )
+            })
+            .collect();
 
         let make_pic = |info: &(Option<libva::VASurfaceID>, u32, i32, u8)| -> PictureH264 {
             match (info.0, info.3) {
                 // Frame references: BottomFieldOrderCnt == TopFieldOrderCnt
                 // (H.264 8.2; FFmpeg writes field_poc[1] == field_poc[0]).
-                (Some(sid), MARKING_SHORT) => {
-                    PictureH264::new(sid, info.1, VA_PICTURE_H264_SHORT_TERM_REFERENCE, info.2, info.2)
-                }
-                (Some(sid), MARKING_LONG) => {
-                    PictureH264::new(sid, info.1, VA_PICTURE_H264_LONG_TERM_REFERENCE, info.2, info.2)
-                }
+                (Some(sid), MARKING_SHORT) => PictureH264::new(
+                    sid,
+                    info.1,
+                    VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                    info.2,
+                    info.2,
+                ),
+                (Some(sid), MARKING_LONG) => PictureH264::new(
+                    sid,
+                    info.1,
+                    VA_PICTURE_H264_LONG_TERM_REFERENCE,
+                    info.2,
+                    info.2,
+                ),
                 // No surface, or the DPB slot is not marked as a reference:
                 // must be INVALID, else the driver may treat the surface
                 // (possibly the current picture's own destination!) as a ref.
@@ -824,10 +917,16 @@ impl VaapiDecoder {
                 l1m,
             );
             let l0: [PictureH264; 32] = core::array::from_fn(|i| {
-                sl.l0.get(i).map(|r| make_pic(&slot_info[r.slot])).unwrap_or_else(invalid_pic)
+                sl.l0
+                    .get(i)
+                    .map(|r| make_pic(&slot_info[r.slot]))
+                    .unwrap_or_else(invalid_pic)
             });
             let l1: [PictureH264; 32] = core::array::from_fn(|i| {
-                sl.l1.get(i).map(|r| make_pic(&slot_info[r.slot])).unwrap_or_else(invalid_pic)
+                sl.l1
+                    .get(i)
+                    .map(|r| make_pic(&slot_info[r.slot]))
+                    .unwrap_or_else(invalid_pic)
             });
             slice_ref_lists.push((l0, l1));
         }
@@ -843,7 +942,9 @@ impl VaapiDecoder {
         // not be recycled until after the decode (done below).
         let used_pool: std::collections::HashSet<usize> =
             ctx.slot_surfaces.iter().filter_map(|s| *s).collect();
-        let (surface_idx, surface) = self.surface_pool.alloc_excluding(&used_pool)
+        let (surface_idx, surface) = self
+            .surface_pool
+            .alloc_excluding(&used_pool)
             .ok_or_else(|| Error::InvalidState("No free surfaces available".to_string()))?;
         let surface_id = surface.id();
 
@@ -856,7 +957,10 @@ impl VaapiDecoder {
         );
 
         let refs: [PictureH264; MAX_H264_REFS] = core::array::from_fn(|i| {
-            ref_slots.get(i).map(|&s| make_pic(&slot_info[s])).unwrap_or_else(invalid_pic)
+            ref_slots
+                .get(i)
+                .map(|&s| make_pic(&slot_info[s]))
+                .unwrap_or_else(invalid_pic)
         });
 
         let seq_fields = H264SeqFields::new(
@@ -878,7 +982,9 @@ impl VaapiDecoder {
         let picture_height_in_mbs_minus1 = if sps.frame_mbs_only_flag {
             sps.pic_height_in_map_units_minus1
         } else {
-            (((sps.pic_height_in_map_units_minus1 as u32 + 1) * 2) - 1).try_into().unwrap()
+            (((sps.pic_height_in_map_units_minus1 as u32 + 1) * 2) - 1)
+                .try_into()
+                .unwrap()
         };
 
         let pic_fields = H264PicFields::new(
@@ -918,7 +1024,9 @@ impl VaapiDecoder {
             sps.bit_depth_chroma_minus8,
             sps.max_num_ref_frames as u8,
             &seq_fields,
-            0, 0, 0,
+            0,
+            0,
+            0,
             pps.pic_init_qp_minus26 as i8,
             pps.pic_init_qs_minus26 as i8,
             pps.chroma_qp_index_offset as i8,
@@ -935,15 +1043,11 @@ impl VaapiDecoder {
         // default scaling lists instead. Verified empirically (pixel-perfect vs FFmpeg):
         // both 4x4 and 8x8 defaults must be all 16.
         let (scaling_list_4x4, scaling_list_8x8) = if sps.seq_scaling_matrix_present_flag {
-            let mut sl4 = [[0u8; 16]; 6];
-            let mut sl8 = [[0u8; 64]; 2];
-            for i in 0..6 {
-                sl4[i] = zigzag_to_raster_4x4(sps.scaling_list_4x4[i]);
-            }
-            for i in 0..2 {
-                sl8[i] = zigzag_to_raster_8x8(sps.scaling_list_8x8[i]);
-            }
-            (sl4, sl8)
+            let scaling_list_4x4 =
+                std::array::from_fn(|i| zigzag_to_raster_4x4(sps.scaling_list_4x4[i]));
+            let scaling_list_8x8 =
+                std::array::from_fn(|i| zigzag_to_raster_8x8(sps.scaling_list_8x8[i]));
+            (scaling_list_4x4, scaling_list_8x8)
         } else {
             // H.264 default scaling lists (all values identical, so scan order is irrelevant).
             ([[16u8; 16]; 6], [[16u8; 64]; 2])
@@ -955,22 +1059,30 @@ impl VaapiDecoder {
         }
 
         // Create picture parameter buffer (shared across all slices)
-        let pic_param_buf = self.context.create_buffer(
-            BufferType::PictureParameter(PictureParameter::H264(pic_param))
-        ).map_err(|e| Error::VaApi(e.to_string()))?;
+        let pic_param_buf = self
+            .context
+            .create_buffer(BufferType::PictureParameter(PictureParameter::H264(
+                pic_param,
+            )))
+            .map_err(|e| Error::VaApi(e.to_string()))?;
 
-        let iq_buf = self.context.create_buffer(
-            BufferType::IQMatrix(IQMatrix::H264(iq_matrix))
-        ).map_err(|e| Error::VaApi(e.to_string()))?;
+        let iq_buf = self
+            .context
+            .create_buffer(BufferType::IQMatrix(IQMatrix::H264(iq_matrix)))
+            .map_err(|e| Error::VaApi(e.to_string()))?;
 
         // Begin picture ONCE for the entire frame
-        let mut picture = Picture::<PictureNew, Rc<Surface<DmaBufSurfaceDescriptor>>>::new(timestamp, Rc::clone(&self.context), Rc::clone(&surface));
+        let mut picture = Picture::<PictureNew, Rc<Surface<DmaBufSurfaceDescriptor>>>::new(
+            timestamp,
+            Rc::clone(&self.context),
+            Rc::clone(&surface),
+        );
         picture.add_buffer(pic_param_buf);
         picture.add_buffer(iq_buf);
 
         // Add all slice buffers BEFORE begin (typestate requires it)
         // VAAPI processes SliceParameter+SliceData pairs in order during render()
-        for (slice_info, (ref_pic_list_0, ref_pic_list_1)) in slices.iter().zip(slice_ref_lists.into_iter()) {
+        for (slice_info, (ref_pic_list_0, ref_pic_list_1)) in slices.iter().zip(slice_ref_lists) {
             let slice_header_opt = slice_info.slice_header.as_ref();
 
             // Slice data buffer INCLUDES the 1-byte NAL header. Per the VA-API
@@ -989,107 +1101,223 @@ impl VaapiDecoder {
             if slice_data.last() == Some(&0) {
                 slice_data.pop();
             }
-            let hbs = slice_header_opt
-                .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.header_bit_size), _ => None });
+            let hbs = slice_header_opt.and_then(|sh| match sh {
+                SliceHeader::H264(h) => Some(h.header_bit_size),
+                _ => None,
+            });
             let slice_data_bit_offset = hbs.map(|h| h + 8).unwrap_or(0);
 
             // Build slice parameter buffer for this slice
 
-             // num_ref_idx_lX_active_minus1 are absent from I-slice headers
-             // (H.264 7.4.3); FFmpeg passes 0 for them. The parser leaves them
-             // at the PPS default, which the Xe driver does not ignore for I
-             // slices, so force 0 here.
-             let eff_slice_type = slice_header_opt
-                 .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_type % 5), _ => None })
-                 .unwrap_or(slice_type);
-             let eff_ref_l0 = if eff_slice_type == 2 { 0 } else { num_ref_idx_l0_active_minus1 };
-             let eff_ref_l1 = if eff_slice_type == 2 { 0 } else { num_ref_idx_l1_active_minus1 };
+            // num_ref_idx_lX_active_minus1 are absent from I-slice headers
+            // (H.264 7.4.3); FFmpeg passes 0 for them. The parser leaves them
+            // at the PPS default, which the Xe driver does not ignore for I
+            // slices, so force 0 here.
+            let eff_slice_type = slice_header_opt
+                .and_then(|sh| match sh {
+                    SliceHeader::H264(h) => Some(h.slice_type % 5),
+                    _ => None,
+                })
+                .unwrap_or(slice_type);
+            let eff_ref_l0 = if eff_slice_type == 2 {
+                0
+            } else {
+                num_ref_idx_l0_active_minus1
+            };
+            let eff_ref_l1 = if eff_slice_type == 2 {
+                0
+            } else {
+                num_ref_idx_l1_active_minus1
+            };
 
-             // Replicate FFmpeg's pwt state (h264_slice.c / h264_parse.c):
-             // - I slices: pwt stays at its initial values (denom 0, empty
-             //   tables — ref_count is 0).
-             // - P/SP with weighted_pred_flag, or B with
-             //   weighted_bipred_idc==1: explicit pred_weight_table from the
-             //   bitstream (our parser already fills inferred defaults per
-             //   FF convention; note the denoms hold the raw minus1 value,
-             //   same as FF's pwt).
-             // - B without an explicit table (implicit, idc==2): FF sets the
-             //   denoms to 5 and the tables to 1 << 5 = 32.
-             // - P/SP without a table: denoms stay 0, tables filled with
-             //   1 << 0 = 1. (iHD ignores the arrays while the per-list flag
-             //   is 0, but match FF anyway.)
-             // slice_type after %5: 0=P, 1=B, 2=I, 3=SP, 4=SI.
-             let st_va = slice_header_opt
-                 .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_type % 5), _ => None })
-                 .unwrap_or(2);
-             let has_pw_table = slice_header_opt
-                 .and_then(|sh| match sh {
-                     SliceHeader::H264(h) => Some(
-                         ((h.slice_type % 5 == 0 || h.slice_type % 5 == 3) && pps.weighted_pred_flag)
-                             || (h.slice_type % 5 == 1 && pps.weighted_bipred_idc == 1),
-                     ),
-                     _ => None,
-                 })
-                 .unwrap_or(false);
-             let implicit_b = st_va == 1 && !has_pw_table;
-             let n_refs0 = if st_va == 2 { 0 } else { eff_ref_l0 as usize + 1 };
-             let n_refs1 = if st_va != 1 { 0 } else { eff_ref_l1 as usize + 1 };
-             let (luma_log2_weight_denom, chroma_log2_weight_denom, luma_weight_l0_flag, luma_weight_l0, luma_offset_l0, chroma_weight_l0_flag, chroma_weight_l0, chroma_offset_l0, luma_weight_l1_flag, luma_weight_l1, luma_offset_l1, chroma_weight_l1_flag, chroma_weight_l1, chroma_offset_l1) = if has_pw_table {
-                 let h = match slice_header_opt { Some(SliceHeader::H264(h)) => h, _ => unreachable!() };
-                 (h.luma_log2_weight_denom, h.chroma_log2_weight_denom, h.luma_weight_l0_flag, h.luma_weight_l0, h.luma_offset_l0, h.chroma_weight_l0_flag, h.chroma_weight_l0, h.chroma_offset_l0, h.luma_weight_l1_flag, h.luma_weight_l1, h.luma_offset_l1, h.chroma_weight_l1_flag, h.chroma_weight_l1, h.chroma_offset_l1)
-             } else if st_va == 2 {
-                 (0, 0, 0, [0i16; 32], [0i16; 32], 0, [[0i16; 2]; 32], [[0i16; 2]; 32], 0, [0i16; 32], [0i16; 32], 0, [[0i16; 2]; 32], [[0i16; 2]; 32])
-             } else {
-                 let denom = if implicit_b { 5 } else { 0 };
-                 let luma_def = 1i16 << denom;
-                 let chroma_def = if sps.chroma_format_idc != 0 { 1i16 << denom } else { 0 };
-                 let mut luma_weight_l0 = [0i16; 32];
-                 let mut chroma_weight_l0 = [[0i16; 2]; 32];
-                 let mut luma_weight_l1 = [0i16; 32];
-                 let mut chroma_weight_l1 = [[0i16; 2]; 32];
-                 for i in 0..n_refs0 {
-                     luma_weight_l0[i] = luma_def;
-                     chroma_weight_l0[i][0] = chroma_def;
-                     chroma_weight_l0[i][1] = chroma_def;
-                 }
-                 for i in 0..n_refs1 {
-                     luma_weight_l1[i] = luma_def;
-                     chroma_weight_l1[i][0] = chroma_def;
-                     chroma_weight_l1[i][1] = chroma_def;
-                 }
-                 (denom, denom, 0, luma_weight_l0, [0i16; 32], 0, chroma_weight_l0, [[0i16; 2]; 32], 0, luma_weight_l1, [0i16; 32], 0, chroma_weight_l1, [[0i16; 2]; 32])
-             };
+            // Replicate FFmpeg's pwt state (h264_slice.c / h264_parse.c):
+            // - I slices: pwt stays at its initial values (denom 0, empty
+            //   tables — ref_count is 0).
+            // - P/SP with weighted_pred_flag, or B with
+            //   weighted_bipred_idc==1: explicit pred_weight_table from the
+            //   bitstream (our parser already fills inferred defaults per
+            //   FF convention; note the denoms hold the raw minus1 value,
+            //   same as FF's pwt).
+            // - B without an explicit table (implicit, idc==2): FF sets the
+            //   denoms to 5 and the tables to 1 << 5 = 32.
+            // - P/SP without a table: denoms stay 0, tables filled with
+            //   1 << 0 = 1. (iHD ignores the arrays while the per-list flag
+            //   is 0, but match FF anyway.)
+            // slice_type after %5: 0=P, 1=B, 2=I, 3=SP, 4=SI.
+            let st_va = slice_header_opt
+                .and_then(|sh| match sh {
+                    SliceHeader::H264(h) => Some(h.slice_type % 5),
+                    _ => None,
+                })
+                .unwrap_or(2);
+            let has_pw_table = slice_header_opt
+                .and_then(|sh| match sh {
+                    SliceHeader::H264(h) => Some(
+                        ((h.slice_type % 5 == 0 || h.slice_type % 5 == 3)
+                            && pps.weighted_pred_flag)
+                            || (h.slice_type % 5 == 1 && pps.weighted_bipred_idc == 1),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            let implicit_b = st_va == 1 && !has_pw_table;
+            let n_refs0 = if st_va == 2 {
+                0
+            } else {
+                eff_ref_l0 as usize + 1
+            };
+            let n_refs1 = if st_va != 1 {
+                0
+            } else {
+                eff_ref_l1 as usize + 1
+            };
+            let (
+                luma_log2_weight_denom,
+                chroma_log2_weight_denom,
+                luma_weight_l0_flag,
+                luma_weight_l0,
+                luma_offset_l0,
+                chroma_weight_l0_flag,
+                chroma_weight_l0,
+                chroma_offset_l0,
+                luma_weight_l1_flag,
+                luma_weight_l1,
+                luma_offset_l1,
+                chroma_weight_l1_flag,
+                chroma_weight_l1,
+                chroma_offset_l1,
+            ) = if has_pw_table {
+                let h = match slice_header_opt {
+                    Some(SliceHeader::H264(h)) => h,
+                    _ => unreachable!(),
+                };
+                (
+                    h.luma_log2_weight_denom,
+                    h.chroma_log2_weight_denom,
+                    h.luma_weight_l0_flag,
+                    h.luma_weight_l0,
+                    h.luma_offset_l0,
+                    h.chroma_weight_l0_flag,
+                    h.chroma_weight_l0,
+                    h.chroma_offset_l0,
+                    h.luma_weight_l1_flag,
+                    h.luma_weight_l1,
+                    h.luma_offset_l1,
+                    h.chroma_weight_l1_flag,
+                    h.chroma_weight_l1,
+                    h.chroma_offset_l1,
+                )
+            } else if st_va == 2 {
+                (
+                    0,
+                    0,
+                    0,
+                    [0i16; 32],
+                    [0i16; 32],
+                    0,
+                    [[0i16; 2]; 32],
+                    [[0i16; 2]; 32],
+                    0,
+                    [0i16; 32],
+                    [0i16; 32],
+                    0,
+                    [[0i16; 2]; 32],
+                    [[0i16; 2]; 32],
+                )
+            } else {
+                let denom = if implicit_b { 5 } else { 0 };
+                let luma_def = 1i16 << denom;
+                let chroma_def = if sps.chroma_format_idc != 0 {
+                    1i16 << denom
+                } else {
+                    0
+                };
+                let mut luma_weight_l0 = [0i16; 32];
+                let mut chroma_weight_l0 = [[0i16; 2]; 32];
+                let mut luma_weight_l1 = [0i16; 32];
+                let mut chroma_weight_l1 = [[0i16; 2]; 32];
+                for i in 0..n_refs0 {
+                    luma_weight_l0[i] = luma_def;
+                    chroma_weight_l0[i][0] = chroma_def;
+                    chroma_weight_l0[i][1] = chroma_def;
+                }
+                for i in 0..n_refs1 {
+                    luma_weight_l1[i] = luma_def;
+                    chroma_weight_l1[i][0] = chroma_def;
+                    chroma_weight_l1[i][1] = chroma_def;
+                }
+                (
+                    denom,
+                    denom,
+                    0,
+                    luma_weight_l0,
+                    [0i16; 32],
+                    0,
+                    chroma_weight_l0,
+                    [[0i16; 2]; 32],
+                    0,
+                    luma_weight_l1,
+                    [0i16; 32],
+                    0,
+                    chroma_weight_l1,
+                    [[0i16; 2]; 32],
+                )
+            };
 
-             let slice_param = SliceParameterBufferH264::new(
-                  slice_data.len() as u32,
-                  0,
-                  VA_SLICE_DATA_FLAG_ALL,
-                  slice_data_bit_offset,
-                 slice_header_opt
-                     .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.first_mb_in_slice as u16), _ => None })
-                     .unwrap_or(0),
+            let slice_param = SliceParameterBufferH264::new(
+                slice_data.len() as u32,
+                0,
+                VA_SLICE_DATA_FLAG_ALL,
+                slice_data_bit_offset,
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h264_slice_type_to_vaapi(h.slice_type)), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.first_mb_in_slice as u16),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.direct_spatial_mv_pred_flag as u8), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h264_slice_type_to_vaapi(h.slice_type)),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                slice_header_opt
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.direct_spatial_mv_pred_flag as u8),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 eff_ref_l0 as u8,
                 eff_ref_l1 as u8,
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.cabac_init_idc), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.cabac_init_idc),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_qp_delta as i8), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.slice_qp_delta as i8),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.disable_deblocking_filter_idc as u8), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.disable_deblocking_filter_idc as u8),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_alpha_c0_offset_div2 as i8), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.slice_alpha_c0_offset_div2 as i8),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 slice_header_opt
-                    .and_then(|sh| match sh { SliceHeader::H264(h) => Some(h.slice_beta_offset_div2 as i8), _ => None })
+                    .and_then(|sh| match sh {
+                        SliceHeader::H264(h) => Some(h.slice_beta_offset_div2 as i8),
+                        _ => None,
+                    })
                     .unwrap_or(0),
                 ref_pic_list_0,
                 ref_pic_list_1,
@@ -1113,37 +1341,36 @@ impl VaapiDecoder {
                 dump_va_slice(&slice_param);
             }
 
-            let slice_param_buf = self.context.create_buffer(
-                BufferType::SliceParameter(SliceParameter::H264(slice_param))
-            ).map_err(|e| Error::VaApi(e.to_string()))?;
+            let slice_param_buf = self
+                .context
+                .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
+                    slice_param,
+                )))
+                .map_err(|e| Error::VaApi(e.to_string()))?;
 
-            let slice_data_buf = self.context.create_buffer(
-                BufferType::SliceData(slice_data)
-            ).map_err(|e| Error::VaApi(e.to_string()))?;
+            let slice_data_buf = self
+                .context
+                .create_buffer(BufferType::SliceData(slice_data))
+                .map_err(|e| Error::VaApi(e.to_string()))?;
 
             picture.add_buffer(slice_param_buf);
             picture.add_buffer(slice_data_buf);
         }
 
         // Now begin and render all slices in one call
-        let picture = picture
-            .begin()
-            .map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture = picture.begin().map_err(|e| Error::VaApi(e.to_string()))?;
 
         // Single render call processes all slice buffers
-        let picture: Picture<PictureRender, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
-            .render()
-            .map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture: Picture<PictureRender, Rc<Surface<DmaBufSurfaceDescriptor>>> =
+            picture.render().map_err(|e| Error::VaApi(e.to_string()))?;
 
         // End picture ONCE after all slices
-        let picture: Picture<PictureEnd, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
-            .end()
-            .map_err(|e| Error::VaApi(e.to_string()))?;
+        let picture: Picture<PictureEnd, Rc<Surface<DmaBufSurfaceDescriptor>>> =
+            picture.end().map_err(|e| Error::VaApi(e.to_string()))?;
 
         // Sync to ensure completion
-        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
-            .sync()
-            .map_err(|e| Error::VaApi(e.0.to_string()))?;
+        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> =
+            picture.sync().map_err(|e| Error::VaApi(e.0.to_string()))?;
 
         // Mark surface as ready
         self.surface_pool.mark_ready(surface_idx);
@@ -1205,7 +1432,6 @@ impl VaapiDecoder {
         self.frame_count += 1;
         Ok(Some(frame))
     }
-
 }
 
 impl Decoder for VaapiDecoder {
@@ -1220,7 +1446,9 @@ impl Decoder for VaapiDecoder {
         _codec: CoreVideoCodec,
         _format: &VideoFormat,
     ) -> Result<Self> {
-        Err(Error::DecoderInit("new_with_format not yet implemented".to_string()))
+        Err(Error::DecoderInit(
+            "new_with_format not yet implemented".to_string(),
+        ))
     }
 
     fn info(&self) -> DecoderInfo {
@@ -1260,7 +1488,12 @@ impl Decoder for VaapiDecoder {
                     _ => ComponentBitDepth::Bit8,
                 };
                 let profile_idc = Some(sps.profile_idc as u32);
-                (chroma_subsampling, luma_bit_depth, chroma_bit_depth, profile_idc)
+                (
+                    chroma_subsampling,
+                    luma_bit_depth,
+                    chroma_bit_depth,
+                    profile_idc,
+                )
             } else {
                 (
                     ChromaSubsampling::_420,
@@ -1376,7 +1609,8 @@ impl Decoder for VaapiDecoder {
                 Some(frame) => {
                     // Insert into the reorder buffer in display-order (key) order.
                     let key = self.pending_key;
-                    let pos = self.pending_frames
+                    let pos = self
+                        .pending_frames
                         .iter()
                         .position(|(k, _)| *k > key)
                         .unwrap_or(self.pending_frames.len());
@@ -1517,9 +1751,13 @@ impl VaapiDecoder {
     /// Process pending H.264 data using the parser with incremental parsing.
     /// Collects all slices for a single frame before decoding.
     fn decode_h264_pending(&mut self) -> Result<Option<DecodedFrame>> {
-        let parser = self.parser.as_mut()
+        let parser = self
+            .parser
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H264 parser not initialized".to_string()))?;
-        let ctx = self.h264_ctx.as_mut()
+        let ctx = self
+            .h264_ctx
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H264 context not initialized".to_string()))?;
 
         // If no more data to parse, return None
@@ -1534,16 +1772,25 @@ impl VaapiDecoder {
             let packet = BitstreamPacket::new(remaining.to_vec());
 
             match parser.parse(&packet) {
-                Ok(ParseResult::ParameterSet { sps: Some(sps), pps: Some(pps), .. }) => {
-                    let sps = sps.downcast_ref::<H264Sps>()
+                Ok(ParseResult::ParameterSet {
+                    sps: Some(sps),
+                    pps: Some(pps),
+                    ..
+                }) => {
+                    let sps = sps
+                        .downcast_ref::<H264Sps>()
                         .ok_or_else(|| Error::DecoderInit("Invalid SPS type".to_string()))?;
-                    let pps = pps.downcast_ref::<H264Pps>()
+                    let pps = pps
+                        .downcast_ref::<H264Pps>()
                         .ok_or_else(|| Error::DecoderInit("Invalid PPS type".to_string()))?;
                     self.stream.sps = Some(sps.clone());
                     self.stream.pps = Some(pps.clone());
                     ctx.max_frame_num = sps.max_frame_num;
                     ctx.dpb.max_frame_num = sps.max_frame_num;
-                    ctx.dpb.num_ref_frames = sps.max_num_ref_frames.min(ctx.slot_surfaces.len() as u32).max(1);
+                    ctx.dpb.num_ref_frames = sps
+                        .max_num_ref_frames
+                        .min(ctx.slot_surfaces.len() as u32)
+                        .max(1);
                     if std::env::var("DBG_H264").is_ok() {
                         eprintln!("[DBG] SPS log2_max_fn={} poc_type={} log2_max_poc_lsb={} max_poc_lsb={} max_ref_frames={} gaps={} frame_mbs_only={}",
                             sps.log2_max_frame_num_minus4, sps.pic_order_cnt_type, sps.log2_max_pic_order_cnt_lsb_minus4,
@@ -1558,18 +1805,23 @@ impl VaapiDecoder {
                     continue;
                 }
                 Ok(ParseResult::ParameterSet { sps: Some(sps), .. }) => {
-                    let sps = sps.downcast_ref::<H264Sps>()
+                    let sps = sps
+                        .downcast_ref::<H264Sps>()
                         .ok_or_else(|| Error::DecoderInit("Invalid SPS type".to_string()))?;
                     self.stream.sps = Some(sps.clone());
                     ctx.max_frame_num = sps.max_frame_num;
                     ctx.dpb.max_frame_num = sps.max_frame_num;
-                    ctx.dpb.num_ref_frames = sps.max_num_ref_frames.min(ctx.slot_surfaces.len() as u32).max(1);
+                    ctx.dpb.num_ref_frames = sps
+                        .max_num_ref_frames
+                        .min(ctx.slot_surfaces.len() as u32)
+                        .max(1);
                     // (no POC reset here; see SPS arm comment above)
                     // Continue loop to find slices
                     continue;
                 }
                 Ok(ParseResult::ParameterSet { pps: Some(pps), .. }) => {
-                    let pps = pps.downcast_ref::<H264Pps>()
+                    let pps = pps
+                        .downcast_ref::<H264Pps>()
                         .ok_or_else(|| Error::DecoderInit("Invalid PPS type".to_string()))?;
                     self.stream.pps = Some(pps.clone());
                     // Continue loop to find slices
@@ -1579,7 +1831,10 @@ impl VaapiDecoder {
                     // Continue loop to find slices
                     continue;
                 }
-                Ok(ParseResult::Slice { slices: parser_slices, bytes_consumed }) => {
+                Ok(ParseResult::Slice {
+                    slices: parser_slices,
+                    bytes_consumed,
+                }) => {
                     if parser_slices.is_empty() {
                         return Ok(None);
                     }
@@ -1589,23 +1844,27 @@ impl VaapiDecoder {
                     let first_slice_header = first_slice.slice_header.clone();
 
                     // Get frame_num from first slice header
-                    let frame_num = if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice_header {
-                        // Skip redundant slices: redundant_pic_cnt > 0 means this is a duplicate
-                        // slice for error resilience, representing the same picture as a prior slice.
-                        if slh.redundant_pic_cnt > 0 {
-                            self.parse_offset += bytes_consumed;
-                            return Ok(None);
-                        }
-                        slh.frame_num
-                    } else {
-                        0
-                    };
+                    let frame_num =
+                        if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice_header {
+                            // Skip redundant slices: redundant_pic_cnt > 0 means this is a duplicate
+                            // slice for error resilience, representing the same picture as a prior slice.
+                            if slh.redundant_pic_cnt > 0 {
+                                self.parse_offset += bytes_consumed;
+                                return Ok(None);
+                            }
+                            slh.frame_num
+                        } else {
+                            0
+                        };
 
                     // Calculate POC for this frame using the common PocCalculator
                     // (ONE POC implementation across backends). Called once per
                     // picture in decode order. FrameNum wraparound is handled by
                     // the common DPB (refresh_frame_num_wrap in picture_start).
-                    let sps = self.stream.sps.as_ref()
+                    let sps = self
+                        .stream
+                        .sps
+                        .as_ref()
                         .expect("SPS should be available for H264 slice");
                     if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice_header {
                         // Per H.264 8.2.1 an IDR picture restarts the POC
@@ -1621,13 +1880,27 @@ impl VaapiDecoder {
                     }
 
                     if std::env::var("DBG_H264").is_ok() {
-                        let (st, mmco) = first_slice_header.as_ref().and_then(|sh| match sh {
-                            SliceHeader::H264(h) => Some((h.slice_type % 5, h.dec_ref_pic_marking.iter().map(|e| (e.memory_management_control_operation, e.value)).collect::<Vec<_>>())),
-                            _ => None
-                        }).unwrap_or((2, vec![]));
-                        eprintln!("[DBG] fn={} poc={} st={} mmco={:?} dpb_refs={}",
-                            frame_num, ctx.curr_poc, st, mmco,
-                            ctx.dpb.get_references().len());
+                        let (st, mmco) = first_slice_header
+                            .as_ref()
+                            .and_then(|sh| match sh {
+                                SliceHeader::H264(h) => Some((
+                                    h.slice_type % 5,
+                                    h.dec_ref_pic_marking
+                                        .iter()
+                                        .map(|e| (e.memory_management_control_operation, e.value))
+                                        .collect::<Vec<_>>(),
+                                )),
+                                _ => None,
+                            })
+                            .unwrap_or((2, vec![]));
+                        eprintln!(
+                            "[DBG] fn={} poc={} st={} mmco={:?} dpb_refs={}",
+                            frame_num,
+                            ctx.curr_poc,
+                            st,
+                            mmco,
+                            ctx.dpb.get_references().len()
+                        );
                         for (si, se) in parser_slices.iter().enumerate() {
                             if let Some(SliceHeader::H264(h)) = &se.slice_header {
                                 eprintln!("[DBG-SL] pic={si} fn={} poc_lsb={} hbs={} mmco={:?} rplm0={:?} nal0={:02x} len={}",
@@ -1640,17 +1913,24 @@ impl VaapiDecoder {
                     }
 
                     // Convert parser's SliceEntry to our H264SliceInfo
-                    let slices: Vec<H264SliceInfo> = parser_slices.into_iter().map(|entry| {
-                        H264SliceInfo {
+                    let slices: Vec<H264SliceInfo> = parser_slices
+                        .into_iter()
+                        .map(|entry| H264SliceInfo {
                             nal_data: entry.nal_data,
                             slice_header: entry.slice_header,
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
                     // Advance offset by bytes consumed (includes start codes)
                     self.parse_offset += bytes_consumed;
                     if std::env::var("DBG_H264").is_ok() {
-                        eprintln!("[DBG-OFFSET] fn={} bytes_consumed={} parse_offset={} remaining={}", frame_num, bytes_consumed, self.parse_offset, self.pending_data.len() - self.parse_offset);
+                        eprintln!(
+                            "[DBG-OFFSET] fn={} bytes_consumed={} parse_offset={} remaining={}",
+                            frame_num,
+                            bytes_consumed,
+                            self.parse_offset,
+                            self.pending_data.len() - self.parse_offset
+                        );
                     }
 
                     // Decode the complete frame with all its slices
@@ -1669,9 +1949,13 @@ impl VaapiDecoder {
     /// Process pending H.265 data using the common parser with incremental
     /// parsing. Collects all slice segments for a single picture, then decodes.
     fn decode_h265_pending(&mut self) -> Result<Option<DecodedFrame>> {
-        let parser = self.h265_parser.as_mut()
+        let parser = self
+            .h265_parser
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H265 parser not initialized".to_string()))?;
-        let ctx = self.h265_ctx.as_mut()
+        let ctx = self
+            .h265_ctx
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H265 context not initialized".to_string()))?;
 
         if self.parse_offset >= self.pending_data.len() {
@@ -1683,7 +1967,9 @@ impl VaapiDecoder {
             let packet = BitstreamPacket::new(remaining.to_vec());
 
             match parser.parse(&packet) {
-                Ok(ParseResult::ParameterSet { sps: Some(s), pps, .. }) => {
+                Ok(ParseResult::ParameterSet {
+                    sps: Some(s), pps, ..
+                }) => {
                     if let Some(sps) = s.downcast_ref::<H265Sps>() {
                         self.stream.h265_sps = Some(sps.clone());
                     }
@@ -1695,21 +1981,32 @@ impl VaapiDecoder {
                     continue;
                 }
                 Ok(ParseResult::ParameterSet { .. }) => continue,
-                Ok(ParseResult::Slice { slices, bytes_consumed }) => {
+                Ok(ParseResult::Slice {
+                    slices,
+                    bytes_consumed,
+                }) => {
                     if slices.is_empty() {
                         return Ok(None);
                     }
                     // POC is computed by the common parser (pocTid0 logic) and
                     // stored in the slice header.
-                    let poc = slices[0].slice_header.as_ref().and_then(|sh| match sh {
-                        SliceHeader::H265(i) => Some(i.curr_pic_order_cnt_val),
-                        _ => None,
-                    }).unwrap_or(ctx.curr_poc);
+                    let poc = slices[0]
+                        .slice_header
+                        .as_ref()
+                        .and_then(|sh| match sh {
+                            SliceHeader::H265(i) => Some(i.curr_pic_order_cnt_val),
+                            _ => None,
+                        })
+                        .unwrap_or(ctx.curr_poc);
                     ctx.curr_poc = poc;
 
-                    let h265_slices: Vec<H265SliceInfo> = slices.into_iter().map(|e| {
-                        H265SliceInfo { nal_data: e.nal_data, slice_header: e.slice_header }
-                    }).collect();
+                    let h265_slices: Vec<H265SliceInfo> = slices
+                        .into_iter()
+                        .map(|e| H265SliceInfo {
+                            nal_data: e.nal_data,
+                            slice_header: e.slice_header,
+                        })
+                        .collect();
 
                     self.parse_offset += bytes_consumed;
                     let timestamp = self.frame_count as u64 * 33_333;
@@ -1735,11 +2032,19 @@ impl VaapiDecoder {
             return Ok(None);
         }
 
-        let ctx = self.h265_ctx.as_mut()
+        let ctx = self
+            .h265_ctx
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("H265 context not initialized".to_string()))?;
-        let sps = self.stream.h265_sps.as_ref()
+        let sps = self
+            .stream
+            .h265_sps
+            .as_ref()
             .ok_or_else(|| Error::InvalidState("H265 SPS not available".to_string()))?;
-        let pps = self.stream.h265_pps.as_ref()
+        let pps = self
+            .stream
+            .h265_pps
+            .as_ref()
             .ok_or_else(|| Error::InvalidState("H265 PPS not available".to_string()))?;
 
         // First slice header carries the picture-level parameters.
@@ -1756,14 +2061,22 @@ impl VaapiDecoder {
 
         // --- ReferenceFrames: every in-use RPS reference (used + keep-alive) ---
         let in_use = ctx.dpb.in_use_refs();
-        let mut reference_frames: [PictureHEVC; 15] = core::array::from_fn(|_| {
-            PictureHEVC::new(VA_INVALID_ID, 0, VA_PICTURE_HEVC_INVALID)
-        });
-        let mut slot_to_refidx: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+        let mut reference_frames: [PictureHEVC; 15] =
+            core::array::from_fn(|_| PictureHEVC::new(VA_INVALID_ID, 0, VA_PICTURE_HEVC_INVALID));
+        let mut slot_to_refidx: std::collections::HashMap<usize, u8> =
+            std::collections::HashMap::new();
         for (ri, &(s, p)) in in_use.iter().enumerate().take(15) {
-            let sid = ctx.slot_surfaces.get(s).and_then(|o| *o)
-                .and_then(|pi| Some(self.surface_pool.entries[pi].surface.id()));
-            let is_lt = ctx.dpb.slots().get(s).map(|sl| sl.is_long_term).unwrap_or(false);
+            let sid = ctx
+                .slot_surfaces
+                .get(s)
+                .and_then(|o| *o)
+                .map(|pi| self.surface_pool.entries[pi].surface.id());
+            let is_lt = ctx
+                .dpb
+                .slots()
+                .get(s)
+                .map(|sl| sl.is_long_term)
+                .unwrap_or(false);
             // RPS type flags per FFmpeg find_frame_rps_type: short-term refs are
             // BEFORE (POC < curr) or AFTER (POC > curr); long-term refs get
             // LT_CURR | LONG_TERM_REFERENCE. in_use_refs() yields exactly the
@@ -1786,18 +2099,23 @@ impl VaapiDecoder {
         let make_list = |l: &Vec<vacc_parser::h265_dpb::H265RefPic>| -> [u8; 15] {
             core::array::from_fn(|i| {
                 l.get(i)
-                    .and_then(|r| (r.slot >= 0).then(|| slot_to_refidx.get(&(r.slot as usize)).copied()))
+                    .and_then(|r| {
+                        (r.slot >= 0).then(|| slot_to_refidx.get(&(r.slot as usize)).copied())
+                    })
                     .flatten()
                     .unwrap_or(0xFF)
             })
         };
-        let slice_ref_lists: Vec<([u8; 15], [u8; 15])> =
-            (0..slices.len()).map(|_| (make_list(&lists.l0), make_list(&lists.l1))).collect();
+        let slice_ref_lists: Vec<([u8; 15], [u8; 15])> = (0..slices.len())
+            .map(|_| (make_list(&lists.l0), make_list(&lists.l1)))
+            .collect();
 
         // --- Allocate the destination surface ---
         let used_pool: std::collections::HashSet<usize> =
             ctx.slot_surfaces.iter().filter_map(|s| *s).collect();
-        let (surface_idx, surface) = self.surface_pool.alloc_excluding(&used_pool)
+        let (surface_idx, surface) = self
+            .surface_pool
+            .alloc_excluding(&used_pool)
             .ok_or_else(|| Error::InvalidState("No free surfaces available".to_string()))?;
         let surface_id = surface.id();
 
@@ -1841,18 +2159,34 @@ impl VaapiDecoder {
             pps.deblocking_filter_override_enabled_flag as u32,
             pps.pps_disable_deblocking_filter_flag as u32,
             pps.slice_segment_header_extension_present_flag as u32,
-            first_info.is_rap as u32,        // rap_pic_flag
-            first_info.is_idr as u32,        // idr_pic_flag
+            first_info.is_rap as u32,            // rap_pic_flag
+            first_info.is_idr as u32,            // idr_pic_flag
             (first_info.slice_type == 0) as u32, // intra_pic_flag (0=I)
         );
 
         // PCM fields. FFmpeg fills these from sps->pcm.* which are 0 when PCM is
         // disabled, yielding the sentinels -1/-1/-3/0 (vaapi_hevc.c). When PCM is
         // enabled the VA fields equal the parsed SPS values directly.
-        let pcm_luma_minus1: u8 = if sps.pcm_enabled_flag { sps.pcm_sample_bit_depth_luma_minus1 } else { 255 };
-        let pcm_chroma_minus1: u8 = if sps.pcm_enabled_flag { sps.pcm_sample_bit_depth_chroma_minus1 } else { 255 };
-        let log2_min_pcm_minus3: u8 = if sps.pcm_enabled_flag { sps.log2_min_pcm_luma_coding_block_size_minus3 } else { 253 };
-        let log2_diff_pcm: u8 = if sps.pcm_enabled_flag { sps.log2_diff_max_min_pcm_luma_coding_block_size } else { 0 };
+        let pcm_luma_minus1: u8 = if sps.pcm_enabled_flag {
+            sps.pcm_sample_bit_depth_luma_minus1
+        } else {
+            255
+        };
+        let pcm_chroma_minus1: u8 = if sps.pcm_enabled_flag {
+            sps.pcm_sample_bit_depth_chroma_minus1
+        } else {
+            255
+        };
+        let log2_min_pcm_minus3: u8 = if sps.pcm_enabled_flag {
+            sps.log2_min_pcm_luma_coding_block_size_minus3
+        } else {
+            253
+        };
+        let log2_diff_pcm: u8 = if sps.pcm_enabled_flag {
+            sps.log2_diff_max_min_pcm_luma_coding_block_size
+        } else {
+            0
+        };
 
         // --- PictureParameterBufferHEVC ---
         let pic_param = PictureParameterBufferHEVC::new(
@@ -1892,9 +2226,12 @@ impl VaapiDecoder {
             pps.pps_beta_offset_div2,
             pps.pps_tc_offset_div2,
             pps.num_extra_slice_header_bits,
-            if first_info.short_term_ref_pic_set_sps_flag { 0 } else { first_info.num_bits_for_strps_in_slice as u32 },
+            if first_info.short_term_ref_pic_set_sps_flag {
+                0
+            } else {
+                first_info.num_bits_for_strps_in_slice as u32
+            },
         );
-
 
         // REXT/SCC (sps profile_idc >= 4): the driver expects the full
         // VAPictureParameterBufferHEVCExtension size, attached as the plain
@@ -1924,13 +2261,17 @@ impl VaapiDecoder {
                 pps.cr_qp_offset_list,
             );
             let ext = PictureParameterBufferHEVCExtension::new(&pic_param, &rext);
-            self.context.create_buffer(
-                BufferType::PictureParameter(PictureParameter::HEVCExtension(ext))
-            ).map_err(|e| Error::VaApi(e.to_string()))?
+            self.context
+                .create_buffer(BufferType::PictureParameter(
+                    PictureParameter::HEVCExtension(ext),
+                ))
+                .map_err(|e| Error::VaApi(e.to_string()))?
         } else {
-            self.context.create_buffer(
-                BufferType::PictureParameter(PictureParameter::HEVC(pic_param))
-            ).map_err(|e| Error::VaApi(e.to_string()))?
+            self.context
+                .create_buffer(BufferType::PictureParameter(PictureParameter::HEVC(
+                    pic_param,
+                )))
+                .map_err(|e| Error::VaApi(e.to_string()))?
         };
 
         // --- IQ matrix buffer (only when scaling lists are present, like FFmpeg) ---
@@ -1944,9 +2285,11 @@ impl VaapiDecoder {
                 core::array::from_fn(|i| sl.scaling_list_dc_coef_16x16[0][i] as u8),
                 core::array::from_fn(|i| sl.scaling_list_dc_coef_32x32[0][i] as u8),
             );
-            Some(self.context.create_buffer(
-                BufferType::IQMatrix(IQMatrix::HEVC(buf))
-            ).map_err(|e| Error::VaApi(e.to_string()))?)
+            Some(
+                self.context
+                    .create_buffer(BufferType::IQMatrix(IQMatrix::HEVC(buf)))
+                    .map_err(|e| Error::VaApi(e.to_string()))?,
+            )
         } else {
             None
         };
@@ -1964,7 +2307,7 @@ impl VaapiDecoder {
         }
 
         // Add all slice buffers BEFORE begin.
-        for (si, (slice_info, (ref_l0, ref_l1))) in slices.iter().zip(slice_ref_lists.into_iter()).enumerate() {
+        for (si, (slice_info, (ref_l0, ref_l1))) in slices.iter().zip(slice_ref_lists).enumerate() {
             let is_last = si == slices.len() - 1;
             let sh = match &slice_info.slice_header {
                 Some(SliceHeader::H265(i)) => i,
@@ -1980,20 +2323,29 @@ impl VaapiDecoder {
             // RBSP byte always carries the EOB stop bit, so a trailing 0x00 is pure
             // byte-alignment padding. Match that for slice_data_size and the data buf.
             let nal_len = slice_info.nal_data.len();
-            let data_len = if nal_len > 0 && slice_info.nal_data[nal_len - 1] == 0 { nal_len - 1 } else { nal_len };
+            let data_len = if nal_len > 0 && slice_info.nal_data[nal_len - 1] == 0 {
+                nal_len - 1
+            } else {
+                nal_len
+            };
 
             let long_slice_flags = HevcLongSliceFlags::new(
-                is_last as u32,                       // last_slice_of_pic
+                is_last as u32,                         // last_slice_of_pic
                 sh.dependent_slice_segment_flag as u32, // dependent_slice_segment_flag
-                match sh.slice_type { 0 => 2, 1 => 1, 2 => 0, n => n } as u32, // slice_type: VA wants de-facto ue values (B=0,P=1,I=2), not our 0=I/1=P/2=B convention
-                sh.colour_plane_id as u32,             // color_plane_id
+                match sh.slice_type {
+                    0 => 2,
+                    1 => 1,
+                    2 => 0,
+                    n => n,
+                } as u32, // slice_type: VA wants de-facto ue values (B=0,P=1,I=2), not our 0=I/1=P/2=B convention
+                sh.colour_plane_id as u32, // color_plane_id
                 sh.slice_sao_luma_flag as u32,
                 sh.slice_sao_chroma_flag as u32,
-                sh.mvd_l1_zero_flag as u32,            // mvd_l1_zero_flag (B-only)
+                sh.mvd_l1_zero_flag as u32, // mvd_l1_zero_flag (B-only)
                 sh.cabac_init_flag as u32,
                 sh.slice_temporal_mvp_enabled_flag as u32,
                 sh.slice_deblocking_filter_disabled_flag as u32,
-                sh.collocated_from_l0_flag as u32,     // collocated_from_l0_flag
+                sh.collocated_from_l0_flag as u32, // collocated_from_l0_flag
                 sh.slice_loop_filter_across_slices_enabled_flag as u32,
             );
 
@@ -2007,26 +2359,31 @@ impl VaapiDecoder {
             let (eff_l0, eff_l1) = if sh.slice_type == 0 {
                 (0u8, 0u8)
             } else {
-                (sh.num_ref_idx_l0_active_minus1, sh.num_ref_idx_l1_active_minus1)
+                (
+                    sh.num_ref_idx_l0_active_minus1,
+                    sh.num_ref_idx_l1_active_minus1,
+                )
             };
 
             let (base_luma_off_l0, base_chroma_off_l0, base_luma_off_l1, base_chroma_off_l1) =
                 if is_rext {
                     ([0i8; 15], [[0i8; 2]; 15], [0i8; 15], [[0i8; 2]; 15])
                 } else {
-                    (sh.luma_offset_l0.map(|v| v as i8),
-                     sh.chroma_offset_l0.map(|c| [c[0] as i8, c[1] as i8]),
-                     sh.luma_offset_l1.map(|v| v as i8),
-                     sh.chroma_offset_l1.map(|c| [c[0] as i8, c[1] as i8]))
+                    (
+                        sh.luma_offset_l0.map(|v| v as i8),
+                        sh.chroma_offset_l0.map(|c| [c[0] as i8, c[1] as i8]),
+                        sh.luma_offset_l1.map(|v| v as i8),
+                        sh.chroma_offset_l1.map(|c| [c[0] as i8, c[1] as i8]),
+                    )
                 };
 
             let slice_param = SliceParameterBufferHEVC::new(
-                data_len as u32,                    // slice_data_size (trailing 0x00 trimmed, like FFmpeg)
-                0,                                  // slice_data_offset
-                VA_SLICE_DATA_FLAG_ALL,             // slice_data_flag
-                slice_data_byte_offset,             // slice_data_byte_offset
-                sh.slice_segment_address,           // slice_segment_address
-                [ref_l0, ref_l1],                   // RefPicList
+                data_len as u32,          // slice_data_size (trailing 0x00 trimmed, like FFmpeg)
+                0,                        // slice_data_offset
+                VA_SLICE_DATA_FLAG_ALL,   // slice_data_flag
+                slice_data_byte_offset,   // slice_data_byte_offset
+                sh.slice_segment_address, // slice_segment_address
+                [ref_l0, ref_l1],         // RefPicList
                 &long_slice_flags,
                 collocated_ref_idx,
                 eff_l0,
@@ -2070,18 +2427,25 @@ impl VaapiDecoder {
                     sh.slice_act_cr_qp_offset as i8,
                 );
                 let ext = SliceParameterBufferHEVCExtension::new(&slice_param, &rext);
-                self.context.create_buffer(
-                    BufferType::SliceParameter(SliceParameter::HEVCExtension(ext))
-                ).map_err(|e| Error::VaApi(e.to_string()))?
+                self.context
+                    .create_buffer(BufferType::SliceParameter(SliceParameter::HEVCExtension(
+                        ext,
+                    )))
+                    .map_err(|e| Error::VaApi(e.to_string()))?
             } else {
-                self.context.create_buffer(
-                    BufferType::SliceParameter(SliceParameter::HEVC(slice_param))
-                ).map_err(|e| Error::VaApi(e.to_string()))?
+                self.context
+                    .create_buffer(BufferType::SliceParameter(SliceParameter::HEVC(
+                        slice_param,
+                    )))
+                    .map_err(|e| Error::VaApi(e.to_string()))?
             };
 
-            let slice_data_buf = self.context.create_buffer(
-                BufferType::SliceData(slice_info.nal_data[..data_len].to_vec())
-            ).map_err(|e| Error::VaApi(e.to_string()))?;
+            let slice_data_buf = self
+                .context
+                .create_buffer(BufferType::SliceData(
+                    slice_info.nal_data[..data_len].to_vec(),
+                ))
+                .map_err(|e| Error::VaApi(e.to_string()))?;
 
             va_buffers.push((format!("slice{}:param", si), slice_param_buf));
             va_buffers.push((format!("slice{}:data", si), slice_data_buf));
@@ -2089,7 +2453,9 @@ impl VaapiDecoder {
 
         // Begin picture ONCE for the entire frame.
         let mut picture = Picture::<PictureNew, Rc<Surface<DmaBufSurfaceDescriptor>>>::new(
-            timestamp, Rc::clone(&self.context), Rc::clone(&surface),
+            timestamp,
+            Rc::clone(&self.context),
+            Rc::clone(&surface),
         );
         for (_, b) in va_buffers {
             picture.add_buffer(b);
@@ -2192,14 +2558,14 @@ fn read_from_image(
                 let y = ((word >> 10) & 0x3FF) as u16;
                 let u = (word & 0x3FF) as u16;
                 let v = ((word >> 20) & 0x3FF) as u16;
-                unsafe {
-                    buffer[(row * out_width + col) * 2..(row * out_width + col) * 2 + 2]
-                        .copy_from_slice(&y.to_ne_bytes());
-                    buffer[(plane_size + row * out_width + col) * 2..(plane_size + row * out_width + col) * 2 + 2]
-                        .copy_from_slice(&u.to_ne_bytes());
-                    buffer[(2 * plane_size + row * out_width + col) * 2..(2 * plane_size + row * out_width + col) * 2 + 2]
-                        .copy_from_slice(&v.to_ne_bytes());
-                }
+                buffer[(row * out_width + col) * 2..(row * out_width + col) * 2 + 2]
+                    .copy_from_slice(&y.to_ne_bytes());
+                buffer[(plane_size + row * out_width + col) * 2
+                    ..(plane_size + row * out_width + col) * 2 + 2]
+                    .copy_from_slice(&u.to_ne_bytes());
+                buffer[(2 * plane_size + row * out_width + col) * 2
+                    ..(2 * plane_size + row * out_width + col) * 2 + 2]
+                    .copy_from_slice(&v.to_ne_bytes());
             }
         }
         drop(image);
@@ -2209,9 +2575,24 @@ fn read_from_image(
         return Ok(Some(PixelData {
             // "16" => bps=2 in the consumer; not "P016" => no top-justification shift.
             format: "Y410P16".to_string(),
-            y: PixelPlane { data: y_ptr, pitch: out_width * 2, width: out_width, height: out_height },
-            u: PixelPlane { data: u_ptr, pitch: out_width * 2, width: out_width, height: out_height },
-            v: Some(PixelPlane { data: v_ptr, pitch: out_width * 2, width: out_width, height: out_height }),
+            y: PixelPlane {
+                data: y_ptr,
+                pitch: out_width * 2,
+                width: out_width,
+                height: out_height,
+            },
+            u: PixelPlane {
+                data: u_ptr,
+                pitch: out_width * 2,
+                width: out_width,
+                height: out_height,
+            },
+            v: Some(PixelPlane {
+                data: v_ptr,
+                pitch: out_width * 2,
+                width: out_width,
+                height: out_height,
+            }),
             buffer,
         }));
     }
@@ -2232,7 +2613,8 @@ fn read_from_image(
                 let px = unsafe { src.add(row_off + col * 4) };
                 buffer[row * out_width + col] = unsafe { *px.add(2) }; // Y
                 buffer[plane_size + row * out_width + col] = unsafe { *px.add(1) }; // U
-                buffer[2 * plane_size + row * out_width + col] = unsafe { *px }; // V
+                buffer[2 * plane_size + row * out_width + col] = unsafe { *px };
+                // V
             }
         }
         drop(image);
@@ -2241,9 +2623,24 @@ fn read_from_image(
         let v_ptr = unsafe { y_ptr.add(2 * plane_size) };
         return Ok(Some(PixelData {
             format: "YUV444".to_string(),
-            y: PixelPlane { data: y_ptr, pitch: out_width, width: out_width, height: out_height },
-            u: PixelPlane { data: u_ptr, pitch: out_width, width: out_width, height: out_height },
-            v: Some(PixelPlane { data: v_ptr, pitch: out_width, width: out_width, height: out_height }),
+            y: PixelPlane {
+                data: y_ptr,
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            },
+            u: PixelPlane {
+                data: u_ptr,
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            },
+            v: Some(PixelPlane {
+                data: v_ptr,
+                pitch: out_width,
+                width: out_width,
+                height: out_height,
+            }),
             buffer,
         }));
     }
@@ -2280,11 +2677,22 @@ fn read_from_image(
     } else if fourcc == u32::from_ne_bytes(*b"I420") {
         "I420".to_string()
     } else {
-        return Err(Error::VaApi(format!("Unsupported image format: {:X}", fourcc)));
+        return Err(Error::VaApi(format!(
+            "Unsupported image format: {:X}",
+            fourcc
+        )));
     };
 
     // Validate num_planes
-    let min_planes = if is_ayuv { 1 } else if is_xyuv { 4 } else if is_nv12 || p016_shift.is_some() || is_p016 { 2 } else { 3 };
+    let min_planes = if is_ayuv {
+        1
+    } else if is_xyuv {
+        4
+    } else if is_nv12 || p016_shift.is_some() || is_p016 {
+        2
+    } else {
+        3
+    };
     if va_image.num_planes < min_planes {
         return Err(Error::VaApi(format!(
             "Unexpected num_planes={} for format {}",
@@ -2300,8 +2708,16 @@ fn read_from_image(
     let out_width = display_width.min(va_image.width as u32) as usize;
     let out_height = display_height.min(va_image.height as u32) as usize;
     // 4:4:4 keeps full-resolution chroma; 4:2:0 downsamples by 2.
-    let uv_width = if is_444 { out_width } else { (out_width + 1) / 2 };
-    let uv_height = if is_444 { out_height } else { (out_height + 1) / 2 };
+    let uv_width = if is_444 {
+        out_width
+    } else {
+        out_width.div_ceil(2)
+    };
+    let uv_height = if is_444 {
+        out_height
+    } else {
+        out_height.div_ceil(2)
+    };
     let _ = bps; // plane widths are in samples; pitches in the image are in bytes
 
     // AYUV: de-interleave the single [A,Y,U,V] plane into planar Y/U/V.
@@ -2316,14 +2732,15 @@ fn read_from_image(
                 // iHD stores the AYUV view as [V, U, Y, A] in memory.
                 out[y * out_width + x] = unsafe { *p.add(2) }; // Y
                 out[out_width * out_height + y * out_width + x] = unsafe { *p.add(1) }; // U
-                out[2 * out_width * out_height + y * out_width + x] = unsafe { *p.add(0) }; // V
+                out[2 * out_width * out_height + y * out_width + x] = unsafe { *p.add(0) };
+                // V
             }
         }
         drop(image);
         return Ok(Some(PixelData {
             format: format_str,
             y: PixelPlane {
-                data: unsafe { out.as_ptr() },
+                data: out.as_ptr(),
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
@@ -2400,7 +2817,7 @@ fn read_from_image(
             },
             v: None,
             buffer: out,
-        }))
+        }));
     }
 
     // Build plane descriptors from the copied buffer. XYUV stores an unused
@@ -2486,8 +2903,8 @@ fn read_from_image_p01x_native(
     // Crop to the display size (top-left origin).
     let out_width = display_width.min(va_image.width as u32) as usize;
     let out_height = display_height.min(va_image.height as u32) as usize;
-    let uv_width = (out_width + 1) / 2;
-    let uv_height = (out_height + 1) / 2;
+    let uv_width = out_width.div_ceil(2);
+    let uv_height = out_height.div_ceil(2);
 
     let y_offset = va_image.offsets[0] as usize;
     let uv_offset = va_image.offsets[1] as usize;
@@ -2570,7 +2987,6 @@ fn read_surface_pixels(
     display_height: u32,
     fourccs: &[u32],
 ) -> Result<Option<PixelData>> {
-
     // Primary: vaCreateImage + vaGetImage (driver-supported CPU read).
     // Read the full coded size, then crop to the display size in read_from_image.
     // The driver may expose a semi-planar or planar variant of the stream's
@@ -2580,29 +2996,23 @@ fn read_surface_pixels(
             fourcc,
             ..Default::default()
         };
-        match Image::create_from(surface, format, (width, height), (width, height)) {
-            Ok(image) => return read_from_image(image, display_width, display_height),
-            Err(_) => {}
+        if let Ok(image) = Image::create_from(surface, format, (width, height), (width, height)) {
+            return read_from_image(image, display_width, display_height);
         }
     }
 
     // Fallback: derive_from (zero-copy; unsupported on NVIDIA).
-    match Image::derive_from(surface, (width, height)) {
-        Ok(img) => {
-            let fourcc = img.image().format.fourcc;
-            if fourcc == libva::VA_FOURCC_NV12
-                || fourcc == u32::from_ne_bytes(*b"YV12")
-                || fourcc == u32::from_ne_bytes(*b"I420")
-            {
-                return read_from_image(img, display_width, display_height);
-            }
+    if let Ok(img) = Image::derive_from(surface, (width, height)) {
+        let fourcc = img.image().format.fourcc;
+        if fourcc == libva::VA_FOURCC_NV12
+            || fourcc == u32::from_ne_bytes(*b"YV12")
+            || fourcc == u32::from_ne_bytes(*b"I420")
+        {
+            return read_from_image(img, display_width, display_height);
         }
-        Err(_) => {}
     }
 
-    Err(Error::VaApi(
-        "All surface read methods failed".to_string(),
-    ))
+    Err(Error::VaApi("All surface read methods failed".to_string()))
 }
 
 /// Parse stream info from initial bitstream data.
@@ -2614,7 +3024,10 @@ fn parse_stream_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         CoreVideoCodec::DecodeH265 => parse_h265_info(display, data),
         CoreVideoCodec::DecodeVp9 => parse_vp9_info(display, data),
         CoreVideoCodec::DecodeAv1 => parse_av1_info(display, data),
-        _ => Err(Error::CodecNotSupported(format!("Unsupported codec: {:?}", codec))),
+        _ => Err(Error::CodecNotSupported(format!(
+            "Unsupported codec: {:?}",
+            codec
+        ))),
     }
 }
 
@@ -2636,11 +3049,11 @@ fn detect_codec(data: &[u8]) -> CoreVideoCodec {
     }
 
     // Check for VP9 frame marker
-    for i in 0..data.len().min(256) {
-        if data[i] == 0 {
+    for &b in data.iter().take(256) {
+        if b == 0 {
             continue;
         }
-        if (data[i] & 0xC0) == 0x80 {
+        if (b & 0xC0) == 0x80 {
             return CoreVideoCodec::DecodeVp9;
         }
         break;
@@ -2654,9 +3067,9 @@ fn detect_codec(data: &[u8]) -> CoreVideoCodec {
     // that mimic H.264 SPS/PPS under the 5-bit interpretation (e.g. IDR_N_LP
     // 0x28 reads as type 8).
     for i in 0..data.len().min(4096) {
-        let start = if i + 4 <= data.len() && data[i..i+4] == [0x00, 0x00, 0x00, 0x01] {
+        let start = if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
             i + 4
-        } else if i + 3 <= data.len() && data[i..i+3] == [0x00, 0x00, 0x01] {
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
             i + 3
         } else {
             continue;
@@ -2687,7 +3100,8 @@ fn detect_codec(data: &[u8]) -> CoreVideoCodec {
 /// Parse H.264 stream info.
 fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     let mut parser = H264Parser::new();
-    parser.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeH264))
+    parser
+        .init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeH264))
         .map_err(|e| Error::Parser(e.to_string()))?;
 
     let packet = BitstreamPacket::new(data.to_vec());
@@ -2702,7 +3116,9 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
 
     // Parse the packet - may return ParameterSet or Slice (with SPS/PPS cached)
     match parser.parse(&packet) {
-        Ok(ParseResult::ParameterSet { sps: Some(s), pps, .. }) => {
+        Ok(ParseResult::ParameterSet {
+            sps: Some(s), pps, ..
+        }) => {
             if let Some(sps) = s.downcast_ref::<H264Sps>() {
                 sps_opt = Some(sps.clone());
                 if let Some(pps_box) = pps {
@@ -2732,14 +3148,18 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         } else {
             (sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
         };
-        max_dpb = sps.max_num_ref_frames as u32;
+        max_dpb = sps.max_num_ref_frames;
 
         // Calculate display dimensions with frame cropping (H.264 spec 7.4.2.1.1).
         // The frame_crop_*_offset values are expressed in units of SubWidthC /
         // SubHeightC luma samples (2 for 4:2:0, 1 for 4:4:4 / 4:0:0), NOT macroblocks.
         // e.g. crop_bottom=4 with 4:2:0 -> 4*2 = 8 luma rows cropped.
         if sps.frame_cropping_flag {
-            let sub_width_c = if sps.chroma_format_idc == 1 || sps.chroma_format_idc == 2 { 2 } else { 1 };
+            let sub_width_c = if sps.chroma_format_idc == 1 || sps.chroma_format_idc == 2 {
+                2
+            } else {
+                1
+            };
             let sub_height_c = if sps.chroma_format_idc == 1 { 2 } else { 1 };
 
             let crop_left = sps.frame_crop_left_offset * sub_width_c;
@@ -2800,7 +3220,9 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     }
 
     if width == 0 || height == 0 {
-        return Err(Error::DecoderInit("Failed to parse H.264 dimensions".to_string()));
+        return Err(Error::DecoderInit(
+            "Failed to parse H.264 dimensions".to_string(),
+        ));
     }
 
     let rt_format = if let Some(ref sps) = sps_opt {
@@ -2830,11 +3252,10 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         height,
         display_width,
         display_height,
-        max_dpb: max_dpb.min(16).max(1),
+        max_dpb: max_dpb.clamp(1, 16),
         rt_format,
         vp9_profile: 0,
         vp9_bit_depth: 8,
-        av1_profile: 0,
         av1_bit_depth: 8,
         sps: sps_opt,
         pps: pps_opt,
@@ -2847,20 +3268,21 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
 /// Parse H.265 stream info.
 fn parse_h265_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     let mut parser = H265Parser::new();
-    parser.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeH265))
+    parser
+        .init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeH265))
         .map_err(|e| Error::Parser(e.to_string()))?;
 
     let packet = BitstreamPacket::new(data.to_vec());
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut display_width = 0u32;
-    let mut display_height = 0u32;
-    let mut max_dpb = 4u32;
+    let display_width;
+    let display_height;
     let mut sps_opt: Option<H265Sps> = None;
     let mut pps_opt: Option<H265Pps> = None;
 
     // The first ParameterSet result carries the SPS (and usually the PPS too).
-    if let Ok(ParseResult::ParameterSet { sps: Some(s), pps, .. }) = parser.parse(&packet) {
+    if let Ok(ParseResult::ParameterSet {
+        sps: Some(s), pps, ..
+    }) = parser.parse(&packet)
+    {
         if let Some(sps) = s.downcast_ref::<H265Sps>() {
             sps_opt = Some(sps.clone());
         }
@@ -2871,22 +3293,23 @@ fn parse_h265_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         }
     }
 
-    let sps = sps_opt.as_ref()
+    let sps = sps_opt
+        .as_ref()
         .ok_or_else(|| Error::DecoderInit("Failed to parse H.265 SPS".to_string()))?;
 
     // Coded size = the SPS luma dimensions (HEVC coded size is NOT necessarily
     // 16-aligned, unlike H.264). The surface is created at this exact size and
     // PictureParameterBufferHEVC carries the same values, so they match.
-    width = sps.pic_width_in_luma_samples as u32;
-    height = sps.pic_height_in_luma_samples as u32;
-    max_dpb = sps.max_num_ref_frames as u32;
+    let width = sps.pic_width_in_luma_samples as u32;
+    let height = sps.pic_height_in_luma_samples as u32;
+    let max_dpb = sps.max_num_ref_frames as u32;
 
     // Conformance window -> display size (H.265 7.4.3.2.1).
     let (sub_w, sub_h) = match sps.chroma_format_idc {
         0 => (1u32, 1u32),
-        1 => (2, 2),   // 4:2:0
-        2 => (2, 1),   // 4:2:2
-        _ => (1, 1),   // 4:4:4
+        1 => (2, 2), // 4:2:0
+        2 => (2, 1), // 4:2:2
+        _ => (1, 1), // 4:4:4
     };
     if sps.conformance_window_flag {
         let cw = (sps.conf_win_left_offset + sps.conf_win_right_offset) * sub_w;
@@ -2966,11 +3389,10 @@ fn parse_h265_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         height,
         display_width,
         display_height,
-        max_dpb: max_dpb.min(16).max(1),
+        max_dpb: max_dpb.clamp(1, 16),
         rt_format,
         vp9_profile: 0,
         vp9_bit_depth: 8,
-        av1_profile: 0,
         av1_bit_depth: 8,
         sps: None,
         pps: None,
@@ -3004,7 +3426,8 @@ fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     }
 
     let mut parser = Vp9Parser::new();
-    parser.init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeVp9))
+    parser
+        .init(&DetectedVideoFormat::new(CoreVideoCodec::DecodeVp9))
         .map_err(|e| Error::Parser(e.to_string()))?;
 
     let parsed = parser
@@ -3014,10 +3437,20 @@ fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     let width = parsed.frame_width;
     let height = parsed.frame_height;
     if width == 0 || height == 0 {
-        return Err(Error::DecoderInit("Failed to parse VP9 dimensions".to_string()));
+        return Err(Error::DecoderInit(
+            "Failed to parse VP9 dimensions".to_string(),
+        ));
     }
-    let display_width = if parsed.render_width > 0 { parsed.render_width } else { width };
-    let display_height = if parsed.render_height > 0 { parsed.render_height } else { height };
+    let display_width = if parsed.render_width > 0 {
+        parsed.render_width
+    } else {
+        width
+    };
+    let display_height = if parsed.render_height > 0 {
+        parsed.render_height
+    } else {
+        height
+    };
 
     let profile_num = parsed.picture_info.profile as u8;
     let bit_depth = parsed.color_config.bit_depth;
@@ -3063,7 +3496,6 @@ fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         rt_format,
         vp9_profile: profile_num,
         vp9_bit_depth: bit_depth,
-        av1_profile: 0,
         av1_bit_depth: 8,
         sps: None,
         pps: None,
@@ -3153,8 +3585,10 @@ fn av1_extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
                 }
             }
             let is_frame = obu_type == 6;
-            let is_show_existing =
-                obu_type == 3 && size > 0 && size_pos < packet.len() && (packet[size_pos] & 0x80) != 0;
+            let is_show_existing = obu_type == 3
+                && size > 0
+                && size_pos < packet.len()
+                && (packet[size_pos] & 0x80) != 0;
             if is_frame || is_show_existing {
                 let payload_end = (size_pos + size).min(packet.len());
                 obus.push(Av1FrameObu {
@@ -3206,9 +3640,8 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
             }
         }
         if frame_payload.is_none() {
-            for obu in av1_extract_frame_obus(&payload) {
+            if let Some(obu) = av1_extract_frame_obus(&payload).into_iter().next() {
                 frame_payload = Some(obu.payload);
-                break;
             }
         }
         if sps_payload.is_some() && frame_payload.is_some() {
@@ -3216,11 +3649,10 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         }
     }
 
-    let sps_data = sps_payload.ok_or_else(|| {
-        Error::DecoderInit("AV1 sequence header OBU not found".to_string())
-    })?;
-    let frame_data = frame_payload
-        .ok_or_else(|| Error::DecoderInit("No AV1 frame OBU found".to_string()))?;
+    let sps_data = sps_payload
+        .ok_or_else(|| Error::DecoderInit("AV1 sequence header OBU not found".to_string()))?;
+    let frame_data =
+        frame_payload.ok_or_else(|| Error::DecoderInit("No AV1 frame OBU found".to_string()))?;
 
     let mut parser = Av1Parser::new();
     parser
@@ -3247,7 +3679,13 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         )));
     }
 
-    let bit_depth = if sps.twelve_bit { 12 } else if sps.high_bitdepth { 10 } else { 8 };
+    let bit_depth = if sps.twelve_bit {
+        12
+    } else if sps.high_bitdepth {
+        10
+    } else {
+        8
+    };
     if bit_depth == 12 {
         return Err(Error::DecoderInit(
             "AV1 12-bit not supported by this VAAPI backend (8/10-bit only)".to_string(),
@@ -3289,10 +3727,20 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     let width = fh.frame_width;
     let height = fh.frame_height;
     if width == 0 || height == 0 {
-        return Err(Error::DecoderInit("Failed to parse AV1 dimensions".to_string()));
+        return Err(Error::DecoderInit(
+            "Failed to parse AV1 dimensions".to_string(),
+        ));
     }
-    let display_width = if fh.render_width > 0 { fh.render_width } else { width };
-    let display_height = if fh.render_height > 0 { fh.render_height } else { height };
+    let display_width = if fh.render_width > 0 {
+        fh.render_width
+    } else {
+        width
+    };
+    let display_height = if fh.render_height > 0 {
+        fh.render_height
+    } else {
+        height
+    };
 
     Ok(StreamInfo {
         codec: CoreVideoCodec::DecodeAv1,
@@ -3305,7 +3753,6 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         rt_format,
         vp9_profile: 0,
         vp9_bit_depth: 8,
-        av1_profile: sps.profile,
         av1_bit_depth: bit_depth,
         sps: None,
         pps: None,
@@ -3450,9 +3897,8 @@ impl VaapiDecoder {
                     .try_into()
                     .unwrap(),
             );
-            let payload = self.pending_data
-                [self.parse_offset + 12..self.parse_offset + 12 + size]
-                .to_vec();
+            let payload =
+                self.pending_data[self.parse_offset + 12..self.parse_offset + 12 + size].to_vec();
             self.parse_offset += 12 + size;
             for f in expand_superframes(&payload) {
                 if let Some(frame) =
@@ -3472,7 +3918,9 @@ impl VaapiDecoder {
         superframe_offset: u32,
         timestamp: u64,
     ) -> Result<Option<DecodedFrame>> {
-        let parser = self.vp9_parser.as_mut()
+        let parser = self
+            .vp9_parser
+            .as_mut()
             .ok_or_else(|| Error::InvalidState("VP9 parser not initialized".to_string()))?;
 
         let parsed = parser
@@ -3482,7 +3930,9 @@ impl VaapiDecoder {
         // show_existing_frame: no decode, no DPB change — re-display an
         // already-decoded surface (FFmpeg re-outputs refs[frame_to_show_map_idx]).
         if parsed.show_existing_frame {
-            let slot = self.vp9_ctx.as_ref()
+            let slot = self
+                .vp9_ctx
+                .as_ref()
                 .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?
                 .dpb
                 .slot_of_frame_buffer(parsed.frame_to_show_map_idx as usize);
@@ -3492,15 +3942,14 @@ impl VaapiDecoder {
                     parsed.frame_to_show_map_idx
                 )));
             }
-            let pool_idx = self.vp9_ctx.as_ref().unwrap().slot_surfaces[slot as usize]
-                .ok_or_else(|| Error::InvalidState("show-existing-frame: slot has no surface".to_string()))?;
+            let pool_idx =
+                self.vp9_ctx.as_ref().unwrap().slot_surfaces[slot as usize].ok_or_else(|| {
+                    Error::InvalidState("show-existing-frame: slot has no surface".to_string())
+                })?;
             let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
             self.surface_pool.sync_surface(pool_idx)?;
-            let pixel_data = read_output_surface_pixels(
-                &surface,
-                &self.stream,
-                self.vp9_image_fourcc(),
-            )?;
+            let pixel_data =
+                read_output_surface_pixels(&surface, &self.stream, self.vp9_image_fourcc())?;
             let mut frame = DecodedFrame::new(
                 self.frame_count,
                 timestamp as i64,
@@ -3522,10 +3971,14 @@ impl VaapiDecoder {
         //    buffers). Slots no longer referenced by any frame buffer release
         //    their surface first.
         let (ref_pool_idxs, out_slot, used_pool) = {
-            let ctx = self.vp9_ctx.as_mut()
+            let ctx = self
+                .vp9_ctx
+                .as_mut()
                 .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?;
 
-            let live: std::collections::HashSet<usize> = ctx.dpb.frame_buffer_slots()
+            let live: std::collections::HashSet<usize> = ctx
+                .dpb
+                .frame_buffer_slots()
                 .iter()
                 .filter(|s| **s >= 0)
                 .map(|s| *s as usize)
@@ -3565,9 +4018,13 @@ impl VaapiDecoder {
 
         // 3. Build the VA parameter buffers (FFmpeg vaapi_vp9.c mapping).
         let (pic_type, slice_type) = build_vp9_va_buffers(&parsed, ref_surfaces, data.len() as u32);
-        let pic_buf = self.context.create_buffer(pic_type)
+        let pic_buf = self
+            .context
+            .create_buffer(pic_type)
             .map_err(|e| Error::VaApi(e.to_string()))?;
-        let slice_buf = self.context.create_buffer(slice_type)
+        let slice_buf = self
+            .context
+            .create_buffer(slice_type)
             .map_err(|e| Error::VaApi(e.to_string()))?;
 
         // 4. Decode: picture parameters + slice parameters + whole frame as
@@ -3588,18 +4045,20 @@ impl VaapiDecoder {
         let picture = picture.begin().map_err(|e| Error::VaApi(e.to_string()))?;
         let picture = picture.render().map_err(|e| Error::VaApi(e.to_string()))?;
         let picture = picture.end().map_err(|e| Error::VaApi(e.to_string()))?;
-        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
-            .sync()
-            .map_err(|e| Error::VaApi(e.0.to_string()))?;
+        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> =
+            picture.sync().map_err(|e| Error::VaApi(e.0.to_string()))?;
 
         self.surface_pool.mark_ready(pool_idx);
 
         // 5. Commit the frame's refresh into the common DPB and track the
         //    surface for the slot.
         {
-            let ctx = self.vp9_ctx.as_mut()
+            let ctx = self
+                .vp9_ctx
+                .as_mut()
                 .ok_or_else(|| Error::InvalidState("VP9 context not initialized".to_string()))?;
-            ctx.dpb.commit_frame(pi.refresh_frame_flags, out_slot as i32);
+            ctx.dpb
+                .commit_frame(pi.refresh_frame_flags, out_slot as i32);
             ctx.slot_surfaces[out_slot] = Some(pool_idx);
         }
 
@@ -3610,11 +4069,8 @@ impl VaapiDecoder {
         }
 
         self.surface_pool.sync_surface(pool_idx)?;
-        let pixel_data = read_output_surface_pixels(
-            &surface,
-            &self.stream,
-            self.vp9_image_fourcc(),
-        )?;
+        let pixel_data =
+            read_output_surface_pixels(&surface, &self.stream, self.vp9_image_fourcc())?;
 
         let mut frame = DecodedFrame::new(
             self.frame_count,
@@ -3653,20 +4109,13 @@ fn read_output_surface_pixels(
             fourcc,
             ..Default::default()
         };
-        match Image::create_from(
+        if let Ok(image) = Image::create_from(
             surface,
             format,
             (stream.width, stream.height),
             (stream.width, stream.height),
         ) {
-            Ok(image) => {
-                return read_from_image_p01x_native(
-                    image,
-                    stream.display_width,
-                    stream.display_height,
-                )
-            }
-            Err(_) => {}
+            return read_from_image_p01x_native(image, stream.display_width, stream.display_height);
         }
         return Err(Error::VaApi(format!(
             "P010/P012 surface read failed (fourcc {:X})",
@@ -3721,9 +4170,8 @@ impl VaapiDecoder {
                     .try_into()
                     .unwrap(),
             );
-            let payload = self.pending_data
-                [self.parse_offset + 12..self.parse_offset + 12 + size]
-                .to_vec();
+            let payload =
+                self.pending_data[self.parse_offset + 12..self.parse_offset + 12 + size].to_vec();
             self.parse_offset += 12 + size;
             for obu in av1_extract_frame_obus(&payload) {
                 if let Some(frame) = self.decode_av1_frame(&obu.payload, pts)? {
@@ -3767,7 +4215,9 @@ impl VaapiDecoder {
                 .as_ref()
                 .ok_or_else(|| Error::InvalidState("AV1 context not initialized".to_string()))?
                 .slot_surfaces[slot as usize]
-                .ok_or_else(|| Error::InvalidState("show-existing-frame: slot has no surface".to_string()))?;
+                .ok_or_else(|| {
+                    Error::InvalidState("show-existing-frame: slot has no surface".to_string())
+                })?;
             let surface = Rc::clone(&self.surface_pool.entries[pool_idx].surface);
             self.surface_pool.sync_surface(pool_idx)?;
             let pixel_data =
@@ -3820,8 +4270,7 @@ impl VaapiDecoder {
                     *entry = None;
                 }
             }
-            for i in 0..8 {
-                let fb = &dpb.frame_buffers[i];
+            for (i, fb) in dpb.frame_buffers.iter().enumerate() {
                 if fb.slot >= 0 {
                     if let Some(pool_idx) = ctx.slot_surfaces[fb.slot as usize] {
                         ref_frame_map[i] = self.surface_pool.entries[pool_idx].surface.id();
@@ -3895,9 +4344,8 @@ impl VaapiDecoder {
         let picture = picture.begin().map_err(|e| Error::VaApi(e.to_string()))?;
         let picture = picture.render().map_err(|e| Error::VaApi(e.to_string()))?;
         let picture = picture.end().map_err(|e| Error::VaApi(e.to_string()))?;
-        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> = picture
-            .sync()
-            .map_err(|e| Error::VaApi(e.0.to_string()))?;
+        let _synced: Picture<PictureSync, Rc<Surface<DmaBufSurfaceDescriptor>>> =
+            picture.sync().map_err(|e| Error::VaApi(e.0.to_string()))?;
 
         self.surface_pool.mark_ready(pool_idx);
 
@@ -3959,7 +4407,7 @@ fn build_av1_va_buffers(
     // lr_unit_shift = loop_restoration_size[0] - 1; lr_uv_shift is 1 iff the
     // chroma size was shifted down from the luma size.
     let lr_unit_shift = if fh.uses_lr {
-        (fh.loop_restoration_size[0].saturating_sub(1)) as u16
+        fh.loop_restoration_size[0].saturating_sub(1)
     } else {
         0
     };
@@ -4039,9 +4487,7 @@ fn build_av1_va_buffers(
             fh.segmentation_temporal_update as u32,
             fh.segmentation_update_data as u32,
         ),
-        std::array::from_fn(|seg| {
-            std::array::from_fn(|feat| fh.segment_feature_data[seg][feat])
-        }),
+        std::array::from_fn(|seg| std::array::from_fn(|feat| fh.segment_feature_data[seg][feat])),
         std::array::from_fn(|seg| fh.segment_feature_enabled[seg]),
     );
 
@@ -4090,11 +4536,10 @@ fn build_av1_va_buffers(
     );
 
     // CDEF strengths: packed (primary << 2) | secondary.
-    let cdef_y_strengths = std::array::from_fn(|i| {
-        ((fh.cdef_y_pri_strength[i] << 2) | (fh.cdef_y_sec_strength[i] & 3)) as u8
-    });
+    let cdef_y_strengths =
+        std::array::from_fn(|i| (fh.cdef_y_pri_strength[i] << 2) | (fh.cdef_y_sec_strength[i] & 3));
     let cdef_uv_strengths = std::array::from_fn(|i| {
-        ((fh.cdef_uv_pri_strength[i] << 2) | (fh.cdef_uv_sec_strength[i] & 3)) as u8
+        (fh.cdef_uv_pri_strength[i] << 2) | (fh.cdef_uv_sec_strength[i] & 3)
     });
 
     // Per-tile width/height in superblocks minus 1 (63 entries; the last
@@ -4118,7 +4563,7 @@ fn build_av1_va_buffers(
         &seq_fields,
         current_frame,
         current_frame, // no film grain: display picture == decoded picture
-        Vec::new(), // anchor_frames_list (large-scale tiles: unused)
+        Vec::new(),    // anchor_frames_list (large-scale tiles: unused)
         (fh.frame_width - 1) as u16,
         (fh.frame_height - 1) as u16,
         0, // output_frame_width_in_tiles_minus_1 (LST)
@@ -4209,7 +4654,11 @@ fn build_vp9_va_buffers(
         pi.flags.error_resilient_mode as u32,
         pi.flags.intra_only as u32,
         // Key frames never use high-precision MVs (FFmpeg forces 0).
-        if is_key { 0 } else { pi.flags.allow_high_precision_mv as u32 },
+        if is_key {
+            0
+        } else {
+            pi.flags.allow_high_precision_mv as u32
+        },
         // The parser's enum values match the VA mcomp_filter_type values
         // exactly (FFmpeg computes `literal ^ (literal <= 1)` from the raw
         // bitstream literal, which reduces to this direct cast).
@@ -4231,7 +4680,11 @@ fn build_vp9_va_buffers(
     );
 
     let segment_pred_probs = if sg.flags.segmentation_temporal_update != 0 {
-        [sg.segmentation_pred_prob[0], sg.segmentation_pred_prob[1], sg.segmentation_pred_prob[2]]
+        [
+            sg.segmentation_pred_prob[0],
+            sg.segmentation_pred_prob[1],
+            sg.segmentation_pred_prob[2],
+        ]
     } else {
         [255, 255, 255]
     };
@@ -4260,7 +4713,8 @@ fn build_vp9_va_buffers(
     );
 
     let seg_param = vp9_segment_params(fd);
-    let slice_param = SliceParameterBufferVP9::new(slice_data_size, 0, VA_SLICE_DATA_FLAG_ALL, seg_param);
+    let slice_param =
+        SliceParameterBufferVP9::new(slice_data_size, 0, VA_SLICE_DATA_FLAG_ALL, seg_param);
 
     (
         BufferType::PictureParameter(PictureParameter::VP9(pic_param)),
@@ -4301,7 +4755,7 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
     let mut out: [SegmentParameterVP9; 8] = unsafe { std::mem::zeroed() };
     // FFmpeg fills only seg[0] when segmentation is disabled ("some hwaccels
     // don't ignore these fields if segmentation is disabled" — iHD included).
-    for i in 0..(if enabled { 8 } else { 1 }) {
+    for (i, slot) in out.iter_mut().enumerate().take(if enabled { 8 } else { 1 }) {
         let fe = sg.feature_enabled[i];
         let q_enabled = enabled && (fe & 1) != 0;
         let lf_enabled = enabled && (fe & 2) != 0;
@@ -4311,7 +4765,11 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
         // Quantization scales (FFmpeg: qmul[Y/UV][DC/AC]).
         let mut qyac: i32 = if q_enabled {
             let qv = sg.feature_data[i][0] as i32;
-            if abs_or_delta { qv } else { yac_qi + qv }
+            if abs_or_delta {
+                qv
+            } else {
+                yac_qi + qv
+            }
         } else {
             yac_qi
         };
@@ -4323,7 +4781,11 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
         // Loop filter level per reference/mode (FFmpeg: feat[i].lflvl[4][2]).
         let lflvl: i32 = if lf_enabled {
             let lv = sg.feature_data[i][1] as i32;
-            if abs_or_delta { lv } else { lf.loop_filter_level as i32 + lv }
+            if abs_or_delta {
+                lv
+            } else {
+                lf.loop_filter_level as i32 + lv
+            }
         } else {
             lf.loop_filter_level as i32
         };
@@ -4332,30 +4794,34 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
             flvl[0][0] = clip_uint(lflvl + ref_delta[0] as i32 * (1 << sh), 6) as u8;
             flvl[0][1] = flvl[0][0];
             for j in 1..4 {
-                flvl[j][0] = clip_uint(lflvl + (ref_delta[j] as i32 + mode_delta[0] as i32) * (1 << sh), 6) as u8;
-                flvl[j][1] = clip_uint(lflvl + (ref_delta[j] as i32 + mode_delta[1] as i32) * (1 << sh), 6) as u8;
+                flvl[j][0] = clip_uint(
+                    lflvl + (ref_delta[j] as i32 + mode_delta[0] as i32) * (1 << sh),
+                    6,
+                ) as u8;
+                flvl[j][1] = clip_uint(
+                    lflvl + (ref_delta[j] as i32 + mode_delta[1] as i32) * (1 << sh),
+                    6,
+                ) as u8;
             }
         } else {
-            for j in 0..4 {
-                flvl[j][0] = clip_uint(lflvl, 6) as u8;
-                flvl[j][1] = flvl[j][0];
+            for row in &mut flvl {
+                row[0] = clip_uint(lflvl, 6) as u8;
+                row[1] = row[0];
             }
         }
 
-        out[i] = SegmentParameterVP9::new(
+        *slot = SegmentParameterVP9::new(
             &VP9SegmentFlags::new(
                 if ref_enabled { 1 } else { 0 },
                 sg.feature_data[i][2] as u16,
                 if skip_enabled { 1 } else { 0 },
             ),
             flvl,
-            VP9_AC_QLOOKUP[bpp_index][qyac as usize] as i16, // luma_ac_quant_scale
-            VP9_DC_QLOOKUP[bpp_index][qydc] as i16, // luma_dc_quant_scale
-            VP9_AC_QLOOKUP[bpp_index][quvac] as i16, // chroma_ac_quant_scale
-            VP9_DC_QLOOKUP[bpp_index][quvdc] as i16, // chroma_dc_quant_scale
+            VP9_AC_QLOOKUP[bpp_index][qyac as usize], // luma_ac_quant_scale
+            VP9_DC_QLOOKUP[bpp_index][qydc],          // luma_dc_quant_scale
+            VP9_AC_QLOOKUP[bpp_index][quvac],         // chroma_ac_quant_scale
+            VP9_DC_QLOOKUP[bpp_index][quvdc],         // chroma_dc_quant_scale
         );
     }
     out
 }
-
-

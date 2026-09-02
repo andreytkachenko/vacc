@@ -17,14 +17,11 @@
 
 static GT: &str = include_str!("h265_cref_50.txt");
 
-
 use std::collections::HashMap;
 use vacc_core::codec::VideoCodec;
 use vacc_core::picture::{H265Pps, H265Sps};
 use vacc_parser::h265::H265Parser;
-use vacc_parser::{
-    BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
-};
+use vacc_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser};
 
 /// One ground-truth picture (cuvid parser output).
 #[derive(Debug, Clone)]

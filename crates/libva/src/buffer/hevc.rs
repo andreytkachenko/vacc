@@ -361,14 +361,13 @@ impl PictureParameterBufferHEVCRext {
 /// For REXT/SCC profiles the driver expects the picture parameter buffer to be
 /// this full extension size (base + rext + scc), while still being attached as
 /// a plain `VAPictureParameterBufferType` (matches FFmpeg vaapi_hevc.c).
-pub struct PictureParameterBufferHEVCExtension(Box<bindings::VAPictureParameterBufferHEVCExtension>);
+pub struct PictureParameterBufferHEVCExtension(
+    Box<bindings::VAPictureParameterBufferHEVCExtension>,
+);
 
 impl PictureParameterBufferHEVCExtension {
     /// Creates the wrapper. The SCC section is zeroed (Rext streams).
-    pub fn new(
-        base: &PictureParameterBufferHEVC,
-        rext: &PictureParameterBufferHEVCRext,
-    ) -> Self {
+    pub fn new(base: &PictureParameterBufferHEVC, rext: &PictureParameterBufferHEVCRext) -> Self {
         Self(Box::new(bindings::VAPictureParameterBufferHEVCExtension {
             base: *base.inner(),
             rext: *rext.inner(),
@@ -692,10 +691,7 @@ pub struct SliceParameterBufferHEVCExtension(Box<bindings::VASliceParameterBuffe
 
 impl SliceParameterBufferHEVCExtension {
     /// Creates the wrapper.
-    pub fn new(
-        base: &SliceParameterBufferHEVC,
-        rext: &SliceParameterBufferHEVCRext,
-    ) -> Self {
+    pub fn new(base: &SliceParameterBufferHEVC, rext: &SliceParameterBufferHEVCRext) -> Self {
         Self(Box::new(bindings::VASliceParameterBufferHEVCExtension {
             base: *base.inner(),
             rext: *rext.inner(),

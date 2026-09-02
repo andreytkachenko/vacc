@@ -3,8 +3,8 @@
 use vacc_core::{
     codec::VideoCodec as CoreVideoCodec,
     decoder::{Decoder, DecoderInfo},
-    frame::DecodedFrame,
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
+    frame::DecodedFrame,
     session::Extent2D,
 };
 
@@ -18,19 +18,19 @@ pub struct VulkanDecoder {
 impl VulkanDecoder {
     /// Create a new video decoder from bitstream data.
     pub fn new(data: Vec<u8>) -> Result<Self> {
-        let inner = vacc_vulkan::VideoDecoder::new(data, 64)
-            .map_err(|e| Error::Vulkan(e))?;
+        let inner = vacc_vulkan::VideoDecoder::new(data, 64).map_err(Error::Vulkan)?;
         Ok(Self { inner })
     }
 
     /// Decode all frames from the bitstream.
     pub fn decode_all(&mut self, max_frames: usize) -> Result<Vec<vacc_vulkan::DecodedFrame>> {
-        self.inner.decode_all(max_frames)
-            .map_err(|e| Error::Vulkan(e))
+        self.inner.decode_all(max_frames).map_err(Error::Vulkan)
     }
 
     /// Reorder frames from decoding order to presentation order (by POC).
-    pub fn reorder_to_presentation(frames: Vec<vacc_vulkan::DecodedFrame>) -> Vec<vacc_vulkan::DecodedFrame> {
+    pub fn reorder_to_presentation(
+        frames: Vec<vacc_vulkan::DecodedFrame>,
+    ) -> Vec<vacc_vulkan::DecodedFrame> {
         vacc_vulkan::VideoDecoder::reorder_to_presentation(frames)
     }
 }
@@ -48,7 +48,7 @@ impl Decoder for VulkanDecoder {
         _format: &VideoFormat,
     ) -> Result<Self> {
         Err(Error::Vulkan(vacc_vulkan::VideoError::DecoderInit(
-            "new_with_format not yet implemented".to_string()
+            "new_with_format not yet implemented".to_string(),
         )))
     }
 
@@ -72,7 +72,7 @@ impl Decoder for VulkanDecoder {
         // The inner decoder works on full bitstream data, not incremental submit
         // This would require modifying the inner decoder's API
         Err(Error::Vulkan(vacc_vulkan::VideoError::InvalidState(
-            "submit not supported - use decode_all instead".to_string()
+            "submit not supported - use decode_all instead".to_string(),
         )))
     }
 
@@ -80,7 +80,7 @@ impl Decoder for VulkanDecoder {
         // The inner decoder returns all frames at once via decode_all
         // This would require modifying the inner decoder's API for incremental decode
         Err(Error::Vulkan(vacc_vulkan::VideoError::InvalidState(
-            "decode not supported - use decode_all instead".to_string()
+            "decode not supported - use decode_all instead".to_string(),
         )))
     }
 

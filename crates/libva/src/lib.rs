@@ -7,6 +7,9 @@
 //! The starting point to using this crate is to open a [`Display`], from which a [`Context`] and
 //! [`Surface`]s can be allocated and used for doing actual work.
 
+// Buffer constructors mirror the C struct layouts, which have many fields.
+#![allow(clippy::too_many_arguments)]
+
 pub mod bindings;
 pub mod buffer;
 mod config;
@@ -18,6 +21,8 @@ mod picture;
 mod surface;
 mod usage_hint;
 
+pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfaceDescriptorObject;
+pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
 pub use bindings::constants;
 pub use bindings::constants::*;
 pub use bindings::VAConfigAttrib;
@@ -31,8 +36,6 @@ pub use bindings::VASurfaceAttribExternalBuffers;
 pub use bindings::VASurfaceAttribType;
 pub use bindings::VASurfaceID;
 pub use bindings::VASurfaceStatus;
-pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfaceDescriptorObject;
-pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
 pub use buffer::*;
 pub use config::*;
 pub use context::*;
@@ -115,7 +118,7 @@ mod tests {
 
         let offset = offsets[1] as usize;
         let pitch = pitches[1] as usize;
-        let uv_plane = data[offset..(offset + pitch * ((height + 1) / 2))]
+        let uv_plane = data[offset..(offset + pitch * height.div_ceil(2))]
             .chunks(pitch)
             .map(|line| &line[0..width]);
 
@@ -140,9 +143,7 @@ mod tests {
         let profile = bindings::VAProfile::VAProfileMPEG2Main;
         let entrypoints = display.query_config_entrypoints(profile).unwrap();
         assert!(!entrypoints.is_empty());
-        assert!(entrypoints
-            .iter()
-            .any(|e| *e == bindings::VAEntrypoint::VAEntrypointVLD));
+        assert!(entrypoints.contains(&bindings::VAEntrypoint::VAEntrypointVLD));
 
         let format = bindings::constants::VA_RT_FORMAT_YUV420;
         let width = 16u32;
@@ -176,7 +177,7 @@ mod tests {
             .create_context(
                 &config,
                 width,
-                ((height + 15) / 16) * 16,
+                height.div_ceil(16) * 16,
                 Some(&surfaces),
                 true,
             )

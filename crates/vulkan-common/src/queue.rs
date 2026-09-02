@@ -11,7 +11,10 @@ pub struct QueueHandle {
 
 impl QueueHandle {
     pub fn new(queue: vk::Queue, family_index: u32) -> Self {
-        Self { queue, family_index }
+        Self {
+            queue,
+            family_index,
+        }
     }
 
     pub fn is_null(&self) -> bool {

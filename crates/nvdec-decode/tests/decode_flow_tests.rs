@@ -12,7 +12,7 @@ const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// Load a known H.264 test file from the project assets.
 fn load_test_file(path: &str) -> Vec<u8> {
     let full_path = format!("{}/{}", PROJECT_ROOT, path);
-    std::fs::read(&full_path).expect(&format!("Failed to read test file: {}", full_path))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("Failed to read test file: {}", full_path))
 }
 
 /// Find the next start code in a byte stream.
@@ -32,49 +32,14 @@ fn find_start_code(data: &[u8], start: usize) -> Option<(usize, usize)> {
             if i == 0 || remaining[i - 1] != 0 {
                 return Some((start + i, 4));
             }
-        } else if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1 {
-            if i == 0 || remaining[i - 1] != 0 {
-                return Some((start + i, 3));
-            }
+        } else if remaining[i] == 0
+            && remaining[i + 1] == 0
+            && remaining[i + 2] == 1
+            && (i == 0 || remaining[i - 1] != 0)
+        {
+            return Some((start + i, 3));
         }
         i += 1;
-    }
-    None
-}
-
-/// Extract the first NAL unit of a given type (without start code).
-fn extract_first_nal(data: &[u8], nal_type: u8) -> Option<Vec<u8>> {
-    let mut offset = 0;
-    while offset < data.len() {
-        let (start, code_len) = match find_start_code(data, offset) {
-            Some((s, 4)) if s + 4 < data.len() => (s, 4),
-            Some((s, 3)) if s + 3 < data.len() => (s, 3),
-            _ => break,
-        };
-
-        let nal_header = data[start + code_len];
-        let unit_type = nal_header & 0x1F;
-
-        if unit_type == nal_type {
-            let mut end = start + code_len + 1;
-            while end < data.len() {
-                if data[end..].starts_with(&[0, 0, 0, 1]) || data[end..].starts_with(&[0, 0, 1]) {
-                    break;
-                }
-                end += 1;
-            }
-            return Some(data[start + code_len..end].to_vec());
-        }
-
-        // Find end of this NAL to skip it
-        let mut end = start + code_len + 1;
-        while end < data.len() {
-            if data[end..].starts_with(&[0, 0, 0, 1]) || data[end..].starts_with(&[0, 0, 1]) {
-                break;
-            }
-            end += 1;
-        }
-        offset = end;
     }
     None
 }
@@ -310,13 +275,6 @@ fn test_parser_handles_idr_frame() {
             "IDR slice must have nal_ref_idc > 0, got {}",
             slh.nal_ref_idc
         );
-
-        // IDR should have a valid idr_pic_id
-        assert!(
-            slh.idr_pic_id >= 0,
-            "IDR slice should have idr_pic_id >= 0, got {}",
-            slh.idr_pic_id
-        );
     }
 }
 
@@ -375,14 +333,6 @@ fn test_parser_handles_p_frames() {
         !p_slices.is_empty(),
         "Should find at least one P-frame slice in born_trailer.h264"
     );
-
-    for slh in &p_slices {
-        // P-slices should have valid L0 reference count
-        assert!(
-            slh.num_ref_idx_l0_active_minus1 >= 0,
-            "P-slice should have valid num_ref_idx_l0_active_minus1"
-        );
-    }
 }
 
 // ============================================================================
@@ -468,7 +418,7 @@ fn test_parser_frame_num_sequence() {
         } else {
             // Normal increasing case
             assert!(
-                curr > prev || curr == prev,
+                curr >= prev,
                 "Frame_num sequence not monotonic: {} -> {}",
                 prev,
                 curr
@@ -516,8 +466,8 @@ fn test_parser_poc_sequence_type0() {
     let max_poc_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
 
     for i in 1..frame_pocs.len() {
-        let prev_lsb = frame_pocs[i - 1].1 as i32;
-        let curr_lsb = frame_pocs[i].1 as i32;
+        let prev_lsb = frame_pocs[i - 1].1;
+        let curr_lsb = frame_pocs[i].1;
 
         // POC LSB should either increase or wrap around (similar to frame_num)
         // Allow wrap-around behavior
@@ -553,15 +503,6 @@ fn test_parser_dec_ref_pic_marking_extraction() {
     for slh in &ref_slices {
         // The field should be parsed (Vec can be empty if no MMCO operations)
         let _ = &slh.dec_ref_pic_marking;
-
-        // For IDR slices, we expect no_output_of_prior_pics_flag or long_term_reference_flag
-        if slh.nal_unit_type == 5 {
-            // IDR should have dec_ref_pic_marking parsed (even if empty)
-            assert!(
-                slh.dec_ref_pic_marking.len() >= 0,
-                "IDR slice should have dec_ref_pic_marking parsed"
-            );
-        }
     }
 }
 
@@ -603,7 +544,7 @@ fn test_parser_slice_nal_data_integrity() {
                     let nal_unit_type = first_byte & 0x1F;
                     // Should be a slice NAL type (1-5)
                     assert!(
-                        nal_unit_type >= 1 && nal_unit_type <= 5,
+                        (1..=5).contains(&nal_unit_type),
                         "Slice {} NAL unit type ({}) should be 1-5",
                         i,
                         nal_unit_type
