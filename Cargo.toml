@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/vk-video-core",
-    "crates/vk-video-parser",
-    "crates/vk-video-vulkan",
+    "crates/vacc-core",
+    "crates/vacc-parser",
+    "crates/vacc-vulkan",
     "crates/nvdec-decode",
     "crates/vulkan-decode",
     "crates/vulkan-common",
@@ -17,12 +17,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Vulkan Video Decoder library in Rust"
-repository = "https://github.com/andreytkachenko/vk-video"
+repository = "https://github.com/andreytkachenko/vacc"
 
 [workspace.dependencies]
-vk-video-core = { path = "crates/vk-video-core", version = "0.1.0" }
-vk-video-vulkan = { path = "crates/vk-video-vulkan", version = "0.1.0" }
-vk-video-parser = { path = "crates/vk-video-parser", version = "0.1.0" }
+vacc-core = { path = "crates/vacc-core", version = "0.1.0" }
+vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.0" }
+vacc-parser = { path = "crates/vacc-parser", version = "0.1.0" }
 nvdec-decode = { path = "crates/nvdec-decode", version = "0.1.0" }
 vaapi-decode = { path = "crates/vaapi-decode", version = "0.1.0" }
 vulkan-decode = { path = "crates/vulkan-decode", version = "0.1.0" }

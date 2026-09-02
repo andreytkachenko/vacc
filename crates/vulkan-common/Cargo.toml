@@ -7,7 +7,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
-vk-video-core = { workspace = true }
+vacc-core = { workspace = true }
 ash = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

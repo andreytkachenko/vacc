@@ -34,7 +34,7 @@ use libva::{
     VA_PICTURE_HEVC_RPS_LT_CURR,
 };
 
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec as CoreVideoCodec,
     decoder::{Decoder, DecoderInfo},
     frame::{DecodedFrame, PixelData, PixelPlane},
@@ -42,7 +42,7 @@ use vk_video_core::{
     session::Extent2D,
     picture::{Av1Sps, H264Sps, H264Pps, H265Sps, H265Pps, Vp9FrameData},
 };
-use vk_video_parser::{
+use vacc_parser::{
     av1::Av1Parser,
     bitstream::BitstreamPacket, h264::H264Parser, h265::H265Parser,
     h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG},
@@ -153,7 +153,7 @@ fn zigzag_to_raster_8x8(src: [u8; 64]) -> [u8; 64] {
 /// VA-API driver expects.
 ///
 /// The parser reports the raw H.264 spec slice_type modulo 5
-/// (vk-video-parser/src/h264.rs:551), i.e. 0=P, 1=B, 2=I, 3=SP, 4=SI.
+/// (vacc-parser/src/h264.rs:551), i.e. 0=P, 1=B, 2=I, 3=SP, 4=SI.
 ///
 /// The NVIDIA driver (drv_h264.c:copyH264SliceParam) sets `intra_pic_flag = 0`
 /// for any slice_type other than 2 (I) or 4 (SI). So intra slices must map to
@@ -333,7 +333,7 @@ impl SurfacePool {
     }
 }
 
-// NOTE: H.264 DPB management uses the common `vk_video_parser::h264_dpb::H264Dpb`
+// NOTE: H.264 DPB management uses the common `vacc_parser::h264_dpb::H264Dpb`
 // (ONE common DPB manager across backends). The per-slot VA surface mapping is
 // kept in `H264Context::slot_surfaces`.
 
@@ -368,7 +368,7 @@ struct StreamInfo {
 
 /// H.265 decode context.
 ///
-/// Uses the common decode-state foundation from `vk-video-parser`:
+/// Uses the common decode-state foundation from `vacc-parser`:
 /// - `dpb`: the common `H265Dpb` manager (ONE DPB manager across backends).
 /// - `slot_surfaces`: maps a common-DPB slot index to a VA surface-pool index.
 struct H265Context {
@@ -387,7 +387,7 @@ struct H265SliceInfo {
 
 /// VP9 decode context.
 ///
-/// Uses the common decode-state foundation from `vk-video-parser`:
+/// Uses the common decode-state foundation from `vacc-parser`:
 /// - `dpb`: the common `Vp9Dpb` manager (ONE DPB manager across backends).
 /// - `slot_surfaces`: maps a common-DPB slot index to a VA surface-pool index.
 struct Vp9Context {
@@ -409,7 +409,7 @@ struct Av1Context {
 
 /// H.264 decode context.
 ///
-/// Uses the common decode-state foundation from `vk-video-parser`:
+/// Uses the common decode-state foundation from `vacc-parser`:
 /// - `dpb`: the common `H264Dpb` manager (ONE DPB manager across backends).
 /// - `poc_calc`: the common `PocCalculator` (ONE POC implementation).
 /// - `slot_surfaces`: maps a common-DPB slot index to a VA surface-pool index.
@@ -705,7 +705,7 @@ impl VaapiDecoder {
         let (nal_unit_type, nal_ref_idc, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, field_pic_flag, bottom_field, idr_pic_id, no_output_of_prior_pics_flag, frame_num, slice_type, mmco, mod_l0, mod_l1) = if let Some(SliceHeader::H264(h264_slh)) = slice_header {
             (h264_slh.nal_unit_type, h264_slh.nal_ref_idc, h264_slh.num_ref_idx_l0_active_minus1, h264_slh.num_ref_idx_l1_active_minus1, h264_slh.field_pic_flag, h264_slh.bottom_field, h264_slh.idr_pic_id, h264_slh.no_output_of_prior_pics_flag, h264_slh.frame_num, h264_slh.slice_type % 5, &h264_slh.dec_ref_pic_marking[..], &h264_slh.ref_pic_list_modification_l0[..], &h264_slh.ref_pic_list_modification_l1[..])
         } else {
-            (1, 3, pps.num_ref_idx_l0_default_active_minus1, pps.num_ref_idx_l1_default_active_minus1, false, false, 0, false, 0, 2, &[] as &[vk_video_parser::h264::DecRefPicMarkingEntry], &[] as &[vk_video_parser::h264::RefPicListModificationEntry], &[] as &[vk_video_parser::h264::RefPicListModificationEntry])
+            (1, 3, pps.num_ref_idx_l0_default_active_minus1, pps.num_ref_idx_l1_default_active_minus1, false, false, 0, false, 0, 2, &[] as &[vacc_parser::h264::DecRefPicMarkingEntry], &[] as &[vacc_parser::h264::RefPicListModificationEntry], &[] as &[vacc_parser::h264::RefPicListModificationEntry])
         };
 
         let is_idr = nal_unit_type == 5 || idr_pic_id > 0;
@@ -1589,7 +1589,7 @@ impl VaapiDecoder {
                     let first_slice_header = first_slice.slice_header.clone();
 
                     // Get frame_num from first slice header
-                    let frame_num = if let Some(vk_video_parser::SliceHeader::H264(slh)) = &first_slice_header {
+                    let frame_num = if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice_header {
                         // Skip redundant slices: redundant_pic_cnt > 0 means this is a duplicate
                         // slice for error resilience, representing the same picture as a prior slice.
                         if slh.redundant_pic_cnt > 0 {
@@ -1607,7 +1607,7 @@ impl VaapiDecoder {
                     // the common DPB (refresh_frame_num_wrap in picture_start).
                     let sps = self.stream.sps.as_ref()
                         .expect("SPS should be available for H264 slice");
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &first_slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice_header {
                         // Per H.264 8.2.1 an IDR picture restarts the POC
                         // state (PicOrderCntMsb = 0). Non-IDR pictures —
                         // including CRAs, which do NOT clear the DPB — must
@@ -1783,7 +1783,7 @@ impl VaapiDecoder {
 
         // --- Per-slice RefPicList (u8 indices into ReferenceFrames) ---
         let lists = ctx.dpb.build_ref_lists();
-        let make_list = |l: &Vec<vk_video_parser::h265_dpb::H265RefPic>| -> [u8; 15] {
+        let make_list = |l: &Vec<vacc_parser::h265_dpb::H265RefPic>| -> [u8; 15] {
             core::array::from_fn(|i| {
                 l.get(i)
                     .and_then(|r| (r.slot >= 0).then(|| slot_to_refidx.get(&(r.slot as usize)).copied()))
@@ -3944,7 +3944,7 @@ impl VaapiDecoder {
 /// region only (Frame OBU payload after the frame header); the single-tile
 /// slice parameter references it at offset 0.
 fn build_av1_va_buffers(
-    fh: &vk_video_parser::av1::Av1FrameHeader,
+    fh: &vacc_parser::av1::Av1FrameHeader,
     sps: &Av1Sps,
     ref_frame_map: [libva::VASurfaceID; 8],
     current_frame: libva::VASurfaceID,

@@ -1,7 +1,7 @@
-//! NVDEC H.264 decoder implementation using vk-video-parser.
+//! NVDEC H.264 decoder implementation using vacc-parser.
 //!
 //! This module provides [`NvdecH264Decoder`], which uses the Rust-based
-//! [`H264Parser`](vk_video_parser::h264::H264Parser) for bitstream parsing,
+//! [`H264Parser`](vacc_parser::h264::H264Parser) for bitstream parsing,
 //! SPS/PPS extraction, POC calculation, and DPB management.
 //!
 //! ## How It Works
@@ -37,14 +37,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
     session::Extent2D,
 };
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 use crate::device::{
     cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
@@ -60,7 +60,7 @@ use crate::ffi::{
 use crate::picparams::build_cuvid_picparams;
 use crate::poc::PocCalculator;
 
-/// NVDEC H.264 Decoder using vk-video-parser.
+/// NVDEC H.264 Decoder using vacc-parser.
 ///
 /// This decoder uses NVIDIA's hardware NVDEC engine for H.264 video decoding.
 /// It leverages the Rust-based H264Parser for bitstream parsing, which handles
@@ -83,7 +83,7 @@ use crate::poc::PocCalculator;
 ///
 /// ```no_run
 /// use nvdec_decode::NvdecH264Decoder;
-/// use vk_video_core::decoder::Decoder;
+/// use vacc_core::decoder::Decoder;
 ///
 /// let data = std::fs::read("video.h264").unwrap();
 /// let mut decoder = NvdecH264Decoder::new(data).unwrap();
@@ -311,7 +311,7 @@ impl NvdecH264Decoder {
                     // Handle SPS — create or recreate decoder
                     if let Some(sps_box) = sps {
                         if let Some(h264_sps) =
-                            sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                            sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                         {
                             let (prev_w, prev_h) = {
                                 let s = self.prev_coded_size.lock().unwrap();
@@ -384,7 +384,7 @@ impl NvdecH264Decoder {
                     }
 
                     // Get the first slice header for this frame
-                    let slh = if let Some(vk_video_parser::SliceHeader::H264(h264_slh)) =
+                    let slh = if let Some(vacc_parser::SliceHeader::H264(h264_slh)) =
                         slices[0].slice_header.as_ref()
                     {
                         h264_slh
@@ -628,7 +628,7 @@ impl NvdecH264Decoder {
     }
 
     /// Create the NVDEC decoder from SPS parameters.
-    fn create_decoder(&mut self, sps: &vk_video_core::picture::H264Sps) -> NvdecResult<()> {
+    fn create_decoder(&mut self, sps: &vacc_core::picture::H264Sps) -> NvdecResult<()> {
         let coded_width = (sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
         let coded_height = if sps.frame_mbs_only_flag {
             (sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
@@ -850,7 +850,7 @@ impl NvdecH264Decoder {
     }
 
     /// Recreate the decoder due to resolution change.
-    fn recreate_decoder(&mut self, sps: &vk_video_core::picture::H264Sps) -> NvdecResult<()> {
+    fn recreate_decoder(&mut self, sps: &vacc_core::picture::H264Sps) -> NvdecResult<()> {
         let funcs = get_funcs()?;
         let _ = cu_ctx_set_current();
 
@@ -1270,7 +1270,7 @@ impl NvdecH264Decoder {
                 ref_pic: is_reference,
                 apply_film_grain: false,
             },
-            sync_info: vk_video_core::frame::FrameSyncInfo::default(),
+            sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
         })
     }

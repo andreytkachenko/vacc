@@ -1,7 +1,7 @@
 //! Tests for the Decoder trait implementation in NvdecH264Decoder.
 //!
 //! These tests verify that NvdecH264Decoder correctly implements the Decoder
-//! trait from vk-video-core, including info(), submit(), decode(), flush(),
+//! trait from vacc-core, including info(), submit(), decode(), flush(),
 //! reset(), and new_with_format().
 //!
 //! Note: Most tests require actual NVDEC hardware and are marked with #[ignore].
@@ -9,7 +9,7 @@
 //! with NVIDIA hardware and proper drivers.
 
 use nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder};
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
     format::{ChromaSubsampling, ComponentBitDepth, H264PictureLayout, VideoFormat},
@@ -68,7 +68,7 @@ fn test_decoder_info_codec() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_coded_size() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -83,7 +83,7 @@ fn test_decoder_info_coded_size() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         expected_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
                         expected_height = if h264_sps.frame_mbs_only_flag {
@@ -121,7 +121,7 @@ fn test_decoder_info_coded_size() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_display_size() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -136,7 +136,7 @@ fn test_decoder_info_display_size() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
                         let coded_height = if h264_sps.frame_mbs_only_flag {
@@ -196,7 +196,7 @@ fn test_decoder_info_display_size() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_chroma_subsampling() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -210,7 +210,7 @@ fn test_decoder_info_chroma_subsampling() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         expected_chroma = match h264_sps.chroma_format_idc {
                             0 => ChromaSubsampling::Monochrome,
@@ -245,7 +245,7 @@ fn test_decoder_info_chroma_subsampling() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_bit_depth() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -260,7 +260,7 @@ fn test_decoder_info_bit_depth() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         let bit_depth_minus8 = h264_sps.bit_depth_luma_minus8;
                         expected_luma_depth = match bit_depth_minus8 {
@@ -306,7 +306,7 @@ fn test_decoder_info_bit_depth() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_profile_idc() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -320,7 +320,7 @@ fn test_decoder_info_profile_idc() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         expected_profile_idc = Some(h264_sps.profile_idc as u32);
                     }
@@ -349,7 +349,7 @@ fn test_decoder_info_profile_idc() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_dpb_slots() {
-    use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
     let data = load_sps_pps_data();
 
@@ -363,7 +363,7 @@ fn test_decoder_info_dpb_slots() {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
                 if let Some(sps_box) = sps {
                     if let Some(h264_sps) =
-                        sps_box.downcast_ref::<vk_video_core::picture::H264Sps>()
+                        sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
                     {
                         expected_dpb_slots = h264_sps.max_num_ref_frames + 1;
                     }

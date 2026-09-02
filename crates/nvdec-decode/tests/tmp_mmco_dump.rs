@@ -1,5 +1,5 @@
 //! Temporary: dump MMCO ops from the sample. DELETE AFTER USE.
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -31,7 +31,7 @@ fn dump_mmco() {
                     }
                     dumped_pps = true;
                 }
-                if let Some(vk_video_parser::SliceHeader::H264(h)) = &slices[0].slice_header {
+                if let Some(vacc_parser::SliceHeader::H264(h)) = &slices[0].slice_header {
                     let ops: Vec<String> = h
                         .dec_ref_pic_marking
                         .iter()

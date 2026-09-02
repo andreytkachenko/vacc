@@ -12,8 +12,8 @@
 //! 9. SAO conditional parsing
 //! 10. FFI struct sizes matching NVIDIA SDK
 
-use vk_video_core::picture::{H265Pps, H265ShortTermRefPicSet, H265Sps};
-use vk_video_parser::{
+use vacc_core::picture::{H265Pps, H265ShortTermRefPicSet, H265Sps};
+use vacc_parser::{
     h265::{H265Parser, SliceHeaderInfo},
     BitstreamPacket, ParseResult, VideoParser,
 };
@@ -243,7 +243,7 @@ fn test_poc_after_reset() {
 
     match idr_result {
         ParseResult::Slice { slices, .. } => {
-            if let Some(vk_video_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
+            if let Some(vacc_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
                 assert_eq!(
                     info.curr_pic_order_cnt_val, 0,
                     "IDR POC should be 0 after reset"
@@ -716,7 +716,7 @@ fn test_full_parse_flow_with_slices() {
     match idr_result {
         ParseResult::Slice { slices, .. } => {
             assert!(!slices.is_empty(), "Should have at least one slice");
-            if let Some(vk_video_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
+            if let Some(vacc_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
                 assert!(info.is_idr, "Should be IDR");
                 assert_eq!(info.slice_type, 2, "IDR slice type should be 2 (I)");
                 assert_eq!(info.curr_pic_order_cnt_val, 0, "IDR POC should be 0");
@@ -736,7 +736,7 @@ fn test_full_parse_flow_with_slices() {
 
     match p_result {
         ParseResult::Slice { slices, .. } => {
-            if let Some(vk_video_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
+            if let Some(vacc_parser::SliceHeader::H265(info)) = &slices[0].slice_header {
                 assert!(!info.is_idr, "Should not be IDR");
                 assert_eq!(info.slice_type, 1, "P slice type should be 1");
                 assert_eq!(info.curr_pic_order_cnt_val, 2, "P-slice POC should be 2");

@@ -1,8 +1,8 @@
 //! H.264 Picture Order Count calculation.
 //!
-//! The POC calculation logic lives in [`vk_video_parser::h264_poc`] so that
+//! The POC calculation logic lives in [`vacc_parser::h264_poc`] so that
 //! all backends (Vulkan, NVDEC, VAAPI) share ONE common implementation.
 //! This module is a thin re-export for backward compatibility with code that
 //! imports `nvdec_decode::poc::PocCalculator`.
 
-pub use vk_video_parser::h264_poc::PocCalculator;
+pub use vacc_parser::h264_poc::PocCalculator;

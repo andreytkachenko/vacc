@@ -1,4 +1,4 @@
-//! Comprehensive tests for H.264 slice header parsing from vk-video-parser.
+//! Comprehensive tests for H.264 slice header parsing from vacc-parser.
 //!
 //! These tests verify that slice header parsing matches the H.264 specification
 //! (Annex B, section 7.4.3) and cuvid expectations.
@@ -19,7 +19,7 @@
 //! - deblocking filter parameters
 //! - Real-world parsing from born_trailer.h264
 
-use vk_video_parser::{
+use vacc_parser::{
     h264::H264Parser, BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser,
 };
 
@@ -385,8 +385,59 @@ fn build_slice_nal(
         bits.extend(encode_ue_bits(rpc));
     }
 
-    // dec_ref_pic_marking (for reference pictures). Per H.264 spec 7.3.2.1.1
-    // this comes BEFORE num_ref_idx_active_override_flag / ref_pic_list_modification.
+    // direct_spatial_mv_pred_flag (B slices only; precedes
+    // num_ref_idx_active_override_flag per spec 7.4.3)
+    if is_b_slice {
+        bits.push(direct_spatial_mv_pred_flag as u8);
+    }
+
+    // num_ref_idx_active_override_flag (P/SP/B slices, i.e. not I/SI)
+    if slice_type != 2 && slice_type != 4 {
+        bits.push(num_ref_idx_active_override_flag as u8);
+        if num_ref_idx_active_override_flag {
+            if let Some(l0) = override_l0 {
+                bits.extend(encode_ue_bits(l0));
+            }
+            if is_b_slice {
+                if let Some(l1) = override_l1 {
+                    bits.extend(encode_ue_bits(l1));
+                }
+            }
+        }
+    }
+
+    // ref_pic_list_modification_l0 (P/SP/B slices, i.e. not I/SI). The op loop
+    // terminates with modification_of_pic_nums_idc=3.
+    if slice_type != 2 && slice_type != 4 {
+        bits.push(ref_pic_list_mod_l0 as u8);
+        if ref_pic_list_mod_l0 {
+            for &(mod_idc, value) in ref_pic_list_mod_l0_entries {
+                bits.extend(encode_ue_bits(mod_idc));
+                if mod_idc <= 2 {
+                    bits.extend(encode_ue_bits(value));
+                }
+            }
+            bits.extend(encode_ue_bits(3)); // terminating modification_of_pic_nums_idc
+        }
+    }
+
+    // ref_pic_list_modification_l1 (B-slice only)
+    if is_b_slice && ref_pic_list_mod_l1 {
+        bits.push(1); // ref_pic_list_modification_flag_l1
+        for &(mod_idc, value) in ref_pic_list_mod_l1_entries {
+            bits.extend(encode_ue_bits(mod_idc));
+            if mod_idc <= 2 {
+                bits.extend(encode_ue_bits(value));
+            }
+        }
+        bits.extend(encode_ue_bits(3)); // terminating modification_of_pic_nums_idc
+    } else if is_b_slice {
+        bits.push(0); // ref_pic_list_modification_flag_l1
+    }
+
+    // dec_ref_pic_marking (for reference pictures). Per H.264 spec 7.4.3 this
+    // comes AFTER num_ref_idx_active_override_flag / ref_pic_list_modification
+    // (and pred_weight_table) and BEFORE cabac_init_idc.
     if nal_ref_idc > 0 {
         if let Some((no_output, lt_ref)) = dec_ref_pic_marking_idr {
             // IDR marking
@@ -406,49 +457,6 @@ fn build_slice_nal(
             // Non-IDR, no adaptive marking
             bits.push(0);
         }
-    }
-
-    // num_ref_idx_active_override_flag (P/SP/B slices)
-    if slice_type != 3 && slice_type != 4 {
-        // not SI/I
-        bits.push(num_ref_idx_active_override_flag as u8);
-        if num_ref_idx_active_override_flag {
-            if let Some(l0) = override_l0 {
-                bits.extend(encode_ue_bits(l0));
-            }
-            if is_b_slice {
-                if let Some(l1) = override_l1 {
-                    bits.extend(encode_ue_bits(l1));
-                }
-            }
-        }
-    }
-
-    // ref_pic_list_modification_l0
-    if slice_type != 3 && slice_type != 4 {
-        // not SI/I
-        bits.push(ref_pic_list_mod_l0 as u8);
-        if ref_pic_list_mod_l0 {
-            for &(mod_idc, value) in ref_pic_list_mod_l0_entries {
-                bits.extend(encode_ue_bits(mod_idc));
-                if mod_idc < 2 {
-                    bits.extend(encode_ue_bits(value));
-                }
-            }
-        }
-    }
-
-    // ref_pic_list_modification_l1 (B-slice only)
-    if is_b_slice && ref_pic_list_mod_l1 {
-        bits.push(1); // ref_pic_list_modification_flag_l1
-        for &(mod_idc, value) in ref_pic_list_mod_l1_entries {
-            bits.extend(encode_ue_bits(mod_idc));
-            if mod_idc < 2 {
-                bits.extend(encode_ue_bits(value));
-            }
-        }
-    } else if is_b_slice {
-        bits.push(0); // ref_pic_list_modification_flag_l1
     }
 
     // cabac_init_idc (not for I/SI slices, only if CABAC enabled)
@@ -503,7 +511,7 @@ fn parse_slice_header_with_parser(
     nal_data: &[u8],
     nal_ref_idc: u8,
     nal_unit_type: u8,
-) -> vk_video_parser::h264::SliceHeader {
+) -> vacc_parser::h264::SliceHeader {
     parser
         .parse_slice_header(nal_data, nal_ref_idc, nal_unit_type)
         .expect("Failed to parse slice header")
@@ -602,12 +610,12 @@ fn test_slice_header_basic_fields() {
     assert_eq!(slh_b.slice_type, 1); // B
     assert_eq!(slh_b.pic_parameter_set_id, 0);
 
-    // Test I-slice (slice_type=4)
+    // Test I-slice (slice_type=2)
     let slice_data_i = build_slice_nal(
         1,
         3,
         0,
-        4, // slice_type=I
+        2, // slice_type=I
         0,
         2,
         8,
@@ -638,7 +646,7 @@ fn test_slice_header_basic_fields() {
 
     let slh_i = parse_slice_header_with_parser(&parser, &slice_data_i, 3, 1);
 
-    assert_eq!(slh_i.slice_type, 4); // I
+    assert_eq!(slh_i.slice_type, 2); // I
 }
 
 // ============================================================================
@@ -681,9 +689,9 @@ fn test_slice_header_frame_num() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser_4bits, &slice_data, 3, 1);
@@ -721,9 +729,9 @@ fn test_slice_header_frame_num() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser_8bits, &slice_data, 3, 1);
@@ -761,9 +769,9 @@ fn test_slice_header_frame_num() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser_12bits, &slice_data, 3, 1);
@@ -810,9 +818,9 @@ fn test_slice_header_pic_order_cnt_lsb() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -865,9 +873,9 @@ fn test_slice_header_idr_pic_id() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 5);
@@ -903,9 +911,9 @@ fn test_slice_header_idr_pic_id() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_non_idr = parse_slice_header_with_parser(&parser, &slice_data_non_idr, 3, 1);
@@ -953,9 +961,9 @@ fn test_slice_header_field_pic_flag() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_frame = parse_slice_header_with_parser(&parser, &slice_data_frame, 3, 1);
@@ -991,9 +999,9 @@ fn test_slice_header_field_pic_flag() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_top = parse_slice_header_with_parser(&parser, &slice_data_top, 3, 1);
@@ -1029,9 +1037,9 @@ fn test_slice_header_field_pic_flag() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_bottom = parse_slice_header_with_parser(&parser, &slice_data_bottom, 3, 1);
@@ -1069,9 +1077,9 @@ fn test_slice_header_field_pic_flag() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_no_field =
@@ -1119,9 +1127,9 @@ fn test_slice_header_delta_pic_order_cnt() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -1160,9 +1168,9 @@ fn test_slice_header_delta_pic_order_cnt() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_zero = parse_slice_header_with_parser(&parser_zero, &slice_data_zero, 3, 1);
@@ -1210,9 +1218,9 @@ fn test_slice_header_redundant_pic_cnt() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -1250,9 +1258,9 @@ fn test_slice_header_redundant_pic_cnt() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_no_redundant =
@@ -1300,9 +1308,9 @@ fn test_slice_header_num_ref_idx_override() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_p = parse_slice_header_with_parser(&parser, &slice_data_p_no_override, 3, 1);
@@ -1338,9 +1346,9 @@ fn test_slice_header_num_ref_idx_override() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_p_override = parse_slice_header_with_parser(&parser, &slice_data_p_override, 3, 1);
@@ -1376,9 +1384,9 @@ fn test_slice_header_num_ref_idx_override() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_b = parse_slice_header_with_parser(&parser, &slice_data_b_override, 0, 1);
@@ -1431,9 +1439,9 @@ fn test_slice_header_ref_pic_list_modification() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -1472,9 +1480,9 @@ fn test_slice_header_ref_pic_list_modification() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_b = parse_slice_header_with_parser(&parser, &slice_data_b, 0, 1);
@@ -1526,9 +1534,9 @@ fn test_slice_header_dec_ref_pic_marking_idr() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 5);
@@ -1565,9 +1573,9 @@ fn test_slice_header_dec_ref_pic_marking_idr() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_lt = parse_slice_header_with_parser(&parser, &slice_data_lt, 3, 5);
@@ -1619,9 +1627,9 @@ fn test_slice_header_dec_ref_pic_marking_non_idr() {
         Some(operations), // adaptive marking
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -1661,9 +1669,9 @@ fn test_slice_header_dec_ref_pic_marking_non_idr() {
         None, // no adaptive marking
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_no_adaptive = parse_slice_header_with_parser(&parser, &slice_data_no_adaptive, 3, 1);
@@ -1698,9 +1706,9 @@ fn test_slice_header_dec_ref_pic_marking_non_idr() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_non_ref = parse_slice_header_with_parser(&parser, &slice_data_non_ref, 0, 1);
@@ -1748,9 +1756,9 @@ fn test_slice_header_cabac_init_idc() {
         None,
         Some(1), // cabac_init_idc=1
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh = parse_slice_header_with_parser(&parser, &slice_data, 3, 1);
@@ -1785,9 +1793,9 @@ fn test_slice_header_cabac_init_idc() {
         None,
         Some(2), // cabac_init_idc=2
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_b = parse_slice_header_with_parser(&parser, &slice_data_b, 0, 1);
@@ -1822,9 +1830,9 @@ fn test_slice_header_cabac_init_idc() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_i = parse_slice_header_with_parser(&parser, &slice_data_i, 3, 1);
@@ -1862,9 +1870,9 @@ fn test_slice_header_cabac_init_idc() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_no_cabac = parse_slice_header_with_parser(&parser_no_cabac, &slice_data_no_cabac, 3, 1);
@@ -1911,9 +1919,9 @@ fn test_slice_header_slice_qp_delta() {
         None,
         None,
         5, // slice_qp_delta=5
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_pos = parse_slice_header_with_parser(&parser, &slice_data_pos, 3, 1);
@@ -1948,9 +1956,9 @@ fn test_slice_header_slice_qp_delta() {
         None,
         None,
         -3, // slice_qp_delta=-3
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_neg = parse_slice_header_with_parser(&parser, &slice_data_neg, 3, 1);
@@ -1985,9 +1993,9 @@ fn test_slice_header_slice_qp_delta() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_zero = parse_slice_header_with_parser(&parser, &slice_data_zero, 3, 1);
@@ -2003,7 +2011,9 @@ fn test_slice_header_deblocking_filter_params() {
     // PPS with deblocking_filter_control_present_flag=false
     // (deblocking params are read from the slice header)
     let sps_data = build_sps(0, 4, 0, 4, false, true, 1);
-    let pps_data = build_pps(0, 0, false, false, false, false, false, 0, 0, 0);
+    // deblocking_filter_control_present_flag=true: the deblocking filter
+    // parameters are present in every slice header.
+    let pps_data = build_pps(0, 0, false, false, true, false, false, 0, 0, 0);
 
     let parser = init_parser_with_params(&sps_data, &pps_data);
 
@@ -2124,8 +2134,7 @@ fn test_slice_header_deblocking_filter_params() {
     assert_eq!(slh_always.slice_alpha_c0_offset_div2, 0);
     assert_eq!(slh_always.slice_beta_offset_div2, 0);
 
-    // PPS with deblocking_filter_control_present_flag=true
-    // (no deblocking params in the slice header)
+    // Same PPS, zero-valued deblocking params
     let pps_data_no_deblock = build_pps(0, 0, false, false, true, false, false, 0, 0, 0);
     let parser_no_deblock = init_parser_with_params(&sps_data, &pps_data_no_deblock);
 
@@ -2157,9 +2166,9 @@ fn test_slice_header_deblocking_filter_params() {
         None,
         None,
         0,
-        None,
-        None,
-        None,
+        Some(0), // disable_deblocking_filter_idc
+        Some(0), // slice_alpha_c0_offset_div2
+        Some(0), // slice_beta_offset_div2
     );
 
     let slh_no_deblock =
@@ -2218,7 +2227,7 @@ fn test_slice_header_from_born_trailer() {
                     break;
                 }
                 for slice in &slices {
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &slice.slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &slice.slice_header {
                         slice_count += 1;
 
                         if !first_slice_parsed {

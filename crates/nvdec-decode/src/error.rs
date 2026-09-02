@@ -66,7 +66,7 @@ pub enum NvdecError {
     ///
     /// Only H.264 is currently supported.
     #[error("Unsupported codec: {0:?}")]
-    UnsupportedCodec(vk_video_core::VideoCodec),
+    UnsupportedCodec(vacc_core::VideoCodec),
 
     /// Pixel format not supported.
     #[error("Unsupported format: {0}")]
@@ -74,7 +74,7 @@ pub enum NvdecError {
 
     /// Error from the bitstream parser.
     #[error("Parser error: {0}")]
-    ParserError(#[from] vk_video_parser::ParserError),
+    ParserError(#[from] vacc_parser::ParserError),
 
     /// I/O error (e.g., file read failure).
     #[error("IO error: {0}")]

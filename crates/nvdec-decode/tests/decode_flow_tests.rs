@@ -1,10 +1,10 @@
-//! Tests for the full decode flow with vk-video-parser in nvdec-decode.
+//! Tests for the full decode flow with vacc-parser in nvdec-decode.
 //!
 //! These tests verify the complete decode flow from bitstream parsing to
 //! CUVIDH264PICPARAMS construction, including SPS/PPS extraction, slice header
 //! parsing, frame type detection, POC calculation, and MMCO command extraction.
 
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -141,7 +141,7 @@ fn init_parser_with_params(data: &[u8]) -> H264Parser {
 }
 
 /// Parse slices from the bitstream and collect them.
-fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceHeader> {
+fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vacc_parser::h264::SliceHeader> {
     let mut parser = init_parser_with_params(data);
     let mut slices = Vec::new();
 
@@ -156,7 +156,7 @@ fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceH
                 ..
             }) => {
                 for slice in &frame_slices {
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &slice.slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &slice.slice_header {
                         slices.push(slh.clone());
                     }
                 }
@@ -791,12 +791,12 @@ fn test_parser_reset_and_reparse() {
 // Helper functions
 // ============================================================================
 
-fn parser_active_sps(data: &[u8]) -> vk_video_core::picture::H264Sps {
+fn parser_active_sps(data: &[u8]) -> vacc_core::picture::H264Sps {
     let parser = init_parser_with_params(data);
     parser.active_sps().unwrap().clone()
 }
 
-fn parser_active_pps(data: &[u8]) -> vk_video_core::picture::H264Pps {
+fn parser_active_pps(data: &[u8]) -> vacc_core::picture::H264Pps {
     let parser = init_parser_with_params(data);
     parser.active_pps().unwrap().clone()
 }

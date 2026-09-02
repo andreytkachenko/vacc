@@ -4,14 +4,14 @@
 //! would compute based on the H.264 specification (Annex B, D.3.3).
 //!
 //! The `PocCalculator` (re-exported from the common
-//! `vk_video_parser::h264_poc` module in `nvdec_decode::poc`) implements
+//! `vacc_parser::h264_poc` module in `nvdec_decode::poc`) implements
 //! the same algorithm as cuvid's parser callbacks.
 //!
 //! Reference: H.264/AVC specification, section D.3.3 "Decoding process for
 //! picture order count"
 
 use nvdec_decode::poc::PocCalculator;
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -110,7 +110,7 @@ fn init_parser_with_params(data: &[u8]) -> H264Parser {
 }
 
 /// Parse slices from the bitstream and collect them.
-fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceHeader> {
+fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vacc_parser::h264::SliceHeader> {
     let mut parser = init_parser_with_params(data);
     let mut slices = Vec::new();
 
@@ -124,7 +124,7 @@ fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceH
                 ..
             }) => {
                 for slice in &frame_slices {
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &slice.slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &slice.slice_header {
                         slices.push(slh.clone());
                     }
                 }
@@ -145,8 +145,8 @@ fn create_slice_header(
     delta_pic_order_cnt: [i32; 2],
     nal_unit_type: u8,
     nal_ref_idc: u8,
-) -> vk_video_parser::h264::SliceHeader {
-    vk_video_parser::h264::SliceHeader {
+) -> vacc_parser::h264::SliceHeader {
+    vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 0, // P slice
         pic_parameter_set_id: 0,
@@ -195,8 +195,8 @@ fn create_slice_header(
 }
 
 /// Create a mock SPS for POC type 0 with given max_pic_order_cnt_lsb.
-fn create_sps_poc_type_0(max_pic_order_cnt_lsb: u32) -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+fn create_sps_poc_type_0(max_pic_order_cnt_lsb: u32) -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 0;
     sps.max_pic_order_cnt_lsb = max_pic_order_cnt_lsb;
     sps.log2_max_pic_order_cnt_lsb_minus4 = (max_pic_order_cnt_lsb as f64).log2() as u8 - 4;
@@ -210,8 +210,8 @@ fn create_sps_poc_type_1(
     delta_pic_order_always_zero_flag: bool,
     num_ref_frames_in_pic_order_cnt_cycle: u32,
     offset_for_ref_frame: Vec<i32>,
-) -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+) -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 1;
     sps.delta_pic_order_always_zero_flag = delta_pic_order_always_zero_flag;
     sps.frame_mbs_only_flag = true;
@@ -222,8 +222,8 @@ fn create_sps_poc_type_1(
 }
 
 /// Create a mock SPS for POC type 2.
-fn create_sps_poc_type_2(max_frame_num: u32) -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+fn create_sps_poc_type_2(max_frame_num: u32) -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 2;
     sps.max_frame_num = max_frame_num;
     sps.log2_max_frame_num_minus4 = (max_frame_num as f64).log2() as u8 - 4;
@@ -729,7 +729,7 @@ fn test_poc_type2_implicit_from_frame_num() {
 
 /// Test 11: POC type 2 with frame_num wraparound.
 ///
-/// The common [`PocCalculator`] (vk_video_parser::h264_poc) tracks FrameNum
+/// The common [`PocCalculator`] (vacc_parser::h264_poc) tracks FrameNum
 /// wrap cycles so that type-2 POCs remain MONOTONIC across wraps:
 /// - ref: (cycle * MaxFrameNum + frame_num) * 2
 /// - non-ref: (cycle * MaxFrameNum + frame_num) * 2 + 1

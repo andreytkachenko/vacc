@@ -1,6 +1,6 @@
-//! Comparison tests between vk-video-parser output and cuvid parser expectations.
+//! Comparison tests between vacc-parser output and cuvid parser expectations.
 //!
-//! These tests verify that vk-video-parser extracts the same information that
+//! These tests verify that vacc-parser extracts the same information that
 //! cuvid's parser would extract in CUVIDEOFORMAT and CUVIDH264PICPARAMS.
 //!
 //! Reference: Video_Codec_SDK cuviddec.h / nvcuvid.h
@@ -8,7 +8,7 @@
 use nvdec_decode::ffi::{
     cudaVideoChromaFormat, cudaVideoCodec, CUVIDDISPLAYAREA, CUVIDEOFORMAT, CUVIDH264PICPARAMS,
 };
-use vk_video_parser::{
+use vacc_parser::{
     h264::H264Parser, BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser,
 };
 
@@ -64,12 +64,12 @@ fn extract_first_nal_with_start_code(data: &[u8], nal_type: u8) -> Option<Vec<u8
     None
 }
 
-/// Build a CUVIDEOFORMAT-equivalent structure from vk-video-parser's SPS.
+/// Build a CUVIDEOFORMAT-equivalent structure from vacc-parser's SPS.
 ///
 /// This mirrors what cuvid's parser does when it calls the sequence callback
 /// with a populated CUVIDEOFORMAT after parsing the H.264 SPS.
 fn build_cuvideoformat_from_sps(
-    sps: &vk_video_core::picture::H264Sps,
+    sps: &vacc_core::picture::H264Sps,
     format: &DetectedVideoFormat,
 ) -> CUVIDEOFORMAT {
     // coded_width = (pic_width_in_mbs_minus1 + 1) * 16
@@ -146,7 +146,7 @@ fn build_cuvideoformat_from_sps(
 // CUVIDEOFORMAT Field Comparison Tests
 // ============================================================================
 
-/// Test that vk-video-parser SPS fields map correctly to CUVIDEOFORMAT fields.
+/// Test that vacc-parser SPS fields map correctly to CUVIDEOFORMAT fields.
 ///
 /// Verifies the core fields that cuvid's parser extracts from H.264 SPS:
 /// - coded_width, coded_height
@@ -341,10 +341,10 @@ fn test_vkvideo_parser_chroma_format_mapping() {
         "chroma_format_idc=1 should map to cudaVideoChromaFormat_420"
     );
 
-    // Verify vk-video-parser's DetectedVideoFormat chroma_subsampling matches
+    // Verify vacc-parser's DetectedVideoFormat chroma_subsampling matches
     assert_eq!(
         format.chroma_subsampling,
-        vk_video_core::format::ChromaSubsampling::_420,
+        vacc_core::format::ChromaSubsampling::_420,
         "DetectedVideoFormat chroma_subsampling should be _420"
     );
 
@@ -391,7 +391,7 @@ fn test_vkvideo_parser_codec_type() {
     // Verify codec is H264
     assert_eq!(
         format.codec,
-        vk_video_core::codec::VideoCodec::DecodeH264,
+        vacc_core::codec::VideoCodec::DecodeH264,
         "Codec should be DecodeH264"
     );
 
@@ -521,7 +521,7 @@ fn test_vkvideo_parser_sps_fields_for_cuvid_picparams() {
 /// Test that SPS fields can be correctly mapped to CUVIDH264PICPARAMS structure.
 ///
 /// This test verifies the exact field mapping that would be used when
-/// constructing CUVIDH264PICPARAMS from vk-video-parser output.
+/// constructing CUVIDH264PICPARAMS from vacc-parser output.
 #[test]
 fn test_vkvideo_parser_sps_to_cuvid_picparams_mapping() {
     let data = load_test_file("assets/born_trailer.h264");
@@ -938,7 +938,7 @@ fn test_cuvid_format_and_picparams_consistency() {
 
 /// Test that DetectedVideoFormat fields are consistent with CUVIDEOFORMAT fields.
 ///
-/// This ensures the vk-video-parser's detected format can be used to populate
+/// This ensures the vacc-parser's detected format can be used to populate
 /// CUVIDEOFORMAT without discrepancies.
 #[test]
 fn test_detected_format_consistency_with_cuvid_format() {
@@ -975,7 +975,7 @@ fn test_detected_format_consistency_with_cuvid_format() {
     // Codec must be H264
     assert_eq!(
         format.codec,
-        vk_video_core::codec::VideoCodec::DecodeH264,
+        vacc_core::codec::VideoCodec::DecodeH264,
         "DetectedVideoFormat codec must be DecodeH264"
     );
 }

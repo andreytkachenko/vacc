@@ -1,7 +1,7 @@
-//! NVDEC AV1 decoder using vk-video-parser (Av1Parser).
+//! NVDEC AV1 decoder using vacc-parser (Av1Parser).
 //!
 //! Mirrors the structure of [`crate::vp9::NvdecVp9Decoder`] and the DPB logic
-//! of the Vulkan AV1 decoder (`crates/vk-video-vulkan/src/av1.rs`):
+//! of the Vulkan AV1 decoder (`crates/vacc-vulkan/src/av1.rs`):
 //!
 //! - IVF packets are OBU-walked; the SPS (OBU type 1) is parsed once, and each
 //!   Frame OBU (type 6) / show_existing FrameHeader OBU (type 3) is parsed with
@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::os::raw::{c_int, c_uint};
 use std::sync::Mutex;
 
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
@@ -34,9 +34,9 @@ use vk_video_core::{
     picture::Av1Sps,
     session::Extent2D,
 };
-use vk_video_parser::av1::{Av1FrameHeader, Av1Parser};
-use vk_video_parser::av1_dpb::{Av1Dpb, AV1_NUM_FRAME_BUFFERS};
-use vk_video_parser::{DetectedVideoFormat, VideoParser};
+use vacc_parser::av1::{Av1FrameHeader, Av1Parser};
+use vacc_parser::av1_dpb::{Av1Dpb, AV1_NUM_FRAME_BUFFERS};
+use vacc_parser::{DetectedVideoFormat, VideoParser};
 
 use crate::{
     device::{
@@ -481,7 +481,7 @@ pub fn build_cuvid_av1_picparams(
 // NvdecAv1Decoder
 // ============================================================================
 
-/// NVDEC AV1 decoder using vk-video-parser.
+/// NVDEC AV1 decoder using vacc-parser.
 ///
 /// Not `Send`/`Sync`; use from a single thread. The CUDA context must be set
 /// current before decode methods.
@@ -1355,7 +1355,7 @@ impl NvdecAv1Decoder {
                 ref_pic: false,
                 apply_film_grain: false,
             },
-            sync_info: vk_video_core::frame::FrameSyncInfo::default(),
+            sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
         })
     }

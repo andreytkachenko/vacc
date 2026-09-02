@@ -14,13 +14,13 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 ┌──────────────────────────────────────────────────────────────────┐
 │                        vacc (workspace)                          │
 │                                                                  │
-│   vk-video-core        shared types, traits, errors              │
-│   vk-video-parser      bitstream parsing (H.264/HEVC/VP9/AV1),   │
+│   vacc-core        shared types, traits, errors              │
+│   vacc-parser      bitstream parsing (H.264/HEVC/VP9/AV1),   │
 │                        common DPB + POC state (one manager       │
 │                        across backends)                          │
 │                                                                  │
 │   Backends:                                                      │
-│     vk-video-vulkan    Vulkan Video (ash)                        │
+│     vacc-vulkan    Vulkan Video (ash)                        │
 │     nvdec-decode       NVIDIA NVDEC via libnvcuvid (cuvid)       │
 │     vaapi-decode       VAAPI stateless decode                    │
 │     libva              Rust bindings for libva                   │
@@ -31,7 +31,7 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 
 ## Crate Overview
 
-### `vk-video-core`
+### `vacc-core`
 Core types and traits shared across all crates:
 - `VideoCodec` - H.264, H.265, AV1, VP9 identification
 - `VideoFormat` - Chroma subsampling, bit depth, profile info
@@ -39,7 +39,7 @@ Core types and traits shared across all crates:
 - `DecodedFrame` - Output frame representation
 - `VideoError` / `VideoResult` - Error handling
 
-### `vk-video-parser`
+### `vacc-parser`
 Bitstream parsing for each codec:
 - **H.264**: SPS, PPS, slice header parsing
 - **H.265**: VPS, SPS, PPS, slice header parsing
@@ -48,7 +48,7 @@ Bitstream parsing for each codec:
 - RBSP (Raw Byte Sequence Payload) handling
 - Emulation prevention byte removal
 
-### `vk-video-vulkan`
+### `vacc-vulkan`
 Vulkan Video implementation using `ash`:
 - `VulkanDevice` - Device initialization with video decode support
 - `VideoSession` - `VkVideoSessionKHR` management
@@ -58,13 +58,13 @@ Vulkan Video implementation using `ash`:
 ### `nvdec-decode`
 NVIDIA NVDEC via `libnvcuvid.so` (loaded dynamically with `libloading`):
 - Per-codec decoders (H.264 / HEVC / VP9 / AV1) with cuvid parser bypass
-  (bitstream parsed by `vk-video-parser`, DPB managed in Rust)
+  (bitstream parsed by `vacc-parser`, DPB managed in Rust)
 - `query_decoder_caps` / `VACC_PROBE_CUVID=1` — driver capability queries;
   unsupported streams fail up front with a clear message
 
 ### `vaapi-decode`
 VAAPI stateless decode on any libva driver (verified with Intel iHD):
-- Per-codec decoders using the common DPB/POC state from `vk-video-parser`
+- Per-codec decoders using the common DPB/POC state from `vacc-parser`
 - Early capability rejections (e.g. H.264 4:2:2 on drivers whose AVC
   pipeline is NV12-only) instead of mid-decode driver errors
 
@@ -76,15 +76,15 @@ Rust bindings for libva (display, config, context, surface, picture).
 ```toml
 # Cargo.toml
 [dependencies]
-vk-video-core = { path = "crates/vk-video-core" }
-vk-video-parser = { path = "crates/vk-video-parser" }
-vk-video-vulkan = { path = "crates/vk-video-vulkan" }
+vacc-core = { path = "crates/vacc-core" }
+vacc-parser = { path = "crates/vacc-parser" }
+vacc-vulkan = { path = "crates/vacc-vulkan" }
 ```
 
 ```rust
-use vk_video_core::codec::VideoCodec;
-use vk_video_parser::h264::H264Parser;
-use vk_video_vulkan::{VideoDeviceBuilder, VideoPipeline, VideoCodec};
+use vacc_core::codec::VideoCodec;
+use vacc_parser::h264::H264Parser;
+use vacc_vulkan::{VideoDeviceBuilder, VideoPipeline, VideoCodec};
 
 // 1. Initialize Vulkan device
 let device = VideoDeviceBuilder::new()
@@ -223,6 +223,26 @@ HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardwa
   cuvid API); readback scales to 8-bit with round+clamp, matching the other backends.
 - Diagnostics: `VACC_PROBE_CUVID=1` dumps the full cuvid decoder-caps table; `VACC_VA_DUMP=1`
   dumps the exact VA-API picture/slice parameter buffers.
+
+## Test Samples
+
+The single master source is `assets/big_buck_bunney.h265` (Big Buck Bunny, 1920x1080,
+300 frames). All 24 samples in `assets/samples/` are codec variants of that one video,
+produced by the ffmpeg recipes embedded in `verify-all.py` (per-sample encoder options:
+profile, chroma format, bit depth, GOP/stress flags).
+
+- `python3 verify-all.py` — verifies the committed samples (default; no encoding).
+- `python3 verify-all.py --generate` — encodes only **missing** samples from the master.
+- `python3 verify-all.py --regen` — re-encodes **all** samples (overwrites). Regenerated
+  files are *structurally equivalent* (same profile/chroma/depth, same keyframe layout)
+  but **not byte-identical** to the committed set (encoder-version differences). The
+  committed samples are the canonical anchors for embedded test data (h264 NAL constants,
+  VP9 golden DPB fixture, AV1 expected-value table), so prefer `--generate` unless you
+  deliberately refresh the whole set.
+
+Other assets: `assets/bframe_test.h264` (B-frame/MMCO DPB-parity test) and
+`assets/born_trailer.h264` (integration tests). The VP9 golden DPB fixture for
+`nvdec-decode` is embedded at `crates/nvdec-decode/tests/data/vp9_dp_golden_20f.ivf`.
 
 ## Re-verification
 

@@ -217,9 +217,9 @@ dependencies = [
  "ash",
  "nvdec-decode",
  "vaapi-decode",
- "vk-video-core",
- "vk-video-parser",
- "vk-video-vulkan",
+ "vacc-core",
+ "vacc-parser",
+ "vacc-vulkan",
  "vulkan-decode",
 ]
 
@@ -604,9 +604,9 @@ dependencies = [
  "libloading",
  "log",
  "thiserror 2.0.18",
- "vk-video-core",
- "vk-video-parser",
- "vk-video-vulkan",
+ "vacc-core",
+ "vacc-parser",
+ "vacc-vulkan",
 ]
 
 [[package]]
@@ -1034,8 +1034,47 @@ dependencies = [
  "log",
  "pkg-config",
  "thiserror 2.0.18",
- "vk-video-core",
- "vk-video-parser",
+ "vacc-core",
+ "vacc-parser",
+]
+
+[[package]]
+name = "vacc-core"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bitflags",
+ "bytemuck",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "vacc-parser"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "log",
+ "thiserror 2.0.18",
+ "vacc-core",
+]
+
+[[package]]
+name = "vacc-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bitflags",
+ "bytemuck",
+ "gpu-video",
+ "libloading",
+ "log",
+ "thiserror 2.0.18",
+ "tracing",
+ "vacc-core",
+ "vacc-parser",
+ "vk-video",
 ]
 
 [[package]]
@@ -1076,52 +1115,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "vk-video-core"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bitflags",
- "bytemuck",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "vk-video-parser"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "bytemuck",
- "log",
- "thiserror 2.0.18",
- "vk-video-core",
-]
-
-[[package]]
-name = "vk-video-vulkan"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bitflags",
- "bytemuck",
- "gpu-video",
- "libloading",
- "log",
- "thiserror 2.0.18",
- "tracing",
- "vk-video",
- "vk-video-core",
- "vk-video-parser",
-]
-
-[[package]]
 name = "vulkan-common"
 version = "0.1.0"
 dependencies = [
  "ash",
  "log",
  "thiserror 2.0.18",
- "vk-video-core",
+ "vacc-core",
 ]
 
 [[package]]
@@ -1130,8 +1130,8 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "thiserror 2.0.18",
- "vk-video-core",
- "vk-video-vulkan",
+ "vacc-core",
+ "vacc-vulkan",
 ]
 
 [[package]]

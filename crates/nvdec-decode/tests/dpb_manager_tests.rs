@@ -1,9 +1,9 @@
 //! DpbManager integration tests for nvdec-decode.
 //!
-//! These tests verify that DpbManager from vk-video-vulkan works correctly
+//! These tests verify that DpbManager from vacc-vulkan works correctly
 //! when used by nvdec-decode for reference frame tracking during decode.
 
-use vk_video_vulkan::{DpbManager, H264MmcoCommand};
+use vacc_vulkan::{DpbManager, H264MmcoCommand};
 
 // ============================================================================
 // Helper: Create a DpbManager with configured slots and populate entries
@@ -443,7 +443,7 @@ fn test_dpb_manager_invalidate_all() {
         );
         assert_eq!(
             dpb.entries[i].last_access,
-            vk_video_vulkan::LastAccessType::None
+            vacc_vulkan::LastAccessType::None
         );
     }
 }
@@ -459,7 +459,7 @@ fn test_dpb_manager_invalidate_slot() {
         create_dpb_with_entries(8, &[(0, 1, [10, 10]), (1, 2, [20, 20]), (2, 3, [30, 30])]);
 
     dpb.entries[1].current_layout = ash::vk::ImageLayout::GENERAL;
-    dpb.entries[1].last_access = vk_video_vulkan::LastAccessType::DecodeWrite;
+    dpb.entries[1].last_access = vacc_vulkan::LastAccessType::DecodeWrite;
 
     dpb.invalidate_slot(1);
 
@@ -467,14 +467,16 @@ fn test_dpb_manager_invalidate_slot() {
     assert!(!dpb.entries[1].is_valid);
     assert!(dpb.entries[2].is_valid);
 
-    // Verify layout and access reset
+    // Verify access reset. `current_layout` is intentionally preserved on
+    // single-slot invalidation (the image's Vulkan layout is physical state;
+    // see DpbManager::invalidate_slot docs).
     assert_eq!(
         dpb.entries[1].current_layout,
-        ash::vk::ImageLayout::UNDEFINED
+        ash::vk::ImageLayout::GENERAL
     );
     assert_eq!(
         dpb.entries[1].last_access,
-        vk_video_vulkan::LastAccessType::None
+        vacc_vulkan::LastAccessType::None
     );
 
     // Out of bounds should be safe
@@ -710,23 +712,23 @@ fn test_dpb_manager_last_access_tracking() {
     let mut dpb = DpbManager::new(4);
 
     // Set last access for slot 0
-    dpb.set_slot_last_access(0, vk_video_vulkan::LastAccessType::DecodeWrite);
+    dpb.set_slot_last_access(0, vacc_vulkan::LastAccessType::DecodeWrite);
     assert_eq!(
         dpb.get_slot_last_access(0),
-        vk_video_vulkan::LastAccessType::DecodeWrite
+        vacc_vulkan::LastAccessType::DecodeWrite
     );
 
     // Set last access for slot 1
-    dpb.set_slot_last_access(1, vk_video_vulkan::LastAccessType::TransferRead);
+    dpb.set_slot_last_access(1, vacc_vulkan::LastAccessType::TransferRead);
     assert_eq!(
         dpb.get_slot_last_access(1),
-        vk_video_vulkan::LastAccessType::TransferRead
+        vacc_vulkan::LastAccessType::TransferRead
     );
 
     // Slot 2 should be None by default
     assert_eq!(
         dpb.get_slot_last_access(2),
-        vk_video_vulkan::LastAccessType::None
+        vacc_vulkan::LastAccessType::None
     );
 }
 

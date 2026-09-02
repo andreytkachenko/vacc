@@ -1,8 +1,8 @@
-//! NAL unit extraction and parsing tests for vk-video-parser.
+//! NAL unit extraction and parsing tests for vacc-parser.
 //!
 //! Tests verify NAL unit extraction matches H.264 specification (ITU-T H.264/AVC).
 
-use vk_video_parser::nal::{self, CodecType, H264NalUnitType, NalUnit};
+use vacc_parser::nal::{self, CodecType, H264NalUnitType, NalUnit};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");

@@ -10,7 +10,7 @@
 //! with NVIDIA hardware and proper drivers.
 
 use nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder, NvdecResult};
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
@@ -221,7 +221,7 @@ fn test_error_decoder_creation_failed() {
 // ============================================================================
 // Test 6: test_error_parser_error_propagation
 // ============================================================================
-// Verify ParserError is correctly propagated from vk-video-parser when
+// Verify ParserError is correctly propagated from vacc-parser when
 // parsing fails.
 // ============================================================================
 
@@ -620,12 +620,12 @@ fn test_error_type_implements_std_error() {
 // ============================================================================
 // Test: test_error_from_parser_error
 // ============================================================================
-// Verify From<vk_video_parser::ParserError> implementation.
+// Verify From<vacc_parser::ParserError> implementation.
 // ============================================================================
 
 #[test]
 fn test_error_from_parser_error() {
-    let parser_err = vk_video_parser::ParserError::InvalidBitstream;
+    let parser_err = vacc_parser::ParserError::InvalidBitstream;
     let nvdec_err: NvdecError = parser_err.into();
 
     match nvdec_err {

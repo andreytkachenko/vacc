@@ -1,0 +1,20 @@
+[package]
+name = "vacc-vulkan"
+description = "Vulkan Video Decoder implementation using ash"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+vacc-parser = { workspace = true }
+ash = { workspace = true }
+bytemuck.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+log.workspace = true
+tracing.workspace = true
+libloading.workspace = true
+vk-video = "0.3.1"
+gpu-video = "0.4.0"

@@ -20,14 +20,14 @@
 //! nvdec (H.264/H.265/VP9/AV1, requires an NVIDIA GPU).
 //!
 //! Examples:
-//!   cargo run --release -p examples --example decode -- -b vulkan -i assets/big_buck_bunney_vp9.ivf
+//!   cargo run --release -p examples --example decode -- -b vulkan -i assets/samples/vp9_profile0.ivf
 //!   cargo run --release -p examples --example decode -- -b nvdec  -i samples/av1_gop1.ivf -n 30
 //!   cargo run --release -p examples --example decode -- -b vaapi  -i assets/born_trailer.h264
 
 use std::time::Instant;
 
-use vk_video_core::decoder::Decoder;
-use vk_video_core::frame::{DecodedFrame as CoreFrame, PixelData, PixelPlane};
+use vacc_core::decoder::Decoder;
+use vacc_core::frame::{DecodedFrame as CoreFrame, PixelData, PixelPlane};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -385,7 +385,7 @@ fn fmt_ms(v: f64) -> String {
 /// One decoded display frame, regardless of backend.
 enum Frame {
     Core(CoreFrame),
-    Vk(vk_video_vulkan::DecodedFrame),
+    Vk(vacc_vulkan::DecodedFrame),
 }
 
 impl Frame {
@@ -510,7 +510,7 @@ fn chroma_sub(coded: u32, chroma: u32) -> usize {
 /// Normalize a Vulkan `DecodedFrame` to canonical planar Y+U+V bytes,
 /// cropped to the display size. Planes are full coded size with
 /// `sample_size` bytes per sample.
-fn canonical_vk(frame: &vk_video_vulkan::DecodedFrame) -> Vec<u8> {
+fn canonical_vk(frame: &vacc_vulkan::DecodedFrame) -> Vec<u8> {
     let bps = frame.pixels.sample_size as usize;
     let disp_w = frame.display_width as usize;
     let disp_h = frame.display_height as usize;

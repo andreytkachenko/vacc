@@ -1,12 +1,12 @@
-//! Construction of CUVID picture parameter structures from vk-video-parser output.
+//! Construction of CUVID picture parameter structures from vacc-parser output.
 //!
 //! Replaces the NVIDIA CUVID parser's automatic population of `CUVIDPICPARAMS`
 //! with explicit construction from parsed SPS, PPS, and slice header data.
 
 use std::os::raw::{c_char, c_int, c_uchar, c_ushort};
 
-use vk_video_core::picture::{H264Pps, H264Sps, H265Pps, H265Sps};
-use vk_video_parser::h265::SliceHeaderInfo;
+use vacc_core::picture::{H264Pps, H264Sps, H265Pps, H265Sps};
+use vacc_parser::h265::SliceHeaderInfo;
 
 use crate::ffi::{
     CUVIDCODECSPECIFIC, CUVIDH264DPBENTRY, CUVIDH264FMOASO, CUVIDH264PICPARAMS, CUVIDH264SVCMVC,
@@ -67,7 +67,7 @@ fn get_weight_scale_8x8(sps: &H264Sps) -> [[u8; 64]; 2] {
 pub fn build_cuvid_h264_picparams(
     sps: &H264Sps,
     pps: &H264Pps,
-    slh: &vk_video_parser::h264::SliceHeader,
+    slh: &vacc_parser::h264::SliceHeader,
     frame_num: u32,
     poc: i32,
     is_reference: bool,
@@ -155,7 +155,7 @@ pub fn build_cuvid_h264_picparams(
 pub fn build_cuvid_picparams(
     sps: &H264Sps,
     pps: &H264Pps,
-    slh: &vk_video_parser::h264::SliceHeader,
+    slh: &vacc_parser::h264::SliceHeader,
     frame_num: u32,
     poc: i32,
     is_reference: bool,

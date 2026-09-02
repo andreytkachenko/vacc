@@ -8,7 +8,7 @@ and compares frame-by-frame over the FULL YUV420P frame (all planes).
 
 Usage:
     python3 pixel-verify-nvdec.py <bitstream> [max_frames] [example_name]
-    python3 pixel-verify-nvdec.py assets/big_buck_bunny_av1.ivf 20 decode_nvdec_av1
+    python3 pixel-verify-nvdec.py assets/samples/av1_main.ivf 20 decode_nvdec_av1
 """
 
 import argparse

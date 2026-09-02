@@ -1,14 +1,14 @@
 [package]
 name = "nvdec-decode"
-description = "NVDEC (NVIDIA Video Decode) backend for vk-video"
+description = "NVDEC (NVIDIA Video Decode) backend for vacc"
 license.workspace = true
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-vk-video-core = { workspace = true }
-vk-video-parser = { workspace = true }
-vk-video-vulkan = { workspace = true }
+vacc-core = { workspace = true }
+vacc-parser = { workspace = true }
+vacc-vulkan = { workspace = true }
 libloading = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

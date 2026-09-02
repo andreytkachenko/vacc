@@ -1,4 +1,4 @@
-//! NVDEC HEVC (H.265) decoder using vk-video-parser.
+//! NVDEC HEVC (H.265) decoder using vacc-parser.
 //!
 //! Mirrors the H.264 decoder architecture (`decoder.rs`) but driven by the
 //! [`H265Parser`]. Unlike H.264, the HEVC POC is already computed by the
@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
@@ -16,8 +16,8 @@ use vk_video_core::{
     picture::{H265Pps, H265Sps},
     session::Extent2D,
 };
-use vk_video_parser::h265_dpb::{resolve_refs, H265Dpb};
-use vk_video_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::h265_dpb::{resolve_refs, H265Dpb};
+use vacc_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
 
 use crate::{
     device::{
@@ -111,7 +111,7 @@ impl H265DpbCtx {
     }
 }
 
-/// NVDEC HEVC decoder using vk-video-parser.
+/// NVDEC HEVC decoder using vacc-parser.
 ///
 /// Not `Send`/`Sync`; use from a single thread. The CUDA context must be set
 /// current before decode methods.
@@ -231,7 +231,7 @@ impl NvdecH265Decoder {
     /// Initialize the parser with the HEVC format (required before parsing).
     fn init_parser_format(&mut self) -> NvdecResult<()> {
         self.parser
-            .init(&vk_video_parser::DetectedVideoFormat::new(
+            .init(&vacc_parser::DetectedVideoFormat::new(
                 VideoCodec::DecodeH265,
             ))
             .map_err(|e| NvdecError::DecodeFailed(format!("parser init: {}", e)))
@@ -325,7 +325,7 @@ impl NvdecH265Decoder {
                         eprintln!("[dpb-start] slots={:?}", occ);
                     }
 
-                    let info = if let Some(vk_video_parser::SliceHeader::H265(info)) =
+                    let info = if let Some(vacc_parser::SliceHeader::H265(info)) =
                         slices[0].slice_header.as_ref()
                     {
                         info
@@ -1251,7 +1251,7 @@ impl NvdecH265Decoder {
                 ref_pic: false,
                 apply_film_grain: false,
             },
-            sync_info: vk_video_core::frame::FrameSyncInfo::default(),
+            sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
         })
     }

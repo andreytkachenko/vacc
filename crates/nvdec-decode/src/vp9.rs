@@ -4,8 +4,9 @@
 //! surface-management behavior of NVIDIA's own cuvid parser, which was
 //! reverse-engineered from a 300-frame parameter dump
 //! (`/tmp/pixel_verify/vp9_cuvid_params.txt`) and verified to reproduce every
-//! `CurrPicIdx` / reference-surface value the cuvid parser emits for
-//! `assets/big_buck_bunney_vp9.ivf`.
+//! `CurrPicIdx` / reference-surface value the cuvid parser emits for the
+//! original 1920x1080 bunny VP9 stream (golden fixture: frames 0-19 in
+//! `tests/data/vp9_dp_golden_20f.ivf`).
 //!
 //! ## DPB model
 //!
@@ -32,7 +33,7 @@ use std::collections::VecDeque;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::sync::Mutex;
 
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec,
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
@@ -40,8 +41,8 @@ use vk_video_core::{
     picture::Vp9FrameData,
     session::Extent2D,
 };
-use vk_video_parser::vp9::Vp9Parser;
-use vk_video_parser::{DetectedVideoFormat, VideoParser};
+use vacc_parser::vp9::Vp9Parser;
+use vacc_parser::{DetectedVideoFormat, VideoParser};
 
 use crate::{
     device::{
@@ -63,7 +64,7 @@ const VP9_NUM_FRAME_BUFFERS: usize = 8;
 /// Common VP9 DPB manager shared by ALL backends (Vulkan / NVDEC / VAAPI).
 /// For NVDEC, a DPB slot IS a cuvid surface index (`PicIdx`), so the common
 /// slot indices can be used directly as `CurrPicIdx` / `*RefIdx` values.
-pub use vk_video_parser::vp9_dpb::Vp9Dpb as Vp9DpbState;
+pub use vacc_parser::vp9_dpb::Vp9Dpb as Vp9DpbState;
 
 /// cuvid `PicIdx` for frame buffer `fb`: the DPB slot, or 255 if empty.
 fn surface_of_frame_buffer(dpb: &Vp9DpbState, fb: usize) -> i32 {
@@ -76,7 +77,7 @@ fn surface_of_frame_buffer(dpb: &Vp9DpbState, fb: usize) -> i32 {
 /// Build a complete [`CUVIDPICPARAMS`] for one VP9 frame from parser output +
 /// DPB state.
 ///
-/// `fd` is the [`Vp9FrameData`] from [`vk_video_parser::vp9::Vp9Parser`],
+/// `fd` is the [`Vp9FrameData`] from [`vacc_parser::vp9::Vp9Parser`],
 /// `dpb` is the running [`Vp9DpbState`], and `bitstream_ptr`/`bitstream_len`
 /// point at the raw (superframe-expanded) frame bitstream. The pointer must
 /// stay valid for the duration of the subsequent `cuvidDecodePicture` call.
@@ -177,7 +178,7 @@ pub fn build_cuvid_vp9_picparams(
     vp9.set_segment_feature_mode(sg.flags.segmentation_update_data as u32);
 
     // Segmentation data: the cuvid parser zero-initializes picparams and only
-    // fills these when segmentation is enabled. vk-video-parser defaults the
+    // fills these when segmentation is enabled. vacc-parser defaults the
     // tree/pred probs to VP9_MAX_PROBABILITY (255), which does NOT match the
     // cuvid dump's 0 — so gate on `segmentation_enabled` (trust the dump).
     if pi.flags.segmentation_enabled != 0 {
@@ -419,7 +420,7 @@ fn dump_cuvid_vp9_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     let _ = out.flush();
 }
 
-/// NVDEC VP9 decoder using vk-video-parser.
+/// NVDEC VP9 decoder using vacc-parser.
 ///
 /// Not `Send`/`Sync`; use from a single thread. The CUDA context must be set
 /// current before decode methods.
@@ -1180,7 +1181,7 @@ impl NvdecVp9Decoder {
                 ref_pic: false,
                 apply_film_grain: false,
             },
-            sync_info: vk_video_core::frame::FrameSyncInfo::default(),
+            sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
         })
     }
@@ -1297,14 +1298,13 @@ impl Drop for NvdecVp9Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vk_video_core::VideoCodec;
-    use vk_video_parser::vp9::Vp9Parser;
-    use vk_video_parser::{DetectedVideoFormat, VideoParser};
+    use vacc_core::VideoCodec;
+    use vacc_parser::vp9::Vp9Parser;
+    use vacc_parser::{DetectedVideoFormat, VideoParser};
 
-    const IVF_PATH: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/big_buck_bunney_vp9.ivf"
-    );
+    /// Golden fixture: frames 0-19 of the original 1920x1080 bunny VP9 stream,
+    /// against which the `EXPECTED` table (cuvid parameter dump) was derived.
+    const GOLDEN_IVF: &[u8] = include_bytes!("../tests/data/vp9_dp_golden_20f.ivf");
 
     // ── IVF container parsing (copied from the decode_nvdec_vp9_cuvid example) ──
 
@@ -1400,8 +1400,7 @@ mod tests {
     }
 
     fn load_frames(n: usize) -> Vec<ExpandedFrame> {
-        let data = std::fs::read(IVF_PATH).expect("failed to read test IVF");
-        let packets = parse_ivf(&data);
+        let packets = parse_ivf(GOLDEN_IVF);
         let expanded = expand_superframes(&packets.0);
         assert!(expanded.len() >= n, "not enough frames in IVF");
         expanded.into_iter().take(n).collect()

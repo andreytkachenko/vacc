@@ -6,8 +6,8 @@
 //! ## Overview
 //!
 //! This crate provides a Rust wrapper around NVIDIA's NVDEC hardware decoder,
-//! implementing the [`vk_video_core::decoder::Decoder`] trait for seamless
-//! integration with the vk-video ecosystem. It supports H.264 decoding with
+//! implementing the [`vacc_core::decoder::Decoder`] trait for seamless
+//! integration with the vacc ecosystem. It supports H.264 decoding with
 //! automatic SPS/PPS parsing, DPB (Decoded Picture Buffer) management, and
 //! frame reordering.
 //!
@@ -15,7 +15,7 @@
 //!
 //! The decoder uses a two-component architecture:
 //!
-//! 1. **vk-video-parser** (`H264Parser`): Rust-based H.264 bitstream parser that
+//! 1. **vacc-parser** (`H264Parser`): Rust-based H.264 bitstream parser that
 //!    extracts SPS/PPS NAL units, calculates POC values, and identifies slices.
 //!
 //! 2. **Custom Decoder** (`cuvidDecodePicture` + frame extraction): Uses the
@@ -61,7 +61,7 @@
 //!
 //! ```no_run
 //! use nvdec_decode::NvdecDecoder;
-//! use vk_video_core::decoder::Decoder;
+//! use vacc_core::decoder::Decoder;
 //!
 //! let data = std::fs::read("video.h264").unwrap();
 //! let mut decoder = NvdecDecoder::new(data).unwrap();
@@ -83,7 +83,7 @@
 //!
 //! ```no_run
 //! use nvdec_decode::NvdecDecoder;
-//! use vk_video_core::decoder::Decoder;
+//! use vacc_core::decoder::Decoder;
 //!
 //! // Initialize with SPS/PPS data (first access unit)
 //! let header = std::fs::read("header.h264").unwrap();
@@ -115,7 +115,7 @@
 //!
 //! ```no_run
 //! use nvdec_decode::{NvdecDecoder, is_available, NvdecError};
-//! use vk_video_core::decoder::Decoder;
+//! use vacc_core::decoder::Decoder;
 //!
 //! // Check availability before decoding
 //! if !is_available() {
@@ -144,7 +144,7 @@
 //!
 //! ## Modules
 //!
-//! - [`decoder`] — H.264 decoder implementation using vk-video-parser
+//! - [`decoder`] — H.264 decoder implementation using vacc-parser
 //! - [`device`] — CUDA/NVDEC device management and initialization
 //! - [`dpb`] — Decoded Picture Buffer management with MMCO support
 //! - [`error`] — Error types and result aliases
@@ -184,7 +184,7 @@ pub use vp9::{build_cuvid_vp9_picparams, NvdecVp9Decoder, Vp9DpbState};
 ///
 /// ```no_run
 /// use nvdec_decode::NvdecDecoder;
-/// use vk_video_core::decoder::Decoder;
+/// use vacc_core::decoder::Decoder;
 ///
 /// let data = std::fs::read("video.h264").unwrap();
 /// let mut decoder = NvdecDecoder::new(data).unwrap();

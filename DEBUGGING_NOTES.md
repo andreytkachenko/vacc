@@ -110,5 +110,5 @@ This suggests a MISMATCH between:
 ## Files Modified
 
 - `crates/examples/src/vulkan_decode.rs`: Main decode example with bisecting debug output
-- `crates/vk-video-parser/src/h264.rs`: Added debug output for SPS parsing
+- `crates/vacc-parser/src/h264.rs`: Added debug output for SPS parsing
 - `DEBUGGING_NOTES.md`: This file

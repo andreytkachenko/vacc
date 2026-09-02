@@ -1,7 +1,7 @@
 //! # vaapi-decode
 //!
 //! VAAPI Video Decode implementation using cros-libva.
-//! Implements `vk_video_core::Decoder` and `vk_video_core::DecoderDevice` traits.
+//! Implements `vacc_core::Decoder` and `vacc_core::DecoderDevice` traits.
 
 pub mod device;
 pub mod decoder;

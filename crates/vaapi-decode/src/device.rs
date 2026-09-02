@@ -3,7 +3,7 @@
 use std::rc::Rc;
 use libva::{Config, Display};
 use libva::VAProfile::Type as VAProfileType;
-use vk_video_core::{
+use vacc_core::{
     codec::VideoCodec as CoreVideoCodec,
     device::{DecodeCapabilities, DecoderDevice},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},

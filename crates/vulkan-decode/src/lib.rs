@@ -1,8 +1,8 @@
 //! # vulkan-decode
 //!
 //! Vulkan Video Decode implementation.
-//! Implements `vk_video_core::Decoder` and `vk_video_core::DecoderDevice` traits
-//! by wrapping the vk-video-vulkan crate.
+//! Implements `vacc_core::Decoder` and `vacc_core::DecoderDevice` traits
+//! by wrapping the vacc-vulkan crate.
 
 pub mod device;
 pub mod decoder;
@@ -10,8 +10,8 @@ pub mod decoder;
 pub use device::VulkanDecoderDevice;
 pub use decoder::VulkanDecoder;
 
-/// Re-export common types from vk-video-vulkan.
-pub use vk_video_vulkan::{
+/// Re-export common types from vacc-vulkan.
+pub use vacc_vulkan::{
     VideoCodec,
     VideoSession,
     VideoSessionParams,
@@ -38,7 +38,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Vulkan error: {0}")]
-    Vulkan(#[from] vk_video_vulkan::VideoError),
+    Vulkan(#[from] vacc_vulkan::VideoError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

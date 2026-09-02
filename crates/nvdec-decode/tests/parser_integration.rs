@@ -1,4 +1,4 @@
-//! Integration tests for nvdec-decode using vk-video-parser.
+//! Integration tests for nvdec-decode using vacc-parser.
 //!
 //! Tests cover:
 //! - SPS/PPS parsing from real H.264 bitstreams
@@ -6,9 +6,9 @@
 //! - POC calculation for all three types
 //! - DPB management operations
 
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
-use vk_video_vulkan::access_unit::H264MmcoCommand;
-use vk_video_vulkan::dpb::{DpbManager, LastAccessType};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_vulkan::access_unit::H264MmcoCommand;
+use vacc_vulkan::dpb::{DpbManager, LastAccessType};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -499,9 +499,9 @@ struct PicParamsMapping {
 
 impl PicParamsMapping {
     fn from_sps_pps(
-        sps: &vk_video_core::picture::H264Sps,
-        pps: &vk_video_core::picture::H264Pps,
-        slh: &vk_video_parser::h264::SliceHeader,
+        sps: &vacc_core::picture::H264Sps,
+        pps: &vacc_core::picture::H264Pps,
+        slh: &vacc_parser::h264::SliceHeader,
     ) -> Self {
         Self {
             // SPS fields - must match decoder.rs:499-510
@@ -557,7 +557,7 @@ fn test_picparams_sps_field_mapping() {
     let pps = parser.active_pps().unwrap();
 
     // Create a mock slice header with reasonable defaults
-    let mock_slh = vk_video_parser::h264::SliceHeader {
+    let mock_slh = vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 4, // I-slice
         pic_parameter_set_id: pps.pic_parameter_set_id,
@@ -664,9 +664,9 @@ fn test_picparams_pps_field_mapping() {
 }
 
 fn create_mock_slice_header(
-    pps: &vk_video_core::picture::H264Pps,
-) -> vk_video_parser::h264::SliceHeader {
-    vk_video_parser::h264::SliceHeader {
+    pps: &vacc_core::picture::H264Pps,
+) -> vacc_parser::h264::SliceHeader {
+    vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 4,
         pic_parameter_set_id: pps.pic_parameter_set_id,
@@ -719,8 +719,8 @@ fn create_mock_slice_header(
 // ============================================================================
 
 /// Mock SPS for POC type 0 testing
-fn create_sps_poc_type_0() -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+fn create_sps_poc_type_0() -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 0;
     sps.log2_max_pic_order_cnt_lsb_minus4 = 4; // max_pic_order_cnt_lsb = 512
     sps.max_pic_order_cnt_lsb = 512;
@@ -729,8 +729,8 @@ fn create_sps_poc_type_0() -> vk_video_core::picture::H264Sps {
 }
 
 /// Mock SPS for POC type 1 testing
-fn create_sps_poc_type_1() -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+fn create_sps_poc_type_1() -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 1;
     sps.delta_pic_order_always_zero_flag = false;
     sps.frame_mbs_only_flag = true;
@@ -738,8 +738,8 @@ fn create_sps_poc_type_1() -> vk_video_core::picture::H264Sps {
 }
 
 /// Mock SPS for POC type 2 testing
-fn create_sps_poc_type_2() -> vk_video_core::picture::H264Sps {
-    let mut sps = vk_video_core::picture::H264Sps::new();
+fn create_sps_poc_type_2() -> vacc_core::picture::H264Sps {
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 2;
     sps.log2_max_frame_num_minus4 = 4; // max_frame_num = 256
     sps.max_frame_num = 256;
@@ -895,7 +895,7 @@ fn test_poc_type_1_with_delta_zero_flag() {
     // POC type 1 with delta_pic_order_always_zero_flag=1
     // In this case, POC is derived differently (no delta read from bitstream)
 
-    let mut sps = vk_video_core::picture::H264Sps::new();
+    let mut sps = vacc_core::picture::H264Sps::new();
     sps.pic_order_cnt_type = 1;
     sps.delta_pic_order_always_zero_flag = true;
     sps.frame_mbs_only_flag = true;
@@ -1218,7 +1218,7 @@ fn test_slice_header_parsing_from_real_bitstream() {
                 if !slices.is_empty() {
                     got_slice = true;
                     let first_slice = &slices[0];
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &first_slice.slice_header
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &first_slice.slice_header
                     {
                         // Verify slice header fields are reasonable
                         assert!(
@@ -1258,7 +1258,7 @@ fn test_idr_slice_detection() {
             Ok(ParseResult::ParameterSet { .. }) => {}
             Ok(ParseResult::Slice { slices, .. }) => {
                 for slice in &slices {
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &slice.slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &slice.slice_header {
                         let is_idr = slh.nal_unit_type == 5;
                         if is_idr {
                             // IDR slice should have nal_ref_idc > 0
@@ -1307,8 +1307,13 @@ fn test_parser_reset_clears_state() {
 
 #[test]
 fn test_interlaced_stream_sps() {
-    let data = load_test_file("assets/test_interlaced.h264");
-    let sps_data = extract_first_nal_with_start_code(&data, 7).expect("No SPS found");
+    // SPS NAL (with start code) from an x264 --tff stream (formerly
+    // assets/test_interlaced.h264), embedded to keep the test self-contained.
+    const INTERLACED_SPS: &[u8] = &[
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1e, 0xac, 0xe4, 0x02, 0xd0, 0x93, 0x60,
+        0x22, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x3e, 0x28, 0x54, 0x90,
+    ];
+    let sps_data = INTERLACED_SPS.to_vec();
 
     let mut parser = H264Parser::new();
     let packet = BitstreamPacket::new(sps_data);

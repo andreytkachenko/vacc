@@ -1,6 +1,6 @@
 [package]
 name = "examples"
-description = "Examples for vk-video library"
+description = "Examples for vacc library"
 license.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -11,9 +11,9 @@ name = "decode"
 path = "src/decode.rs"
 
 [dependencies]
-vk-video-core = { workspace = true }
-vk-video-parser = { workspace = true }
-vk-video-vulkan = { workspace = true }
+vacc-core = { workspace = true }
+vacc-parser = { workspace = true }
+vacc-vulkan = { workspace = true }
 nvdec-decode = { workspace = true }
 vaapi-decode = { workspace = true }
 vulkan-decode = { workspace = true }

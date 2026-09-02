@@ -1,9 +1,9 @@
-//! Comprehensive tests for CUVIDH264PICPARAMS construction from vk-video-parser output.
+//! Comprehensive tests for CUVIDH264PICPARAMS construction from vacc-parser output.
 //!
 //! These tests verify that CUVIDH264PICPARAMS is correctly constructed from
-//! vk-video-parser's parsed SPS/PPS/SliceHeader data.
+//! vacc-parser's parsed SPS/PPS/SliceHeader data.
 
-use vk_video_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -102,7 +102,7 @@ fn init_parser_with_params(data: &[u8]) -> H264Parser {
 }
 
 /// Parse slices from the bitstream and collect them.
-fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceHeader> {
+fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vacc_parser::h264::SliceHeader> {
     let mut parser = init_parser_with_params(data);
     let mut slices = Vec::new();
 
@@ -116,7 +116,7 @@ fn parse_slices_from_bitstream(data: &[u8]) -> Vec<vk_video_parser::h264::SliceH
                 ..
             }) => {
                 for slice in &frame_slices {
-                    if let Some(vk_video_parser::SliceHeader::H264(slh)) = &slice.slice_header {
+                    if let Some(vacc_parser::SliceHeader::H264(slh)) = &slice.slice_header {
                         slices.push(slh.clone());
                     }
                 }
@@ -163,7 +163,7 @@ const DEFAULT_QM8x8_INTER: [u8; 64] = [
 /// For lossless (qpprime_y_zero_transform_bypass_flag=1): identity (64).
 /// For non-lossy without custom scaling lists: default H.264 matrices.
 /// For custom scaling lists: use SPS scaling_list_4x4.
-fn get_weight_scale_4x4(sps: &vk_video_core::picture::H264Sps) -> [[u8; 16]; 6] {
+fn get_weight_scale_4x4(sps: &vacc_core::picture::H264Sps) -> [[u8; 16]; 6] {
     if sps.qpprime_y_zero_transform_bypass_flag {
         // Lossless: identity matrices
         [[64u8; 16]; 6]
@@ -191,7 +191,7 @@ fn get_weight_scale_4x4(sps: &vk_video_core::picture::H264Sps) -> [[u8; 16]; 6] 
 /// For lossless (qpprime_y_zero_transform_bypass_flag=1): identity (64).
 /// For non-lossy without custom scaling lists: default H.264 matrices.
 /// For custom scaling lists: use SPS scaling_list_8x8.
-fn get_weight_scale_8x8(sps: &vk_video_core::picture::H264Sps) -> [[u8; 64]; 2] {
+fn get_weight_scale_8x8(sps: &vacc_core::picture::H264Sps) -> [[u8; 64]; 2] {
     if sps.qpprime_y_zero_transform_bypass_flag {
         // Lossless: identity matrices
         [[64u8; 64]; 2]
@@ -206,9 +206,9 @@ fn get_weight_scale_8x8(sps: &vk_video_core::picture::H264Sps) -> [[u8; 64]; 2] 
 
 /// Build CUVIDH264PICPARAMS from SPS, PPS, and SliceHeader, mirroring decoder.rs logic.
 fn build_cuvid_h264_picparams(
-    sps: &vk_video_core::picture::H264Sps,
-    pps: &vk_video_core::picture::H264Pps,
-    slh: &vk_video_parser::h264::SliceHeader,
+    sps: &vacc_core::picture::H264Sps,
+    pps: &vacc_core::picture::H264Pps,
+    slh: &vacc_parser::h264::SliceHeader,
     poc: i32,
     ref_pic_flag: bool,
 ) -> nvdec_decode::ffi::CUVIDH264PICPARAMS {

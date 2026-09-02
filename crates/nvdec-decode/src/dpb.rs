@@ -6,9 +6,9 @@
 use crate::ffi::CUVIDH264DPBENTRY;
 use std::os::raw::c_int;
 #[cfg(not(test))]
-use vk_video_parser::h264::SliceHeader;
+use vacc_parser::h264::SliceHeader;
 #[cfg(test)]
-use vk_video_parser::h264::{DecRefPicMarkingEntry, SliceHeader};
+use vacc_parser::h264::{DecRefPicMarkingEntry, SliceHeader};
 
 /// Single entry in the NVDEC DPB.
 #[derive(Debug, Clone)]

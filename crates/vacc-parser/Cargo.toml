@@ -1,0 +1,14 @@
+[package]
+name = "vacc-parser"
+description = "Bitstream parser for H.264, H.265, and AV1 video codecs"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+bytemuck.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+log.workspace = true
