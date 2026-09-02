@@ -4,16 +4,16 @@
 //! would compute based on the H.264 specification (Annex B, D.3.3).
 //!
 //! The `PocCalculator` (re-exported from the common
-//! `vacc_parser::h264_poc` module in `nvdec_decode::poc`) implements
+//! `vacc_parser::h264_poc` module in `vacc_nvdec_decode::poc`) implements
 //! the same algorithm as cuvid's parser callbacks.
 //!
 //! Reference: H.264/AVC specification, section D.3.3 "Decoding process for
 //! picture order count"
 
-use nvdec_decode::poc::PocCalculator;
+use vacc_nvdec_decode::poc::PocCalculator;
 use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
-/// Path to the project root (parent of nvdec-decode crate).
+/// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Load a known H.264 test file from the project assets.

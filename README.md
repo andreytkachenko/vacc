@@ -21,11 +21,11 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 │                                                                  │
 │   Backends:                                                      │
 │     vacc-vulkan    Vulkan Video (ash)                        │
-│     nvdec-decode       NVIDIA NVDEC via libnvcuvid (cuvid)       │
-│     vaapi-decode       VAAPI stateless decode                    │
+│     vacc-nvdec-decode  NVIDIA NVDEC via libnvcuvid (cuvid)        │
+│     vacc-vaapi-decode  VAAPI stateless decode                     │
 │     libva              Rust bindings for libva                   │
 │                                                                  │
-│   examples: decode         unified CLI: -b <backend> -i <file>   │
+│   vacc-examples: decode  unified CLI: -b <backend> -i <file>     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,14 +55,14 @@ Vulkan Video implementation using `ash`:
 - `BitstreamBuffer` - `VkBuffer` for compressed video data
 - Codec-specific decoders (H.264 / H.265 / VP9 / AV1) and readback
 
-### `nvdec-decode`
+### `vacc-nvdec-decode`
 NVIDIA NVDEC via `libnvcuvid.so` (loaded dynamically with `libloading`):
 - Per-codec decoders (H.264 / HEVC / VP9 / AV1) with cuvid parser bypass
   (bitstream parsed by `vacc-parser`, DPB managed in Rust)
 - `query_decoder_caps` / `VACC_PROBE_CUVID=1` — driver capability queries;
   unsupported streams fail up front with a clear message
 
-### `vaapi-decode`
+### `vacc-vaapi-decode`
 VAAPI stateless decode on any libva driver (verified with Intel iHD):
 - Per-codec decoders using the common DPB/POC state from `vacc-parser`
 - Early capability rejections (e.g. H.264 4:2:2 on drivers whose AVC
@@ -242,7 +242,7 @@ profile, chroma format, bit depth, GOP/stress flags).
 
 Other assets: `assets/bframe_test.h264` (B-frame/MMCO DPB-parity test) and
 `assets/born_trailer.h264` (integration tests). The VP9 golden DPB fixture for
-`nvdec-decode` is embedded at `crates/nvdec-decode/tests/data/vp9_dp_golden_20f.ivf`.
+`nvdec-decode` is embedded at `crates/vacc-nvdec-decode/tests/data/vp9_dp_golden_20f.ivf`.
 
 ## Re-verification
 

@@ -1,4 +1,4 @@
-//! Comprehensive H.265/HEVC decoder tests for nvdec-decode.
+//! Comprehensive H.265/HEVC decoder tests for vacc-nvdec-decode.
 //!
 //! These tests verify all the bugs that were fixed in the H.265 decoder pipeline:
 //! 1. NAL data extraction in SliceEntry
@@ -419,7 +419,7 @@ fn test_predictive_rps_bit_count() {
         + (rps.num_negative_pics as u32 + rps.num_positive_pics as u32 + 1) * 2;
 
     // The hevc_rps_bit_count function computes this
-    // We can't call it directly (it's in nvdec-decode), but we can verify the formula
+    // We can't call it directly (it's in vacc-nvdec-decode), but we can verify the formula
     assert_eq!(expected_bits, 15, "Predictive RPS bit count should be 15");
 }
 
@@ -436,7 +436,7 @@ fn test_predictive_rps_bit_count() {
 /// wrong surfaces for reference pictures.
 #[test]
 fn test_dpb_state_uses_surface_indices() {
-    use nvdec_decode::picparams::H265DpbState;
+    use vacc_nvdec_decode::picparams::H265DpbState;
 
     // Create a DPB state manually to verify the semantics
     let mut state = H265DpbState::default();
@@ -579,7 +579,7 @@ fn test_sao_conditional_parsing() {
 /// CUVIDPICPARAMS to the CUDA decoder.
 #[test]
 fn test_ffi_struct_sizes() {
-    use nvdec_decode::ffi::{
+    use vacc_nvdec_decode::ffi::{
         CUVIDCODECSPECIFIC, CUVIDDECODECREATEINFO, CUVIDHEVCPICPARAMS, CUVIDPICPARAMS, CUVIDRECT,
         CUVIDVP9PICPARAMS,
     };
@@ -635,7 +635,7 @@ fn test_ffi_struct_sizes() {
 /// build_cuvid_hevc_picparams.
 #[test]
 fn test_h265_dpb_state_layout() {
-    use nvdec_decode::picparams::H265DpbState;
+    use vacc_nvdec_decode::picparams::H265DpbState;
 
     let state = H265DpbState::default();
 

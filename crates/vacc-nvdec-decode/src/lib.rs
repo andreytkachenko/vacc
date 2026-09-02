@@ -1,4 +1,4 @@
-//! # nvdec-decode
+//! # vacc-nvdec-decode
 //!
 //! Hardware-accelerated video decoding using NVIDIA's NVDEC (Video Decode) engine
 //! via the Video Codec SDK (`cuviddec.h`).
@@ -60,7 +60,7 @@
 //! Decode an entire H.264 bitstream at once:
 //!
 //! ```no_run
-//! use nvdec_decode::NvdecDecoder;
+//! use vacc_nvdec_decode::NvdecDecoder;
 //! use vacc_core::decoder::Decoder;
 //!
 //! let data = std::fs::read("video.h264").unwrap();
@@ -82,7 +82,7 @@
 //! Feed data incrementally for streaming scenarios:
 //!
 //! ```no_run
-//! use nvdec_decode::NvdecDecoder;
+//! use vacc_nvdec_decode::NvdecDecoder;
 //! use vacc_core::decoder::Decoder;
 //!
 //! // Initialize with SPS/PPS data (first access unit)
@@ -114,7 +114,7 @@
 //! ### Error Handling
 //!
 //! ```no_run
-//! use nvdec_decode::{NvdecDecoder, is_available, NvdecError};
+//! use vacc_nvdec_decode::{NvdecDecoder, is_available, NvdecError};
 //! use vacc_core::decoder::Decoder;
 //!
 //! // Check availability before decoding
@@ -183,7 +183,7 @@ pub use vp9::{build_cuvid_vp9_picparams, NvdecVp9Decoder, Vp9DpbState};
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::NvdecDecoder;
+/// use vacc_nvdec_decode::NvdecDecoder;
 /// use vacc_core::decoder::Decoder;
 ///
 /// let data = std::fs::read("video.h264").unwrap();

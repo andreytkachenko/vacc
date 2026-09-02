@@ -1,4 +1,4 @@
-//! # vulkan-common
+//! # vacc-vulkan-common
 //!
 //! Common Vulkan device initialization, queue management, and utility types.
 //! Used by vulkan-decode and other Vulkan-based crates.

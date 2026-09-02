@@ -259,19 +259,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "examples"
-version = "0.1.0"
-dependencies = [
- "ash",
- "nvdec-decode",
- "vaapi-decode",
- "vacc-core",
- "vacc-parser",
- "vacc-vulkan",
- "vulkan-decode",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -673,19 +660,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "nvdec-decode"
-version = "0.1.0"
-dependencies = [
- "ash",
- "libloading",
- "log",
- "thiserror 2.0.18",
- "vacc-core",
- "vacc-parser",
- "vacc-vulkan",
 ]
 
 [[package]]
@@ -1150,19 +1124,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
-name = "vaapi-decode"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "cros-libva",
- "log",
- "pkg-config",
- "thiserror 2.0.18",
- "vacc-core",
- "vacc-parser",
-]
-
-[[package]]
 name = "vacc-core"
 version = "0.1.0"
 dependencies = [
@@ -1174,6 +1135,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-examples"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "vacc-core",
+ "vacc-nvdec-decode",
+ "vacc-parser",
+ "vacc-vaapi-decode",
+ "vacc-vulkan",
+ "vacc-vulkan-decode",
+]
+
+[[package]]
+name = "vacc-nvdec-decode"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "libloading",
+ "log",
+ "thiserror 2.0.18",
+ "vacc-core",
+ "vacc-parser",
+ "vacc-vulkan",
+]
+
+[[package]]
 name = "vacc-parser"
 version = "0.1.0"
 dependencies = [
@@ -1182,6 +1169,19 @@ dependencies = [
  "log",
  "thiserror 2.0.18",
  "vacc-core",
+]
+
+[[package]]
+name = "vacc-vaapi-decode"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "cros-libva",
+ "log",
+ "pkg-config",
+ "thiserror 2.0.18",
+ "vacc-core",
+ "vacc-parser",
 ]
 
 [[package]]
@@ -1199,6 +1199,26 @@ dependencies = [
  "vacc-core",
  "vacc-parser",
  "vk-video",
+]
+
+[[package]]
+name = "vacc-vulkan-common"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "log",
+ "thiserror 2.0.18",
+ "vacc-core",
+]
+
+[[package]]
+name = "vacc-vulkan-decode"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "thiserror 2.0.18",
+ "vacc-core",
+ "vacc-vulkan",
 ]
 
 [[package]]
@@ -1236,26 +1256,6 @@ dependencies = [
  "tracing",
  "vk-mem",
  "wgpu",
-]
-
-[[package]]
-name = "vulkan-common"
-version = "0.1.0"
-dependencies = [
- "ash",
- "log",
- "thiserror 2.0.18",
- "vacc-core",
-]
-
-[[package]]
-name = "vulkan-decode"
-version = "0.1.0"
-dependencies = [
- "ash",
- "thiserror 2.0.18",
- "vacc-core",
- "vacc-vulkan",
 ]
 
 [[package]]

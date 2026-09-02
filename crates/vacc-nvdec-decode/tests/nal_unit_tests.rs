@@ -4,7 +4,7 @@
 
 use vacc_parser::nal::{self, CodecType, H264NalUnitType, NalUnit};
 
-/// Path to the project root (parent of nvdec-decode crate).
+/// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Load a test file from the project assets.

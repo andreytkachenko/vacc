@@ -1,4 +1,4 @@
-//! Error handling tests for nvdec-decode.
+//! Error handling tests for vacc-nvdec-decode.
 //!
 //! These tests verify proper error handling across all error types defined in
 //! NvdecError, including UnsupportedCodec, DecoderCreationFailed, ParserError,
@@ -9,7 +9,7 @@
 //! Run with `cargo test --test error_handling_tests -- --ignored` on a system
 //! with NVIDIA hardware and proper drivers.
 
-use nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder, NvdecResult};
+use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder, NvdecResult};
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,

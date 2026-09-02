@@ -85,7 +85,7 @@ pub type CUvideoctxlock = *mut c_void;
 /// # Example
 ///
 /// ```
-/// use nvdec_decode::ffi::cudaVideoCodec;
+/// use vacc_nvdec_decode::ffi::cudaVideoCodec;
 /// let codec = cudaVideoCodec::cudaVideoCodec_H264;
 /// ```
 #[repr(i32)]
@@ -1426,7 +1426,7 @@ pub const CUDA_ERROR_PEER_ACCESS_UNSUPPORTED: CUresult = 218;
 /// # Example
 ///
 /// ```
-/// use nvdec_decode::ffi::{cu_result_to_string, CUDA_SUCCESS, CUDA_ERROR_OUT_OF_MEMORY};
+/// use vacc_nvdec_decode::ffi::{cu_result_to_string, CUDA_SUCCESS, CUDA_ERROR_OUT_OF_MEMORY};
 ///
 /// assert_eq!(cu_result_to_string(CUDA_SUCCESS), "CUDA_SUCCESS");
 /// assert_eq!(cu_result_to_string(CUDA_ERROR_OUT_OF_MEMORY), "CUDA_ERROR_OUT_OF_MEMORY");

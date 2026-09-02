@@ -23,11 +23,11 @@
 //! reordering and up to 4 live references, so it exercises IDR resets, POC
 //! wraparound, reference-list evolution and DPB eviction.
 
-use nvdec_decode::dpb::NvdecDpbManager;
-use nvdec_decode::poc::PocCalculator;
+use vacc_nvdec_decode::dpb::NvdecDpbManager;
+use vacc_nvdec_decode::poc::PocCalculator;
 use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
-/// Project root (parent of the nvdec-decode crate).
+/// Project root (parent of the vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 const SAMPLE: &str = "assets/bframe_test.h264";
 /// Number of pictures to validate against the hardcoded ground truth.
@@ -229,7 +229,7 @@ const CUIDATA: &[(i32, &[Ref])] = &[
 
 /// Collect the non-empty DPB reference set from cuvid entries, sorted so the
 /// comparison is independent of slot (`PicIdx`) assignment.
-fn ref_set(entries: &[nvdec_decode::ffi::CUVIDH264DPBENTRY; 16]) -> Vec<Ref> {
+fn ref_set(entries: &[vacc_nvdec_decode::ffi::CUVIDH264DPBENTRY; 16]) -> Vec<Ref> {
     let mut refs: Vec<Ref> = entries
         .iter()
         .filter(|e| e.PicIdx != -1)

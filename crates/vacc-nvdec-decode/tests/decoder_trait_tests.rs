@@ -8,7 +8,7 @@
 //! Run with `cargo test --test decoder_trait_tests -- --ignored` on a system
 //! with NVIDIA hardware and proper drivers.
 
-use nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder};
+use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder};
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
@@ -591,7 +591,7 @@ fn test_decoder_from_born_trailer() {
             Ok(None) => break,
             Err(e) => {
                 // EndOfStream is acceptable
-                if !matches!(e, nvdec_decode::NvdecError::EndOfStream) {
+                if !matches!(e, vacc_nvdec_decode::NvdecError::EndOfStream) {
                     panic!("Decode error: {:?}", e);
                 }
                 break;

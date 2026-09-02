@@ -21,7 +21,7 @@
 
 use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
-/// Path to the project root (parent of nvdec-decode crate).
+/// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Load a known H.264 test file from the project assets.

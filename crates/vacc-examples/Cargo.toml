@@ -1,5 +1,5 @@
 [package]
-name = "examples"
+name = "vacc-examples"
 description = "Examples for vacc library"
 license.workspace = true
 version.workspace = true
@@ -14,7 +14,7 @@ path = "src/decode.rs"
 vacc-core = { workspace = true }
 vacc-parser = { workspace = true }
 vacc-vulkan = { workspace = true }
-nvdec-decode = { workspace = true }
-vaapi-decode = { workspace = true }
-vulkan-decode = { workspace = true }
+vacc-nvdec-decode = { workspace = true }
+vacc-vaapi-decode = { workspace = true }
+vacc-vulkan-decode = { workspace = true }
  ash = { workspace = true }

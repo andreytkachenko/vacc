@@ -427,7 +427,7 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::init_nvdec;
+/// use vacc_nvdec_decode::init_nvdec;
 ///
 /// init_nvdec().expect("Failed to initialize NVDEC");
 /// ```
@@ -764,7 +764,7 @@ pub fn cu_ctx_set_current() -> NvdecResult<u32> {
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::is_available;
+/// use vacc_nvdec_decode::is_available;
 ///
 /// if is_available() {
 ///     println!("NVDEC is available");
@@ -802,8 +802,8 @@ pub fn is_available() -> bool {
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::{query_decoder_caps, init_nvdec};
-/// use nvdec_decode::ffi::{cudaVideoCodec, cudaVideoChromaFormat};
+/// use vacc_nvdec_decode::{query_decoder_caps, init_nvdec};
+/// use vacc_nvdec_decode::ffi::{cudaVideoCodec, cudaVideoChromaFormat};
 ///
 /// init_nvdec().unwrap();
 /// let caps = query_decoder_caps(
@@ -862,8 +862,8 @@ pub fn query_decoder_caps(
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::{is_codec_supported, init_nvdec};
-/// use nvdec_decode::ffi::cudaVideoCodec;
+/// use vacc_nvdec_decode::{is_codec_supported, init_nvdec};
+/// use vacc_nvdec_decode::ffi::cudaVideoCodec;
 ///
 /// init_nvdec().unwrap();
 /// if is_codec_supported(cudaVideoCodec::cudaVideoCodec_H264) {

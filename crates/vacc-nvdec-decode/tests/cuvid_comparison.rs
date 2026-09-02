@@ -5,14 +5,14 @@
 //!
 //! Reference: Video_Codec_SDK cuviddec.h / nvcuvid.h
 
-use nvdec_decode::ffi::{
+use vacc_nvdec_decode::ffi::{
     cudaVideoChromaFormat, cudaVideoCodec, CUVIDDISPLAYAREA, CUVIDEOFORMAT, CUVIDH264PICPARAMS,
 };
 use vacc_parser::{
     h264::H264Parser, BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser,
 };
 
-/// Path to the project root (parent of nvdec-decode crate).
+/// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Load a known H.264 test file from the project assets.
@@ -116,7 +116,7 @@ fn build_cuvideoformat_from_sps(
 
     CUVIDEOFORMAT {
         codec: cudaVideoCodec::cudaVideoCodec_H264,
-        frame_rate: nvdec_decode::ffi::CUVIDFRAMERATE {
+        frame_rate: vacc_nvdec_decode::ffi::CUVIDFRAMERATE {
             numerator: format.frame_rate.numerator,
             denominator: format.frame_rate.denominator,
         },
@@ -129,8 +129,8 @@ fn build_cuvideoformat_from_sps(
         display_area,
         chroma_format,
         bitrate: 0,
-        display_aspect_ratio: nvdec_decode::ffi::CUVIDDISPLAYASPECTRATIO { x: 0, y: 0 },
-        video_signal_description: nvdec_decode::ffi::CUVIDVIDEOSIGNALDESCRIPTION {
+        display_aspect_ratio: vacc_nvdec_decode::ffi::CUVIDDISPLAYASPECTRATIO { x: 0, y: 0 },
+        video_signal_description: vacc_nvdec_decode::ffi::CUVIDVIDEOSIGNALDESCRIPTION {
             video_format: 5, // default: component
             video_full_range_flag: 0,
             reserved_zero_bits: 0,
@@ -573,7 +573,7 @@ fn test_vkvideo_parser_sps_to_cuvid_picparams_mapping() {
         ref_pic_flag: 1,
         frame_num: 0,
         CurrFieldOrderCnt: [0, 0],
-        dpb: [nvdec_decode::ffi::CUVIDH264DPBENTRY {
+        dpb: [vacc_nvdec_decode::ffi::CUVIDH264DPBENTRY {
             PicIdx: -1,
             FrameIdx: 0,
             is_long_term: 0,
@@ -589,11 +589,11 @@ fn test_vkvideo_parser_sps_to_cuvid_picparams_mapping() {
         slice_group_map_type: 0,
         pic_init_qs_minus26: pps.pic_init_qs_minus26 as i8,
         slice_group_change_rate_minus1: 0,
-        fmo: nvdec_decode::ffi::CUVIDH264FMOASO {
+        fmo: vacc_nvdec_decode::ffi::CUVIDH264FMOASO {
             pMb2SliceGroupMap: std::ptr::null(),
         },
         Reserved: [0; 12],
-        svc_mvc: nvdec_decode::ffi::CUVIDH264SVCMVC::default(),
+        svc_mvc: vacc_nvdec_decode::ffi::CUVIDH264SVCMVC::default(),
     };
 
     // Verify SPS fields are correctly mapped

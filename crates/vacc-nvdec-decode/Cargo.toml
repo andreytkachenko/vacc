@@ -1,5 +1,5 @@
 [package]
-name = "nvdec-decode"
+name = "vacc-nvdec-decode"
 description = "NVDEC (NVIDIA Video Decode) backend for vacc"
 license.workspace = true
 version.workspace = true

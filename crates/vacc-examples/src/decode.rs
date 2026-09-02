@@ -621,7 +621,7 @@ fn main() {
     if !std::path::Path::new(&args.input).exists() {
         die(&format!("file not found: {}", args.input));
     }
-    if args.backend == Backend::Nvdec && !nvdec_decode::is_available() {
+    if args.backend == Backend::Nvdec && !vacc_nvdec_decode::is_available() {
         die("NVDEC not available on this system (NVIDIA GPU + CUDA driver required)");
     }
 
@@ -662,18 +662,18 @@ fn main() {
     let start = Instant::now();
     let frames: Vec<Frame> = match args.backend {
         Backend::Vulkan => {
-            let mut decoder = vulkan_decode::VulkanDecoder::new(data)
+            let mut decoder = vacc_vulkan_decode::VulkanDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vulkan decoder init: {}", e)));
             let frames = decoder
                 .decode_all(args.max_frames)
                 .unwrap_or_else(|e| die(&format!("vulkan decode: {}", e)));
-            vulkan_decode::VulkanDecoder::reorder_to_presentation(frames)
+            vacc_vulkan_decode::VulkanDecoder::reorder_to_presentation(frames)
                 .into_iter()
                 .map(Frame::Vk)
                 .collect()
         }
         Backend::Vaapi => {
-            let mut decoder = vaapi_decode::VaapiDecoder::new(data)
+            let mut decoder = vacc_vaapi_decode::VaapiDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vaapi decoder init: {}", e)));
             decode_all_core(&mut decoder, args.max_frames)
                 .into_iter()
@@ -683,22 +683,22 @@ fn main() {
         Backend::Nvdec => {
             let frames = match codec {
                 Codec::H264 => {
-                    let mut d = nvdec_decode::NvdecH264Decoder::new(data)
+                    let mut d = vacc_nvdec_decode::NvdecH264Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::H265 => {
-                    let mut d = nvdec_decode::NvdecH265Decoder::new(data)
+                    let mut d = vacc_nvdec_decode::NvdecH265Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::Vp9 => {
-                    let mut d = nvdec_decode::NvdecVp9Decoder::new(data)
+                    let mut d = vacc_nvdec_decode::NvdecVp9Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
                 Codec::Av1 => {
-                    let mut d = nvdec_decode::NvdecAv1Decoder::new(data)
+                    let mut d = vacc_nvdec_decode::NvdecAv1Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }

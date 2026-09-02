@@ -82,7 +82,7 @@ use crate::poc::PocCalculator;
 /// # Example
 ///
 /// ```no_run
-/// use nvdec_decode::NvdecH264Decoder;
+/// use vacc_nvdec_decode::NvdecH264Decoder;
 /// use vacc_core::decoder::Decoder;
 ///
 /// let data = std::fs::read("video.h264").unwrap();

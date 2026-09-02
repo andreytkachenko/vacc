@@ -1,5 +1,5 @@
 [package]
-name = "vulkan-common"
+name = "vacc-vulkan-common"
 description = "Common Vulkan device initialization and management"
 license.workspace = true
 version.workspace = true

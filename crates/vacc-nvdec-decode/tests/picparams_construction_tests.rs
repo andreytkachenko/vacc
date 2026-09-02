@@ -5,7 +5,7 @@
 
 use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
 
-/// Path to the project root (parent of nvdec-decode crate).
+/// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Load a known H.264 test file from the project assets.
@@ -213,8 +213,8 @@ fn build_cuvid_h264_picparams(
     slh: &vacc_parser::h264::SliceHeader,
     poc: i32,
     ref_pic_flag: bool,
-) -> nvdec_decode::ffi::CUVIDH264PICPARAMS {
-    use nvdec_decode::ffi::{
+) -> vacc_nvdec_decode::ffi::CUVIDH264PICPARAMS {
+    use vacc_nvdec_decode::ffi::{
         CUVIDH264DPBENTRY, CUVIDH264FMOASO, CUVIDH264PICPARAMS, CUVIDH264SVCMVC,
     };
     use std::os::raw::{c_char, c_int, c_uchar};

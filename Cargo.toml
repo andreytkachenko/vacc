@@ -3,11 +3,11 @@ members = [
     "crates/vacc-core",
     "crates/vacc-parser",
     "crates/vacc-vulkan",
-    "crates/nvdec-decode",
-    "crates/vulkan-decode",
-    "crates/vulkan-common",
-    "crates/examples",
-    "crates/vaapi-decode",
+    "crates/vacc-nvdec-decode",
+    "crates/vacc-vulkan-decode",
+    "crates/vacc-vulkan-common",
+    "crates/vacc-examples",
+    "crates/vacc-vaapi-decode",
 ]
 resolver = "2"
 
@@ -22,10 +22,10 @@ repository = "https://github.com/andreytkachenko/vacc"
 vacc-core = { path = "crates/vacc-core", version = "0.1.0" }
 vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.0" }
 vacc-parser = { path = "crates/vacc-parser", version = "0.1.0" }
-nvdec-decode = { path = "crates/nvdec-decode", version = "0.1.0" }
-vaapi-decode = { path = "crates/vaapi-decode", version = "0.1.0" }
-vulkan-decode = { path = "crates/vulkan-decode", version = "0.1.0" }
-vulkan-common = { path = "crates/vulkan-common", version = "0.1.0" }
+vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.0" }
+vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.0" }
+vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.0" }
+vacc-vulkan-common = { path = "crates/vacc-vulkan-common", version = "0.1.0" }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2"
