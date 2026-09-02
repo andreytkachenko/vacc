@@ -8,7 +8,6 @@ members = [
     "crates/vulkan-common",
     "crates/examples",
     "crates/vaapi-decode",
-    "crates/libva",
 ]
 resolver = "2"
 
