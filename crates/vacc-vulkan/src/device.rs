@@ -309,13 +309,15 @@ impl VideoDeviceBuilder {
             if p_callback_data.is_null() {
                 return 0;
             }
-            let data = *p_callback_data;
-            let message = if !data.p_message.is_null() {
-                std::ffi::CStr::from_ptr(data.p_message)
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                String::new()
+            let message = unsafe {
+                let data = *p_callback_data;
+                if !data.p_message.is_null() {
+                    std::ffi::CStr::from_ptr(data.p_message)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                }
             };
 
             // Format severity level

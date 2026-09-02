@@ -1327,7 +1327,7 @@ pub struct CUVIDPARSERPARAMS {
 //
 // These are declared as `extern "C"` for direct linking. In practice,
 // the `device` module loads these dynamically via `libloading`.
-extern "C" {
+unsafe extern "C" {
     /// Query decoder capabilities
     pub fn cuvidGetDecoderCaps(pdc: *mut CUVIDDECODECAPS) -> CUresult;
 
