@@ -331,11 +331,11 @@ fn test_nal_unit_extraction_from_annexb() {
             let end = next_start.map(|(s, _)| s).unwrap_or(data.len());
 
             let nal_data = &data[start + code_len..end];
-            if !nal_data.is_empty() {
-                if let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data) {
-                    nal_types.push(unit_type);
-                    nal_count += 1;
-                }
+            if !nal_data.is_empty()
+                && let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data)
+            {
+                nal_types.push(unit_type);
+                nal_count += 1;
             }
             offset = end;
         } else {
@@ -381,11 +381,11 @@ fn test_nal_unit_extraction_from_avcc() {
         }
 
         let nal_data = &data[offset..offset + length];
-        if !nal_data.is_empty() {
-            if let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data) {
-                nal_types.push(unit_type);
-                nal_count += 1;
-            }
+        if !nal_data.is_empty()
+            && let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data)
+        {
+            nal_types.push(unit_type);
+            nal_count += 1;
         }
         offset += length;
     }
@@ -413,33 +413,32 @@ fn test_nal_unit_extraction_from_born_trailer() {
             let end = next_start.map(|(s, _)| s).unwrap_or(data.len());
 
             let nal_data = &data[start + code_len..end];
-            if !nal_data.is_empty() {
-                if let Some((forbidden, ref_idc, unit_type)) = nal::parse_h264_nal_header(nal_data)
-                {
-                    nal_types.push(unit_type);
-                    nal_count += 1;
+            if !nal_data.is_empty()
+                && let Some((forbidden, ref_idc, unit_type)) = nal::parse_h264_nal_header(nal_data)
+            {
+                nal_types.push(unit_type);
+                nal_count += 1;
 
-                    // Verify all extracted NALs have valid headers
-                    assert!(
-                        !forbidden,
-                        "NAL#{} at offset {} has forbidden_zero_bit=1",
-                        nal_count, start
-                    );
-                    assert!(
-                        ref_idc <= 3,
-                        "NAL#{} at offset {} has invalid nal_ref_idc={}",
-                        nal_count,
-                        start,
-                        ref_idc
-                    );
-                    assert!(
-                        H264NalUnitType::from_u8(unit_type).is_some(),
-                        "NAL#{} at offset {} has unknown type={}",
-                        nal_count,
-                        start,
-                        unit_type
-                    );
-                }
+                // Verify all extracted NALs have valid headers
+                assert!(
+                    !forbidden,
+                    "NAL#{} at offset {} has forbidden_zero_bit=1",
+                    nal_count, start
+                );
+                assert!(
+                    ref_idc <= 3,
+                    "NAL#{} at offset {} has invalid nal_ref_idc={}",
+                    nal_count,
+                    start,
+                    ref_idc
+                );
+                assert!(
+                    H264NalUnitType::from_u8(unit_type).is_some(),
+                    "NAL#{} at offset {} has unknown type={}",
+                    nal_count,
+                    start,
+                    unit_type
+                );
             }
             offset = end;
         } else {
@@ -482,10 +481,10 @@ fn test_nal_unit_types_from_born_trailer() {
             let end = next_start.map(|(s, _)| s).unwrap_or(data.len());
 
             let nal_data = &data[start + code_len..end];
-            if !nal_data.is_empty() {
-                if let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data) {
-                    unique_types.insert(unit_type);
-                }
+            if !nal_data.is_empty()
+                && let Some((_, _, unit_type)) = nal::parse_h264_nal_header(nal_data)
+            {
+                unique_types.insert(unit_type);
             }
             offset = end;
         } else {

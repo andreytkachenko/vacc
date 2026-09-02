@@ -3,7 +3,7 @@
 //! These tests verify that CUVIDH264PICPARAMS is correctly constructed from
 //! vacc-parser's parsed SPS/PPS/SliceHeader data.
 
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 /// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -214,10 +214,10 @@ fn build_cuvid_h264_picparams(
     poc: i32,
     ref_pic_flag: bool,
 ) -> vacc_nvdec_decode::ffi::CUVIDH264PICPARAMS {
+    use std::os::raw::{c_char, c_int, c_uchar};
     use vacc_nvdec_decode::ffi::{
         CUVIDH264DPBENTRY, CUVIDH264FMOASO, CUVIDH264PICPARAMS, CUVIDH264SVCMVC,
     };
-    use std::os::raw::{c_char, c_int, c_uchar};
 
     let dpb_entries = [CUVIDH264DPBENTRY {
         PicIdx: -1,

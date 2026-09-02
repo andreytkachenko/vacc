@@ -4,7 +4,7 @@ use vacc_parser::nal::{
     find_next_start_code, parse_h264_nal_header, parse_h265_nal_header,
     remove_emulation_prevention_bytes,
 };
-use vacc_parser::{bitstream::BitstreamPacket, DetectedVideoFormat, VideoParser};
+use vacc_parser::{DetectedVideoFormat, VideoParser, bitstream::BitstreamPacket};
 
 /// An access unit (single frame) extracted from the bitstream.
 #[derive(Debug, Clone)]
@@ -907,8 +907,14 @@ pub fn extract_all_access_units(
                                 if std::env::var("VACC_DBG_AU").is_ok() {
                                     eprintln!(
                                         "[H265-AU] nal={} poc={} lsb={} msb={} stype={} idr={} ref={} ref_pocs={:?}",
-                                        nal_unit_type, poc[0], poc_lsb, poc_msb, slice_type,
-                                        slice_is_idr, slice_is_reference, current_ref_pocs
+                                        nal_unit_type,
+                                        poc[0],
+                                        poc_lsb,
+                                        poc_msb,
+                                        slice_type,
+                                        slice_is_idr,
+                                        slice_is_reference,
+                                        current_ref_pocs
                                     );
                                 }
                                 prev_frame_num += 1;
@@ -990,20 +996,20 @@ pub fn extract_all_access_units(
                             2
                         };
                     }
-                } else if codec == VideoCodec::H265 {
-                    if let Some((_, nal_type, _, _)) = parse_h265_nal_header(nal_data) {
-                        current_is_idr = nal_type == 19 || nal_type == 20;
-                        current_is_reference = (16..=23).contains(&nal_type) || nal_type % 2 == 1;
-                        prev_frame_num += 1;
-                        current_frame_num = prev_frame_num;
-                        current_slice_type = if current_is_idr {
-                            2
-                        } else if current_is_reference {
-                            1
-                        } else {
-                            0
-                        };
-                    }
+                } else if codec == VideoCodec::H265
+                    && let Some((_, nal_type, _, _)) = parse_h265_nal_header(nal_data)
+                {
+                    current_is_idr = nal_type == 19 || nal_type == 20;
+                    current_is_reference = (16..=23).contains(&nal_type) || nal_type % 2 == 1;
+                    prev_frame_num += 1;
+                    current_frame_num = prev_frame_num;
+                    current_slice_type = if current_is_idr {
+                        2
+                    } else if current_is_reference {
+                        1
+                    } else {
+                        0
+                    };
                 }
                 in_frame = true;
             }
@@ -1047,7 +1053,7 @@ fn parse_h264_inband_params(
     seen_sps_ids: &std::collections::HashSet<u32>,
     seen_pps_ids: &std::collections::HashSet<u32>,
 ) -> Option<InBandParameterSet> {
-    use vacc_parser::{h264::H264Parser, ParseResult};
+    use vacc_parser::{ParseResult, h264::H264Parser};
 
     if nal_data.is_empty() {
         return None;
@@ -1070,20 +1076,20 @@ fn parse_h264_inband_params(
 
     match parser.parse(&packet) {
         Ok(ParseResult::ParameterSet { sps: s, pps: p, .. }) => {
-            if let Some(s) = s {
-                if let Some(h264_sps) = s.downcast_ref::<vacc_core::picture::H264Sps>() {
-                    // Only report if this is a new SPS ID
-                    if !seen_sps_ids.contains(&{ h264_sps.seq_parameter_set_id }) {
-                        sps = Some(H264OrH265Sps::H264(h264_sps.clone()));
-                    }
+            if let Some(s) = s
+                && let Some(h264_sps) = s.downcast_ref::<vacc_core::picture::H264Sps>()
+            {
+                // Only report if this is a new SPS ID
+                if !seen_sps_ids.contains(&{ h264_sps.seq_parameter_set_id }) {
+                    sps = Some(H264OrH265Sps::H264(h264_sps.clone()));
                 }
             }
-            if let Some(p) = p {
-                if let Some(h264_pps) = p.downcast_ref::<vacc_core::picture::H264Pps>() {
-                    // Only report if this is a new PPS ID
-                    if !seen_pps_ids.contains(&{ h264_pps.pic_parameter_set_id }) {
-                        pps = Some(H264OrH265Pps::H264(h264_pps.clone()));
-                    }
+            if let Some(p) = p
+                && let Some(h264_pps) = p.downcast_ref::<vacc_core::picture::H264Pps>()
+            {
+                // Only report if this is a new PPS ID
+                if !seen_pps_ids.contains(&{ h264_pps.pic_parameter_set_id }) {
+                    pps = Some(H264OrH265Pps::H264(h264_pps.clone()));
                 }
             }
         }
@@ -1105,7 +1111,7 @@ fn parse_h265_inband_params(
     seen_sps_ids: &std::collections::HashSet<u32>,
     seen_pps_ids: &std::collections::HashSet<u32>,
 ) -> Option<InBandParameterSet> {
-    use vacc_parser::{h265::H265Parser, ParseResult};
+    use vacc_parser::{ParseResult, h265::H265Parser};
 
     if nal_data.is_empty() {
         return None;
@@ -1133,28 +1139,28 @@ fn parse_h265_inband_params(
             pps: p,
             ..
         }) => {
-            if let Some(v) = v {
-                if let Some(h265_vps) = v.downcast_ref::<vacc_core::picture::H265Vps>() {
-                    // Only report if this is a new VPS ID
-                    if !seen_vps_ids.contains(&(h265_vps.vps_video_parameter_set_id as u32)) {
-                        vps = Some(H265VpsOpt::H265(h265_vps.clone()));
-                    }
+            if let Some(v) = v
+                && let Some(h265_vps) = v.downcast_ref::<vacc_core::picture::H265Vps>()
+            {
+                // Only report if this is a new VPS ID
+                if !seen_vps_ids.contains(&(h265_vps.vps_video_parameter_set_id as u32)) {
+                    vps = Some(H265VpsOpt::H265(h265_vps.clone()));
                 }
             }
-            if let Some(s) = s {
-                if let Some(h265_sps) = s.downcast_ref::<vacc_core::picture::H265Sps>() {
-                    // Only report if this is a new SPS ID
-                    if !seen_sps_ids.contains(&{ h265_sps.sps_seq_parameter_set_id }) {
-                        sps = Some(H264OrH265Sps::H265(h265_sps.clone()));
-                    }
+            if let Some(s) = s
+                && let Some(h265_sps) = s.downcast_ref::<vacc_core::picture::H265Sps>()
+            {
+                // Only report if this is a new SPS ID
+                if !seen_sps_ids.contains(&{ h265_sps.sps_seq_parameter_set_id }) {
+                    sps = Some(H264OrH265Sps::H265(h265_sps.clone()));
                 }
             }
-            if let Some(p) = p {
-                if let Some(h265_pps) = p.downcast_ref::<vacc_core::picture::H265Pps>() {
-                    // Only report if this is a new PPS ID
-                    if !seen_pps_ids.contains(&{ h265_pps.pps_pic_parameter_set_id }) {
-                        pps = Some(H264OrH265Pps::H265(h265_pps.clone()));
-                    }
+            if let Some(p) = p
+                && let Some(h265_pps) = p.downcast_ref::<vacc_core::picture::H265Pps>()
+            {
+                // Only report if this is a new PPS ID
+                if !seen_pps_ids.contains(&{ h265_pps.pps_pic_parameter_set_id }) {
+                    pps = Some(H264OrH265Pps::H265(h265_pps.clone()));
                 }
             }
         }

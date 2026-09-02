@@ -169,7 +169,10 @@ impl DpbManager {
                 H264MmcoCommand::UnmarkLongTerm {
                     long_term_frame_idx,
                 } => {
-                    eprintln!("[DEBUG]   MMCO 2: unmark long-term long_term_frame_idx={} (not fully tracked)", long_term_frame_idx);
+                    eprintln!(
+                        "[DEBUG]   MMCO 2: unmark long-term long_term_frame_idx={} (not fully tracked)",
+                        long_term_frame_idx
+                    );
                     // For now, skip - long-term reference tracking would require additional state
                 }
 
@@ -180,8 +183,10 @@ impl DpbManager {
                 } => {
                     let pic_num_x =
                         self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
-                    eprintln!("[DEBUG]   MMCO 3: assign LongTermFrameIdx={} to picNumX={} (not fully tracked)",
-                              long_term_frame_idx, pic_num_x);
+                    eprintln!(
+                        "[DEBUG]   MMCO 3: assign LongTermFrameIdx={} to picNumX={} (not fully tracked)",
+                        long_term_frame_idx, pic_num_x
+                    );
                     // For now, skip - long-term reference tracking would require additional state
                 }
 
@@ -210,8 +215,10 @@ impl DpbManager {
                 H264MmcoCommand::AssignLongTermToCurrent {
                     long_term_frame_idx,
                 } => {
-                    eprintln!("[DEBUG]   MMCO 6: assign LongTermFrameIdx={} to current (slot {}) (not fully tracked)",
-                              long_term_frame_idx, current_slot_index);
+                    eprintln!(
+                        "[DEBUG]   MMCO 6: assign LongTermFrameIdx={} to current (slot {}) (not fully tracked)",
+                        long_term_frame_idx, current_slot_index
+                    );
                     // For now, skip - long-term reference tracking would require additional state
                 }
             }

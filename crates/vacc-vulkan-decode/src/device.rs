@@ -135,7 +135,7 @@ impl DecoderDevice for VulkanDecoderDevice {
             _ => {
                 return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(
                     format!("{:?}", codec),
-                )))
+                )));
             }
         };
 
@@ -194,7 +194,7 @@ impl DecoderDevice for VulkanDecoderDevice {
             _ => {
                 return Err(Error::Vulkan(vacc_vulkan::VideoError::CodecNotSupported(
                     format!("{:?}", codec),
-                )))
+                )));
             }
         };
 

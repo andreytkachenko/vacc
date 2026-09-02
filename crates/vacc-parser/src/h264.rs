@@ -299,11 +299,7 @@ impl H264Parser {
                         } else {
                             // 8x8: 6→2 (or 5 for 4:4:4), 7→6, 8→5, 9→5, 10→5, 11→5
                             if idx == 6 {
-                                if chroma_format_idc == 3 {
-                                    5
-                                } else {
-                                    2
-                                }
+                                if chroma_format_idc == 3 { 5 } else { 2 }
                             } else if idx == 7 {
                                 6
                             } else {
@@ -925,11 +921,19 @@ impl H264Parser {
         slh.header_bit_size = (r.position() - header_start_pos) as u16;
 
         if std::env::var("DBG_H264").is_ok() {
-            eprintln!("[DBG-PARSER] fn={} st={} hbs={} sep_colour={} redpic={} deblock_flag={} wpred={} entropy={} qp_delta={} dis_db={}",
-                slh.frame_num, slh.slice_type, slh.header_bit_size,
-                sps.separate_colour_plane_flag, pps.redundant_pic_cnt_present_flag,
-                pps.deblocking_filter_control_present_flag, pps.weighted_pred_flag,
-                pps.entropy_coding_mode_flag, slh.slice_qp_delta, slh.disable_deblocking_filter_idc);
+            eprintln!(
+                "[DBG-PARSER] fn={} st={} hbs={} sep_colour={} redpic={} deblock_flag={} wpred={} entropy={} qp_delta={} dis_db={}",
+                slh.frame_num,
+                slh.slice_type,
+                slh.header_bit_size,
+                sps.separate_colour_plane_flag,
+                pps.redundant_pic_cnt_present_flag,
+                pps.deblocking_filter_control_present_flag,
+                pps.weighted_pred_flag,
+                pps.entropy_coding_mode_flag,
+                slh.slice_qp_delta,
+                slh.disable_deblocking_filter_idc
+            );
         }
 
         Ok(slh)
@@ -1214,15 +1218,15 @@ impl H264Parser {
                 // decoder produces corrupted output.
                 let nal_end = if next_code_len == 4 { end + 1 } else { end };
                 let nal_data = &data[start + code_len..nal_end];
-                if !nal_data.is_empty() {
-                    if let Some((_, _, nal_unit_type)) = nal::parse_h264_nal_header(nal_data) {
-                        nal_units.push(NalUnit::new(
-                            nal_unit_type,
-                            nal_data.to_vec(),
-                            start + code_len,
-                            nal_data.len(),
-                        ));
-                    }
+                if !nal_data.is_empty()
+                    && let Some((_, _, nal_unit_type)) = nal::parse_h264_nal_header(nal_data)
+                {
+                    nal_units.push(NalUnit::new(
+                        nal_unit_type,
+                        nal_data.to_vec(),
+                        start + code_len,
+                        nal_data.len(),
+                    ));
                 }
 
                 offset = end;
@@ -1349,13 +1353,12 @@ impl VideoParser for H264Parser {
                     let (_is_trailing, nal_ref_idc, nal_unit_type) =
                         nal::parse_h264_nal_header(&nal_data).unwrap_or((false, 0, 0));
 
-                    if self.first_slice_header.is_none() {
-                        if let Ok(slh) =
+                    if self.first_slice_header.is_none()
+                        && let Ok(slh) =
                             self.parse_slice_header(&nal_data, nal_ref_idc, nal_unit_type)
-                        {
-                            self.first_slice_header = Some(slh);
-                            self.frame_count += 1;
-                        }
+                    {
+                        self.first_slice_header = Some(slh);
+                        self.frame_count += 1;
                     }
 
                     // Parse slice header for this NAL
@@ -1390,13 +1393,12 @@ impl VideoParser for H264Parser {
                     // only if they share both frame_num and pic_order_cnt_lsb.
                     if let (Some(first_frame_num), Some(first_poc_lsb)) =
                         (self.current_frame_num, self.current_poc_lsb)
+                        && (current_frame_num != first_frame_num
+                            || current_poc_lsb != first_poc_lsb)
                     {
-                        if current_frame_num != first_frame_num || current_poc_lsb != first_poc_lsb
-                        {
-                            // New picture detected, stop collecting (do not
-                            // consume this NAL; it starts the next picture).
-                            break;
-                        }
+                        // New picture detected, stop collecting (do not
+                        // consume this NAL; it starts the next picture).
+                        break;
                     }
 
                     // Track offsets for bytes_consumed calculation

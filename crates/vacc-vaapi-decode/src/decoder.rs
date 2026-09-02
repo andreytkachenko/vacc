@@ -38,6 +38,7 @@ use vacc_core::{
     session::Extent2D,
 };
 use vacc_parser::{
+    DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
     av1::Av1Parser,
     bitstream::BitstreamPacket,
     h264::H264Parser,
@@ -47,7 +48,6 @@ use vacc_parser::{
     h265_dpb::H265Dpb,
     vp9::Vp9Parser,
     vp9_dpb::Vp9Dpb,
-    DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
 };
 
 use super::{Error, Result};
@@ -186,12 +186,25 @@ fn dump_va_pic(p: &PictureParameterBufferH264) {
     let cp = &pp.CurrPic;
     println!(
         "VADUMP PIC frame={} curr=(id={},fidx={},fl={},top={},bot={}) w_mbs={} h_mbs={} bdl={} bdc={} nrf={} seq={:#010x} picf={:#010x} nsg={} sgt={} qp={} qs={} c0={} c1={}",
-        pp.frame_num, cp.picture_id, cp.frame_idx, cp.flags, cp.TopFieldOrderCnt, cp.BottomFieldOrderCnt,
-        pp.picture_width_in_mbs_minus1, pp.picture_height_in_mbs_minus1,
-        pp.bit_depth_luma_minus8, pp.bit_depth_chroma_minus8, pp.num_ref_frames,
-        unsafe { pp.seq_fields.value }, unsafe { pp.pic_fields.value },
-        pp.num_slice_groups_minus1, pp.slice_group_map_type,
-        pp.pic_init_qp_minus26, pp.pic_init_qs_minus26, pp.chroma_qp_index_offset, pp.second_chroma_qp_index_offset,
+        pp.frame_num,
+        cp.picture_id,
+        cp.frame_idx,
+        cp.flags,
+        cp.TopFieldOrderCnt,
+        cp.BottomFieldOrderCnt,
+        pp.picture_width_in_mbs_minus1,
+        pp.picture_height_in_mbs_minus1,
+        pp.bit_depth_luma_minus8,
+        pp.bit_depth_chroma_minus8,
+        pp.num_ref_frames,
+        unsafe { pp.seq_fields.value },
+        unsafe { pp.pic_fields.value },
+        pp.num_slice_groups_minus1,
+        pp.slice_group_map_type,
+        pp.pic_init_qp_minus26,
+        pp.pic_init_qs_minus26,
+        pp.chroma_qp_index_offset,
+        pp.second_chroma_qp_index_offset,
     );
     for (i, r) in pp.ReferenceFrames.iter().enumerate() {
         if r.flags != libva::VA_PICTURE_H264_INVALID {
@@ -228,12 +241,26 @@ fn dump_va_slice(s: &SliceParameterBufferH264) {
             .collect();
         println!(
             "VADUMP SLICE size={} off={} flag={} bitoff={} firstmb={} stype={} dsp={} nrl0={} nrl1={} cabac={} qpdel={} disdeb={} alpha={} beta={} lwd={} cwd={} lw0f={} cw0f={} lw1f={} cw1f={}",
-            sp.slice_data_size, sp.slice_data_offset, sp.slice_data_flag, sp.slice_data_bit_offset,
-            sp.first_mb_in_slice, sp.slice_type, sp.direct_spatial_mv_pred_flag,
-            sp.num_ref_idx_l0_active_minus1, sp.num_ref_idx_l1_active_minus1, sp.cabac_init_idc,
-            sp.slice_qp_delta, sp.disable_deblocking_filter_idc, sp.slice_alpha_c0_offset_div2, sp.slice_beta_offset_div2,
-            sp.luma_log2_weight_denom, sp.chroma_log2_weight_denom,
-            sp.luma_weight_l0_flag, sp.chroma_weight_l0_flag, sp.luma_weight_l1_flag, sp.chroma_weight_l1_flag,
+            sp.slice_data_size,
+            sp.slice_data_offset,
+            sp.slice_data_flag,
+            sp.slice_data_bit_offset,
+            sp.first_mb_in_slice,
+            sp.slice_type,
+            sp.direct_spatial_mv_pred_flag,
+            sp.num_ref_idx_l0_active_minus1,
+            sp.num_ref_idx_l1_active_minus1,
+            sp.cabac_init_idc,
+            sp.slice_qp_delta,
+            sp.disable_deblocking_filter_idc,
+            sp.slice_alpha_c0_offset_div2,
+            sp.slice_beta_offset_div2,
+            sp.luma_log2_weight_denom,
+            sp.chroma_log2_weight_denom,
+            sp.luma_weight_l0_flag,
+            sp.chroma_weight_l0_flag,
+            sp.luma_weight_l1_flag,
+            sp.chroma_weight_l1_flag,
         );
         eprintln!("VADUMP  L0[{}]", l0.join(","));
         eprintln!("VADUMP  L1[{}]", l1.join(","));
@@ -307,10 +334,10 @@ impl SurfacePool {
     }
 
     fn mark_ready(&mut self, idx: usize) {
-        if let Some(entry) = self.entries.get_mut(idx) {
-            if let SurfaceState::Pending(id) = entry.state {
-                entry.state = SurfaceState::Ready(id);
-            }
+        if let Some(entry) = self.entries.get_mut(idx)
+            && let SurfaceState::Pending(id) = entry.state
+        {
+            entry.state = SurfaceState::Ready(id);
         }
     }
 
@@ -782,11 +809,7 @@ impl VaapiDecoder {
         // direct-mode and implicit-weight POC math (a zero there corrupts
         // B-frame prediction).
         let (top_field_order_cnt, bottom_field_order_cnt) = if field_pic_flag {
-            if bottom_field {
-                (0, poc)
-            } else {
-                (poc, 0)
-            }
+            if bottom_field { (0, poc) } else { (poc, 0) }
         } else {
             (poc, poc)
         };
@@ -1005,14 +1028,40 @@ impl VaapiDecoder {
 
         // Debug: log PicParam fields before construction
         if std::env::var("DBG_H264").is_ok() {
-            eprintln!("[DBG-PICPARAM] scaling_present={} 8x8={} chroma_fmt={} bitdepth_l={} bitdepth_c={} max_ref={} w_mbs={} h_mbs={} init_qp={} init_qs={} chroma_qp_off={} log2fn={} poc_type={} log2poc={} dpaz={} gaps={} fmo={} mbaff={} direct8x8={} minluma={} entropy={} wpred={} wbipred={} t8x8={} field={} cip={} bfpoc={} deblock={} redpic={} refpic={} frame_num={}",
-                sps.seq_scaling_matrix_present_flag, pps.transform_8x8_mode_flag, sps.chroma_format_idc,
-                sps.bit_depth_luma_minus8, sps.bit_depth_chroma_minus8, sps.max_num_ref_frames,
-                sps.pic_width_in_mbs_minus1, picture_height_in_mbs_minus1,
-                pps.pic_init_qp_minus26, pps.pic_init_qs_minus26, pps.chroma_qp_index_offset,
-                sps.log2_max_frame_num_minus4, sps.pic_order_cnt_type, sps.log2_max_pic_order_cnt_lsb_minus4, sps.delta_pic_order_always_zero_flag,
-                sps.gaps_in_frame_num_value_allowed_flag, sps.frame_mbs_only_flag, sps.mb_adaptive_frame_field_flag, sps.direct_8x8_inference_flag, (sps.level_idc >= 41) as u32,
-                pps.entropy_coding_mode_flag, pps.weighted_pred_flag, pps.weighted_bipred_idc, pps.transform_8x8_mode_flag, field_pic_flag, pps.constrained_intra_pred_flag, pps.bottom_field_pic_order_in_frame_present_flag, pps.deblocking_filter_control_present_flag, pps.redundant_pic_cnt_present_flag, (nal_ref_idc != 0) as u32, frame_num);
+            eprintln!(
+                "[DBG-PICPARAM] scaling_present={} 8x8={} chroma_fmt={} bitdepth_l={} bitdepth_c={} max_ref={} w_mbs={} h_mbs={} init_qp={} init_qs={} chroma_qp_off={} log2fn={} poc_type={} log2poc={} dpaz={} gaps={} fmo={} mbaff={} direct8x8={} minluma={} entropy={} wpred={} wbipred={} t8x8={} field={} cip={} bfpoc={} deblock={} redpic={} refpic={} frame_num={}",
+                sps.seq_scaling_matrix_present_flag,
+                pps.transform_8x8_mode_flag,
+                sps.chroma_format_idc,
+                sps.bit_depth_luma_minus8,
+                sps.bit_depth_chroma_minus8,
+                sps.max_num_ref_frames,
+                sps.pic_width_in_mbs_minus1,
+                picture_height_in_mbs_minus1,
+                pps.pic_init_qp_minus26,
+                pps.pic_init_qs_minus26,
+                pps.chroma_qp_index_offset,
+                sps.log2_max_frame_num_minus4,
+                sps.pic_order_cnt_type,
+                sps.log2_max_pic_order_cnt_lsb_minus4,
+                sps.delta_pic_order_always_zero_flag,
+                sps.gaps_in_frame_num_value_allowed_flag,
+                sps.frame_mbs_only_flag,
+                sps.mb_adaptive_frame_field_flag,
+                sps.direct_8x8_inference_flag,
+                (sps.level_idc >= 41) as u32,
+                pps.entropy_coding_mode_flag,
+                pps.weighted_pred_flag,
+                pps.weighted_bipred_idc,
+                pps.transform_8x8_mode_flag,
+                field_pic_flag,
+                pps.constrained_intra_pred_flag,
+                pps.bottom_field_pic_order_in_frame_present_flag,
+                pps.deblocking_filter_control_present_flag,
+                pps.redundant_pic_cnt_present_flag,
+                (nal_ref_idc != 0) as u32,
+                frame_num
+            );
         }
 
         let pic_param = PictureParameterBufferH264::new(
@@ -1792,9 +1841,16 @@ impl VaapiDecoder {
                         .min(ctx.slot_surfaces.len() as u32)
                         .max(1);
                     if std::env::var("DBG_H264").is_ok() {
-                        eprintln!("[DBG] SPS log2_max_fn={} poc_type={} log2_max_poc_lsb={} max_poc_lsb={} max_ref_frames={} gaps={} frame_mbs_only={}",
-                            sps.log2_max_frame_num_minus4, sps.pic_order_cnt_type, sps.log2_max_pic_order_cnt_lsb_minus4,
-                            sps.max_pic_order_cnt_lsb, sps.max_num_ref_frames, sps.gaps_in_frame_num_value_allowed_flag, sps.frame_mbs_only_flag);
+                        eprintln!(
+                            "[DBG] SPS log2_max_fn={} poc_type={} log2_max_poc_lsb={} max_poc_lsb={} max_ref_frames={} gaps={} frame_mbs_only={}",
+                            sps.log2_max_frame_num_minus4,
+                            sps.pic_order_cnt_type,
+                            sps.log2_max_pic_order_cnt_lsb_minus4,
+                            sps.max_pic_order_cnt_lsb,
+                            sps.max_num_ref_frames,
+                            sps.gaps_in_frame_num_value_allowed_flag,
+                            sps.frame_mbs_only_flag
+                        );
                     }
                     // NOTE: do NOT reset POC state here. Encoders (e.g. x264)
                     // re-send SPS/PPS before every keyframe; a mid-stream
@@ -1903,11 +1959,22 @@ impl VaapiDecoder {
                         );
                         for (si, se) in parser_slices.iter().enumerate() {
                             if let Some(SliceHeader::H264(h)) = &se.slice_header {
-                                eprintln!("[DBG-SL] pic={si} fn={} poc_lsb={} hbs={} mmco={:?} rplm0={:?} nal0={:02x} len={}",
-                                    h.frame_num, h.pic_order_cnt_lsb, h.header_bit_size,
-                                    h.dec_ref_pic_marking.iter().map(|e| (e.memory_management_control_operation, e.value)).collect::<Vec<_>>(),
-                                    h.ref_pic_list_modification_l0.iter().map(|e| (e.op, e.difference)).collect::<Vec<_>>(),
-                                    se.nal_data.first().copied().unwrap_or(0), se.nal_data.len());
+                                eprintln!(
+                                    "[DBG-SL] pic={si} fn={} poc_lsb={} hbs={} mmco={:?} rplm0={:?} nal0={:02x} len={}",
+                                    h.frame_num,
+                                    h.pic_order_cnt_lsb,
+                                    h.header_bit_size,
+                                    h.dec_ref_pic_marking
+                                        .iter()
+                                        .map(|e| (e.memory_management_control_operation, e.value))
+                                        .collect::<Vec<_>>(),
+                                    h.ref_pic_list_modification_l0
+                                        .iter()
+                                        .map(|e| (e.op, e.difference))
+                                        .collect::<Vec<_>>(),
+                                    se.nal_data.first().copied().unwrap_or(0),
+                                    se.nal_data.len()
+                                );
                             }
                         }
                     }
@@ -1973,10 +2040,10 @@ impl VaapiDecoder {
                     if let Some(sps) = s.downcast_ref::<H265Sps>() {
                         self.stream.h265_sps = Some(sps.clone());
                     }
-                    if let Some(pb) = pps {
-                        if let Some(pps) = pb.downcast_ref::<H265Pps>() {
-                            self.stream.h265_pps = Some(pps.clone());
-                        }
+                    if let Some(pb) = pps
+                        && let Some(pps) = pb.downcast_ref::<H265Pps>()
+                    {
+                        self.stream.h265_pps = Some(pps.clone());
                     }
                     continue;
                 }
@@ -3121,10 +3188,10 @@ fn parse_h264_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         }) => {
             if let Some(sps) = s.downcast_ref::<H264Sps>() {
                 sps_opt = Some(sps.clone());
-                if let Some(pps_box) = pps {
-                    if let Some(pps_ref) = pps_box.downcast_ref::<H264Pps>() {
-                        pps_opt = Some(pps_ref.clone());
-                    }
+                if let Some(pps_box) = pps
+                    && let Some(pps_ref) = pps_box.downcast_ref::<H264Pps>()
+                {
+                    pps_opt = Some(pps_ref.clone());
                 }
             }
         }
@@ -3286,10 +3353,10 @@ fn parse_h265_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         if let Some(sps) = s.downcast_ref::<H265Sps>() {
             sps_opt = Some(sps.clone());
         }
-        if let Some(pps_box) = pps {
-            if let Some(pps) = pps_box.downcast_ref::<H265Pps>() {
-                pps_opt = Some(pps.clone());
-            }
+        if let Some(pps_box) = pps
+            && let Some(pps) = pps_box.downcast_ref::<H265Pps>()
+        {
+            pps_opt = Some(pps.clone());
         }
     }
 
@@ -3481,7 +3548,7 @@ fn parse_vp9_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         _ => {
             return Err(Error::DecoderInit(format!(
                 "Unsupported VP9 bit depth {bit_depth}"
-            )))
+            )));
         }
     };
 
@@ -3634,15 +3701,15 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
             pos = data.len();
         }
 
-        if sps_payload.is_none() {
-            if let Some(s) = av1_find_sps_obu(&payload) {
-                sps_payload = Some(s);
-            }
+        if sps_payload.is_none()
+            && let Some(s) = av1_find_sps_obu(&payload)
+        {
+            sps_payload = Some(s);
         }
-        if frame_payload.is_none() {
-            if let Some(obu) = av1_extract_frame_obus(&payload).into_iter().next() {
-                frame_payload = Some(obu.payload);
-            }
+        if frame_payload.is_none()
+            && let Some(obu) = av1_extract_frame_obus(&payload).into_iter().next()
+        {
+            frame_payload = Some(obu.payload);
         }
         if sps_payload.is_some() && frame_payload.is_some() {
             break;
@@ -3698,7 +3765,7 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         p => {
             return Err(Error::DecoderInit(format!(
                 "Unsupported AV1 profile {p} (VAAPI supports profiles 0/1)"
-            )))
+            )));
         }
     };
     if !display
@@ -4271,10 +4338,10 @@ impl VaapiDecoder {
                 }
             }
             for (i, fb) in dpb.frame_buffers.iter().enumerate() {
-                if fb.slot >= 0 {
-                    if let Some(pool_idx) = ctx.slot_surfaces[fb.slot as usize] {
-                        ref_frame_map[i] = self.surface_pool.entries[pool_idx].surface.id();
-                    }
+                if fb.slot >= 0
+                    && let Some(pool_idx) = ctx.slot_surfaces[fb.slot as usize]
+                {
+                    ref_frame_map[i] = self.surface_pool.entries[pool_idx].surface.id();
                 }
             }
         }
@@ -4765,11 +4832,7 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
         // Quantization scales (FFmpeg: qmul[Y/UV][DC/AC]).
         let mut qyac: i32 = if q_enabled {
             let qv = sg.feature_data[i][0] as i32;
-            if abs_or_delta {
-                qv
-            } else {
-                yac_qi + qv
-            }
+            if abs_or_delta { qv } else { yac_qi + qv }
         } else {
             yac_qi
         };

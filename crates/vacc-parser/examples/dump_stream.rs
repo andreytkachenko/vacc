@@ -214,8 +214,14 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                     rplm(&slh.ref_pic_list_modification_l0),
                     rplm(&slh.ref_pic_list_modification_l1),
                     slh.header_bit_size,
-                    l0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
-                    l1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
+                    l0.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    l1.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 );
                 let header_bytes = (slh.header_bit_size as usize).div_ceil(8);
                 let raw = &first.nal_data[..header_bytes.min(first.nal_data.len())];
@@ -335,8 +341,14 @@ fn dump_h265(data: &[u8], max_frames: usize) {
                     info.num_long_term_pics,
                     info.slice_segment_address,
                     u32::from(info.dependent_slice_segment_flag),
-                    l0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
-                    l1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "),
+                    l0.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    l1.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 );
                 let header_bytes = 2 + (info.header_bit_size as usize).div_ceil(8);
                 let raw = &first.nal_data[..header_bytes.min(first.nal_data.len())];

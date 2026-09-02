@@ -66,10 +66,10 @@ fn parse_gt() -> Vec<GtPic> {
             let get = |key: &str| -> i64 {
                 for l in &lines {
                     for t in l.split_whitespace() {
-                        if let Some((k, v)) = t.split_once('=') {
-                            if k == key {
-                                return v.parse().unwrap();
-                            }
+                        if let Some((k, v)) = t.split_once('=')
+                            && k == key
+                        {
+                            return v.parse().unwrap();
                         }
                     }
                 }
@@ -393,10 +393,10 @@ fn h265_parser_matches_cuvid_ground_truth() {
 
                 // --- slice type / flags ---
                 let intra = info.slice_type == 0; // 0=I, 1=P, 2=B
-                                                  // Known IDR quirk: the IDR slice header is mis-parsed as a B
-                                                  // slice (subtle bit-alignment nuance; the POC is still correct,
-                                                  // which is asserted above). The parser's intra flag is therefore
-                                                  // unreliable for IDR pictures, so only assert it for non-IDR pics.
+                // Known IDR quirk: the IDR slice header is mis-parsed as a B
+                // slice (subtle bit-alignment nuance; the POC is still correct,
+                // which is asserted above). The parser's intra flag is therefore
+                // unreliable for IDR pictures, so only assert it for non-IDR pics.
                 if !g.idr {
                     assert_eq!(intra, g.intra, "pic {pic}: intra flag mismatch");
                 }

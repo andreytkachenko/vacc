@@ -1,8 +1,8 @@
 //! H.264/AVC Vulkan video decoder.
 
 use ash::vk;
-use ash::vk::native::*;
 use ash::vk::Handle;
+use ash::vk::native::*;
 
 use super::dpb::LastAccessType;
 use super::{VideoError, VideoResult};
@@ -1016,13 +1016,17 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
         );
         eprintln!(
             "[H264-SESS-DUMP] bit_depth_luma_minus8={} bit_depth_chroma_minus8={} log2_max_frame_num_minus4={} poc_type={}",
-            out.bit_depth_luma_minus8, out.bit_depth_chroma_minus8,
-            out.log2_max_frame_num_minus4, out.pic_order_cnt_type
+            out.bit_depth_luma_minus8,
+            out.bit_depth_chroma_minus8,
+            out.log2_max_frame_num_minus4,
+            out.pic_order_cnt_type
         );
         eprintln!(
             "[H264-SESS-DUMP] offset_non_ref={} offset_top_bottom={} log2_max_poc_lsb={} num_ref_frames_in_cycle={} max_num_ref_frames={}",
-            out.offset_for_non_ref_pic, out.offset_for_top_to_bottom_field,
-            out.log2_max_pic_order_cnt_lsb_minus4, out.num_ref_frames_in_pic_order_cnt_cycle,
+            out.offset_for_non_ref_pic,
+            out.offset_for_top_to_bottom_field,
+            out.log2_max_pic_order_cnt_lsb_minus4,
+            out.num_ref_frames_in_pic_order_cnt_cycle,
             out.max_num_ref_frames
         );
         eprintln!(
@@ -1108,13 +1112,18 @@ pub fn convert_h264_pps(pps: &vacc_core::picture::H264Pps) -> StdVideoH264Pictur
         );
         eprintln!(
             "[H264-SESS-DUMP] pps_id={} sps_id={} nrl0={} nrl1={} weighted_bipred_idc={} pic_init_qp={} pic_init_qs={}",
-            out.pic_parameter_set_id, out.seq_parameter_set_id,
-            out.num_ref_idx_l0_default_active_minus1, out.num_ref_idx_l1_default_active_minus1,
-            out.weighted_bipred_idc, out.pic_init_qp_minus26, out.pic_init_qs_minus26
+            out.pic_parameter_set_id,
+            out.seq_parameter_set_id,
+            out.num_ref_idx_l0_default_active_minus1,
+            out.num_ref_idx_l1_default_active_minus1,
+            out.weighted_bipred_idc,
+            out.pic_init_qp_minus26,
+            out.pic_init_qs_minus26
         );
         eprintln!(
             "[H264-SESS-DUMP] chroma_qp_index_offset={} second_chroma_qp_index_offset={} pScalingLists={:?}",
-            out.chroma_qp_index_offset, out.second_chroma_qp_index_offset,
+            out.chroma_qp_index_offset,
+            out.second_chroma_qp_index_offset,
             out.pScalingLists.is_null()
         );
     }

@@ -18,7 +18,7 @@ static GT: &str = include_str!("h265_cref_50.txt");
 use vacc_core::codec::VideoCodec;
 use vacc_core::picture::H265Sps;
 use vacc_parser::h265::H265Parser;
-use vacc_parser::h265_dpb::{resolve_refs, H265Dpb};
+use vacc_parser::h265_dpb::{H265Dpb, resolve_refs};
 use vacc_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser};
 
 struct GtPic {
@@ -39,10 +39,10 @@ fn parse_gt() -> Vec<GtPic> {
             let get = |key: &str| -> i64 {
                 for l in sec.lines() {
                     for t in l.split_whitespace() {
-                        if let Some((k, v)) = t.split_once('=') {
-                            if k == key {
-                                return v.parse().unwrap();
-                            }
+                        if let Some((k, v)) = t.split_once('=')
+                            && k == key
+                        {
+                            return v.parse().unwrap();
                         }
                     }
                 }
@@ -138,5 +138,7 @@ fn h265_dpb_full_stream_no_missing_refs() {
         pic_idx >= 300,
         "expected >= 300 pictures in the stream, got {pic_idx}"
     );
-    eprintln!("OK: {pic_idx} pictures decoded through the common H265 DPB with no missing references (first 50 GT-checked)");
+    eprintln!(
+        "OK: {pic_idx} pictures decoded through the common H265 DPB with no missing references (first 50 GT-checked)"
+    );
 }

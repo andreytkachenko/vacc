@@ -1,5 +1,5 @@
 //! Temporary: dump MMCO ops from the sample. DELETE AFTER USE.
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -17,16 +17,23 @@ fn dump_mmco() {
                     if let (Some(sps), Some(pps)) = (parser.active_sps(), parser.active_pps()) {
                         eprintln!(
                             "SPS: log2_fn={} poc_type={} log2_poc={} fmo={} sep_colour={} max_ref={}",
-                            sps.log2_max_frame_num_minus4, sps.pic_order_cnt_type,
-                            sps.log2_max_pic_order_cnt_lsb_minus4, sps.frame_mbs_only_flag,
-                            sps.separate_colour_plane_flag, sps.max_num_ref_frames
+                            sps.log2_max_frame_num_minus4,
+                            sps.pic_order_cnt_type,
+                            sps.log2_max_pic_order_cnt_lsb_minus4,
+                            sps.frame_mbs_only_flag,
+                            sps.separate_colour_plane_flag,
+                            sps.max_num_ref_frames
                         );
                         eprintln!(
                             "PPS: entropy={} bf_poc={} nrl0={} nrl1={} wpred={} wbipred={} deblock={} red={}",
-                            pps.entropy_coding_mode_flag, pps.bottom_field_pic_order_in_frame_present_flag,
-                            pps.num_ref_idx_l0_default_active_minus1, pps.num_ref_idx_l1_default_active_minus1,
-                            pps.weighted_pred_flag, pps.weighted_bipred_idc,
-                            pps.deblocking_filter_control_present_flag, pps.redundant_pic_cnt_present_flag
+                            pps.entropy_coding_mode_flag,
+                            pps.bottom_field_pic_order_in_frame_present_flag,
+                            pps.num_ref_idx_l0_default_active_minus1,
+                            pps.num_ref_idx_l1_default_active_minus1,
+                            pps.weighted_pred_flag,
+                            pps.weighted_bipred_idc,
+                            pps.deblocking_filter_control_present_flag,
+                            pps.redundant_pic_cnt_present_flag
                         );
                     }
                     dumped_pps = true;

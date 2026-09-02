@@ -4,7 +4,7 @@
 //! CUVIDH264PICPARAMS construction, including SPS/PPS extraction, slice header
 //! parsing, frame type detection, POC calculation, and MMCO command extraction.
 
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 /// Path to the project root (parent of nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -356,7 +356,8 @@ fn test_parser_handles_i_frames() {
     assert!(
         !i_slices.is_empty(),
         "Should find at least one I-frame slice in born_trailer.h264 (found {} I-slices out of {} total)",
-        i_slices.len(), slices.len()
+        i_slices.len(),
+        slices.len()
     );
 
     for slh in &i_slices {

@@ -165,15 +165,15 @@ pub mod picparams;
 pub mod poc;
 pub mod vp9;
 
-pub use av1::{build_cuvid_av1_picparams, NvdecAv1Decoder};
+pub use av1::{NvdecAv1Decoder, build_cuvid_av1_picparams};
 pub use decoder::NvdecH264Decoder;
 pub use device::{
-    cu_memcpy_2d, init_nvdec, is_available, is_codec_supported, query_decoder_caps, CUDA_MEMCPY2D,
-    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST,
+    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_memcpy_2d, init_nvdec,
+    is_available, is_codec_supported, query_decoder_caps,
 };
 pub use error::{NvdecError, NvdecResult};
 pub use h265::NvdecH265Decoder;
-pub use vp9::{build_cuvid_vp9_picparams, NvdecVp9Decoder, Vp9DpbState};
+pub use vp9::{NvdecVp9Decoder, Vp9DpbState, build_cuvid_vp9_picparams};
 
 /// Convenience type alias for the H.264 decoder.
 ///

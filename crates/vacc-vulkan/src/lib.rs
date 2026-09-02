@@ -34,9 +34,9 @@ pub use decoder::{DecodedFrame, VideoDecoder};
 pub use device::{QueueFamilies, VideoCodec, VideoDeviceBuilder, VulkanDevice};
 pub use dpb::{DpbEntry, DpbManager, LastAccessType};
 pub use frame::{DecodedFrame as FrameDecodedFrame, YCbCrPlane};
-pub use image::{create_output_image, create_output_image_with_pnext, StagingImage};
+pub use image::{StagingImage, create_output_image, create_output_image_with_pnext};
 pub use profile_chain::{create_bitstream_buffer_with_profile, create_output_image_with_profile};
-pub use readback::{readback_decoded_image, DecodedPixels};
+pub use readback::{DecodedPixels, readback_decoded_image};
 pub use session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams};
 
 /// Returns true when `VACC_DEBUG=1` is set. Gates the verbose per-frame

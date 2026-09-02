@@ -306,10 +306,10 @@ fn test_full_stream_pocs() {
             ParseResult::Slice { slices, .. } => {
                 for s in &slices {
                     let header = s.slice_header.clone().expect("slice header must parse");
-                    if let SliceHeader::H264(slh) = header {
-                        if slh.redundant_pic_cnt <= 0 {
-                            headers.push(slh);
-                        }
+                    if let SliceHeader::H264(slh) = header
+                        && slh.redundant_pic_cnt <= 0
+                    {
+                        headers.push(slh);
                     }
                 }
             }

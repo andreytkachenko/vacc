@@ -44,18 +44,18 @@ use vacc_core::{
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
     session::Extent2D,
 };
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 use crate::device::{
-    cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
-    get_funcs, init_nvdec, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST,
+    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_ctx_set_current,
+    cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d, get_funcs, init_nvdec,
 };
 use crate::dpb::NvdecDpbManager;
 use crate::error::{NvdecError, NvdecResult};
 use crate::ffi::{
-    cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags, cudaVideoDeinterlaceMode,
-    cudaVideoSurfaceFormat, CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
-    CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
+    CUDA_SUCCESS, CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT, CUdeviceptr,
+    CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags,
+    cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
 };
 use crate::picparams::build_cuvid_picparams;
 use crate::poc::PocCalculator;
@@ -309,56 +309,54 @@ impl NvdecH264Decoder {
                     ..
                 }) => {
                     // Handle SPS — create or recreate decoder
-                    if let Some(sps_box) = sps {
-                        if let Some(h264_sps) =
+                    if let Some(sps_box) = sps
+                        && let Some(h264_sps) =
                             sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                    {
+                        let (prev_w, prev_h) = {
+                            let s = self.prev_coded_size.lock().unwrap();
+                            *s
+                        };
+
+                        let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
+                        let coded_height = if h264_sps.frame_mbs_only_flag {
+                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
+                        } else {
+                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
+                        };
+
+                        let resolution_changed = prev_w != coded_width || prev_h != coded_height;
+                        if resolution_changed {
+                            self.recreate_decoder(h264_sps)?;
+                        } else {
+                            // Check if decoder needs to be created for the first time
+                            let decoder_handle = {
+                                let d = self.decoder.lock().unwrap();
+                                *d
+                            };
+                            if decoder_handle.is_null() {
+                                self.create_decoder(h264_sps)?;
+                            }
+                        }
+
+                        // Store profile_idc
                         {
-                            let (prev_w, prev_h) = {
-                                let s = self.prev_coded_size.lock().unwrap();
-                                *s
-                            };
+                            let mut p = self.profile_idc.lock().unwrap();
+                            *p = Some(h264_sps.profile_idc as u32);
+                        }
 
-                            let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
-                            let coded_height = if h264_sps.frame_mbs_only_flag {
-                                (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
-                            } else {
-                                (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
-                            };
+                        // Update DPB manager from SPS
+                        {
+                            let mut dpb = self.dpb_manager.lock().unwrap();
+                            dpb.set_max_frame_num(h264_sps.max_frame_num);
+                            dpb.set_max_dpb_size(h264_sps.max_num_ref_frames as usize);
+                        }
 
-                            let resolution_changed =
-                                prev_w != coded_width || prev_h != coded_height;
-                            if resolution_changed {
-                                self.recreate_decoder(h264_sps)?;
-                            } else {
-                                // Check if decoder needs to be created for the first time
-                                let decoder_handle = {
-                                    let d = self.decoder.lock().unwrap();
-                                    *d
-                                };
-                                if decoder_handle.is_null() {
-                                    self.create_decoder(h264_sps)?;
-                                }
-                            }
-
-                            // Store profile_idc
-                            {
-                                let mut p = self.profile_idc.lock().unwrap();
-                                *p = Some(h264_sps.profile_idc as u32);
-                            }
-
-                            // Update DPB manager from SPS
-                            {
-                                let mut dpb = self.dpb_manager.lock().unwrap();
-                                dpb.set_max_frame_num(h264_sps.max_frame_num);
-                                dpb.set_max_dpb_size(h264_sps.max_num_ref_frames as usize);
-                            }
-
-                            // Set the POC wrap period from the SPS (POC type 0).
-                            if h264_sps.pic_order_cnt_type == 0 {
-                                self.poc_period = h264_sps.max_pic_order_cnt_lsb as i32;
-                            } else {
-                                self.poc_period = 0;
-                            }
+                        // Set the POC wrap period from the SPS (POC type 0).
+                        if h264_sps.pic_order_cnt_type == 0 {
+                            self.poc_period = h264_sps.max_pic_order_cnt_lsb as i32;
+                        } else {
+                            self.poc_period = 0;
                         }
                     }
 
@@ -691,7 +689,8 @@ impl NvdecH264Decoder {
             };
             return Err(NvdecError::DecoderCreationFailed(format!(
                 "HW does not support H.264 {}-bit {} decode on this NVDEC device (cuvidGetDecoderCaps reports unsupported)",
-                8 + sps.bit_depth_luma_minus8, chroma_name,
+                8 + sps.bit_depth_luma_minus8,
+                chroma_name,
             )));
         }
 
@@ -1412,11 +1411,7 @@ impl NvdecH264Decoder {
 
     /// Get the next decoded frame if available.
     fn get_decoded_frame(&self) -> Option<DecodedFrame> {
-        let frame = {
-            let mut pending = self.pending_frames.lock().unwrap();
-            pending.pop_front()
-        };
-        frame
+        self.pending_frames.lock().unwrap().pop_front()
     }
 }
 
@@ -1562,10 +1557,10 @@ impl Drop for NvdecH264Decoder {
             let d = self.decoder.lock().unwrap();
             *d
         };
-        if !decoder_handle.is_null() {
-            if let Ok(funcs) = get_funcs() {
-                let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
-            }
+        if !decoder_handle.is_null()
+            && let Ok(funcs) = get_funcs()
+        {
+            let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
         }
     }
 }

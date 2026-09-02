@@ -17,7 +17,7 @@
 //! NVDEC, and VAAPI backends (moved from `vacc-vulkan`).
 
 use crate::h264::RefPicListModificationEntry;
-use crate::h264_reflist::{build_ref_pic_lists, DpbRefState, RefPicLists};
+use crate::h264_reflist::{DpbRefState, RefPicLists, build_ref_pic_lists};
 
 /// H.264 Memory Management Control Operation (MMCO) command.
 /// See H.264 spec 8.2.5.4 for details.

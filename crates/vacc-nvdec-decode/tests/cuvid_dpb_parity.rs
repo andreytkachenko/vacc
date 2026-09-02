@@ -25,7 +25,7 @@
 
 use vacc_nvdec_decode::dpb::NvdecDpbManager;
 use vacc_nvdec_decode::poc::PocCalculator;
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 /// Project root (parent of the vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -264,16 +264,15 @@ fn test_parser_dpb_poc_matches_cuvid_parser() {
             Ok(ParseResult::ParameterSet { sps: sps_box, .. }) => {
                 // Initialize the DPB manager from the first SPS, mirroring the
                 // production decoder.
-                if dpb.is_none() {
-                    if let Some(sb) = sps_box {
-                        if let Some(sps) = sb.downcast_ref::<vacc_core::picture::H264Sps>() {
-                            let mut m = NvdecDpbManager::new(sps.max_num_ref_frames as usize);
-                            m.set_max_frame_num(sps.max_frame_num);
-                            m.set_max_dpb_size(sps.max_num_ref_frames as usize);
-                            m.set_max_decode_surfaces(MAX_DECODE_SURFACES);
-                            dpb = Some(m);
-                        }
-                    }
+                if dpb.is_none()
+                    && let Some(sb) = sps_box
+                    && let Some(sps) = sb.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    let mut m = NvdecDpbManager::new(sps.max_num_ref_frames as usize);
+                    m.set_max_frame_num(sps.max_frame_num);
+                    m.set_max_dpb_size(sps.max_num_ref_frames as usize);
+                    m.set_max_decode_surfaces(MAX_DECODE_SURFACES);
+                    dpb = Some(m);
                 }
             }
             Ok(ParseResult::Slice { slices, .. }) => {

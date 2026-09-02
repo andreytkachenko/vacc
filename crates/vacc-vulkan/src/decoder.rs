@@ -3,6 +3,7 @@
 use ash::vk::{self, Handle};
 
 use super::{
+    VideoError, VideoResult,
     access_unit::{
         AccessUnit, ExtractedItem, H264OrH265Pps, H264OrH265Sps, H265VpsOpt, InBandParameterSet,
         VideoCodec as AccessUnitCodec,
@@ -19,12 +20,11 @@ use super::{
     },
     readback::DecodedPixels,
     session::{CodecProfileInfo, VideoSession, VideoSessionParameters, VideoSessionParams},
-    vp9::{convert_vp9_picture_info, VideoDecodeVP9PictureInfoKHR, Vp9Decoder},
-    VideoError, VideoResult,
+    vp9::{VideoDecodeVP9PictureInfoKHR, Vp9Decoder, convert_vp9_picture_info},
 };
-use vacc_parser::h264_dpb::MARKING_SHORT;
-use vacc_parser::h264_reflist::{build_ref_pic_lists, DpbRefState};
 use vacc_parser::VideoParser;
+use vacc_parser::h264_dpb::MARKING_SHORT;
+use vacc_parser::h264_reflist::{DpbRefState, build_ref_pic_lists};
 
 /// Decoded frame with metadata for presentation ordering.
 #[derive(Debug, Clone)]
@@ -139,11 +139,7 @@ impl VideoDecoder {
     /// shared image; in separate-image mode each slot is its own single-layer
     /// image, so the layer is always 0.
     fn dpb_base_layer(&self, slot: u32) -> u32 {
-        if self.dpb_use_image_array {
-            slot
-        } else {
-            0
-        }
+        if self.dpb_use_image_array { slot } else { 0 }
     }
 
     /// Create a new video decoder from bitstream data.
@@ -399,7 +395,9 @@ impl VideoDecoder {
                 for (idx, view) in views.iter().enumerate() {
                     eprintln!(
                         "[DPB-ITER8]   slot {}: view={:#x} (subresource: base_array_layer={}, layer_count=1)",
-                        idx, view.as_raw(), idx
+                        idx,
+                        view.as_raw(),
+                        idx
                     );
                 }
             }
@@ -433,7 +431,9 @@ impl VideoDecoder {
                 if super::vacc_debug() {
                     eprintln!(
                         "[DPB-ITER8]   slot {}: view={:#x} img={:#x} (separate, base_array_layer=0)",
-                        i, view.as_raw(), img.as_raw()
+                        i,
+                        view.as_raw(),
+                        img.as_raw()
                     );
                 }
                 dpb_views.push(view);
@@ -746,7 +746,7 @@ impl VideoDecoder {
                             _ => {
                                 return Err(VideoError::DecoderInit(
                                     "H265 SPS not found".to_string(),
-                                ))
+                                ));
                             }
                         };
                         let parser = h265_parser.as_mut().expect("h265 parser initialized");
@@ -778,7 +778,7 @@ impl VideoDecoder {
                                 Err(e) => {
                                     return Err(VideoError::DecoderInit(format!(
                                         "H265 parse error: {e}"
-                                    )))
+                                    )));
                                 }
                             }
                         }
@@ -807,13 +807,21 @@ impl VideoDecoder {
                                 slot,
                                 lists.l0.iter().map(|r| r.slot).collect::<Vec<_>>(),
                                 lists.l1.iter().map(|r| r.slot).collect::<Vec<_>>(),
-                                rps_slots.0, rps_slots.1, rps_slots.2,
+                                rps_slots.0,
+                                rps_slots.1,
+                                rps_slots.2,
                                 info.num_bits_for_strps_in_slice,
                                 info.slice_type,
                                 info.num_ref_idx_l0_active_minus1,
                                 info.num_ref_idx_l1_active_minus1,
-                                info.ref_pic_lists_modification_l0.iter().map(|m| (m.flag, m.ref_idx)).collect::<Vec<_>>(),
-                                info.ref_pic_lists_modification_l1.iter().map(|m| (m.flag, m.ref_idx)).collect::<Vec<_>>()
+                                info.ref_pic_lists_modification_l0
+                                    .iter()
+                                    .map(|m| (m.flag, m.ref_idx))
+                                    .collect::<Vec<_>>(),
+                                info.ref_pic_lists_modification_l1
+                                    .iter()
+                                    .map(|m| (m.flag, m.ref_idx))
+                                    .collect::<Vec<_>>()
                             );
                         }
 
@@ -1417,31 +1425,31 @@ impl VideoDecoder {
                 None => {
                     return Err(VideoError::DecoderInit(
                         "AV1 parser not initialized".to_string(),
-                    ))
+                    ));
                 }
             };
 
             if super::vacc_debug() {
                 eprintln!(
-                      "[AV1] Frame {} (disp#{}): type={:?}, show_frame={}, show_existing={}, show_map_idx={}, order_hint={}, primary_ref={}, refresh_flags={:08b}, ref_idx={:?}, payload_start={}",
-                      frame_idx,
-                      display_count,
-                      match fh.frame_type {
-                          0 => "KEY",
-                          1 => "INTER",
-                          2 => "INTRA_ONLY",
-                          3 => "SWITCH",
-                          _ => "UNKNOWN",
-                      },
-                      fh.show_frame,
-                      fh.show_existing_frame,
-                      fh.frame_to_show_map_idx,
-                      fh.order_hint,
-                      fh.primary_ref_frame,
-                      fh.refresh_frame_flags,
-                      fh.ref_frame_idx,
-                      av1_frame.payload_start,
-                  );
+                    "[AV1] Frame {} (disp#{}): type={:?}, show_frame={}, show_existing={}, show_map_idx={}, order_hint={}, primary_ref={}, refresh_flags={:08b}, ref_idx={:?}, payload_start={}",
+                    frame_idx,
+                    display_count,
+                    match fh.frame_type {
+                        0 => "KEY",
+                        1 => "INTER",
+                        2 => "INTRA_ONLY",
+                        3 => "SWITCH",
+                        _ => "UNKNOWN",
+                    },
+                    fh.show_frame,
+                    fh.show_existing_frame,
+                    fh.frame_to_show_map_idx,
+                    fh.order_hint,
+                    fh.primary_ref_frame,
+                    fh.refresh_frame_flags,
+                    fh.ref_frame_idx,
+                    av1_frame.payload_start,
+                );
             }
 
             // Handle show_existing_frame: no new decode, output the already-decoded
@@ -1544,11 +1552,20 @@ impl VideoDecoder {
                 );
                 eprintln!(
                     "[FH-DIAG] frame0: frame_type={} frame_w={}x{} tile_cols_log2={} tile_rows_log2={} order_hint={} refresh_flags={:08b} primary_ref={} base_q={} interp_filter={} tx_mode={} superres={} render_diff={} film_grain={} enable_order_hint_sps={}",
-                    fh.frame_type, fh.frame_width, fh.frame_height,
-                    fh.tile_cols_log2, fh.tile_rows_log2, fh.order_hint,
-                    fh.refresh_frame_flags, fh.primary_ref_frame, fh.base_q_index,
-                    fh.interpolation_filter, fh.tx_mode, fh.use_superres,
-                    fh.render_and_frame_size_different, fh.apply_grain,
+                    fh.frame_type,
+                    fh.frame_width,
+                    fh.frame_height,
+                    fh.tile_cols_log2,
+                    fh.tile_rows_log2,
+                    fh.order_hint,
+                    fh.refresh_frame_flags,
+                    fh.primary_ref_frame,
+                    fh.base_q_index,
+                    fh.interpolation_filter,
+                    fh.tx_mode,
+                    fh.use_superres,
+                    fh.render_and_frame_size_different,
+                    fh.apply_grain,
                     0
                 );
                 eprintln!(
@@ -1574,7 +1591,10 @@ impl VideoDecoder {
                     fh.tile_size_bytes_minus_1,
                     fh.context_update_tile_id,
                     fh.diff_uv_delta,
-                    self.av1_sps.as_ref().map(|s| s.separate_uv_delta_q).unwrap_or(false),
+                    self.av1_sps
+                        .as_ref()
+                        .map(|s| s.separate_uv_delta_q)
+                        .unwrap_or(false),
                     fh.base_q_index,
                     fh.using_qmatrix,
                     &fh.tile_width_in_sbs_minus_1[..fh.tile_cols.min(64) as usize],
@@ -2161,13 +2181,30 @@ impl VideoDecoder {
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} useslr={} chromalr={} grain={}",
-                    f.use_superres(), f.render_and_frame_size_different(), f.allow_screen_content_tools(),
-                    f.is_filter_switchable(), f.force_integer_mv(), f.allow_intrabc(), f.frame_refs_short_signaling(),
-                    f.allow_high_precision_mv(), f.is_motion_mode_switchable(), f.use_ref_frame_mvs(),
-                    f.allow_warped_motion(), f.reduced_tx_set(), f.reference_select(), f.skip_mode_present(),
-                    f.delta_q_present(), f.delta_lf_present(), f.delta_lf_multi(), f.segmentation_enabled(),
-                    f.segmentation_update_map(), f.segmentation_temporal_update(), f.segmentation_update_data(),
-                    f.UsesLr(), f.usesChromaLr(), f.apply_grain()
+                    f.use_superres(),
+                    f.render_and_frame_size_different(),
+                    f.allow_screen_content_tools(),
+                    f.is_filter_switchable(),
+                    f.force_integer_mv(),
+                    f.allow_intrabc(),
+                    f.frame_refs_short_signaling(),
+                    f.allow_high_precision_mv(),
+                    f.is_motion_mode_switchable(),
+                    f.use_ref_frame_mvs(),
+                    f.allow_warped_motion(),
+                    f.reduced_tx_set(),
+                    f.reference_select(),
+                    f.skip_mode_present(),
+                    f.delta_q_present(),
+                    f.delta_lf_present(),
+                    f.delta_lf_multi(),
+                    f.segmentation_enabled(),
+                    f.segmentation_update_map(),
+                    f.segmentation_temporal_update(),
+                    f.segmentation_update_data(),
+                    f.UsesLr(),
+                    f.usesChromaLr(),
+                    f.apply_grain()
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   flags2: errres={} discdf={} fso={} brt={}",
@@ -2183,24 +2220,50 @@ impl VideoDecoder {
                 let q = &picture_info_container.quantization;
                 eprintln!(
                     "[RUST-PI-ALL]   quant: using_qmatrix={} diff_uv_delta={} base_q={} dQYdc={} dQUdc={} dQUac={} dQVdc={} dQVac={} qm_y={} qm_u={} qm_v={}",
-                    q.flags.using_qmatrix(), q.flags.diff_uv_delta(), q.base_q_idx, q.DeltaQYDc, q.DeltaQUDc, q.DeltaQUAc, q.DeltaQVDc, q.DeltaQVAc, q.qm_y, q.qm_u, q.qm_v
+                    q.flags.using_qmatrix(),
+                    q.flags.diff_uv_delta(),
+                    q.base_q_idx,
+                    q.DeltaQYDc,
+                    q.DeltaQUDc,
+                    q.DeltaQUAc,
+                    q.DeltaQVDc,
+                    q.DeltaQVAc,
+                    q.qm_y,
+                    q.qm_u,
+                    q.qm_v
                 );
                 let lf = &picture_info_container.loop_filter;
                 eprintln!(
                     "[RUST-PI-ALL]   lf: delta_en={} delta_upd={} level=[{},{},{},{}] sharp={} updrefd={} refd=[{},{},{},{},{},{},{},{}] updmodes={} moded=[{},{}]",
-                    lf.flags.loop_filter_delta_enabled(), lf.flags.loop_filter_delta_update(),
-                    lf.loop_filter_level[0], lf.loop_filter_level[1], lf.loop_filter_level[2], lf.loop_filter_level[3],
-                    lf.loop_filter_sharpness, lf.update_ref_delta,
-                    lf.loop_filter_ref_deltas[0], lf.loop_filter_ref_deltas[1], lf.loop_filter_ref_deltas[2], lf.loop_filter_ref_deltas[3],
-                    lf.loop_filter_ref_deltas[4], lf.loop_filter_ref_deltas[5], lf.loop_filter_ref_deltas[6], lf.loop_filter_ref_deltas[7],
-                    lf.update_mode_delta, lf.loop_filter_mode_deltas[0], lf.loop_filter_mode_deltas[1]
+                    lf.flags.loop_filter_delta_enabled(),
+                    lf.flags.loop_filter_delta_update(),
+                    lf.loop_filter_level[0],
+                    lf.loop_filter_level[1],
+                    lf.loop_filter_level[2],
+                    lf.loop_filter_level[3],
+                    lf.loop_filter_sharpness,
+                    lf.update_ref_delta,
+                    lf.loop_filter_ref_deltas[0],
+                    lf.loop_filter_ref_deltas[1],
+                    lf.loop_filter_ref_deltas[2],
+                    lf.loop_filter_ref_deltas[3],
+                    lf.loop_filter_ref_deltas[4],
+                    lf.loop_filter_ref_deltas[5],
+                    lf.loop_filter_ref_deltas[6],
+                    lf.loop_filter_ref_deltas[7],
+                    lf.update_mode_delta,
+                    lf.loop_filter_mode_deltas[0],
+                    lf.loop_filter_mode_deltas[1]
                 );
                 let c = &picture_info_container.cdef;
                 eprintln!(
                     "[RUST-PI-ALL]   cdef: damping={} bits={} ypri={:?} ysec={:?} uvprim={:?} uvsec={:?}",
-                    c.cdef_damping_minus_3, c.cdef_bits,
-                    c.cdef_y_pri_strength, c.cdef_y_sec_strength,
-                    c.cdef_uv_pri_strength, c.cdef_uv_sec_strength
+                    c.cdef_damping_minus_3,
+                    c.cdef_bits,
+                    c.cdef_y_pri_strength,
+                    c.cdef_y_sec_strength,
+                    c.cdef_uv_pri_strength,
+                    c.cdef_uv_sec_strength
                 );
                 let lr = &picture_info_container.loop_restoration;
                 eprintln!(
@@ -2268,7 +2331,11 @@ impl VideoDecoder {
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   orderHints={:?} expectedFrameId={:?} skipModeFrame={:?} coded_denom={} current_frame_id={}",
-                    pi.OrderHints, pi.expectedFrameId, pi.SkipModeFrame, pi.coded_denom, pi.current_frame_id
+                    pi.OrderHints,
+                    pi.expectedFrameId,
+                    pi.SkipModeFrame,
+                    pi.coded_denom,
+                    pi.current_frame_id
                 );
                 eprintln!(
                     "[RUST-PI-ALL]   tile: tileOffsets[0]={} tileSizes[0]={}",
@@ -2314,8 +2381,12 @@ impl VideoDecoder {
                     fg.num_y_points,
                     fg.num_cb_points,
                     fg.num_cr_points,
-                    fg.cb_mult, fg.cb_luma_mult, fg.cb_offset,
-                    fg.cr_mult, fg.cr_luma_mult, fg.cr_offset
+                    fg.cb_mult,
+                    fg.cb_luma_mult,
+                    fg.cb_offset,
+                    fg.cr_mult,
+                    fg.cr_luma_mult,
+                    fg.cr_offset
                 );
                 // DEBUG (iteration 4): bitstream bytes dump for fc2
                 if frame_idx == 6 {
@@ -2327,10 +2398,13 @@ impl VideoDecoder {
                         &bs_data[..bytes_to_dump]
                     );
                     eprintln!(
-                    "[RUST-BS-DUMP]   tile_offset={} tile_size={} frame_header_offset={} payload_start={} payload_size={}",
-                    tile_offset, tile_size, frame_header_offset,
-                    av1_frame.payload_start, av1_frame.payload_size
-                );
+                        "[RUST-BS-DUMP]   tile_offset={} tile_size={} frame_header_offset={} payload_start={} payload_size={}",
+                        tile_offset,
+                        tile_size,
+                        frame_header_offset,
+                        av1_frame.payload_start,
+                        av1_frame.payload_size
+                    );
                     eprintln!(
                         "[RUST-BS-DUMP]   fh.frame_header_size={} fh.tile_count={} fh.tile_cols={} fh.tile_rows={}",
                         fh.frame_header_size, fh.tile_count, fh.tile_cols, fh.tile_rows
@@ -2394,7 +2468,11 @@ impl VideoDecoder {
                         .fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
                     eprintln!(
                         "[TEST-B-DPB] slot={} written to {} ({} bytes) Y[0..256] hash={:016x} first16Y={:02x?}",
-                        slot, path, out.len(), hash, &px.y_plane[..16.min(px.y_plane.len())]
+                        slot,
+                        path,
+                        out.len(),
+                        hash,
+                        &px.y_plane[..16.min(px.y_plane.len())]
                     );
                 }
             }
@@ -3312,7 +3390,7 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
 
 fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
     use vacc_parser::{
-        bitstream::BitstreamPacket, h264::H264Parser, DetectedVideoFormat, ParseResult, VideoParser,
+        DetectedVideoFormat, ParseResult, VideoParser, bitstream::BitstreamPacket, h264::H264Parser,
     };
 
     let mut parser = H264Parser::new();
@@ -3426,7 +3504,7 @@ fn parse_h264(data: &[u8]) -> VideoResult<ParsedInfo> {
 
 fn parse_h265(data: &[u8]) -> VideoResult<ParsedInfo> {
     use vacc_parser::{
-        bitstream::BitstreamPacket, h265::H265Parser, DetectedVideoFormat, ParseResult, VideoParser,
+        DetectedVideoFormat, ParseResult, VideoParser, bitstream::BitstreamPacket, h265::H265Parser,
     };
 
     let mut parser = H265Parser::new();
@@ -4288,9 +4366,14 @@ fn parse_av1_init(
     if let Some(ref s) = sps {
         eprintln!(
             "[SPS-DIAG] profile={} high_bitdepth={} twelve_bit={} max_w={} max_h={} mono_chrome={} subsampling_x={} subsampling_y={}",
-            s.profile, s.high_bitdepth, s.twelve_bit,
-            s.max_frame_width_minus_1, s.max_frame_height_minus_1,
-            s.mono_chrome, s.subsampling_x, s.subsampling_y
+            s.profile,
+            s.high_bitdepth,
+            s.twelve_bit,
+            s.max_frame_width_minus_1,
+            s.max_frame_height_minus_1,
+            s.mono_chrome,
+            s.subsampling_x,
+            s.subsampling_y
         );
     } else {
         eprintln!("[SPS-DIAG] SPS parse FAILED");
@@ -4302,11 +4385,7 @@ fn parse_av1_init(
             s.max_frame_height_minus_1 as u32 + 1,
             s.profile as u32,
             if s.high_bitdepth {
-                if s.twelve_bit {
-                    12
-                } else {
-                    10
-                }
+                if s.twelve_bit { 12 } else { 10 }
             } else {
                 8
             },
@@ -4412,7 +4491,7 @@ fn parse_av1_sps_from_data(
     data: &[u8],
     parser: &mut vacc_parser::av1::Av1Parser,
 ) -> Option<vacc_core::picture::Av1Sps> {
-    use vacc_parser::{bitstream::BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{ParseResult, VideoParser, bitstream::BitstreamPacket};
 
     if data.is_empty() {
         return None;
@@ -4432,193 +4511,193 @@ fn parse_av1_sps_from_data(
     match parser.parse(&packet) {
         Ok(ParseResult::ParameterSet { sps: s, .. }) => {
             let result = s.and_then(|sp| sp.downcast_ref::<vacc_core::picture::Av1Sps>().cloned());
-            if let Some(ref sps) = result {
-                if super::vacc_debug() {
-                    eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
-                    eprintln!(
-                        "[SPS-PARSE] profile                               = {}",
-                        sps.profile
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] level                                 = {}",
-                        sps.level
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] still_picture                         = {}",
-                        sps.still_picture
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] reduced_still_picture_header          = {}",
-                        sps.reduced_still_picture_header
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] use_128x128_superblock                = {}",
-                        sps.use_128x128_superblock
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_filter_intra                   = {}",
-                        sps.enable_filter_intra
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_intra_edge_filter              = {}",
-                        sps.enable_intra_edge_filter
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_interintra_compound            = {}",
-                        sps.enable_interintra_compound
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_masked_compound                = {}",
-                        sps.enable_masked_compound
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_warped_motion                  = {}",
-                        sps.enable_warped_motion
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_dual_filter                    = {}",
-                        sps.enable_dual_filter
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_order_hint                     = {}",
-                        sps.enable_order_hint
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_jnt_motion                     = {}",
-                        sps.enable_jnt_motion
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_ref_frame_mvs                  = {}",
-                        sps.enable_ref_frame_mvs
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] seq_force_screen_content_tools        = {} (SELECT=2)",
-                        sps.seq_force_screen_content_tools
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] seq_force_integer_mv                  = {} (SELECT=2)",
-                        sps.seq_force_integer_mv
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] separate_uv_delta_q                   = {}",
-                        sps.separate_uv_delta_q
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_superres                       = {}",
-                        sps.enable_superres
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_cdef                           = {}",
-                        sps.enable_cdef
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] enable_restoration                    = {}",
-                        sps.enable_restoration
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] film_grain_params_present             = {}",
-                        sps.film_grain_params_present
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] timing_info_present_flag              = {}",
-                        sps.timing_info_present_flag
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] initial_display_delay_present_flag    = {}",
-                        sps.initial_display_delay_present_flag
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] frame_width_bits                      = {} (-> minus_1={})",
-                        sps.frame_width_bits,
-                        sps.frame_width_bits.saturating_sub(1)
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] frame_height_bits                     = {} (-> minus_1={})",
-                        sps.frame_height_bits,
-                        sps.frame_height_bits.saturating_sub(1)
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] max_frame_width_minus_1               = {}",
-                        sps.max_frame_width_minus_1
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] max_frame_height_minus_1              = {}",
-                        sps.max_frame_height_minus_1
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] frame_id_numbers_present_flag         = {}",
-                        sps.frame_id_numbers_present_flag
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] delta_frame_id_length_minus2          = {}",
-                        sps.delta_frame_id_length_minus2
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] additional_frame_id_length_minus1     = {}",
-                        sps.additional_frame_id_length_minus1
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] order_hint_bits_minus1                = {}",
-                        sps.order_hint_bits_minus1
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] high_bitdepth                         = {}",
-                        sps.high_bitdepth
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] twelve_bit                            = {}",
-                        sps.twelve_bit
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] mono_chrome                           = {}",
-                        sps.mono_chrome
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] color_description_present             = {}",
-                        sps.color_description_present
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] color_primaries                       = {}",
-                        sps.color_primaries
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] transfer_characteristics              = {}",
-                        sps.transfer_characteristics
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] matrix_coefficients                   = {}",
-                        sps.matrix_coefficients
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] color_range                           = {}",
-                        sps.color_range
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] subsampling_x                         = {}",
-                        sps.subsampling_x
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] subsampling_y                         = {}",
-                        sps.subsampling_y
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] chroma_sample_position                = {}",
-                        sps.chroma_sample_position
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] num_units_in_display_tick             = {}",
-                        sps.num_units_in_display_tick
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] time_scale                            = {}",
-                        sps.time_scale
-                    );
-                    eprintln!(
-                        "[SPS-PARSE] equal_picture_interval                = {}",
-                        sps.equal_picture_interval
-                    );
-                    eprintln!("[SPS-PARSE] ============================================");
-                }
+            if let Some(ref sps) = result
+                && super::vacc_debug()
+            {
+                eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
+                eprintln!(
+                    "[SPS-PARSE] profile                               = {}",
+                    sps.profile
+                );
+                eprintln!(
+                    "[SPS-PARSE] level                                 = {}",
+                    sps.level
+                );
+                eprintln!(
+                    "[SPS-PARSE] still_picture                         = {}",
+                    sps.still_picture
+                );
+                eprintln!(
+                    "[SPS-PARSE] reduced_still_picture_header          = {}",
+                    sps.reduced_still_picture_header
+                );
+                eprintln!(
+                    "[SPS-PARSE] use_128x128_superblock                = {}",
+                    sps.use_128x128_superblock
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_filter_intra                   = {}",
+                    sps.enable_filter_intra
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_intra_edge_filter              = {}",
+                    sps.enable_intra_edge_filter
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_interintra_compound            = {}",
+                    sps.enable_interintra_compound
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_masked_compound                = {}",
+                    sps.enable_masked_compound
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_warped_motion                  = {}",
+                    sps.enable_warped_motion
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_dual_filter                    = {}",
+                    sps.enable_dual_filter
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_order_hint                     = {}",
+                    sps.enable_order_hint
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_jnt_motion                     = {}",
+                    sps.enable_jnt_motion
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_ref_frame_mvs                  = {}",
+                    sps.enable_ref_frame_mvs
+                );
+                eprintln!(
+                    "[SPS-PARSE] seq_force_screen_content_tools        = {} (SELECT=2)",
+                    sps.seq_force_screen_content_tools
+                );
+                eprintln!(
+                    "[SPS-PARSE] seq_force_integer_mv                  = {} (SELECT=2)",
+                    sps.seq_force_integer_mv
+                );
+                eprintln!(
+                    "[SPS-PARSE] separate_uv_delta_q                   = {}",
+                    sps.separate_uv_delta_q
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_superres                       = {}",
+                    sps.enable_superres
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_cdef                           = {}",
+                    sps.enable_cdef
+                );
+                eprintln!(
+                    "[SPS-PARSE] enable_restoration                    = {}",
+                    sps.enable_restoration
+                );
+                eprintln!(
+                    "[SPS-PARSE] film_grain_params_present             = {}",
+                    sps.film_grain_params_present
+                );
+                eprintln!(
+                    "[SPS-PARSE] timing_info_present_flag              = {}",
+                    sps.timing_info_present_flag
+                );
+                eprintln!(
+                    "[SPS-PARSE] initial_display_delay_present_flag    = {}",
+                    sps.initial_display_delay_present_flag
+                );
+                eprintln!(
+                    "[SPS-PARSE] frame_width_bits                      = {} (-> minus_1={})",
+                    sps.frame_width_bits,
+                    sps.frame_width_bits.saturating_sub(1)
+                );
+                eprintln!(
+                    "[SPS-PARSE] frame_height_bits                     = {} (-> minus_1={})",
+                    sps.frame_height_bits,
+                    sps.frame_height_bits.saturating_sub(1)
+                );
+                eprintln!(
+                    "[SPS-PARSE] max_frame_width_minus_1               = {}",
+                    sps.max_frame_width_minus_1
+                );
+                eprintln!(
+                    "[SPS-PARSE] max_frame_height_minus_1              = {}",
+                    sps.max_frame_height_minus_1
+                );
+                eprintln!(
+                    "[SPS-PARSE] frame_id_numbers_present_flag         = {}",
+                    sps.frame_id_numbers_present_flag
+                );
+                eprintln!(
+                    "[SPS-PARSE] delta_frame_id_length_minus2          = {}",
+                    sps.delta_frame_id_length_minus2
+                );
+                eprintln!(
+                    "[SPS-PARSE] additional_frame_id_length_minus1     = {}",
+                    sps.additional_frame_id_length_minus1
+                );
+                eprintln!(
+                    "[SPS-PARSE] order_hint_bits_minus1                = {}",
+                    sps.order_hint_bits_minus1
+                );
+                eprintln!(
+                    "[SPS-PARSE] high_bitdepth                         = {}",
+                    sps.high_bitdepth
+                );
+                eprintln!(
+                    "[SPS-PARSE] twelve_bit                            = {}",
+                    sps.twelve_bit
+                );
+                eprintln!(
+                    "[SPS-PARSE] mono_chrome                           = {}",
+                    sps.mono_chrome
+                );
+                eprintln!(
+                    "[SPS-PARSE] color_description_present             = {}",
+                    sps.color_description_present
+                );
+                eprintln!(
+                    "[SPS-PARSE] color_primaries                       = {}",
+                    sps.color_primaries
+                );
+                eprintln!(
+                    "[SPS-PARSE] transfer_characteristics              = {}",
+                    sps.transfer_characteristics
+                );
+                eprintln!(
+                    "[SPS-PARSE] matrix_coefficients                   = {}",
+                    sps.matrix_coefficients
+                );
+                eprintln!(
+                    "[SPS-PARSE] color_range                           = {}",
+                    sps.color_range
+                );
+                eprintln!(
+                    "[SPS-PARSE] subsampling_x                         = {}",
+                    sps.subsampling_x
+                );
+                eprintln!(
+                    "[SPS-PARSE] subsampling_y                         = {}",
+                    sps.subsampling_y
+                );
+                eprintln!(
+                    "[SPS-PARSE] chroma_sample_position                = {}",
+                    sps.chroma_sample_position
+                );
+                eprintln!(
+                    "[SPS-PARSE] num_units_in_display_tick             = {}",
+                    sps.num_units_in_display_tick
+                );
+                eprintln!(
+                    "[SPS-PARSE] time_scale                            = {}",
+                    sps.time_scale
+                );
+                eprintln!(
+                    "[SPS-PARSE] equal_picture_interval                = {}",
+                    sps.equal_picture_interval
+                );
+                eprintln!("[SPS-PARSE] ============================================");
             }
             result
         }
@@ -4801,7 +4880,10 @@ fn build_av1_dpb_picture_resources(
             if super::vacc_debug() {
                 eprintln!(
                     "[DPB-ITER8]   AV1 REF picture[fb={}]: slot_idx={} view={:#x} base_array_layer={}",
-                    fb, slot_idx, view.as_raw(), 0
+                    fb,
+                    slot_idx,
+                    view.as_raw(),
+                    0
                 );
             }
             ref_pictures.push(picture_resource);

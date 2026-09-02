@@ -6,7 +6,7 @@
 //! - POC calculation for all three types
 //! - DPB management operations
 
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 use vacc_vulkan::access_unit::H264MmcoCommand;
 use vacc_vulkan::dpb::{DpbManager, LastAccessType};
 

@@ -1,7 +1,7 @@
 //! Helpers for creating Vulkan resources with VkVideoProfileListInfoKHR pNext chains.
 
 use super::vp9::vp9_vk_constants;
-use super::{buffer::BitstreamBuffer, device::VideoCodec, VideoError, VideoResult};
+use super::{VideoError, VideoResult, buffer::BitstreamBuffer, device::VideoCodec};
 use ash::vk;
 use ash::vk::Handle;
 
@@ -302,8 +302,13 @@ fn create_image_with_profile_chain(
     if array_layers > 1 {
         eprintln!(
             "[DPB-IMG-CREATE] format={:?} extent={{ {}x{}x1 }} arrayLayers={} flags={:?} usage={:?} queueFamilyIdx={}",
-            format, width, height, array_layers,
-            image_create_info.flags, image_create_info.usage, queue_family_index
+            format,
+            width,
+            height,
+            array_layers,
+            image_create_info.flags,
+            image_create_info.usage,
+            queue_family_index
         );
         eprintln!(
             "[DPB-IMG-CREATE]   profile={{ codecOp={:?} chromaSubsampling={:?} lumaBitDepth={:?} chromaBitDepth={:?} }}",

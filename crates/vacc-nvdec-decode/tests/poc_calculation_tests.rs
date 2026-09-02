@@ -11,7 +11,7 @@
 //! picture order count"
 
 use vacc_nvdec_decode::poc::PocCalculator;
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 /// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");

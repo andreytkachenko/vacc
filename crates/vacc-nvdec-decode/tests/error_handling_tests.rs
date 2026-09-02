@@ -9,12 +9,12 @@
 //! Run with `cargo test --test error_handling_tests -- --ignored` on a system
 //! with NVIDIA hardware and proper drivers.
 
-use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder, NvdecResult};
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
 };
+use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder, NvdecResult};
 
 /// Path to the project root.
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");

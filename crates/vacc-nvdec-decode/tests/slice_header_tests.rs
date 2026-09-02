@@ -19,7 +19,7 @@
 //! - deblocking filter parameters
 //! - Real-world parsing from born_trailer.h264
 
-use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
 /// Path to the project root (parent of vacc-nvdec-decode crate).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -372,10 +372,8 @@ fn build_slice_nal(
             if let Some(l0) = override_l0 {
                 bits.extend(encode_ue_bits(l0));
             }
-            if is_b_slice {
-                if let Some(l1) = override_l1 {
-                    bits.extend(encode_ue_bits(l1));
-                }
+            if is_b_slice && let Some(l1) = override_l1 {
+                bits.extend(encode_ue_bits(l1));
             }
         }
     }

@@ -11,11 +11,11 @@
 use crate::bitreader::BitReader;
 use crate::{DetectedVideoFormat, ParseResult, ParserError, ParserResult, VideoParser};
 use vacc_core::picture::{
-    Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType, Vp9InterpolationFilter, Vp9Profile,
     VP9_FRAME_MARKER, VP9_FRAME_SYNC_CODE, VP9_LOOP_FILTER_ADJUSTMENTS, VP9_MAX_PROBABILITY,
     VP9_MAX_REF_FRAMES, VP9_MAX_SEGMENTATION_PRED_PROB, VP9_MAX_SEGMENTATION_TREE_PROBS,
     VP9_MAX_SEGMENTS, VP9_MAX_TILE_WIDTH_B64, VP9_MIN_TILE_WIDTH_B64, VP9_NUM_REF_FRAMES,
-    VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX,
+    VP9_REFS_PER_FRAME, VP9_SEG_LVL_MAX, Vp9ColorConfig, Vp9ColorSpace, Vp9FrameData, Vp9FrameType,
+    Vp9InterpolationFilter, Vp9Profile,
 };
 
 /// VP9 parser state.

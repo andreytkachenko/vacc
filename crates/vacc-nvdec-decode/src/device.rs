@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 use libloading::Library;
 
 use crate::error::{NvdecError, NvdecResult};
-use crate::ffi::{cudaVideoChromaFormat, cudaVideoCodec, CUDA_SUCCESS, CUVIDDECODECAPS};
+use crate::ffi::{CUDA_SUCCESS, CUVIDDECODECAPS, cudaVideoChromaFormat, cudaVideoCodec};
 
 /// CUDA memory type (matches `CUmemorytype` in cuda.h).
 pub const CU_MEMORYTYPE_HOST: u32 = 1;

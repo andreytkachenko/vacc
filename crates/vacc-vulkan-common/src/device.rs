@@ -336,26 +336,25 @@ impl DeviceBuilder {
             );
         }
 
-        if builder.create_graphics_queue {
-            if let Some(qf) = queue_families.graphics {
-                queue_create_infos.push(
-                    vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(qf)
-                        .queue_priorities(&[1.0f32]),
-                );
-            }
+        if builder.create_graphics_queue
+            && let Some(qf) = queue_families.graphics
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&[1.0f32]),
+            );
         }
 
-        if builder.create_transfer_queue {
-            if let Some(qf) = queue_families.transfer {
-                if queue_families.video_decode != Some(qf) {
-                    queue_create_infos.push(
-                        vk::DeviceQueueCreateInfo::default()
-                            .queue_family_index(qf)
-                            .queue_priorities(&[1.0f32]),
-                    );
-                }
-            }
+        if builder.create_transfer_queue
+            && let Some(qf) = queue_families.transfer
+            && queue_families.video_decode != Some(qf)
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&[1.0f32]),
+            );
         }
 
         // ash still requires the (now-deprecated) layer fields in the literal.

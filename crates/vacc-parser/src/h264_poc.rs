@@ -227,11 +227,7 @@ impl PocCalculator {
         self.has_prev_pic = true;
 
         let base_poc = (self.frame_num_cycle * max_frame_num + frame_num) * 2;
-        if is_reference {
-            base_poc
-        } else {
-            base_poc + 1
-        }
+        if is_reference { base_poc } else { base_poc + 1 }
     }
 }
 

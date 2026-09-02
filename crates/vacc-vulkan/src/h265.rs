@@ -1,8 +1,8 @@
 //! H.265/HEVC Vulkan video decoder.
 
 use ash::vk;
-use ash::vk::native::*;
 use ash::vk::Handle;
+use ash::vk::native::*;
 
 use super::{VideoError, VideoResult};
 
@@ -998,11 +998,10 @@ pub fn convert_h265_sps(sps: &H265Sps) -> StdVideoH265SequenceParameterSet {
     // LongTermRefPicsSps - per C++ reference (VulkanH265Parser.cpp:600+)
     let long_term_ref_pics_sps =
         if sps.long_term_ref_pics_present_flag && sps.num_long_term_ref_pics_sps > 0 {
-            let ltrp = Box::leak(Box::new(StdVideoH265LongTermRefPicsSps {
+            Box::leak(Box::new(StdVideoH265LongTermRefPicsSps {
                 used_by_curr_pic_lt_sps_flag: sps.used_by_curr_pic_lt_sps_flag,
                 lt_ref_pic_poc_lsb_sps: sps.lt_ref_pic_poc_lsb_sps,
-            }));
-            ltrp
+            }))
         } else {
             std::ptr::null()
         };

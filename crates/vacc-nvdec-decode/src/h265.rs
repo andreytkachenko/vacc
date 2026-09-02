@@ -16,21 +16,22 @@ use vacc_core::{
     picture::H265Sps,
     session::Extent2D,
 };
-use vacc_parser::h265_dpb::{resolve_refs, H265Dpb};
-use vacc_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::h265_dpb::{H265Dpb, resolve_refs};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h265::H265Parser};
 
 use crate::{
     device::{
-        cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
-        get_funcs, init_nvdec, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST,
+        CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_ctx_set_current,
+        cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d, get_funcs,
+        init_nvdec,
     },
     error::{NvdecError, NvdecResult},
     ffi::{
-        cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags, cudaVideoDeinterlaceMode,
-        cudaVideoSurfaceFormat, CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO,
-        CUVIDPROCPARAMS, CUVIDRECT,
+        CUDA_SUCCESS, CUVIDDECODECREATEINFO, CUVIDPROCPARAMS, CUVIDRECT, CUdeviceptr,
+        CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags,
+        cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
     },
-    picparams::{build_cuvid_hevc_picparams, dump_cuvid_hevc_picparams, H265DpbState},
+    picparams::{H265DpbState, build_cuvid_hevc_picparams, dump_cuvid_hevc_picparams},
 };
 
 /// Number of decode surfaces / DPB slots (matches the C reference).
@@ -256,58 +257,58 @@ impl NvdecH265Decoder {
         loop {
             match self.parser.parse(&packet) {
                 Ok(ParseResult::ParameterSet { sps, .. }) => {
-                    if let Some(sps_box) = sps {
-                        if let Some(h265_sps) = sps_box.downcast_ref::<H265Sps>() {
-                            let (prev_w, prev_h) = {
-                                let s = self.prev_coded_size.lock().unwrap();
-                                *s
-                            };
-                            // Compute the coded size using the EXACT same CTB
-                            // rounding as create_decoder (see below). Using a
-                            // 16-pixel rounding here (as before) disagreed with
-                            // create_decoder's CTB rounding, so a re-emitted SPS
-                            // with identical dimensions (e.g. the one x265 writes
-                            // before each CRA) was misdetected as a resolution
-                            // change, triggering recreate_decoder and wiping the
-                            // DPB's stale refs that a CRA needs to decode.
-                            let log2_ctb_size = h265_sps.log2_min_luma_coding_block_size_minus3
-                                as u32
-                                + h265_sps.log2_diff_max_min_luma_coding_block_size as u32
-                                + 2;
-                            let ctb_size = 1u32 << log2_ctb_size;
-                            let coded_width = (h265_sps.pic_width_in_luma_samples as u32)
-                                .div_ceil(ctb_size)
-                                * ctb_size;
-                            let coded_height = (h265_sps.pic_height_in_luma_samples as u32)
-                                .div_ceil(ctb_size)
-                                * ctb_size;
-                            let resolution_changed =
-                                prev_w != coded_width || prev_h != coded_height;
-                            if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                                eprintln!(
-                                    "[sps] new SPS {}x{} prev={}x{} resolution_changed={}",
-                                    coded_width, coded_height, prev_w, prev_h, resolution_changed
-                                );
-                            }
-                            if resolution_changed {
-                                self.recreate_decoder(h265_sps)?;
-                            } else {
-                                let decoder_handle = {
-                                    let d = self.decoder.lock().unwrap();
-                                    *d
-                                };
-                                if decoder_handle.is_null() {
-                                    self.create_decoder(h265_sps)?;
-                                }
-                            }
-                            // POC wrap period from the SPS.
-                            self.poc_period =
-                                1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
-                            // Reorder delay for the common DPB's display logic.
-                            self.dpb.lock().unwrap().dpb.set_max_num_reorder_frames(
-                                h265_sps.max_num_reorder_pics[0] as u32,
+                    if let Some(sps_box) = sps
+                        && let Some(h265_sps) = sps_box.downcast_ref::<H265Sps>()
+                    {
+                        let (prev_w, prev_h) = {
+                            let s = self.prev_coded_size.lock().unwrap();
+                            *s
+                        };
+                        // Compute the coded size using the EXACT same CTB
+                        // rounding as create_decoder (see below). Using a
+                        // 16-pixel rounding here (as before) disagreed with
+                        // create_decoder's CTB rounding, so a re-emitted SPS
+                        // with identical dimensions (e.g. the one x265 writes
+                        // before each CRA) was misdetected as a resolution
+                        // change, triggering recreate_decoder and wiping the
+                        // DPB's stale refs that a CRA needs to decode.
+                        let log2_ctb_size = h265_sps.log2_min_luma_coding_block_size_minus3 as u32
+                            + h265_sps.log2_diff_max_min_luma_coding_block_size as u32
+                            + 2;
+                        let ctb_size = 1u32 << log2_ctb_size;
+                        let coded_width = (h265_sps.pic_width_in_luma_samples as u32)
+                            .div_ceil(ctb_size)
+                            * ctb_size;
+                        let coded_height = (h265_sps.pic_height_in_luma_samples as u32)
+                            .div_ceil(ctb_size)
+                            * ctb_size;
+                        let resolution_changed = prev_w != coded_width || prev_h != coded_height;
+                        if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
+                            eprintln!(
+                                "[sps] new SPS {}x{} prev={}x{} resolution_changed={}",
+                                coded_width, coded_height, prev_w, prev_h, resolution_changed
                             );
                         }
+                        if resolution_changed {
+                            self.recreate_decoder(h265_sps)?;
+                        } else {
+                            let decoder_handle = {
+                                let d = self.decoder.lock().unwrap();
+                                *d
+                            };
+                            if decoder_handle.is_null() {
+                                self.create_decoder(h265_sps)?;
+                            }
+                        }
+                        // POC wrap period from the SPS.
+                        self.poc_period =
+                            1 << (h265_sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+                        // Reorder delay for the common DPB's display logic.
+                        self.dpb
+                            .lock()
+                            .unwrap()
+                            .dpb
+                            .set_max_num_reorder_frames(h265_sps.max_num_reorder_pics[0] as u32);
                     }
                 }
                 Ok(ParseResult::Slice { slices, .. }) => {
@@ -410,9 +411,16 @@ impl NvdecH265Decoder {
                     if debug_status {
                         eprintln!(
                             "[dbg] poc={} is_idr={} is_rap={} slice_type={} rps_sps_flag={} rps_idx={} before={:?} after={:?} lt={:?} num_bits={}",
-                            poc, info.is_idr, info.is_rap, info.slice_type,
-                            info.short_term_ref_pic_set_sps_flag, info.short_term_ref_pic_set_idx,
-                            before, after, lt, num_bits
+                            poc,
+                            info.is_idr,
+                            info.is_rap,
+                            info.slice_type,
+                            info.short_term_ref_pic_set_sps_flag,
+                            info.short_term_ref_pic_set_idx,
+                            before,
+                            after,
+                            lt,
+                            num_bits
                         );
                     }
 
@@ -1659,16 +1667,16 @@ impl Drop for NvdecH265Decoder {
             let d = self.decoder.lock().unwrap();
             *d
         };
-        if !decoder_handle.is_null() {
-            if let Ok(funcs) = get_funcs() {
-                let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
-            }
+        if !decoder_handle.is_null()
+            && let Ok(funcs) = get_funcs()
+        {
+            let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
         }
         // Free pinned host buffer to avoid leaking page-locked memory
-        if let Ok(mut cache) = self.pinned_cache.lock() {
-            if let Some((ptr, _)) = cache.take() {
-                let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
-            }
+        if let Ok(mut cache) = self.pinned_cache.lock()
+            && let Some((ptr, _)) = cache.take()
+        {
+            let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
         }
     }
 }

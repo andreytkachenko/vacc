@@ -1996,19 +1996,19 @@ impl H265Parser {
                 // Include it in the NAL data to match the raw byte stream payload.
                 let nal_end = if next_code_len == 4 { end + 1 } else { end };
                 let nal_data = &data[start + code_len..nal_end];
-                if !nal_data.is_empty() {
-                    if let Some(nal_unit_type) = H265NalUnitType::from_u8(
+                if !nal_data.is_empty()
+                    && let Some(nal_unit_type) = H265NalUnitType::from_u8(
                         nal::parse_h265_nal_header(nal_data)
                             .map(|(_, t, _, _)| t)
                             .unwrap_or(0),
-                    ) {
-                        nal_units.push(NalUnit::new(
-                            nal_unit_type as u8,
-                            nal_data.to_vec(),
-                            start + code_len,
-                            nal_data.len(),
-                        ));
-                    }
+                    )
+                {
+                    nal_units.push(NalUnit::new(
+                        nal_unit_type as u8,
+                        nal_data.to_vec(),
+                        start + code_len,
+                        nal_data.len(),
+                    ));
                 }
 
                 offset = end;
@@ -2183,10 +2183,10 @@ impl VideoParser for H265Parser {
                     // of the first segment's. The first segment's header is
                     // kept separately as picture-level state.
                     let parsed_header = self.parse_slice_segment_header(&nal_data, nal_type);
-                    if self.first_slice_header.is_none() {
-                        if let Ok(info) = &parsed_header {
-                            self.first_slice_header = Some(info.clone());
-                        }
+                    if self.first_slice_header.is_none()
+                        && let Ok(info) = &parsed_header
+                    {
+                        self.first_slice_header = Some(info.clone());
                     }
                     let header = match &parsed_header {
                         Ok(info) => Some(crate::SliceHeader::H265(info.clone())),
@@ -2933,7 +2933,7 @@ mod tests {
 
         // Set bit 0 and bit 2 for S0
         rps.used_by_curr_pic_s0_flag = 0b101; // bits 0 and 2
-                                              // Set bit 1 for S1
+        // Set bit 1 for S1
         rps.used_by_curr_pic_s1_flag = 0b010; // bit 1
 
         // Verify bit extraction

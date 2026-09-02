@@ -3,8 +3,8 @@
 use ash::vk;
 use ash::vk::Handle;
 
-use super::vp9::{vp9_vk_constants, VideoDecodeVP9ProfileInfoKHR};
-use super::{device::VideoCodec, VideoError, VideoResult};
+use super::vp9::{VideoDecodeVP9ProfileInfoKHR, vp9_vk_constants};
+use super::{VideoError, VideoResult, device::VideoCodec};
 
 /// Codec-specific profile information for session creation.
 #[derive(Debug, Clone)]
@@ -355,7 +355,10 @@ impl VideoSession {
                 std_profile_idc,
                 picture_layout,
             } => {
-                eprintln!("[SESSION-CREATE]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={}", std_profile_idc, picture_layout);
+                eprintln!(
+                    "[SESSION-CREATE]   VkVideoDecodeH264ProfileInfoKHR: stdProfileIdc={} pictureLayout={}",
+                    std_profile_idc, picture_layout
+                );
             }
             CodecProfileInfo::H265 { std_profile_idc } => {
                 eprintln!(
@@ -367,7 +370,10 @@ impl VideoSession {
                 std_profile,
                 film_grain_support,
             } => {
-                eprintln!("[SESSION-CREATE]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}", std_profile, film_grain_support);
+                eprintln!(
+                    "[SESSION-CREATE]   VkVideoDecodeAV1ProfileInfoKHR: stdProfile={} filmGrainSupport={}",
+                    std_profile, film_grain_support
+                );
             }
             CodecProfileInfo::Vp9 { std_profile } => {
                 eprintln!(
@@ -951,7 +957,8 @@ impl VideoSessionParameters {
                     if let Some(sps) = std_sps_h265 {
                         // The driver may retain this pointer (it does not copy the
                         // data), so leak it like the AV1 sequence header above.
-                        let sps_ptr = Box::leak(Box::new(sps)) as *const StdVideoH265SequenceParameterSet;
+                        let sps_ptr =
+                            Box::leak(Box::new(sps)) as *const StdVideoH265SequenceParameterSet;
                         let mut add_info =
                             vk::VideoDecodeH265SessionParametersAddInfoKHR::default();
                         add_info.std_sps_count = 1;
@@ -963,10 +970,14 @@ impl VideoSessionParameters {
                             ..Default::default()
                         };
                         let r = unsafe { upd(device.handle(), parameters, &update_info) };
-                        eprintln!("[SessionParams] vkUpdateVideoSessionParametersKHR (SPS) -> {:?}", r);
+                        eprintln!(
+                            "[SessionParams] vkUpdateVideoSessionParametersKHR (SPS) -> {:?}",
+                            r
+                        );
                     }
                     if let Some(pps) = std_pps_h265 {
-                        let pps_ptr = Box::leak(Box::new(pps)) as *const StdVideoH265PictureParameterSet;
+                        let pps_ptr =
+                            Box::leak(Box::new(pps)) as *const StdVideoH265PictureParameterSet;
                         let mut add_info =
                             vk::VideoDecodeH265SessionParametersAddInfoKHR::default();
                         add_info.std_pps_count = 1;
@@ -978,7 +989,10 @@ impl VideoSessionParameters {
                             ..Default::default()
                         };
                         let r = unsafe { upd(device.handle(), parameters, &update_info) };
-                        eprintln!("[SessionParams] vkUpdateVideoSessionParametersKHR (PPS) -> {:?}", r);
+                        eprintln!(
+                            "[SessionParams] vkUpdateVideoSessionParametersKHR (PPS) -> {:?}",
+                            r
+                        );
                     }
                 }
                 None => eprintln!(
@@ -1037,7 +1051,9 @@ impl VideoSessionParameters {
                 // session is auto-initialized by vkCmdBeginVideoCodingKHR with the session
                 // parameters. Rely on that (matches the C++ reference, which never calls
                 // vkUpdateVideoSessionKHR).
-                eprintln!("[SessionParams] vkUpdateVideoSessionKHR not found (tried KHR + core names); relying on maintenance1 auto-init");
+                eprintln!(
+                    "[SessionParams] vkUpdateVideoSessionKHR not found (tried KHR + core names); relying on maintenance1 auto-init"
+                );
                 return Ok(());
             }
         };

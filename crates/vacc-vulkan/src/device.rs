@@ -3,7 +3,7 @@
 use ash::vk;
 use std::ffi::CString;
 
-use super::vp9::{vp9_vk_constants, VideoDecodeVP9CapabilitiesKHR, VideoDecodeVP9ProfileInfoKHR};
+use super::vp9::{VideoDecodeVP9CapabilitiesKHR, VideoDecodeVP9ProfileInfoKHR, vp9_vk_constants};
 use super::{AppInfo, VideoError, VideoResult};
 
 /// PhysicalDeviceVideoMaintenance2FeaturesKHR - not available in ash 0.38, define manually.
@@ -394,11 +394,10 @@ impl VideoDeviceBuilder {
         if let Some(idx) = std::env::var("NVD_GPU")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
+            && idx < candidates.len()
         {
-            if idx < candidates.len() {
-                let pd = candidates.remove(idx);
-                candidates.insert(0, pd);
-            }
+            let pd = candidates.remove(idx);
+            candidates.insert(0, pd);
         }
 
         // Find a physical device with video decode support
@@ -552,7 +551,9 @@ impl VideoDeviceBuilder {
         {
             extensions.push("VK_KHR_video_maintenance2");
         } else {
-            eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_maintenance2 not available (NULL session params invalid for AV1 decode)");
+            eprintln!(
+                "[VideoDeviceBuilder] WARNING: VK_KHR_video_maintenance2 not available (NULL session params invalid for AV1 decode)"
+            );
         }
 
         // Add codec-specific extensions only if available
@@ -584,7 +585,9 @@ impl VideoDeviceBuilder {
             {
                 extensions.push("VK_KHR_video_decode_av1");
             } else {
-                eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)");
+                eprintln!(
+                    "[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)"
+                );
             }
         }
         if builder
@@ -599,7 +602,9 @@ impl VideoDeviceBuilder {
             {
                 extensions.push("VK_KHR_video_decode_vp9");
             } else {
-                eprintln!("[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_vp9 not available (VP9 decode not supported)");
+                eprintln!(
+                    "[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_vp9 not available (VP9 decode not supported)"
+                );
             }
         }
 
@@ -646,26 +651,26 @@ impl VideoDeviceBuilder {
             );
         }
 
-        if builder.create_graphics_queue {
-            if let Some(qf) = queue_families.graphics {
+        if builder.create_graphics_queue
+            && let Some(qf) = queue_families.graphics
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&[1.0f32]),
+            );
+        }
+
+        if builder.create_transfer_queue
+            && let Some(qf) = queue_families.transfer
+        {
+            // Only add if different from decode queue
+            if queue_families.video_decode != Some(qf) {
                 queue_create_infos.push(
                     vk::DeviceQueueCreateInfo::default()
                         .queue_family_index(qf)
                         .queue_priorities(&[1.0f32]),
                 );
-            }
-        }
-
-        if builder.create_transfer_queue {
-            if let Some(qf) = queue_families.transfer {
-                // Only add if different from decode queue
-                if queue_families.video_decode != Some(qf) {
-                    queue_create_infos.push(
-                        vk::DeviceQueueCreateInfo::default()
-                            .queue_family_index(qf)
-                            .queue_priorities(&[1.0f32]),
-                    );
-                }
             }
         }
 

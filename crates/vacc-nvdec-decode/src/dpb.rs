@@ -286,13 +286,13 @@ impl NvdecDpbManager {
                 // with long_term_pic_num >= max_long_term_frame_idx_plus1.
                 3 => {
                     for e in &mut self.entries {
-                        if e.is_valid && e.is_long_term {
-                            if let Some(idx) = e.long_term_frame_idx {
-                                if idx >= entry.value {
-                                    e.is_valid = false;
-                                    e.is_reference = false;
-                                }
-                            }
+                        if e.is_valid
+                            && e.is_long_term
+                            && let Some(idx) = e.long_term_frame_idx
+                            && idx >= entry.value
+                        {
+                            e.is_valid = false;
+                            e.is_reference = false;
                         }
                     }
                 }
@@ -359,13 +359,13 @@ impl NvdecDpbManager {
                 // with long_term_frame_idx >= long_term_pic_num.
                 9 => {
                     for e in &mut self.entries {
-                        if e.is_valid && e.is_long_term {
-                            if let Some(idx) = e.long_term_frame_idx {
-                                if idx >= entry.value {
-                                    e.is_valid = false;
-                                    e.is_reference = false;
-                                }
-                            }
+                        if e.is_valid
+                            && e.is_long_term
+                            && let Some(idx) = e.long_term_frame_idx
+                            && idx >= entry.value
+                        {
+                            e.is_valid = false;
+                            e.is_reference = false;
                         }
                     }
                 }

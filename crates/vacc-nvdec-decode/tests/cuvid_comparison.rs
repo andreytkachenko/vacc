@@ -6,10 +6,10 @@
 //! Reference: Video_Codec_SDK cuviddec.h / nvcuvid.h
 
 use vacc_nvdec_decode::ffi::{
-    cudaVideoChromaFormat, cudaVideoCodec, CUVIDDISPLAYAREA, CUVIDEOFORMAT, CUVIDH264PICPARAMS,
+    CUVIDDISPLAYAREA, CUVIDEOFORMAT, CUVIDH264PICPARAMS, cudaVideoChromaFormat, cudaVideoCodec,
 };
 use vacc_parser::{
-    h264::H264Parser, BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser,
+    BitstreamPacket, DetectedVideoFormat, ParseResult, VideoParser, h264::H264Parser,
 };
 
 /// Path to the project root (parent of vacc-nvdec-decode crate).

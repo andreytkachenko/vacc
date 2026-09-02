@@ -8,12 +8,12 @@
 //! Run with `cargo test --test decoder_trait_tests -- --ignored` on a system
 //! with NVIDIA hardware and proper drivers.
 
-use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder};
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
     format::{ChromaSubsampling, ComponentBitDepth, H264PictureLayout, VideoFormat},
 };
+use vacc_nvdec_decode::{NvdecDecoder, NvdecError, NvdecH264Decoder};
 
 /// Path to the project root.
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -68,7 +68,7 @@ fn test_decoder_info_codec() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_coded_size() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -81,15 +81,15 @@ fn test_decoder_info_coded_size() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        expected_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
-                        expected_height = if h264_sps.frame_mbs_only_flag {
-                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
-                        } else {
-                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
-                        };
-                    }
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    expected_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
+                    expected_height = if h264_sps.frame_mbs_only_flag {
+                        (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
+                    } else {
+                        (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
+                    };
                 }
                 break;
             }
@@ -119,7 +119,7 @@ fn test_decoder_info_coded_size() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_display_size() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -132,36 +132,36 @@ fn test_decoder_info_display_size() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
-                        let coded_height = if h264_sps.frame_mbs_only_flag {
-                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
-                        } else {
-                            (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
-                        };
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    let coded_width = (h264_sps.pic_width_in_mbs_minus1 as u32 + 1) * 16;
+                    let coded_height = if h264_sps.frame_mbs_only_flag {
+                        (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16
+                    } else {
+                        (h264_sps.pic_height_in_map_units_minus1 as u32 + 1) * 16 * 2
+                    };
 
-                        if h264_sps.frame_cropping_flag {
-                            let left = (h264_sps.frame_crop_left_offset as i32) * 2;
-                            let right =
-                                coded_width as i32 - (h264_sps.frame_crop_right_offset as i32) * 2;
-                            let top = if h264_sps.frame_mbs_only_flag {
-                                (h264_sps.frame_crop_top_offset as i32) * 2
-                            } else {
-                                (h264_sps.frame_crop_top_offset as i32) * 4
-                            };
-                            let bottom = coded_height as i32
-                                - if h264_sps.frame_mbs_only_flag {
-                                    (h264_sps.frame_crop_bottom_offset as i32) * 2
-                                } else {
-                                    (h264_sps.frame_crop_bottom_offset as i32) * 4
-                                };
-                            expected_width = (right - left) as u32;
-                            expected_height = (bottom - top) as u32;
+                    if h264_sps.frame_cropping_flag {
+                        let left = (h264_sps.frame_crop_left_offset as i32) * 2;
+                        let right =
+                            coded_width as i32 - (h264_sps.frame_crop_right_offset as i32) * 2;
+                        let top = if h264_sps.frame_mbs_only_flag {
+                            (h264_sps.frame_crop_top_offset as i32) * 2
                         } else {
-                            expected_width = coded_width;
-                            expected_height = coded_height;
-                        }
+                            (h264_sps.frame_crop_top_offset as i32) * 4
+                        };
+                        let bottom = coded_height as i32
+                            - if h264_sps.frame_mbs_only_flag {
+                                (h264_sps.frame_crop_bottom_offset as i32) * 2
+                            } else {
+                                (h264_sps.frame_crop_bottom_offset as i32) * 4
+                            };
+                        expected_width = (right - left) as u32;
+                        expected_height = (bottom - top) as u32;
+                    } else {
+                        expected_width = coded_width;
+                        expected_height = coded_height;
                     }
                 }
                 break;
@@ -192,7 +192,7 @@ fn test_decoder_info_display_size() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_chroma_subsampling() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -204,16 +204,16 @@ fn test_decoder_info_chroma_subsampling() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        expected_chroma = match h264_sps.chroma_format_idc {
-                            0 => ChromaSubsampling::Monochrome,
-                            1 => ChromaSubsampling::_420,
-                            2 => ChromaSubsampling::_422,
-                            3 => ChromaSubsampling::_444,
-                            _ => ChromaSubsampling::_420,
-                        };
-                    }
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    expected_chroma = match h264_sps.chroma_format_idc {
+                        0 => ChromaSubsampling::Monochrome,
+                        1 => ChromaSubsampling::_420,
+                        2 => ChromaSubsampling::_422,
+                        3 => ChromaSubsampling::_444,
+                        _ => ChromaSubsampling::_420,
+                    };
                 }
                 break;
             }
@@ -239,7 +239,7 @@ fn test_decoder_info_chroma_subsampling() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_bit_depth() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -252,23 +252,23 @@ fn test_decoder_info_bit_depth() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        let bit_depth_minus8 = h264_sps.bit_depth_luma_minus8;
-                        expected_luma_depth = match bit_depth_minus8 {
-                            0 => ComponentBitDepth::Bit8,
-                            2 => ComponentBitDepth::Bit10,
-                            4 => ComponentBitDepth::Bit12,
-                            _ => ComponentBitDepth::Bit8,
-                        };
-                        let chroma_minus8 = h264_sps.bit_depth_chroma_minus8;
-                        expected_chroma_depth = match chroma_minus8 {
-                            0 => ComponentBitDepth::Bit8,
-                            2 => ComponentBitDepth::Bit10,
-                            4 => ComponentBitDepth::Bit12,
-                            _ => ComponentBitDepth::Bit8,
-                        };
-                    }
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    let bit_depth_minus8 = h264_sps.bit_depth_luma_minus8;
+                    expected_luma_depth = match bit_depth_minus8 {
+                        0 => ComponentBitDepth::Bit8,
+                        2 => ComponentBitDepth::Bit10,
+                        4 => ComponentBitDepth::Bit12,
+                        _ => ComponentBitDepth::Bit8,
+                    };
+                    let chroma_minus8 = h264_sps.bit_depth_chroma_minus8;
+                    expected_chroma_depth = match chroma_minus8 {
+                        0 => ComponentBitDepth::Bit8,
+                        2 => ComponentBitDepth::Bit10,
+                        4 => ComponentBitDepth::Bit12,
+                        _ => ComponentBitDepth::Bit8,
+                    };
                 }
                 break;
             }
@@ -298,7 +298,7 @@ fn test_decoder_info_bit_depth() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_profile_idc() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -310,10 +310,10 @@ fn test_decoder_info_profile_idc() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        expected_profile_idc = Some(h264_sps.profile_idc as u32);
-                    }
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    expected_profile_idc = Some(h264_sps.profile_idc as u32);
                 }
                 break;
             }
@@ -339,7 +339,7 @@ fn test_decoder_info_profile_idc() {
 #[test]
 #[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_dpb_slots() {
-    use vacc_parser::{h264::H264Parser, BitstreamPacket, ParseResult, VideoParser};
+    use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
     let data = load_sps_pps_data();
 
@@ -351,10 +351,10 @@ fn test_decoder_info_dpb_slots() {
     loop {
         match parser.parse(&packet) {
             Ok(ParseResult::ParameterSet { sps, .. }) => {
-                if let Some(sps_box) = sps {
-                    if let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>() {
-                        expected_dpb_slots = h264_sps.max_num_ref_frames + 1;
-                    }
+                if let Some(sps_box) = sps
+                    && let Some(h264_sps) = sps_box.downcast_ref::<vacc_core::picture::H264Sps>()
+                {
+                    expected_dpb_slots = h264_sps.max_num_ref_frames + 1;
                 }
                 break;
             }

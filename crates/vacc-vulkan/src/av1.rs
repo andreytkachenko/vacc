@@ -506,11 +506,7 @@ pub fn convert_av1_color_config(
     ash::vk::native::StdVideoAV1ColorConfig {
         flags,
         BitDepth: if sps.high_bitdepth {
-            if sps.twelve_bit {
-                12
-            } else {
-                10
-            }
+            if sps.twelve_bit { 12 } else { 10 }
         } else {
             8
         },
@@ -763,10 +759,14 @@ impl Av1Decoder {
                     info.frame_type,
                     info.flags.disable_frame_end_update_cdf(),
                     info.flags.segmentation_enabled(),
-                    info.SavedOrderHints[0], info.SavedOrderHints[1],
-                    info.SavedOrderHints[2], info.SavedOrderHints[3],
-                    info.SavedOrderHints[4], info.SavedOrderHints[5],
-                    info.SavedOrderHints[6], info.SavedOrderHints[7],
+                    info.SavedOrderHints[0],
+                    info.SavedOrderHints[1],
+                    info.SavedOrderHints[2],
+                    info.SavedOrderHints[3],
+                    info.SavedOrderHints[4],
+                    info.SavedOrderHints[5],
+                    info.SavedOrderHints[6],
+                    info.SavedOrderHints[7],
                 );
             }
         }
@@ -869,10 +869,14 @@ impl Av1Decoder {
                 "[RUST-REFINFO]   SETUP: OrderHint={} RefFrameSignBias={:02x} SavedOH=[{},{},{},{},{},{},{},{}]",
                 info.OrderHint,
                 info.RefFrameSignBias,
-                info.SavedOrderHints[0], info.SavedOrderHints[1],
-                info.SavedOrderHints[2], info.SavedOrderHints[3],
-                info.SavedOrderHints[4], info.SavedOrderHints[5],
-                info.SavedOrderHints[6], info.SavedOrderHints[7],
+                info.SavedOrderHints[0],
+                info.SavedOrderHints[1],
+                info.SavedOrderHints[2],
+                info.SavedOrderHints[3],
+                info.SavedOrderHints[4],
+                info.SavedOrderHints[5],
+                info.SavedOrderHints[6],
+                info.SavedOrderHints[7],
             );
         }
 
@@ -934,9 +938,16 @@ impl Av1Decoder {
         if self.frame_count == 1 && super::vacc_debug() {
             eprintln!(
                 "[RUST-DEC] frame1: output_slot={} output_old_layout={:?} ref_slots={:?} ref_layouts={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
-                output_slot_index, output_slot_old_layout, dpb_ref_slot_indices, dpb_ref_slot_layouts,
-                bitstream_offset, bitstream_offset + bitstream_range,
-                coded_extent.width, coded_extent.height, all_slots_count, dpb_use_image_array
+                output_slot_index,
+                output_slot_old_layout,
+                dpb_ref_slot_indices,
+                dpb_ref_slot_layouts,
+                bitstream_offset,
+                bitstream_offset + bitstream_range,
+                coded_extent.width,
+                coded_extent.height,
+                all_slots_count,
+                dpb_use_image_array
             );
         }
 
@@ -955,9 +966,13 @@ impl Av1Decoder {
         if super::vacc_debug() {
             eprintln!(
                 "[RUST-REF] fc={} out_slot={} ref_slots={:?} refNameIdx={:?} tile=[{}..{}) fh_off={}",
-                self.frame_count, output_slot_index, dpb_ref_slot_indices,
+                self.frame_count,
+                output_slot_index,
+                dpb_ref_slot_indices,
                 av1_decode_info.reference_name_slot_indices,
-                dbg_t_off, dbg_t_off + dbg_t_size, av1_decode_info.frame_header_offset
+                dbg_t_off,
+                dbg_t_off + dbg_t_size,
+                av1_decode_info.frame_header_offset
             );
         }
 
@@ -971,15 +986,24 @@ impl Av1Decoder {
             let setup = dpb_setup_picture.as_ref();
             eprintln!(
                 "[RUST-DEC-F3] frame3: output_slot={} output_old_layout={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
-                output_slot_index, output_slot_old_layout,
-                bitstream_offset, bitstream_offset + bitstream_range,
-                coded_extent.width, coded_extent.height, all_slots_count, dpb_use_image_array
+                output_slot_index,
+                output_slot_old_layout,
+                bitstream_offset,
+                bitstream_offset + bitstream_range,
+                coded_extent.width,
+                coded_extent.height,
+                all_slots_count,
+                dpb_use_image_array
             );
             if let Some(sp) = setup {
                 eprintln!(
                     "[RUST-DEC-F3]   SETUP picture: view={:#x} base_array_layer={} coded_offset=({},{}) coded_extent={}x{}",
-                    sp.image_view_binding.as_raw(), sp.base_array_layer,
-                    sp.coded_offset.x, sp.coded_offset.y, sp.coded_extent.width, sp.coded_extent.height
+                    sp.image_view_binding.as_raw(),
+                    sp.base_array_layer,
+                    sp.coded_offset.x,
+                    sp.coded_offset.y,
+                    sp.coded_extent.width,
+                    sp.coded_extent.height
                 );
             } else {
                 eprintln!("[RUST-DEC-F3]   SETUP picture: NONE");
@@ -988,23 +1012,47 @@ impl Av1Decoder {
                 let slot = dpb_ref_slot_indices.get(i).copied().unwrap_or(-1);
                 eprintln!(
                     "[RUST-DEC-F3]   REF[{}] picture: view={:#x} base_array_layer={} slot_index={} coded_extent={}x{}",
-                    i, rp.image_view_binding.as_raw(), rp.base_array_layer, slot,
-                    rp.coded_extent.width, rp.coded_extent.height
+                    i,
+                    rp.image_view_binding.as_raw(),
+                    rp.base_array_layer,
+                    slot,
+                    rp.coded_extent.width,
+                    rp.coded_extent.height
                 );
             }
             for i in 0..dpb_ref_pictures.len() {
                 let ri = unsafe { &*ref_std_infos_ptr.add(i) };
                 eprintln!(
                     "[RUST-DEC-F3]   REF[{}] std_info: OrderHint={} SavedOrderHints={:?} RefFrameSignBias={:#04x} frame_type={} disable_cdf={} seg={}",
-                    i, ri.OrderHint, ri.SavedOrderHints, ri.RefFrameSignBias, ri.frame_type,
-                    ri.flags.disable_frame_end_update_cdf(), ri.flags.segmentation_enabled()
+                    i,
+                    ri.OrderHint,
+                    ri.SavedOrderHints,
+                    ri.RefFrameSignBias,
+                    ri.frame_type,
+                    ri.flags.disable_frame_end_update_cdf(),
+                    ri.flags.segmentation_enabled()
                 );
             }
             eprintln!(
                 "[RUST-DEC-F3]   SETUP std_info: OrderHint={} SavedOrderHints={:?} RefFrameSignBias={:#04x}",
-                unsafe { setup_std_info_ptr.as_ref().map(|s| s.OrderHint).unwrap_or(0) },
-                unsafe { setup_std_info_ptr.as_ref().map(|s| s.SavedOrderHints).unwrap_or([0; 8]) },
-                unsafe { setup_std_info_ptr.as_ref().map(|s| s.RefFrameSignBias).unwrap_or(0) }
+                unsafe {
+                    setup_std_info_ptr
+                        .as_ref()
+                        .map(|s| s.OrderHint)
+                        .unwrap_or(0)
+                },
+                unsafe {
+                    setup_std_info_ptr
+                        .as_ref()
+                        .map(|s| s.SavedOrderHints)
+                        .unwrap_or([0; 8])
+                },
+                unsafe {
+                    setup_std_info_ptr
+                        .as_ref()
+                        .map(|s| s.RefFrameSignBias)
+                        .unwrap_or(0)
+                }
             );
             eprintln!(
                 "[RUST-DEC-F3]   all_slots: {:?}",
@@ -1044,17 +1092,40 @@ impl Av1Decoder {
             let fl = &pi.flags;
             eprintln!(
                 "[RUST-PI-F3] fc={} type={} oh={} primref={} refresh={:08x} interp={} txmode={} dqres={} dlres={} coded_denom={}",
-                self.frame_count, pi.frame_type, pi.OrderHint, pi.primary_ref_frame, pi.refresh_frame_flags,
-                { pi.interpolation_filter }, { pi.TxMode }, pi.delta_q_res, pi.delta_lf_res, pi.coded_denom
+                self.frame_count,
+                pi.frame_type,
+                pi.OrderHint,
+                pi.primary_ref_frame,
+                pi.refresh_frame_flags,
+                { pi.interpolation_filter },
+                { pi.TxMode },
+                pi.delta_q_res,
+                pi.delta_lf_res,
+                pi.coded_denom
             );
             eprintln!(
                 "[RUST-PI-F3] flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} grain={}",
-                fl.use_superres(), fl.render_and_frame_size_different(), fl.allow_screen_content_tools(),
-                fl.is_filter_switchable(), fl.force_integer_mv(), fl.allow_intrabc(), fl.frame_refs_short_signaling(),
-                fl.allow_high_precision_mv(), fl.is_motion_mode_switchable(), fl.use_ref_frame_mvs(),
-                fl.allow_warped_motion(), fl.reduced_tx_set(), fl.reference_select(), fl.skip_mode_present(),
-                fl.delta_q_present(), fl.delta_lf_present(), fl.delta_lf_multi(), fl.segmentation_enabled(),
-                fl.segmentation_update_map(), fl.segmentation_temporal_update(), fl.segmentation_update_data(),
+                fl.use_superres(),
+                fl.render_and_frame_size_different(),
+                fl.allow_screen_content_tools(),
+                fl.is_filter_switchable(),
+                fl.force_integer_mv(),
+                fl.allow_intrabc(),
+                fl.frame_refs_short_signaling(),
+                fl.allow_high_precision_mv(),
+                fl.is_motion_mode_switchable(),
+                fl.use_ref_frame_mvs(),
+                fl.allow_warped_motion(),
+                fl.reduced_tx_set(),
+                fl.reference_select(),
+                fl.skip_mode_present(),
+                fl.delta_q_present(),
+                fl.delta_lf_present(),
+                fl.delta_lf_multi(),
+                fl.segmentation_enabled(),
+                fl.segmentation_update_map(),
+                fl.segmentation_temporal_update(),
+                fl.segmentation_update_data(),
                 fl.apply_grain()
             );
             eprintln!(
@@ -1064,16 +1135,32 @@ impl Av1Decoder {
             let q = &picture_info_container.quantization;
             eprintln!(
                 "[RUST-PI-F3] quant: using_qmatrix={} diff_uv_delta={} base_q={} dQYdc={} dQUdc={} dQUac={} dQVdc={} dQVac={} qm_y={} qm_u={} qm_v={}",
-                q.flags.using_qmatrix(), q.flags.diff_uv_delta(), q.base_q_idx, q.DeltaQYDc,
-                q.DeltaQUDc, q.DeltaQUAc, q.DeltaQVDc, q.DeltaQVAc, q.qm_y, q.qm_u, q.qm_v
+                q.flags.using_qmatrix(),
+                q.flags.diff_uv_delta(),
+                q.base_q_idx,
+                q.DeltaQYDc,
+                q.DeltaQUDc,
+                q.DeltaQUAc,
+                q.DeltaQVDc,
+                q.DeltaQVAc,
+                q.qm_y,
+                q.qm_u,
+                q.qm_v
             );
             let lf = &picture_info_container.loop_filter;
             eprintln!(
                 "[RUST-PI-F3] lf: delta_en={} delta_upd={} level=[{},{},{},{}] sharp={} updrefd={} updmodes={} moded=[{},{}]",
-                lf.flags.loop_filter_delta_enabled(), lf.flags.loop_filter_delta_update(),
-                lf.loop_filter_level[0], lf.loop_filter_level[1], lf.loop_filter_level[2], lf.loop_filter_level[3],
-                lf.loop_filter_sharpness, lf.update_ref_delta, lf.update_mode_delta,
-                lf.loop_filter_mode_deltas[0], lf.loop_filter_mode_deltas[1]
+                lf.flags.loop_filter_delta_enabled(),
+                lf.flags.loop_filter_delta_update(),
+                lf.loop_filter_level[0],
+                lf.loop_filter_level[1],
+                lf.loop_filter_level[2],
+                lf.loop_filter_level[3],
+                lf.loop_filter_sharpness,
+                lf.update_ref_delta,
+                lf.update_mode_delta,
+                lf.loop_filter_mode_deltas[0],
+                lf.loop_filter_mode_deltas[1]
             );
             eprintln!(
                 "[RUST-PI-F3] lf refd=[{},{},{},{},{},{},{},{}]",
@@ -1089,11 +1176,24 @@ impl Av1Decoder {
             let c = &picture_info_container.cdef;
             eprintln!(
                 "[RUST-PI-F3] cdef: damping={} bits={} ypri=[{},{},{},{}] ysec=[{},{},{},{}] uvprim=[{},{},{},{}] uvsec=[{},{},{},{}]",
-                c.cdef_damping_minus_3, c.cdef_bits,
-                c.cdef_y_pri_strength[0], c.cdef_y_pri_strength[1], c.cdef_y_pri_strength[2], c.cdef_y_pri_strength[3],
-                c.cdef_y_sec_strength[0], c.cdef_y_sec_strength[1], c.cdef_y_sec_strength[2], c.cdef_y_sec_strength[3],
-                c.cdef_uv_pri_strength[0], c.cdef_uv_pri_strength[1], c.cdef_uv_pri_strength[2], c.cdef_uv_pri_strength[3],
-                c.cdef_uv_sec_strength[0], c.cdef_uv_sec_strength[1], c.cdef_uv_sec_strength[2], c.cdef_uv_sec_strength[3]
+                c.cdef_damping_minus_3,
+                c.cdef_bits,
+                c.cdef_y_pri_strength[0],
+                c.cdef_y_pri_strength[1],
+                c.cdef_y_pri_strength[2],
+                c.cdef_y_pri_strength[3],
+                c.cdef_y_sec_strength[0],
+                c.cdef_y_sec_strength[1],
+                c.cdef_y_sec_strength[2],
+                c.cdef_y_sec_strength[3],
+                c.cdef_uv_pri_strength[0],
+                c.cdef_uv_pri_strength[1],
+                c.cdef_uv_pri_strength[2],
+                c.cdef_uv_pri_strength[3],
+                c.cdef_uv_sec_strength[0],
+                c.cdef_uv_sec_strength[1],
+                c.cdef_uv_sec_strength[2],
+                c.cdef_uv_sec_strength[3]
             );
             let lr = &picture_info_container.loop_restoration;
             eprintln!(

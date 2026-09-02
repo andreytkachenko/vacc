@@ -46,14 +46,15 @@ use vacc_parser::{DetectedVideoFormat, VideoParser};
 
 use crate::{
     device::{
-        cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
-        get_funcs, init_nvdec, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST,
+        CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_ctx_set_current,
+        cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d, get_funcs,
+        init_nvdec,
     },
     error::{NvdecError, NvdecResult},
     ffi::{
-        cudaVideoChromaFormat, cudaVideoCodec, cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
-        CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDDECODECREATEINFO, CUVIDPICPARAMS,
-        CUVIDPROCPARAMS, CUVIDRECT, CUVIDVP9PICPARAMS,
+        CUDA_SUCCESS, CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
+        CUVIDVP9PICPARAMS, CUdeviceptr, CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec,
+        cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
     },
 };
 
@@ -1276,16 +1277,16 @@ impl Drop for NvdecVp9Decoder {
             let d = self.decoder.lock().unwrap();
             *d
         };
-        if !decoder_handle.is_null() {
-            if let Ok(funcs) = get_funcs() {
-                let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
-            }
+        if !decoder_handle.is_null()
+            && let Ok(funcs) = get_funcs()
+        {
+            let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
         }
         // Free pinned host buffer to avoid leaking page-locked memory.
-        if let Ok(mut cache) = self.pinned_cache.lock() {
-            if let Some((ptr, _)) = cache.take() {
-                let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
-            }
+        if let Ok(mut cache) = self.pinned_cache.lock()
+            && let Some((ptr, _)) = cache.take()
+        {
+            let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
         }
     }
 }

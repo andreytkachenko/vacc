@@ -35,20 +35,21 @@ use vacc_core::{
     session::Extent2D,
 };
 use vacc_parser::av1::{Av1FrameHeader, Av1Parser};
-use vacc_parser::av1_dpb::{Av1Dpb, AV1_NUM_FRAME_BUFFERS};
+use vacc_parser::av1_dpb::{AV1_NUM_FRAME_BUFFERS, Av1Dpb};
 use vacc_parser::{DetectedVideoFormat, VideoParser};
 
 use crate::{
     device::{
-        cu_ctx_set_current, cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d,
-        get_funcs, init_nvdec, query_decoder_caps, CUDA_MEMCPY2D, CU_MEMORYTYPE_DEVICE,
-        CU_MEMORYTYPE_HOST,
+        CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_ctx_set_current,
+        cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d, get_funcs,
+        init_nvdec, query_decoder_caps,
     },
     error::{NvdecError, NvdecResult},
     ffi::{
-        cudaVideoChromaFormat, cudaVideoCodec, cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
-        CUdeviceptr, CUvideodecoder, CUDA_SUCCESS, CUVIDAV1GLOBALMOTION, CUVIDAV1PICPARAMS,
-        CUVIDAV1REFFRAME, CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT,
+        CUDA_SUCCESS, CUVIDAV1GLOBALMOTION, CUVIDAV1PICPARAMS, CUVIDAV1REFFRAME,
+        CUVIDDECODECREATEINFO, CUVIDPICPARAMS, CUVIDPROCPARAMS, CUVIDRECT, CUdeviceptr,
+        CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec, cudaVideoDeinterlaceMode,
+        cudaVideoSurfaceFormat,
     },
 };
 
@@ -648,26 +649,34 @@ impl NvdecAv1Decoder {
                 let payload =
                     &self.pending_data[self.parsed_offset + 12..self.parsed_offset + 12 + size];
                 // Parse the SPS (type 1 OBU) once, from whichever packet carries it.
-                if self.sps.lock().unwrap().is_none() {
-                    if let Some(sps_payload) = find_sps_obu(payload) {
-                        match self.parser.parse_sequence_header_obu(&sps_payload) {
-                            Ok(s) => {
-                                eprintln!(
-                                    "[AV1-DBG] SPS: profile={} maxw-1={} maxh-1={} ohb-1={} 128x128={} sub={}/{} mono={} highbit={} 12bit={} cdef={} restoration={} superres={}",
-                                    s.profile, s.max_frame_width_minus_1, s.max_frame_height_minus_1,
-                                    s.order_hint_bits_minus1, s.use_128x128_superblock,
-                                    s.subsampling_x, s.subsampling_y, s.mono_chrome,
-                                    s.high_bitdepth, s.twelve_bit, s.enable_cdef,
-                                    s.enable_restoration, s.enable_superres
-                                );
-                                *self.sps.lock().unwrap() = Some(s);
-                            }
-                            Err(e) => {
-                                return Err(NvdecError::DecodeFailed(format!(
-                                    "parse_sequence_header_obu: {}",
-                                    e
-                                )));
-                            }
+                if self.sps.lock().unwrap().is_none()
+                    && let Some(sps_payload) = find_sps_obu(payload)
+                {
+                    match self.parser.parse_sequence_header_obu(&sps_payload) {
+                        Ok(s) => {
+                            eprintln!(
+                                "[AV1-DBG] SPS: profile={} maxw-1={} maxh-1={} ohb-1={} 128x128={} sub={}/{} mono={} highbit={} 12bit={} cdef={} restoration={} superres={}",
+                                s.profile,
+                                s.max_frame_width_minus_1,
+                                s.max_frame_height_minus_1,
+                                s.order_hint_bits_minus1,
+                                s.use_128x128_superblock,
+                                s.subsampling_x,
+                                s.subsampling_y,
+                                s.mono_chrome,
+                                s.high_bitdepth,
+                                s.twelve_bit,
+                                s.enable_cdef,
+                                s.enable_restoration,
+                                s.enable_superres
+                            );
+                            *self.sps.lock().unwrap() = Some(s);
+                        }
+                        Err(e) => {
+                            return Err(NvdecError::DecodeFailed(format!(
+                                "parse_sequence_header_obu: {}",
+                                e
+                            )));
                         }
                     }
                 }
@@ -1448,16 +1457,16 @@ impl Drop for NvdecAv1Decoder {
             let d = self.decoder.lock().unwrap();
             *d
         };
-        if !decoder_handle.is_null() {
-            if let Ok(funcs) = get_funcs() {
-                let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
-            }
+        if !decoder_handle.is_null()
+            && let Ok(funcs) = get_funcs()
+        {
+            let _ = unsafe { (funcs.destroy_decoder)(decoder_handle) };
         }
         // Free pinned host buffers to avoid leaking page-locked memory.
-        if let Ok(mut cache) = self.pinned_cache.lock() {
-            if let Some((ptr, _)) = cache.take() {
-                let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
-            }
+        if let Ok(mut cache) = self.pinned_cache.lock()
+            && let Some((ptr, _)) = cache.take()
+        {
+            let _ = unsafe { crate::device::cu_mem_free_host(ptr) };
         }
         if let Ok(mut ring) = self.bitstream_ring.lock() {
             for (ptr, _) in ring.0.drain(..) {
@@ -1553,22 +1562,42 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     let _ = writeln!(
         f,
         "enable_order_hint = {} order_hint_bits_minus1 = {} enable_cdef = {} enable_restoration = {} enable_superres = {} enable_fgs = {}",
-        av1.enable_order_hint(), av1.order_hint_bits_minus1(), av1.enable_cdef(), av1.enable_restoration(), av1.enable_superres(), av1.enable_fgs()
+        av1.enable_order_hint(),
+        av1.order_hint_bits_minus1(),
+        av1.enable_cdef(),
+        av1.enable_restoration(),
+        av1.enable_superres(),
+        av1.enable_fgs()
     );
     let _ = writeln!(
         f,
         "frame_type = {} show_frame = {} disable_cdf_update = {} allow_sct = {} force_integer_mv = {} coded_denom = {}",
-        av1.frame_type(), av1.show_frame(), av1.disable_cdf_update(), av1.allow_screen_content_tools(), av1.force_integer_mv(), av1.coded_denom()
+        av1.frame_type(),
+        av1.show_frame(),
+        av1.disable_cdf_update(),
+        av1.allow_screen_content_tools(),
+        av1.force_integer_mv(),
+        av1.coded_denom()
     );
     let _ = writeln!(
         f,
         "interp_filter = {} switchable_motion_mode = {} use_ref_frame_mvs = {} tx_mode = {} reference_mode = {} reduced_tx_set = {} skip_mode = {}",
-        av1.interp_filter(), av1.switchable_motion_mode(), av1.use_ref_frame_mvs(), av1.tx_mode(), av1.reference_mode(), av1.reduced_tx_set(), av1.skip_mode()
+        av1.interp_filter(),
+        av1.switchable_motion_mode(),
+        av1.use_ref_frame_mvs(),
+        av1.tx_mode(),
+        av1.reference_mode(),
+        av1.reduced_tx_set(),
+        av1.skip_mode()
     );
     let _ = writeln!(
         f,
         "delta_q_present = {} delta_q_res = {} using_qmatrix = {} coded_lossless = {} use_superres = {}",
-        av1.delta_q_present(), av1.delta_q_res(), av1.using_qmatrix(), av1.coded_lossless(), av1.use_superres()
+        av1.delta_q_present(),
+        av1.delta_q_res(),
+        av1.using_qmatrix(),
+        av1.coded_lossless(),
+        av1.use_superres()
     );
     let _ = writeln!(
         f,
@@ -1624,8 +1653,16 @@ fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPA
     let _ = writeln!(
         f,
         "loop_filter: level=[{},{}] level_u={} level_v={} sharpness={} delta_enabled={} delta_update={} delta_lf_present={} delta_lf_res={} delta_lf_multi={}",
-        av1.loop_filter_level[0], av1.loop_filter_level[1], av1.loop_filter_level_u, av1.loop_filter_level_v, av1.loop_filter_sharpness,
-        av1.loop_filter_delta_enabled(), av1.loop_filter_delta_update(), av1.delta_lf_present(), av1.delta_lf_res(), av1.delta_lf_multi()
+        av1.loop_filter_level[0],
+        av1.loop_filter_level[1],
+        av1.loop_filter_level_u,
+        av1.loop_filter_level_v,
+        av1.loop_filter_sharpness,
+        av1.loop_filter_delta_enabled(),
+        av1.loop_filter_delta_update(),
+        av1.delta_lf_present(),
+        av1.delta_lf_res(),
+        av1.delta_lf_multi()
     );
     let _ = writeln!(
         f,

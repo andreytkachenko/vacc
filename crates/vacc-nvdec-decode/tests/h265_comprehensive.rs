@@ -13,7 +13,7 @@
 //! 10. FFI struct sizes matching NVIDIA SDK
 
 use vacc_core::picture::H265ShortTermRefPicSet;
-use vacc_parser::{h265::H265Parser, BitstreamPacket, ParseResult, VideoParser};
+use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h265::H265Parser};
 
 // ============================================================================
 // Test helpers
@@ -90,7 +90,7 @@ fn create_p_slice_data(poc_lsb: u16) -> Vec<u8> {
     // 3 extra bits: 1 (sps_flag) + 0 (temporal_mvp) + x = 10x
     let poc_lsb_u8 = poc_lsb as u8;
     let first_payload_byte = 0xA0 | ((poc_lsb_u8 >> 5) & 0x07); // 10101000 | top 3 bits of POC
-                                                                // Bottom 5 bits of POC + sps_flag(1) + temporal_mvp(0) + padding
+    // Bottom 5 bits of POC + sps_flag(1) + temporal_mvp(0) + padding
     let second_payload_byte = ((poc_lsb_u8 << 3) & 0xF8) | 0x04; // 00000100 for sps_flag=1, temporal=0
     data.push(first_payload_byte);
     data.push(second_payload_byte);
@@ -275,7 +275,7 @@ fn test_used_by_curr_pic_filtering() {
     rps.delta_poc_s0_minus1[0] = 65535; // -1 as u16
     rps.delta_poc_s0_minus1[1] = 65533; // -3 as u16
     rps.used_by_curr_pic_s0_flag = 0b01; // Only first pic used
-                                         // S1: pic at delta +2 (used), pic at delta +5 (not used)
+    // S1: pic at delta +2 (used), pic at delta +5 (not used)
     rps.delta_poc_s1_minus1[0] = 2;
     rps.delta_poc_s1_minus1[1] = 5;
     rps.used_by_curr_pic_s1_flag = 0b01; // Only first pic used

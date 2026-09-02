@@ -596,15 +596,15 @@ impl H265Dpb {
         let states = self.slot_states();
         let mut out: Vec<(usize, i32)> = Vec::new();
         let mut add = |e: &H265RefEntry| {
-            if let Some(i) = match_entry(&states, e, cur.log2_max_poc_lsb, Some(cur.poc)) {
-                if !out.iter().any(|(s, _)| *s == i) {
-                    let poc = states
-                        .iter()
-                        .find(|(si, _, _)| *si == i)
-                        .expect("matched slot in states")
-                        .1;
-                    out.push((i, poc));
-                }
+            if let Some(i) = match_entry(&states, e, cur.log2_max_poc_lsb, Some(cur.poc))
+                && !out.iter().any(|(s, _)| *s == i)
+            {
+                let poc = states
+                    .iter()
+                    .find(|(si, _, _)| *si == i)
+                    .expect("matched slot in states")
+                    .1;
+                out.push((i, poc));
             }
         };
         for r in &cur.resolved.st_curr_before {
@@ -792,7 +792,7 @@ mod tests {
         rps.used_by_curr_pic_s0_flag = 0b11;
         info.num_ref_idx_l0_active_minus1 = 2; // 3 refs in L0
         info.num_ref_idx_l1_active_minus1 = 2; // 3 refs in L1
-                                               // Swap L0 positions 0 and 2.
+        // Swap L0 positions 0 and 2.
         info.ref_pic_lists_modification_l0
             .push(H265ListModification {
                 flag: true,
@@ -842,8 +842,8 @@ mod tests {
         use_in_slice_rps(&mut info);
         info.slice_strps = Some(H265ShortTermRefPicSet::default()); // no ST refs
         info.num_ref_idx_l0_active_minus1 = 2; // 3 refs in L0
-                                               // SPS LT ref (poc_lsb=8, used, msb cycle 1) + slice LT ref (poc_lsb=10,
-                                               // unused, msb cycle 1 -> cumulative 2).
+        // SPS LT ref (poc_lsb=8, used, msb cycle 1) + slice LT ref (poc_lsb=10,
+        // unused, msb cycle 1 -> cumulative 2).
         info.num_long_term_sps = 1;
         info.num_long_term_pics = 2;
         info.long_term_refs.push(H265LtRef {
