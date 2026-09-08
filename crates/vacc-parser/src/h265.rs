@@ -250,6 +250,10 @@ pub struct H265Parser {
     prev_pic_order_cnt_lsb: i32,
     /// Flag: true when we have a valid previous non-discardable picture for POC derivation
     has_prev_pic: bool,
+    /// Set when an EOS (36) or EOB (37) NAL unit is seen; consumed by the
+    /// next coded picture, which becomes the first access unit after end of
+    /// sequence (H.265 8.3.1 NoRaslOutputFlag).
+    pending_eos: bool,
     /// All NAL units parsed from the current packet, cached so that repeated
     /// `parse()` calls do not re-scan and re-copy the (large) remaining
     /// bitstream each time (which would be O(n^2) over a whole file).
@@ -298,6 +302,7 @@ impl H265Parser {
             prev_pic_order_cnt_msb: 0,
             prev_pic_order_cnt_lsb: 0,
             has_prev_pic: false,
+            pending_eos: false,
             cached_nals: Vec::new(),
             cached_payload_len: 0,
             nal_cursor: 0,
@@ -1635,15 +1640,21 @@ impl H265Parser {
         // (based on VulkanH265Parser.cpp:2757-2799)
         let pic_order_cnt_msb: i32;
 
-        // NoRaslOutputFlag per H.265 spec 8.3.1:
+        // NoRaslOutputFlag per H.265 spec 8.3.1 (verified against FFmpeg
+        // ff_hevc_compute_poc2 + no_rasl_output_flag and cros-codecs
+        // PictureData::new_from_slice): derived from the NAL unit type, NOT
+        // from the in-band no_output_of_prior_pics_flag:
         // - 1 for IDR (19-20): POC is 0, pic_order_cnt_lsb absent from bitstream
-        // - equal to no_output_of_prior_pics_flag for other IRAPs (BLA/CRA/RSV_IRAP)
-        // - 0 for non-IRAP
-        let no_rasl_output_flag = if info.is_idr {
-            true
-        } else {
-            no_output_of_prior_pics_flag
-        };
+        // - 1 for BLA (16-18)
+        // - 1 for CRA (21) only when it is the first access unit in decoding
+        //   order (no previous tid-0 picture yet) or follows an EOS/EOB NAL
+        // - 0 otherwise (including mid-stream CRA: POC MSB wraps normally)
+        let eos = self.pending_eos;
+        self.pending_eos = false;
+        let no_rasl_output_flag = info.is_idr
+            || matches!(nal_unit_type, 16..=18)
+            || (nal_unit_type == 21 && !self.has_prev_pic)
+            || eos;
         if no_rasl_output_flag {
             // IRAP with NoRaslOutputFlag: MSB is 0
             pic_order_cnt_msb = 0;
@@ -1675,10 +1686,14 @@ impl H265Parser {
         // Update prevPicOrderCntMsb/Lsb per HEVC spec 8.3.1 (matching FFmpeg's
         // pocTid0 update rule): only the first slice of a temporal_id_plus1 == 1
         // picture with NAL type TRAIL_R (1), TSA_R (3), STSA_R (5) or IRAP (16-23).
+        // prevTid0Pic per H.265 spec 8.3.1: the previous picture in decoding
+        // order with TemporalId == 0 that is not RASL (8-9), RADL (6-7) or
+        // SLNR — i.e. TRAIL_R/TSA_R/STSA_R, reserved VCL R (10-15) and all
+        // IRAP types (matches FFmpeg's pocTid0 update rule).
         let temporal_id_plus1 = nal_data[1] & 0x07; // nuh_temporal_id_plus1
         if first_slice_segment_in_pic_flag
             && temporal_id_plus1 == 1
-            && matches!(nal_unit_type, 1 | 3 | 5 | 16..=23)
+            && matches!(nal_unit_type, 1 | 3 | 5 | 10..=23)
         {
             self.prev_pic_order_cnt_lsb = info.pic_order_cnt_lsb as i32;
             self.prev_pic_order_cnt_msb = pic_order_cnt_msb;
@@ -2253,6 +2268,12 @@ impl VideoParser for H265Parser {
                     });
                     i += 1;
                 }
+                Some(H265NalUnitType::Eos) | Some(H265NalUnitType::Eob) => {
+                    // End of sequence / end of bitstream: the next coded
+                    // picture is the first access unit after EOS (H.265 8.3.1).
+                    self.pending_eos = true;
+                    i += 1;
+                }
                 _ => {
                     // Non-VCL NAL unit (AUD, SEI, ...) - skip
                     i += 1;
@@ -2310,6 +2331,7 @@ impl VideoParser for H265Parser {
         self.prev_pic_order_cnt_msb = 0;
         self.prev_pic_order_cnt_lsb = 0;
         self.has_prev_pic = false;
+        self.pending_eos = false;
         self.cached_nals.clear();
         self.cached_payload_len = 0;
         self.nal_cursor = 0;
@@ -3655,5 +3677,181 @@ mod tests {
             info.num_ref_idx_l0_active_minus1 as usize + 1,
             n0
         );
+    }
+
+    /// NoRaslOutputFlag must be derived from the NAL unit type (spec 8.3.1),
+    /// NOT from the in-band no_output_of_prior_pics_flag: BLA always forces
+    /// POC MSB to 0, while a mid-stream CRA with no_output_of_prior_pics_flag
+    /// = 1 still wraps the MSB normally from prevTid0Pic.
+    #[test]
+    fn test_no_rasl_output_flag_nal_type_derivation() {
+        let mut parser = init_parser();
+
+        // One SPS-level STRPS so non-IDR slices can index it (idx omitted
+        // because num_short_term_ref_pic_sets == 1).
+        parser
+            .active_sps
+            .as_mut()
+            .expect("SPS")
+            .short_term_ref_pic_sets
+            .push(vacc_core::picture::H265ShortTermRefPicSet::default());
+        parser
+            .active_sps
+            .as_mut()
+            .expect("SPS")
+            .num_short_term_ref_pic_sets = 1;
+
+        let sps = parser.active_sps().expect("SPS").clone();
+        let pps = parser.active_pps().expect("PPS").clone();
+        let max_poc_lsb = 1i32 << (sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+
+        /// Synthesize a single-slice IRAP NAL (temporal_id_plus1=1).
+        fn synth_irap_nal(
+            sps: &vacc_core::picture::H265Sps,
+            pps: &vacc_core::picture::H265Pps,
+            nal_type: u8,
+            no_output_of_prior_pics_flag: bool,
+            poc_lsb: i32,
+        ) -> Vec<u8> {
+            let mut b = BitBuf::new();
+            b.put(1, 1); // first_slice_segment_in_pic_flag
+            b.put(no_output_of_prior_pics_flag as u32, 1); // no_output_of_prior_pics_flag
+            b.ue(0); // pic_parameter_set_id
+            if pps.num_extra_slice_header_bits > 0 {
+                for _ in 0..pps.num_extra_slice_header_bits {
+                    b.put(0, 1);
+                }
+            }
+            b.ue(2); // slice_type I
+            if pps.output_flag_present_flag {
+                b.put(1, 1); // pic_output_flag
+            }
+            if sps.separate_colour_plane_flag {
+                b.put(0, 2); // colour_plane_id
+            }
+            b.put(poc_lsb as u32, sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+            b.put(1, 1); // short_term_ref_pic_set_sps_flag (idx omitted: count == 1)
+            if sps.long_term_ref_pics_present_flag {
+                if sps.num_long_term_ref_pics_sps > 0 {
+                    b.ue(0); // num_long_term_sps
+                }
+                b.ue(0); // num_long_term_pics
+            }
+            if sps.sps_temporal_mvp_enabled_flag {
+                b.put(0, 1); // slice_temporal_mvp_enabled_flag
+            }
+            if sps.sample_adaptive_offset_enabled_flag {
+                b.put(0, 1); // slice_sao_luma_flag
+                if sps.chroma_format_idc != 0 {
+                    b.put(0, 1); // slice_sao_chroma_flag
+                }
+            }
+            // I slice: no inter fields.
+            b.se(0); // slice_qp_delta
+            if pps.pps_slice_chroma_qp_offsets_present_flag {
+                b.se(0);
+                b.se(0);
+            }
+            if pps.pps_slice_act_qp_offsets_present_flag {
+                b.se(0);
+                b.se(0);
+                b.se(0);
+            }
+            if pps.chroma_qp_offset_list_enabled_flag {
+                b.put(0, 1); // cu_chroma_qp_offset_enabled_flag
+            }
+            if pps.deblocking_filter_control_present_flag
+                && pps.deblocking_filter_override_enabled_flag
+            {
+                b.put(0, 1); // no deblocking override
+            }
+            if pps.pps_loop_filter_across_slices_enabled_flag
+                && !pps.pps_deblocking_filter_disabled_flag
+            {
+                b.put(0, 1); // slice_loop_filter_across_slices_enabled_flag
+            }
+            if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
+                b.ue(0); // num_entry_point_offsets
+            }
+            if pps.slice_segment_header_extension_present_flag {
+                b.ue(0); // extension bytes
+            }
+
+            let mut out = vec![0u8, 0, 1]; // Annex-B start code
+            out.push(nal_type << 1); // NAL header byte 0 (temporal_id_plus1 low bit)
+            out.push(0x01); // NAL header byte 1 (temporal_id_plus1 = 1)
+            out.extend_from_slice(&b.finish());
+            out
+        }
+
+        /// Parse a single-slice NAL and return the slice header POC.
+        fn parse_poc(parser: &mut H265Parser, payload: &[u8]) -> i32 {
+            // The test payloads share lengths; force a NAL cache rebuild so
+            // each case parses its own bits.
+            parser.cached_payload_len = 0;
+            let packet = crate::bitstream::BitstreamPacket::new(payload.to_vec());
+            loop {
+                match parser.parse(&packet).expect("parse failed") {
+                    ParseResult::Slice { slices, .. } => {
+                        let sh = &slices[0].slice_header;
+                        let info = match sh {
+                            Some(crate::SliceHeader::H265(info)) => info,
+                            other => panic!("slice header missing: {other:?}"),
+                        };
+                        return info.curr_pic_order_cnt_val;
+                    }
+                    ParseResult::Nothing | ParseResult::EndOfStream => {
+                        panic!("slice NAL was not parsed")
+                    }
+                    ParseResult::ParameterSet { .. } => {}
+                }
+            }
+        }
+
+        // prevTid0Pic state: previous picture POC = max_poc_lsb + 10.
+        let prev_msb = max_poc_lsb;
+        let prev_lsb = 10;
+
+        // (A) Mid-stream CRA with no_output_of_prior_pics_flag=1: the flag is
+        // IGNORED for POC purposes — MSB wraps normally from prevTid0Pic.
+        parser.prev_pic_order_cnt_msb = prev_msb;
+        parser.prev_pic_order_cnt_lsb = prev_lsb;
+        parser.has_prev_pic = true;
+        let payload = synth_irap_nal(&sps, &pps, 21 /* CRA */, true, 5);
+        let poc = parse_poc(&mut parser, &payload);
+        assert_eq!(
+            poc,
+            prev_msb + 5,
+            "mid-stream CRA must wrap MSB from prevTid0Pic, not reset to 0"
+        );
+
+        // (B) BLA with no_output_of_prior_pics_flag=0: NoRaslOutputFlag=1 by
+        // NAL type — POC MSB is forced to 0 regardless of the flag.
+        parser.prev_pic_order_cnt_msb = prev_msb;
+        parser.prev_pic_order_cnt_lsb = prev_lsb;
+        parser.has_prev_pic = true;
+        let payload = synth_irap_nal(&sps, &pps, 16 /* BLA_W_LP */, false, 5);
+        let poc = parse_poc(&mut parser, &payload);
+        assert_eq!(poc, 5, "BLA must force POC MSB to 0");
+
+        // (C) CRA as the first access unit in decoding order: NoRaslOutputFlag
+        // =1 even with no_output_of_prior_pics_flag=0.
+        parser.prev_pic_order_cnt_msb = prev_msb;
+        parser.prev_pic_order_cnt_lsb = prev_lsb;
+        parser.has_prev_pic = false;
+        let payload = synth_irap_nal(&sps, &pps, 21 /* CRA */, false, 5);
+        let poc = parse_poc(&mut parser, &payload);
+        assert_eq!(poc, 5, "first-in-bitstream CRA must have POC MSB 0");
+
+        // (D) Mid-stream CRA after an EOS NAL: first access unit after end of
+        // sequence — NoRaslOutputFlag=1.
+        parser.prev_pic_order_cnt_msb = prev_msb;
+        parser.prev_pic_order_cnt_lsb = prev_lsb;
+        parser.has_prev_pic = true;
+        parser.pending_eos = true;
+        let payload = synth_irap_nal(&sps, &pps, 21 /* CRA */, false, 5);
+        let poc = parse_poc(&mut parser, &payload);
+        assert_eq!(poc, 5, "post-EOS CRA must have POC MSB 0");
+        assert!(!parser.pending_eos, "pending_eos must be consumed");
     }
 }
