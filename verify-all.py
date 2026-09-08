@@ -38,43 +38,84 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SAMPLES_DIR = ROOT / "samples"
+SAMPLES_DIR = ROOT / "assets" / "samples"
 EX = ROOT / "target/release/examples"
 WORK = Path("/tmp/verify_all")
 NFRAMES_DEFAULT = 300
 
-# (filename, codec, pix_fmt)  — AV1 excluded from verification (HW unsupported).
+# (filename, codec, pix_fmt) — the committed sample set in assets/samples/.
 SAMPLES = [
-    ("h264_baseline.h264",  "h264", "yuv420p"),
-    ("h264_main.h264",      "h264", "yuv420p"),
-    ("h264_high.h264",      "h264", "yuv420p"),
-    ("h264_high10.h264",    "h264", "yuv420p10le"),
-    ("h264_high422.h264",   "h264", "yuv422p10le"),
-    ("h264_high444_8.h264", "h264", "yuv444p"),
-    ("h264_high444_10.h264","h264", "yuv444p10le"),
-    ("h264_gop1.h264",      "h264", "yuv420p"),
-    ("h264_gop100.h264",    "h264", "yuv420p"),
-    ("h264_cra.h264",       "h264", "yuv420p"),
-    ("hevc_main.h265",      "hevc", "yuv420p"),
-    ("hevc_main10.h265",    "hevc", "yuv420p10le"),
-    ("hevc_main422.h265",   "hevc", "yuv422p10le"),
-    ("hevc_main444_8.h265", "hevc", "yuv444p"),
-    ("hevc_main444_10.h265","hevc", "yuv444p10le"),
-    ("hevc_gop1.h265",      "hevc", "yuv420p"),
-    ("hevc_gop100.h265",    "hevc", "yuv420p"),
-    ("hevc_cra.h265",       "hevc", "yuv420p"),
-    ("vp9_p0_8bit.ivf",     "vp9",  "yuv420p"),
-    ("vp9_p2_10bit.ivf",    "vp9",  "yuv420p10le"),
-    ("vp9_p2_12bit.ivf",    "vp9",  "yuv420p12le"),
-    ("vp9_gop1.ivf",        "vp9",  "yuv420p"),
-    ("vp9_gop100.ivf",      "vp9",  "yuv420p"),
+    ("h264_baseline.h264",          "h264", "yuv420p"),
+    ("h264_constrained_baseline.h264", "h264", "yuv420p"),
+    ("h264_main.h264",              "h264", "yuv420p"),
+    ("h264_high.h264",              "h264", "yuv420p"),
+    ("h264_tC.h264",                "h264", "yuv420p"),
+    ("h264_tD.h264",                "h264", "yuv420p"),
+    ("h264_tN.h264",                "h264", "yuv420p"),
+    ("h264_tW.h264",                "h264", "yuv420p"),
+    ("h264_xallI.h264",             "h264", "yuv420p"),
+    ("h264_xfd.h264",               "h264", "yuv420p"),
+    ("h264_high10.h264",            "h264", "yuv420p10le"),
+    ("h264_high422.h264",           "h264", "yuv422p"),
+    ("h264_high444.h264",           "h264", "yuv444p"),
+    ("h265_main.h265",              "hevc", "yuv420p"),
+    ("h265_cra.h265",               "hevc", "yuv420p"),
+    ("h265_msp.h265",               "hevc", "yuv420p"),
+    ("h265_main10.h265",            "hevc", "yuv420p10le"),
+    ("vp9_profile0.ivf",            "vp9",  "yuv420p"),
+    ("vp9_profile1_444.ivf",        "vp9",  "yuv444p"),
+    ("vp9_profile1.ivf",            "vp9",  "yuv420p10le"),
+    ("vp9_profile2.ivf",            "vp9",  "yuv420p12le"),
+    ("av1_main.ivf",                "av1",  "yuv420p"),
+    ("av1_high.ivf",                "av1",  "yuv420p10le"),
+    ("av1_professional.ivf",        "av1",  "yuv422p10le"),
 ]
 
 # backend -> supported codecs (all use the single unified `decode` binary)
 BACKENDS = {
-    "vulkan": {"h264", "hevc", "vp9"},
-    "vaapi":  {"h264", "hevc", "vp9"},
-    "nvdec":  {"h264", "hevc", "vp9"},
+    "vulkan": {"h264", "hevc", "vp9", "av1"},
+    "vaapi":  {"h264", "hevc", "vp9", "av1"},
+    "nvdec":  {"h264", "hevc", "vp9", "av1"},
+}
+
+# (sample, backend) cells where the hardware/driver genuinely cannot decode
+# the stream — NOT a bug in our decoders. Evidence (verified 2026-08-31 on
+# RTX 3060 GA106 + Meteor Lake iGPU; AV1 re-verified 2026-09-08 on GA106):
+HW_UNSUPPORTED = {
+    # H.264 High 10-bit: GA106 NVDEC caps report it unsupported (create fails
+    # with 801); MTL Vulkan driver rejects the spec-legal profile+depth combo
+    # with ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR; iHD VAAPI rejects
+    # RTFormat=YUV420_10 for H.264 (its AVC caps list is 8-bit only).
+    ("h264_high10.h264", "nvdec"),
+    ("h264_high10.h264", "vulkan"),
+    ("h264_high10.h264", "vaapi"),
+    # GA106 NVDEC: cuvidGetDecoderCaps reports H.264 as 8-bit 4:2:0 only
+    # (10-bit, 4:2:2 and 4:4:4 all "unsupported"; create fails with 801).
+    ("h264_high422.h264", "nvdec"),
+    ("h264_high444.h264", "nvdec"),
+    # H.264 4:2:2 / 4:4:4 on Vulkan Video: the spec exposes no 4:2:2/4:4:4
+    # formats for H.264 decode (only HEVC has them); the MTL driver rejects
+    # the profile with ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR.
+    ("h264_high422.h264", "vulkan"),
+    ("h264_high444.h264", "vulkan"),
+    # iHD (Gen12/MTL): AVC VLD pipeline is NV12-only. Config creation with
+    # RTFormat=YUV422 is accepted (lenient caps fallback) but decode fails at
+    # vaEndPicture; RTFormat=YUV444 config is rejected outright. No-attr
+    # configs expose only NV12 surface pixfmts for every H.264 profile.
+    ("h264_high422.h264", "vaapi"),
+    ("h264_high444.h264", "vaapi"),
+    # VP9 4:4:4: Vulkan Video spec exposes only 4:2:0 formats for VP9 decode
+    # and the iGPU driver rejects the 4:4:4 profile with
+    # ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR; GA106 NVDEC caps report
+    # VP9 P1 4:4:4 unsupported.
+    ("vp9_profile1_444.ivf", "vulkan"),
+    ("vp9_profile1_444.ivf", "nvdec"),
+    # AV1 Professional (profile 2, 10-bit 4:2:2): unsupported everywhere —
+    # iHD caps list only AV1 Profile0/1, GA106 NVDEC caps say AV1 is
+    # main/high 4:2:0 only, and the Vulkan driver rejects profile 2.
+    ("av1_professional.ivf", "vulkan"),
+    ("av1_professional.ivf", "nvdec"),
+    ("av1_professional.ivf", "vaapi"),
 }
 
 # pix_fmt -> (bytes per frame / (w*h), bytes per sample, semi-planar UV?)
@@ -181,6 +222,8 @@ def compare_one(sample, codec, pixfmt, backend, nframes):
     sample_path = SAMPLES_DIR / sample
     if not sample_path.exists():
         return dict(status="MISSING_SAMPLE")
+    if (sample, backend) in HW_UNSUPPORTED:
+        return dict(status="HW_UNSUPPORTED")
     if pixfmt not in PXFMT:
         return dict(status="SKIP_NO_REF_FMT", detail=pixfmt)
 
@@ -280,15 +323,21 @@ def main():
                 c = f"{res['exact']}/{res['total']}"
             elif st in ("FAIL", "SHORT") and "exact" in res:
                 c = f"{res['exact']}/{res['total']}"
+            elif st == "HW_UNSUPPORTED":
+                c = "hw-unsuppt"[:11]
             else:
                 c = st[:11]
             cells.append(f"{c:>12}")
         print(f"{fname:<22}" + "".join(cells))
 
+    hw_na = sum(1 for _, _, r in rows if r["status"] == "HW_UNSUPPORTED")
+    n_pass = sum(1 for _, _, r in rows if r["status"] == "PASS")
+    print(f"\n{n_pass} PASS, {hw_na} HW-unsupported (skipped by design)")
+
     # ---- details ----
     print("\nDETAILS")
     for fname, backend, res in rows:
-        if res["status"] in ("PASS", "N/A"):
+        if res["status"] in ("PASS", "N/A", "HW_UNSUPPORTED"):
             continue
         extra = ""
         if res.get("first_diff"):
