@@ -312,7 +312,7 @@ impl H265Parser {
     ///
     /// profile_tier_level( ProfilePresentFlag, MaxSubLayersMinus1, CommonInfPresentFlag, SubLayerLevelPresentFlag )
     ///
-    /// For SPS: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=0
+    /// For SPS: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=1
     /// For VPS: ProfilePresentFlag=1, CommonInfPresentFlag=1, SubLayerLevelPresentFlag=1
     fn parse_ptl(
         r: &mut BitReader,
@@ -341,30 +341,34 @@ impl H265Parser {
         let level_idc = r.read_bits(8)? as u8; // general_level_idc
 
         // --- Sub-layer profile/level presence flags ---
+        let mut sub_layer_profile_flags: Vec<bool> = Vec::new();
         let mut sub_layer_level_flags: Vec<bool> = Vec::new();
         for _ in 0..max_sub_layers {
-            let _ = r.read_bit()?; // sub_layer_profile_present_flag (ignored)
+            sub_layer_profile_flags.push(r.read_bit()?); // sub_layer_profile_present_flag
             sub_layer_level_flags.push(r.read_bit()?); // sub_layer_level_present_flag
         }
 
-        // Padding bits: (8 - MaxNumSubLayersMinus1 - 1) * 2 per H.265 spec
+        // Padding bits: reserved_zero_2bits[i] u(2) for i = MaxNumSubLayersMinus1..8,
+        // i.e. (8 - MaxNumSubLayersMinus1) * 2 bits per H.265 Table 7-1.
         if max_sub_layers > 0 && max_sub_layers < 8 {
-            let _ = r.read_bits((8 - max_sub_layers - 1) * 2)?;
+            let _ = r.read_bits((8 - max_sub_layers) * 2)?;
         }
 
-        // --- Sub-layer level info (SubLayerLevelPresentFlag) ---
-        if sub_layer_level_present {
-            for &level_present in &sub_layer_level_flags {
-                if level_present {
-                    // Skip sub-layer profile info (same as general: 8 + 32 + 48 = 88 bits)
-                    let _ = r.read_bits(8)?;
-                    let _ = r.read_bits(16)?;
-                    let _ = r.read_bits(16)?;
-                    let _ = r.read_bits(24)?;
-                    let _ = r.read_bits(24)?;
-                    // sub_layer_level_idc
-                    let _ = r.read_bits(8)?;
-                }
+        // --- Sub-layer profile/level info (H.265 Table 7-1) ---
+        // sub_layer_profile(i) is gated by sub_layer_profile_present_flag[i] (SPS and VPS);
+        // sub_layer_level_idc[i] additionally requires SubLayerLevelPresentFlag (VPS).
+        for i in 0..max_sub_layers as usize {
+            if sub_layer_profile_flags[i] {
+                // Skip sub-layer profile info (same as general: 8 + 32 + 48 = 88 bits)
+                let _ = r.read_bits(8)?;
+                let _ = r.read_bits(16)?;
+                let _ = r.read_bits(16)?;
+                let _ = r.read_bits(24)?;
+                let _ = r.read_bits(24)?;
+            }
+            if sub_layer_level_present && sub_layer_level_flags[i] {
+                // sub_layer_level_idc
+                let _ = r.read_bits(8)?;
             }
         }
 
@@ -1403,7 +1407,7 @@ impl H265Parser {
                 }
             }
             if pps_scc_extension_flag {
-                let _pps_curr_pic_ref_enabled_flag = r.read_bit()?;
+                pps.pps_curr_pic_ref_enabled_flag = r.read_bit()?;
                 let residual_adaptive_colour_transform_enabled = r.read_bit()?;
                 if residual_adaptive_colour_transform_enabled {
                     // Gates slice-level slice_act_*_qp_offset in the slice header.
@@ -1759,14 +1763,48 @@ impl H265Parser {
             };
 
             // ref_pic_lists_modification (H.265 7.3.6.1, verified against
-            // FFmpeg n8.1.2): the L0 modification flag is present for BOTH P
-            // and B slices (when ListsModificationPresent &&
-            // NumRefIdxL0Active > 1); the L1 flag is B-only. When set, the
-            // whole list is replaced by fixed-length indices of
-            // ceil(log2(max(NumRefIdxL0Active, NumRefIdxL1Active))) bits —
-            // NOT the H.264-style per-entry flag+ue(v) form.
-            if pps.lists_modification_present_flag && n0.max(n1) > 1 {
-                let idx_bits = (n0.max(n1) as f64).log2().ceil() as u8;
+            // FFmpeg ff_hls_slice_header + ff_hevc_frame_nb_refs): present when
+            // ListsModificationPresentFlag && NumPicTotalCurr > 1; the L0
+            // modification flag is present for BOTH P and B slices, the L1 flag
+            // is B-only. When set, each list is replaced by fixed-length
+            // indices of ceil(log2(NumPicTotalCurr)) bits — NOT the H.264-style
+            // per-entry flag+ue(v) form, and NOT keyed off NumRefIdxLxActive.
+            //
+            // NumPicTotalCurr (Eq. 7-57) = number of reference pictures for the
+            // current picture: used short-term RPS entries + used long-term
+            // refs (+1 if pps_curr_pic_ref_enabled_flag, SCC).
+            let strps = if info.short_term_ref_pic_set_sps_flag {
+                &sps
+                    .short_term_ref_pic_sets
+                    .get(info.short_term_ref_pic_set_idx as usize)
+                    .expect("SPS STRPS index out of range")
+            } else {
+                info.slice_strps
+                    .as_ref()
+                    .expect("in-slice STRPS missing for non-SPS RPS")
+            };
+            let mut num_pic_total_curr = 0usize;
+            for i in 0..strps.num_negative_pics as usize {
+                if (strps.used_by_curr_pic_s0_flag >> i) & 1 == 1 {
+                    num_pic_total_curr += 1;
+                }
+            }
+            for i in 0..strps.num_positive_pics as usize {
+                if (strps.used_by_curr_pic_s1_flag >> i) & 1 == 1 {
+                    num_pic_total_curr += 1;
+                }
+            }
+            for lt in &info.long_term_refs {
+                if lt.used_by_curr_pic {
+                    num_pic_total_curr += 1;
+                }
+            }
+            if pps.pps_curr_pic_ref_enabled_flag {
+                num_pic_total_curr += 1;
+            }
+
+            if pps.lists_modification_present_flag && num_pic_total_curr > 1 {
+                let idx_bits = (num_pic_total_curr as f64).log2().ceil() as u8;
                 // L0: P and B slices
                 if r.read_bit()? {
                     for _i in 0..n0 {
