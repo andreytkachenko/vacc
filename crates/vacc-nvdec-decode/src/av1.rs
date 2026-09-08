@@ -461,8 +461,57 @@ pub fn build_cuvid_av1_picparams(
         };
     }
 
-    // Film grain (only apply_grain is signalled by the parser).
-    av1.film_grain_flags = fh.apply_grain as u16 & 1;
+    // Film grain: pass the bitstream params through. apply_grain is forced
+    // to 0 so NVDEC does not synthesize grain on output — ffmpeg's reference
+    // decode path does not apply grain, and verify-all requires pixel parity.
+    {
+        let g = &fh.film_grain;
+        av1.film_grain_flags = ((g.overlap_flag as u16 & 1) << 1)
+            | ((g.grain_scaling_minus_8 as u16 & 3) << 2)
+            | ((g.chroma_scaling_from_luma as u16 & 1) << 4)
+            | ((g.ar_coeff_lag as u16 & 3) << 5)
+            | ((g.ar_coeff_shift_minus_6 as u16 & 3) << 7)
+            | ((g.grain_scale_shift as u16 & 3) << 9)
+            | ((g.clip_to_restricted_range as u16 & 1) << 11);
+        av1.num_y_points = g.num_y_points;
+        for i in 0..g.num_y_points.min(14) as usize {
+            av1.scaling_points_y[i] = [g.point_y_value[i], g.point_y_scaling[i]];
+        }
+        av1.num_cb_points = g.num_cb_points.min(10);
+        for i in 0..av1.num_cb_points as usize {
+            av1.scaling_points_cb[i] = [g.point_cb_value[i], g.point_cb_scaling[i]];
+        }
+        av1.num_cr_points = g.num_cr_points.min(10);
+        for i in 0..av1.num_cr_points as usize {
+            av1.scaling_points_cr[i] = [g.point_cr_value[i], g.point_cr_scaling[i]];
+        }
+        av1.random_seed = g.grain_seed;
+        let n_pos_luma = 2 * g.ar_coeff_lag as usize * (g.ar_coeff_lag as usize + 1);
+        let n_pos_chroma = if g.num_y_points > 0 {
+            n_pos_luma + 1
+        } else {
+            n_pos_luma
+        };
+        for i in 0..n_pos_luma.min(24) {
+            av1.ar_coeffs_y[i] = g.ar_coeffs_y_plus_128[i] as u8 as i16;
+        }
+        if g.chroma_scaling_from_luma || g.num_cb_points > 0 {
+            for i in 0..n_pos_chroma.min(25) {
+                av1.ar_coeffs_cb[i] = g.ar_coeffs_cb_plus_128[i] as u8 as i16;
+            }
+        }
+        if g.chroma_scaling_from_luma || g.num_cr_points > 0 {
+            for i in 0..n_pos_chroma.min(25) {
+                av1.ar_coeffs_cr[i] = g.ar_coeffs_cr_plus_128[i] as u8 as i16;
+            }
+        }
+        av1.cb_mult = g.cb_mult;
+        av1.cb_luma_mult = g.cb_luma_mult;
+        av1.cb_offset = g.cb_offset as i16;
+        av1.cr_mult = g.cr_mult;
+        av1.cr_luma_mult = g.cr_luma_mult;
+        av1.cr_offset = g.cr_offset as i16;
+    }
 
     // 4. Common CUVIDPICPARAMS.
     let mut params = unsafe { std::mem::zeroed::<CUVIDPICPARAMS>() };

@@ -1990,7 +1990,12 @@ impl VideoDecoder {
             pic_info.flags.set_usesChromaLr(
                 (fh.loop_restoration_type[1] != 0 || fh.loop_restoration_type[2] != 0) as u32,
             );
-            pic_info.flags.set_apply_grain(fh.apply_grain as u32);
+            // The decode profile declares film_grain_support=false, so the
+            // driver must not apply grain (and the ffmpeg reference pipeline
+            // decodes without grain — HW-applied grain would break the
+            // pixel-exact comparison). The parsed grain params are still
+            // stored below for future grain-supporting profiles.
+            pic_info.flags.set_apply_grain(0);
 
             // Interpolation filter and tx mode (parser already stores Vulkan enum values)
             pic_info.interpolation_filter = fh.interpolation_filter as u32;
@@ -2147,7 +2152,56 @@ impl VideoDecoder {
                 gm.gm_params[i] = fh.global_motion_params[i - 1];
             }
 
-            // Film grain: not present in our SPS (pFilmGrain stays null via init_pointers)
+            // Film grain: fill the container from the parsed params (the
+            // pointer is always valid via init_pointers). apply_grain is NOT
+            // requested in pic_info.flags — see above.
+            {
+                let g = &fh.film_grain;
+                let fg = &mut picture_info_container.film_grain;
+                fg.flags.set_chroma_scaling_from_luma(g.chroma_scaling_from_luma as u32);
+                fg.flags.set_overlap_flag(g.overlap_flag as u32);
+                fg.flags.set_clip_to_restricted_range(g.clip_to_restricted_range as u32);
+                fg.flags.set_update_grain(g.update_grain as u32);
+                fg.grain_scaling_minus_8 = g.grain_scaling_minus_8;
+                fg.ar_coeff_lag = g.ar_coeff_lag;
+                fg.ar_coeff_shift_minus_6 = g.ar_coeff_shift_minus_6;
+                fg.grain_scale_shift = g.grain_scale_shift;
+                fg.grain_seed = g.grain_seed;
+                fg.film_grain_params_ref_idx = g.film_grain_params_ref_idx;
+                fg.num_y_points = g.num_y_points.min(14);
+                fg.point_y_value[..fg.num_y_points as usize]
+                    .copy_from_slice(&g.point_y_value[..fg.num_y_points as usize]);
+                fg.point_y_scaling[..fg.num_y_points as usize]
+                    .copy_from_slice(&g.point_y_scaling[..fg.num_y_points as usize]);
+                fg.num_cb_points = g.num_cb_points.min(10);
+                fg.point_cb_value[..fg.num_cb_points as usize]
+                    .copy_from_slice(&g.point_cb_value[..fg.num_cb_points as usize]);
+                fg.point_cb_scaling[..fg.num_cb_points as usize]
+                    .copy_from_slice(&g.point_cb_scaling[..fg.num_cb_points as usize]);
+                fg.num_cr_points = g.num_cr_points.min(10);
+                fg.point_cr_value[..fg.num_cr_points as usize]
+                    .copy_from_slice(&g.point_cr_value[..fg.num_cr_points as usize]);
+                fg.point_cr_scaling[..fg.num_cr_points as usize]
+                    .copy_from_slice(&g.point_cr_scaling[..fg.num_cr_points as usize]);
+                let n_pos_luma = 2 * g.ar_coeff_lag as usize * (g.ar_coeff_lag as usize + 1);
+                let n_pos_chroma = if g.num_y_points > 0 {
+                    (n_pos_luma + 1).min(25)
+                } else {
+                    n_pos_luma.min(24)
+                };
+                fg.ar_coeffs_y_plus_128[..n_pos_luma.min(24)]
+                    .copy_from_slice(&g.ar_coeffs_y_plus_128[..n_pos_luma.min(24)]);
+                fg.ar_coeffs_cb_plus_128[..n_pos_chroma]
+                    .copy_from_slice(&g.ar_coeffs_cb_plus_128[..n_pos_chroma]);
+                fg.ar_coeffs_cr_plus_128[..n_pos_chroma]
+                    .copy_from_slice(&g.ar_coeffs_cr_plus_128[..n_pos_chroma]);
+                fg.cb_mult = g.cb_mult;
+                fg.cb_luma_mult = g.cb_luma_mult;
+                fg.cb_offset = g.cb_offset;
+                fg.cr_mult = g.cr_mult;
+                fg.cr_luma_mult = g.cr_luma_mult;
+                fg.cr_offset = g.cr_offset;
+            }
 
             picture_info_container.init_pointers();
 

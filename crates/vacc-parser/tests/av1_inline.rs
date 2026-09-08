@@ -275,7 +275,7 @@ impl BitWriter {
 /// Minimal Main-profile SPS: timing_info present, equal_picture_interval=0,
 /// decoder_model_info present (FPT/BRT lengths minus 1 = 5 → n=6), one or
 /// two operating points with decoder_model_present_for_this_op set.
-fn synthetic_timing_sps(op_count: usize, op1_idc: u32) -> Vec<u8> {
+fn synthetic_timing_sps(op_count: usize, op1_idc: u32, grain_present: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write(0, 3); // seq_profile Main
     w.write(0, 1); // still_picture
@@ -317,15 +317,14 @@ fn synthetic_timing_sps(op_count: usize, op1_idc: u32) -> Vec<u8> {
     w.write(0, 1); // enable_superres
     w.write(0, 1); // enable_cdef
     w.write(0, 1); // enable_restoration
-    // color_config (profile 0: no twelve_bit field)
+    // color_config (profile 0: no twelve_bit; 4:2:0 subsampling implicit)
     w.write(0, 1); // high_bitdepth
     w.write(0, 1); // mono_chrome
     w.write(0, 1); // color_description_present
+    w.write(0, 1); // color_range
+    w.write(0, 2); // chroma_sample_position (4:2:0)
     w.write(0, 1); // separate_uv_delta_q
-    w.write(1, 1); // subsampling_x
-    w.write(1, 1); // subsampling_y
-    w.write(0, 2); // chroma_sample_position
-    w.write(0, 1); // film_grain_params_present
+    w.write(grain_present as u64, 1); // film_grain_params_present
     // trailing bits: 1 bit then zero pad to the byte boundary
     w.write(1, 1);
     if w.bitpos % 8 != 0 {
@@ -366,7 +365,7 @@ fn synthetic_key_frame_with_timing() -> (Vec<u8>, u32) {
 
 #[test]
 fn test_decoder_model_timing_reads() {
-    let sps_bytes = synthetic_timing_sps(1, 0);
+    let sps_bytes = synthetic_timing_sps(1, 0, false);
     let mut parser = Av1Parser::new();
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
@@ -407,7 +406,7 @@ fn test_decoder_model_timing_reads() {
 fn test_brt_operating_point_gating() {
     // op1 idc = 4: with temporal_id=0/spatial_id=0, inTemporal=(4>>0)&1=0
     // and inSpatial=(4>>8)&1=0 → its BRT value is NOT read (only op0's is).
-    let sps_bytes = synthetic_timing_sps(2, 4);
+    let sps_bytes = synthetic_timing_sps(2, 4, false);
     let mut parser = Av1Parser::new();
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
@@ -453,7 +452,7 @@ fn test_brt_operating_point_gating() {
     let frame_bytes = w.into_bytes();
     assert_eq!(nbits, 50);
 
-    let sps_bytes = synthetic_timing_sps(2, 0x101);
+    let sps_bytes = synthetic_timing_sps(2, 0x101, false);
     let mut parser = Av1Parser::new();
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
@@ -465,4 +464,142 @@ fn test_brt_operating_point_gating() {
         .parse_frame_header(&frame_bytes, &sps, 0, 0)
         .expect("frame header parse");
     assert_eq!(fh.frame_header_size, 7, "54 bits -> 7 header bytes");
+}
+
+/// Minimal Main-profile SPS with film_grain_params_present=1 and NO
+/// timing/decoder-model info (isolates the grain block).
+fn synthetic_grain_sps() -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write(0, 3); // seq_profile Main
+    w.write(0, 1); // still_picture
+    w.write(0, 1); // reduced_still_picture_header
+    w.write(0, 1); // timing_info_present_flag = 0 -> no decoder model
+    w.write(0, 1); // initial_display_delay_present_flag
+    w.write(0, 5); // operating_points_cnt_minus_1 = 0
+    w.write(0, 12); // op0 operating_point_idc
+    w.write(1, 5); // op0 seq_level_idx
+    w.write(5, 4); // frame_width_bits_minus_1 (6-bit widths)
+    w.write(5, 4); // frame_height_bits_minus_1
+    w.write(63, 6); // max_frame_width_minus_1 -> 64
+    w.write(35, 6); // max_frame_height_minus_1 -> 36
+    w.write(0, 1); // frame_id_numbers_present_flag
+    w.write(0, 1); // use_128x128_superblock
+    w.write(0, 1); // enable_filter_intra
+    w.write(0, 1); // enable_intra_edge_filter
+    w.write(0, 1); // enable_interintra_compound
+    w.write(0, 1); // enable_masked_compound
+    w.write(0, 1); // enable_warped_motion
+    w.write(0, 1); // enable_dual_filter
+    w.write(0, 1); // enable_order_hint = 0
+    w.write(0, 1); // seq_choose_screen_content_tools
+    w.write(0, 1); // seq_force_screen_content_tools = 0
+    w.write(0, 1); // enable_superres
+    w.write(0, 1); // enable_cdef
+    w.write(0, 1); // enable_restoration
+    // color_config (profile 0: no twelve_bit; 4:2:0 subsampling implicit)
+    w.write(0, 1); // high_bitdepth
+    w.write(0, 1); // mono_chrome
+    w.write(0, 1); // color_description_present
+    w.write(0, 1); // color_range
+    w.write(0, 2); // chroma_sample_position (4:2:0)
+    w.write(0, 1); // separate_uv_delta_q
+    w.write(1, 1); // film_grain_params_present = 1
+    // trailing bits: 1 bit then zero pad to byte boundary
+    w.write(1, 1);
+    if w.bitpos % 8 != 0 {
+        w.write(0, 8 - (w.bitpos % 8));
+    }
+    w.into_bytes()
+}
+
+/// Minimal KEY frame header (64x36) whose last element is a full
+/// film_grain_params block: apply_grain=1, 1 y point, chroma_scaling_from_
+/// luma=1, ar_coeff_lag=1 (numPosLuma=4, numPosChroma=5). Base header is 35
+/// bits, grain block 160 bits -> 195 bits total -> frame_header_size 25.
+fn synthetic_key_frame_with_grain() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(0, 2); // frame_type KEY
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(63, 6); // frame_width_minus_1 -> 64
+    w.write(35, 6); // frame_height_minus_1 -> 36
+    w.write(0, 1); // render_and_frame_size_different
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(0, 8); // base_q_index
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    w.write(0, 1); // segmentation_enabled
+    w.write(0, 1); // reduced_tx_set
+    // ---- film_grain_params (last element) ----
+    w.write(1, 1); // apply_grain
+    w.write(0x1234, 16); // grain_seed
+    // update_grain inferred 1 for KEY (no bit)
+    w.write(1, 4); // num_y_points = 1
+    w.write(0x80, 8); // point_y_value[0]
+    w.write(0x7f, 8); // point_y_scaling[0]
+    w.write(1, 1); // chroma_scaling_from_luma = 1 (skips cb/cr points)
+    w.write(2, 2); // grain_scaling_minus_8
+    w.write(1, 2); // ar_coeff_lag = 1 -> numPosLuma=4, numPosChroma=5
+    for v in [0x7f, 0x80, 0x81, 0x82] {
+        w.write(v as u64, 8); // ar_coeffs_y_plus_128[0..4]
+    }
+    for v in [0x00, 0x01, 0x02, 0x03, 0x04] {
+        w.write(v as u64, 8); // ar_coeffs_cb_plus_128[0..5]
+    }
+    for v in [0x05, 0x06, 0x07, 0x08, 0x09] {
+        w.write(v as u64, 8); // ar_coeffs_cr_plus_128[0..5]
+    }
+    w.write(1, 2); // ar_coeff_shift_minus_6
+    w.write(3, 2); // grain_scale_shift
+    w.write(1, 1); // overlap_flag
+    w.write(0, 1); // clip_to_restricted_range
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_film_grain_params_reads() {
+    let sps_bytes = synthetic_grain_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
+    assert!(sps.film_grain_params_present);
+
+    let (frame_bytes, nbits) = synthetic_key_frame_with_grain();
+    assert_eq!(nbits, 195, "35 base + 160 grain bits");
+
+    let fh = parser
+        .parse_frame_header(&frame_bytes, &sps, 0, 0)
+        .expect("frame header parse");
+
+    // The full grain block must have been consumed (pins its position as the
+    // last element of uncompressed_header); a short/long read shifts the size.
+    assert_eq!(fh.frame_header_size, 25, "195 bits -> 25 header bytes");
+    assert!(fh.apply_grain);
+    let g = &fh.film_grain;
+    assert!(g.apply_grain);
+    assert_eq!(g.grain_seed, 0x1234);
+    assert!(g.update_grain);
+    assert_eq!(g.num_y_points, 1);
+    assert_eq!(g.point_y_value[0], 0x80);
+    assert_eq!(g.point_y_scaling[0], 0x7f);
+    assert!(g.chroma_scaling_from_luma);
+    assert_eq!(g.grain_scaling_minus_8, 2);
+    assert_eq!(g.ar_coeff_lag, 1);
+    assert_eq!(&g.ar_coeffs_y_plus_128[..4], [0x7f_i8, 0x80_u8 as i8, 0x81_u8 as i8, 0x82_u8 as i8]);
+    assert_eq!(&g.ar_coeffs_cb_plus_128[..5], [0, 1, 2, 3, 4]);
+    assert_eq!(&g.ar_coeffs_cr_plus_128[..5], [5, 6, 7, 8, 9]);
+    assert_eq!(g.ar_coeff_shift_minus_6, 1);
+    assert_eq!(g.grain_scale_shift, 3);
+    assert!(g.overlap_flag);
+    assert!(!g.clip_to_restricted_range);
 }

@@ -69,6 +69,11 @@ SAMPLES = [
     ("av1_main.ivf",                "av1",  "yuv420p"),
     ("av1_high.ivf",                "av1",  "yuv420p10le"),
     ("av1_professional.ivf",        "av1",  "yuv422p10le"),
+    # aomenc --film-grain-table: SPS film_grain_params_present=1 and a grain
+    # block at the end of every showable frame header. Exercises parser issue
+    # 3 (film_grain_params) end-to-end. Decoded without grain application on
+    # all backends (apply_grain forced 0) to stay pixel-identical to ffmpeg.
+    ("av1_grain.ivf",               "av1",  "yuv420p"),
 ]
 
 # backend -> supported codecs (all use the single unified `decode` binary)

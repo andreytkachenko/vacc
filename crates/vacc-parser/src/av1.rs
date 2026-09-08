@@ -95,6 +95,54 @@ impl std::ops::DerefMut for TileArray {
     }
 }
 
+/// AV1 film grain parameters (spec 5.9 `film_grain_params()`), stored in
+/// bitstream order for direct mapping onto the HW picture-info structs
+/// (Vulkan `StdVideoAV1FilmGrain`, VAAPI `VAFilmGrainStructAV1`).
+///
+/// Array bounds follow the spec conformance limits: num_y_points <= 14,
+/// num_cb_points <= 10, num_cr_points <= 12, ar coefficient positions
+/// numPosLuma = 2*lag*(lag+1) <= 24, numPosChroma <= 25.
+#[derive(Debug, Clone, Default)]
+pub struct Av1FilmGrain {
+    /// apply_grain (u(1)).
+    pub apply_grain: bool,
+    /// grain_seed (u(16)); valid when apply_grain.
+    pub grain_seed: u16,
+    /// update_grain (u(1) for INTER frames; inferred 1 otherwise).
+    pub update_grain: bool,
+    /// film_grain_params_ref_idx (u(3)); valid when !update_grain.
+    pub film_grain_params_ref_idx: u8,
+    /// chroma_scaling_from_luma (u(1); inferred 0 for mono_chrome).
+    pub chroma_scaling_from_luma: bool,
+    pub num_y_points: u8,
+    pub point_y_value: [u8; 14],
+    pub point_y_scaling: [u8; 14],
+    pub num_cb_points: u8,
+    pub point_cb_value: [u8; 10],
+    pub point_cb_scaling: [u8; 10],
+    pub num_cr_points: u8,
+    pub point_cr_value: [u8; 12],
+    pub point_cr_scaling: [u8; 12],
+    pub grain_scaling_minus_8: u8,
+    pub ar_coeff_lag: u8,
+    /// ar_coeffs_*_plus_128 (u(8) raw bitstream values, stored wrapped as
+    /// i8 to match the StdVideo/VAAPI int8_t fields).
+    pub ar_coeffs_y_plus_128: [i8; 24],
+    pub ar_coeffs_cb_plus_128: [i8; 25],
+    pub ar_coeffs_cr_plus_128: [i8; 25],
+    pub ar_coeff_shift_minus_6: u8,
+    pub grain_scale_shift: u8,
+    /// cb/cr mult/luma_mult (u(8)) and offset (u(9) raw).
+    pub cb_mult: u8,
+    pub cb_luma_mult: u8,
+    pub cb_offset: u16,
+    pub cr_mult: u8,
+    pub cr_luma_mult: u8,
+    pub cr_offset: u16,
+    pub overlap_flag: bool,
+    pub clip_to_restricted_range: bool,
+}
+
 /// AV1 frame header parsed from Frame/FrameHeader OBU.
 /// Contains fields needed for hardware decode (Vulkan/VAAPI).
 #[derive(Debug, Clone, Default)]
@@ -271,6 +319,9 @@ pub struct Av1FrameHeader {
     pub all_lossless: bool,
     /// apply_grain (film grain applied this frame).
     pub apply_grain: bool,
+    /// Full film grain parameters (valid when SPS film_grain_params_present
+    /// and the frame is shown/showable; `apply_grain` mirrors the flag).
+    pub film_grain: Av1FilmGrain,
     /// showable_frame (derived).
     pub showable_frame: bool,
     /// coded_denom (superres denominator; 0 when no superres).
@@ -1507,8 +1558,8 @@ impl Av1Parser {
             self.parse_global_motion(&mut r, &mut fh, sps, primary_ref)?;
         }
 
-        // 32. film_grain (not present in our SPS)
-        fh.apply_grain = false;
+        // 32. film_grain_params (last element of uncompressed_header)
+        self.parse_film_grain(&mut r, &mut fh, sps)?;
 
         // Update reference frame tracking state for subsequent frames
         self.update_ref_frames(&fh);
@@ -1517,6 +1568,126 @@ impl Av1Parser {
         fh.frame_header_size = r.position().div_ceil(8) as u32;
 
         Ok(fh)
+    }
+
+    /// AV1 spec 5.9: film_grain_params — the last element of
+    /// `uncompressed_header`. No bits at all when the SPS has no grain
+    /// params or the frame is neither shown nor showable (the grain state
+    /// is then reset, which is a no-op for this decoder).
+    fn parse_film_grain(
+        &self,
+        r: &mut BitReader,
+        fh: &mut Av1FrameHeader,
+        sps: &vacc_core::picture::Av1Sps,
+    ) -> ParserResult<()> {
+        let mut grain = Av1FilmGrain::default();
+        if !sps.film_grain_params_present || (!fh.show_frame && !fh.showable_frame) {
+            return Ok(());
+        }
+
+        grain.apply_grain = r.read_bit()?;
+        if !grain.apply_grain {
+            return Ok(());
+        }
+
+        grain.grain_seed = r.read_bits(16)? as u16;
+        // update_grain is inferred 1 for non-INTER frames.
+        grain.update_grain = if fh.frame_type == 1 { r.read_bit()? } else { true };
+        if !grain.update_grain {
+            grain.film_grain_params_ref_idx = r.read_bits(3)? as u8;
+            // Params are loaded from the referenced frame; the bitstream
+            // carries nothing further here.
+            fh.film_grain = grain;
+            fh.apply_grain = true;
+            return Ok(());
+        }
+
+        grain.num_y_points = r.read_bits(4)? as u8;
+        if grain.num_y_points > 14 {
+            return Err(ParserError::InvalidBitstream);
+        }
+        for i in 0..grain.num_y_points as usize {
+            grain.point_y_value[i] = r.read_bits(8)? as u8;
+            grain.point_y_scaling[i] = r.read_bits(8)? as u8;
+        }
+
+        grain.chroma_scaling_from_luma = if sps.mono_chrome {
+            false
+        } else {
+            r.read_bit()?
+        };
+
+        let no_chroma_points = sps.mono_chrome
+            || grain.chroma_scaling_from_luma
+            || (sps.subsampling_x == 1 && sps.subsampling_y == 1 && grain.num_y_points == 0);
+        if !no_chroma_points {
+            grain.num_cb_points = r.read_bits(4)? as u8;
+            if grain.num_cb_points > 10 {
+                return Err(ParserError::InvalidBitstream);
+            }
+            for i in 0..grain.num_cb_points as usize {
+                grain.point_cb_value[i] = r.read_bits(8)? as u8;
+                grain.point_cb_scaling[i] = r.read_bits(8)? as u8;
+            }
+            grain.num_cr_points = r.read_bits(4)? as u8;
+            if grain.num_cr_points > 12 {
+                return Err(ParserError::InvalidBitstream);
+            }
+            for i in 0..grain.num_cr_points as usize {
+                grain.point_cr_value[i] = r.read_bits(8)? as u8;
+                grain.point_cr_scaling[i] = r.read_bits(8)? as u8;
+            }
+        }
+
+        grain.grain_scaling_minus_8 = r.read_bits(2)? as u8;
+        grain.ar_coeff_lag = r.read_bits(2)? as u8;
+        let num_pos_luma = 2 * grain.ar_coeff_lag as usize * (grain.ar_coeff_lag as usize + 1);
+        if num_pos_luma > 24 {
+            return Err(ParserError::InvalidBitstream);
+        }
+        let num_pos_chroma = if grain.num_y_points > 0 {
+            num_pos_luma + 1
+        } else {
+            num_pos_luma
+        };
+        if num_pos_chroma > 25 {
+            return Err(ParserError::InvalidBitstream);
+        }
+
+        if grain.num_y_points > 0 {
+            for i in 0..num_pos_luma {
+                grain.ar_coeffs_y_plus_128[i] = r.read_bits(8)? as i8;
+            }
+        }
+        if grain.chroma_scaling_from_luma || grain.num_cb_points > 0 {
+            for i in 0..num_pos_chroma {
+                grain.ar_coeffs_cb_plus_128[i] = r.read_bits(8)? as i8;
+            }
+        }
+        if grain.chroma_scaling_from_luma || grain.num_cr_points > 0 {
+            for i in 0..num_pos_chroma {
+                grain.ar_coeffs_cr_plus_128[i] = r.read_bits(8)? as i8;
+            }
+        }
+
+        grain.ar_coeff_shift_minus_6 = r.read_bits(2)? as u8;
+        grain.grain_scale_shift = r.read_bits(2)? as u8;
+        if grain.num_cb_points > 0 {
+            grain.cb_mult = r.read_bits(8)? as u8;
+            grain.cb_luma_mult = r.read_bits(8)? as u8;
+            grain.cb_offset = r.read_bits(9)? as u16;
+        }
+        if grain.num_cr_points > 0 {
+            grain.cr_mult = r.read_bits(8)? as u8;
+            grain.cr_luma_mult = r.read_bits(8)? as u8;
+            grain.cr_offset = r.read_bits(9)? as u16;
+        }
+        grain.overlap_flag = r.read_bit()?;
+        grain.clip_to_restricted_range = r.read_bit()?;
+
+        fh.film_grain = grain;
+        fh.apply_grain = true;
+        Ok(())
     }
 
     /// AV1 spec 7.8: derive the 7 reference frame indices from last/golden indices.
