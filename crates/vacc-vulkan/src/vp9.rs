@@ -1030,7 +1030,7 @@ pub fn convert_vp9_picture_info(
         segmentation_tree_probs: segmentation.segmentation_tree_probs,
         segmentation_pred_prob: segmentation.segmentation_pred_prob,
         feature_enabled: segmentation.feature_enabled,
-        feature_data: segmentation.feature_data.map(|row| row.map(|v| v as i16)),
+        feature_data: segmentation.feature_data,
     };
 
     Vp9PictureInfoContainer {

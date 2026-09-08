@@ -1379,7 +1379,8 @@ pub struct Vp9Segmentation {
     /// Feature enabled flags [VP9_MAX_SEGMENTS]
     pub feature_enabled: [u8; VP9_MAX_SEGMENTS as usize],
     /// Feature data [VP9_MAX_SEGMENTS][VP9_SEG_LVL_MAX]
-    pub feature_data: [[i8; VP9_SEG_LVL_MAX as usize]; VP9_MAX_SEGMENTS as usize],
+    /// i16: ALT_Q/ALT_Y_AC are 8-bit magnitude + sign (range ±255), does not fit i8.
+    pub feature_data: [[i16; VP9_SEG_LVL_MAX as usize]; VP9_MAX_SEGMENTS as usize],
 }
 
 impl Default for Vp9Segmentation {

@@ -620,7 +620,9 @@ impl Vp9Parser {
                     segmentation.feature_enabled[i] |= (feature_enabled as u8) << j;
 
                     if feature_enabled != 0 && feature_bits[j] > 0 {
-                        let mut feature_value = r.read_bits(feature_bits[j])? as i8;
+                        // Magnitude is unsigned (8/6/2 bits), sign is a separate bit —
+                        // signed features range ±255 and must not wrap through i8.
+                        let mut feature_value = r.read_bits(feature_bits[j])? as i16;
                         if feature_signed[j] {
                             let feature_sign = r.read_bits(1)?;
                             if feature_sign != 0 {
