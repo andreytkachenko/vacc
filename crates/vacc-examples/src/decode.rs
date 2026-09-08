@@ -257,9 +257,11 @@ fn vp9_subframes(payload: &[u8]) -> Vec<&[u8]> {
 }
 
 /// VP9: does this (sub)frame produce a display picture?
-/// Frame header byte 0: bit 7 = show_existing_frame, bit 6 = show_frame.
+/// Frame header byte 0 (MSB first): frame_marker(2)=10, profile(2),
+/// show_existing_frame(1), frame_type(1), show_frame(1). A
+/// show_existing_frame always displays; otherwise bit 1 is show_frame.
 fn vp9_shows(data: &[u8]) -> bool {
-    data.first().is_some_and(|&b| b & 0xC0 != 0)
+    data.first().is_some_and(|&b| b & 0x08 != 0 || (b >> 1) & 1 != 0)
 }
 
 /// AV1: walk the OBU sequence of an IVF packet and report whether its Frame

@@ -1396,7 +1396,9 @@ pub fn extract_vp9_frames(data: &[u8], max_frames: usize) -> Vec<Vp9Frame> {
 
     let raw_frames = if is_ivf {
         match parse_ivf_container(data) {
-            Ok(frames) => frames,
+            // IVF packets may be VP9 superframes carrying several frames;
+            // expand them so every frame gets its own decode command.
+            Ok(frames) => expand_superframes(&frames),
             Err(_) => vec![data.to_vec()],
         }
     } else {
