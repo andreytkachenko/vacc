@@ -723,6 +723,9 @@ pub struct H265Pps {
     pub pps_deblocking_filter_disabled_flag: bool,
     pub pps_scaling_list_data_present_flag: bool,
     pub lists_modification_present_flag: bool,
+    /// SCC extension: current picture used as its own reference (adds 1 to
+    /// NumPicTotalCurr per spec Eq. 7-57 / FFmpeg ff_hevc_frame_nb_refs).
+    pub pps_curr_pic_ref_enabled_flag: bool,
     pub slice_segment_header_extension_present_flag: bool,
     pub pps_extension_present_flag: bool,
 
@@ -810,6 +813,7 @@ impl H265Pps {
             pps_deblocking_filter_disabled_flag: false,
             pps_scaling_list_data_present_flag: false,
             lists_modification_present_flag: false,
+            pps_curr_pic_ref_enabled_flag: false,
             slice_segment_header_extension_present_flag: false,
             pps_extension_present_flag: false,
 

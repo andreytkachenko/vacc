@@ -250,10 +250,11 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
         out.l0 = pad_list(&l0, n_l0);
         out.l1 = pad_list(&l1, n_l1);
 
-        // ref_pic_lists_modification (B slices only, spec 7.3.7.1) — gather
-        // form: RefPicListX[i] = initial[ flag ? ref_idx : i ].
+        // ref_pic_lists_modification (spec 7.3.6.1 / 8.3.3) — gather form:
+        // RefPicListX[i] = initial[ flag ? ref_idx : i ]. The L0 modification
+        // applies to BOTH P and B slices; L1 only to B slices.
+        out.l0 = apply_mod(&out.l0, &info.ref_pic_lists_modification_l0);
         if info.slice_type == 2 {
-            out.l0 = apply_mod(&out.l0, &info.ref_pic_lists_modification_l0);
             out.l1 = apply_mod(&out.l1, &info.ref_pic_lists_modification_l1);
         }
     }

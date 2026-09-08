@@ -375,6 +375,48 @@ impl H265Parser {
         Ok((general_profile_idc, level_idc, general_tier_flag))
     }
 
+    /// NumPicTotalCurr (H.265 Eq. 7-57): the number of reference pictures for
+    /// the current picture — used short-term RPS entries + used long-term
+    /// references (+1 when pps_curr_pic_ref_enabled_flag, SCC). Gates and sizes
+    /// ref_pic_lists_modification; matches FFmpeg `ff_hevc_frame_nb_refs` and
+    /// cros-codecs.
+    fn num_pic_total_curr(
+        sps: &vacc_core::picture::H265Sps,
+        info: &SliceHeaderInfo,
+        curr_pic_ref_enabled: bool,
+    ) -> usize {
+        let strps = if info.short_term_ref_pic_set_sps_flag {
+            sps
+                .short_term_ref_pic_sets
+                .get(info.short_term_ref_pic_set_idx as usize)
+        } else {
+            info.slice_strps.as_ref()
+        };
+
+        let mut n = 0usize;
+        if let Some(strps) = strps {
+            for i in 0..strps.num_negative_pics as usize {
+                if (strps.used_by_curr_pic_s0_flag >> i) & 1 == 1 {
+                    n += 1;
+                }
+            }
+            for i in 0..strps.num_positive_pics as usize {
+                if (strps.used_by_curr_pic_s1_flag >> i) & 1 == 1 {
+                    n += 1;
+                }
+            }
+        }
+        for lt in &info.long_term_refs {
+            if lt.used_by_curr_pic {
+                n += 1;
+            }
+        }
+        if curr_pic_ref_enabled {
+            n += 1;
+        }
+        n
+    }
+
     /// Parse scaling_list_data per H.265 spec and C++ VulkanH265Parser.cpp:1674-1727.
     fn parse_scaling_list_data(
         r: &mut BitReader,
@@ -1770,38 +1812,8 @@ impl H265Parser {
             // indices of ceil(log2(NumPicTotalCurr)) bits — NOT the H.264-style
             // per-entry flag+ue(v) form, and NOT keyed off NumRefIdxLxActive.
             //
-            // NumPicTotalCurr (Eq. 7-57) = number of reference pictures for the
-            // current picture: used short-term RPS entries + used long-term
-            // refs (+1 if pps_curr_pic_ref_enabled_flag, SCC).
-            let strps = if info.short_term_ref_pic_set_sps_flag {
-                &sps
-                    .short_term_ref_pic_sets
-                    .get(info.short_term_ref_pic_set_idx as usize)
-                    .expect("SPS STRPS index out of range")
-            } else {
-                info.slice_strps
-                    .as_ref()
-                    .expect("in-slice STRPS missing for non-SPS RPS")
-            };
-            let mut num_pic_total_curr = 0usize;
-            for i in 0..strps.num_negative_pics as usize {
-                if (strps.used_by_curr_pic_s0_flag >> i) & 1 == 1 {
-                    num_pic_total_curr += 1;
-                }
-            }
-            for i in 0..strps.num_positive_pics as usize {
-                if (strps.used_by_curr_pic_s1_flag >> i) & 1 == 1 {
-                    num_pic_total_curr += 1;
-                }
-            }
-            for lt in &info.long_term_refs {
-                if lt.used_by_curr_pic {
-                    num_pic_total_curr += 1;
-                }
-            }
-            if pps.pps_curr_pic_ref_enabled_flag {
-                num_pic_total_curr += 1;
-            }
+            let num_pic_total_curr =
+                Self::num_pic_total_curr(sps, &info, pps.pps_curr_pic_ref_enabled_flag);
 
             if pps.lists_modification_present_flag && num_pic_total_curr > 1 {
                 let idx_bits = (num_pic_total_curr as f64).log2().ceil() as u8;
@@ -3347,5 +3359,301 @@ mod tests {
 
         assert!(pictures >= 290, "expected ~300 pictures, got {pictures}");
         assert!(slices >= 290, "expected ~300 slice headers, got {slices}");
+    }
+
+    // ========================================================================
+    // ref_pic_lists_modification (NumPicTotalCurr gate/width) tests
+    // ========================================================================
+
+    /// NumPicTotalCurr (Eq. 7-57): used short-term RPS entries + used
+    /// long-term refs (+1 for SCC curr-pic-ref). Covers SPS-indexed and
+    /// in-slice RPS sources.
+    #[test]
+    fn test_num_pic_total_curr_counts() {
+        let mut sps = vacc_core::picture::H265Sps::new();
+        // Synthetic STRPS: 3 negative entries with used flags [1,1,0],
+        // 2 positive entries with used flag [1,0] -> 3 used entries.
+        let mut strps = vacc_core::picture::H265ShortTermRefPicSet::default();
+        strps.num_negative_pics = 3;
+        strps.used_by_curr_pic_s0_flag = 0b011;
+        strps.num_positive_pics = 2;
+        strps.used_by_curr_pic_s1_flag = 0b01;
+        sps.short_term_ref_pic_sets.push(strps.clone());
+
+        // SPS-indexed RPS: 3 used entries, no LT refs.
+        let mut info = SliceHeaderInfo::default();
+        info.short_term_ref_pic_set_sps_flag = true;
+        info.short_term_ref_pic_set_idx = 0;
+        assert_eq!(H265Parser::num_pic_total_curr(&sps, &info, false), 3);
+
+        // In-slice RPS + 2 LT refs (1 used) + SCC curr-pic-ref.
+        info.short_term_ref_pic_set_sps_flag = false;
+        info.slice_strps = Some(strps);
+        info.long_term_refs.push(H265LtRef {
+            used_by_curr_pic: true,
+            ..Default::default()
+        });
+        info.long_term_refs.push(H265LtRef {
+            used_by_curr_pic: false,
+            ..Default::default()
+        });
+        assert_eq!(H265Parser::num_pic_total_curr(&sps, &info, false), 4);
+        assert_eq!(H265Parser::num_pic_total_curr(&sps, &info, true), 5);
+
+        // No RPS at all (IDR-like): only LT + SCC contribute.
+        info.slice_strps = None;
+        assert_eq!(H265Parser::num_pic_total_curr(&sps, &info, false), 1);
+    }
+
+    /// Minimal MSB-first bit buffer for synthesizing slice headers.
+    struct BitBuf {
+        bytes: Vec<u8>,
+        pos: u32,
+    }
+
+    impl BitBuf {
+        fn new() -> Self {
+            Self {
+                bytes: vec![0u8; 64],
+                pos: 0,
+            }
+        }
+        fn put(&mut self, val: u32, n: u32) {
+            for i in (0..n).rev() {
+                if val >> i & 1 == 1 {
+                    let byte = (self.pos / 8) as usize;
+                    self.bytes[byte] |= 1 << (7 - self.pos % 8);
+                }
+                self.pos += 1;
+            }
+        }
+        /// ue(v) per H.265 spec 7.4.1: (L-1) zeros + (v+1) in L bits,
+        /// where L = bit count of (v+1).
+        fn ue(&mut self, v: u32) {
+            let l = 32 - (v + 1).leading_zeros(); // bits of (v+1)
+            for _ in 0..l - 1 {
+                self.put(0, 1);
+            }
+            self.put(v + 1, l);
+        }
+        /// se(v) per H.265 spec 7.4.2: codeNum = 2|v| (v >= 0) or 2|v|-1, then ue.
+        fn se(&mut self, v: i32) {
+            let code_num = if v >= 0 { 2 * v as u32 } else { 2 * (-v as u32) - 1 };
+            self.ue(code_num);
+        }
+        fn finish(&self) -> Vec<u8> {
+            let n = (self.pos + 7) / 8;
+            self.bytes[..n as usize].to_vec()
+        }
+    }
+
+    /// Bit-level regression: with lists_modification_present_flag=1 the slice
+    /// header must gate lmod on NumPicTotalCurr > 1 and code ref_idx_lx with
+    /// clog2(NumPicTotalCurr) bits (NOT clog2(max(NumRefIdxL0,NumRefIdxL1))).
+    #[test]
+    fn test_slice_header_lmod_gate_and_width() {
+        let mut parser = init_parser();
+
+        // The test SPS carries no SPS-level RPS (the real stream uses in-slice
+        // RPS), so synthesize one with 3 used entries: npic = 3, idx_bits = 2.
+        let mut strps = vacc_core::picture::H265ShortTermRefPicSet::default();
+        strps.num_negative_pics = 3;
+        strps.used_by_curr_pic_s0_flag = 0b011; // entries 0,1 used
+        strps.num_positive_pics = 2;
+        strps.used_by_curr_pic_s1_flag = 0b01; // entry 0 used
+        parser
+            .active_sps
+            .as_mut()
+            .expect("SPS")
+            .short_term_ref_pic_sets
+            .push(strps.clone());
+        parser
+            .active_sps
+            .as_mut()
+            .expect("SPS")
+            .num_short_term_ref_pic_sets = 1;
+
+        let sps = parser.active_sps().expect("SPS").clone();
+        let pps = parser.active_pps().expect("PPS").clone();
+
+        // NumPicTotalCurr for SPS RPS 0, no LT refs, no SCC — computed
+        // independently from the raw flag bitmasks.
+        let strps = &sps.short_term_ref_pic_sets[0];
+        let mut npic = 0usize;
+        for i in 0..strps.num_negative_pics as usize {
+            if strps.used_by_curr_pic_s0_flag >> i & 1 == 1 {
+                npic += 1;
+            }
+        }
+        for i in 0..strps.num_positive_pics as usize {
+            if strps.used_by_curr_pic_s1_flag >> i & 1 == 1 {
+                npic += 1;
+            }
+        }
+        assert_eq!(npic, 3, "synthetic RPS must have exactly 3 used refs");
+
+        let n0 = pps.num_ref_idx_l0_default_active_minus1 as usize + 1;
+        let idx_bits = (npic as f64).log2().ceil() as u8;
+        assert_eq!(idx_bits, 2);
+
+        // Enable lists_modification_present_flag on the active PPS.
+        parser
+            .active_pps
+            .as_mut()
+            .expect("PPS")
+            .lists_modification_present_flag = true;
+
+        // Synthesize a P-slice NAL (type 1, temporal_id_plus1=1). The bit
+        // layout mirrors parse_slice_segment_header exactly, gated on the
+        // real SPS/PPS flags.
+        let mut b = BitBuf::new();
+        b.put(1, 1); // first_slice_segment_in_pic_flag
+        b.ue(0); // pic_parameter_set_id (read BEFORE slice_type)
+        if pps.num_extra_slice_header_bits > 0 {
+            for _ in 0..pps.num_extra_slice_header_bits {
+                b.put(0, 1);
+            }
+        }
+        b.ue(1); // slice_type (P)
+        if pps.output_flag_present_flag {
+            b.put(1, 1); // pic_output_flag
+        }
+        if sps.separate_colour_plane_flag {
+            b.put(0, 2); // colour_plane_id
+        }
+        b.put(0, sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4); // pic_order_cnt_lsb = 0
+        b.put(1, 1); // short_term_ref_pic_set_sps_flag
+        if sps.num_short_term_ref_pic_sets > 1 {
+            b.put(0, (sps.num_short_term_ref_pic_sets as f64).log2().ceil() as u32);
+        }
+        if sps.long_term_ref_pics_present_flag {
+            if sps.num_long_term_ref_pics_sps > 0 {
+                b.ue(0); // num_long_term_sps
+            }
+            b.ue(0); // num_long_term_pics
+        }
+        if sps.sps_temporal_mvp_enabled_flag {
+            b.put(0, 1); // slice_temporal_mvp_enabled_flag
+        }
+        if sps.sample_adaptive_offset_enabled_flag {
+            b.put(0, 1); // slice_sao_luma_flag
+            if sps.chroma_format_idc != 0 {
+                b.put(0, 1); // slice_sao_chroma_flag
+            }
+        }
+        b.put(0, 1); // num_ref_idx_active_override_flag (use PPS defaults)
+
+        // lmod: L0 flag set; each of the n0 positions gets an explicit
+        // ref_idx of idx_bits = clog2(NumPicTotalCurr) bits.
+        b.put(1, 1); // ref_pic_list_modify_flag[0]
+        for i in 0..n0 {
+            b.put(i as u32, idx_bits as u32); // ref_idx_l0[i] = i (identity permutation)
+        }
+
+        if pps.cabac_init_present_flag {
+            b.put(0, 1); // cabac_init_flag
+        }
+        // slice_temporal_mvp_enabled_flag is off above: no collocated bits.
+        if pps.weighted_pred_flag {
+            b.ue(0); // luma_log2_weight_denom
+            if sps.chroma_format_idc != 0 {
+                b.se(0); // delta_chroma_log2_weight_denom
+            }
+            for _ in 0..n0 {
+                b.put(0, 1); // luma_weight_l0_flag[i] = 0 (no weighted entries)
+            }
+            if sps.chroma_format_idc != 0 {
+                for _ in 0..n0 {
+                    b.put(0, 1); // chroma_weight_l0_flag[i] = 0
+                }
+            }
+        }
+
+        b.ue(0); // five_minus_max_num_merge_cand
+        if sps.motion_vector_resolution_control_idc == 2 {
+            b.put(0, 1); // use_integer_mv_flag
+        }
+        b.se(0); // slice_qp_delta
+        if pps.pps_slice_chroma_qp_offsets_present_flag {
+            b.se(0);
+            b.se(0);
+        }
+        if pps.pps_slice_act_qp_offsets_present_flag {
+            b.se(0);
+            b.se(0);
+            b.se(0);
+        }
+        if pps.chroma_qp_offset_list_enabled_flag {
+            b.put(0, 1); // cu_chroma_qp_offset_enabled_flag
+        }
+        if pps.deblocking_filter_control_present_flag {
+            if pps.deblocking_filter_override_enabled_flag {
+                b.put(0, 1); // no override -> inherit PPS
+            }
+        }
+        if pps.pps_loop_filter_across_slices_enabled_flag
+            && !pps.pps_deblocking_filter_disabled_flag
+        {
+            b.put(0, 1); // slice_loop_filter_across_slices_enabled_flag
+        }
+        if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
+            b.ue(0); // num_entry_point_offsets
+        }
+        if pps.slice_segment_header_extension_present_flag {
+            b.ue(0); // extension bytes
+        }
+
+        let mut payload = vec![0x00u8, 0x00, 0x01, 0x02, 0x01];
+        payload.extend_from_slice(&b.finish());
+        let packet = crate::bitstream::BitstreamPacket::new(payload.clone());
+
+        let mut info: Option<SliceHeaderInfo> = None;
+        let mut got_slice = false;
+        loop {
+            match parser.parse(&packet).expect("parse failed") {
+                ParseResult::Slice { slices, .. } => {
+                    assert!(!slices.is_empty());
+                    got_slice = true;
+                    let sh = slices[0].slice_header.clone();
+                    if sh.is_none() {
+                        let err = parser
+                            .parse_slice_segment_header(&payload[3..], 1)
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_default();
+                        panic!("slice header parse failed: {err}");
+                    }
+                    info = match sh {
+                        Some(crate::SliceHeader::H265(info)) => Some(info),
+                        other => panic!("unexpected slice header: {other:?}"),
+                    };
+                }
+                ParseResult::Nothing | ParseResult::EndOfStream => break,
+                ParseResult::ParameterSet { .. } => {}
+            }
+        }
+        if !got_slice {
+            let err = parser
+                .parse_slice_segment_header(&payload[3..], 1)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            panic!("slice was dropped (bit misalignment?) — direct parse error: {err}");
+        }
+
+        let info = info.expect("slice header missing");
+        // L0 modification must have been read: n0 entries, identity mapping.
+        assert_eq!(info.ref_pic_lists_modification_l0.len(), n0);
+        for (i, m) in info.ref_pic_lists_modification_l0.iter().enumerate() {
+            assert!(m.flag);
+            assert_eq!(m.ref_idx as usize, i, "ref_idx_l0[{i}]");
+        }
+        // P slice: no L1 modification.
+        assert!(info.ref_pic_lists_modification_l1.is_empty());
+        // Active counts came from the PPS defaults (override flag = 0).
+        assert_eq!(
+            info.num_ref_idx_l0_active_minus1 as usize + 1,
+            n0
+        );
     }
 }
