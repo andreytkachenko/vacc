@@ -1414,7 +1414,12 @@ impl VideoDecoder {
             // the common AV1 DPB: parsing updates its per-buffer content state
             // and derives ref_frame_idx via the shared order-hint math.
             let fh = match self.av1_parser.as_mut() {
-                Some(parser) => match parser.parse_frame_header(frame_obu_payload, sps) {
+                Some(parser) => match parser.parse_frame_header(
+                    frame_obu_payload,
+                    sps,
+                    av1_frame.temporal_id,
+                    av1_frame.spatial_id,
+                ) {
                     Ok(fh) => fh,
                     Err(e) => {
                         eprintln!("[AV1] Failed to parse frame {} header: {:?}", frame_idx, e);

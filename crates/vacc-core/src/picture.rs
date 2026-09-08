@@ -926,6 +926,12 @@ pub struct Av1Sps {
     // Decoder model info
     pub decoder_model_info_present_flag: bool,
     pub buffer_delay_length_minus_1: u8,
+    pub frame_presentation_time_length_minus_1: u8,
+    pub buffer_removal_time_length_minus_1: u8,
+    // Operating points (length = operating_points_cnt_minus_1 + 1)
+    pub operating_points_cnt_minus_1: u32,
+    pub operating_point_idc: Vec<u32>,
+    pub decoder_model_present_for_this_op: Vec<bool>,
     // Color config
     pub high_bitdepth: bool,
     pub twelve_bit: bool,
@@ -984,6 +990,11 @@ impl Av1Sps {
             // Decoder model info
             decoder_model_info_present_flag: false,
             buffer_delay_length_minus_1: 0,
+            frame_presentation_time_length_minus_1: 0,
+            buffer_removal_time_length_minus_1: 0,
+            operating_points_cnt_minus_1: 0,
+            operating_point_idc: vec![0],
+            decoder_model_present_for_this_op: vec![false],
             // Color config
             high_bitdepth: false,
             twelve_bit: false,

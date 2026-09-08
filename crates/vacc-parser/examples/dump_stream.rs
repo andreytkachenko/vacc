@@ -492,21 +492,28 @@ fn leb128(data: &[u8], mut off: usize) -> (usize, usize) {
 /// Header layout mirrors `Av1Parser::parse_obu_header`:
 /// forbidden(1) type(4) extension(1) has_size_field(1) reserved(1),
 /// + extension byte when set, + leb128 payload size when has_size_field.
-fn walk_obus(pkt: &[u8], mut f: impl FnMut(u8, Option<&[u8]>)) {
+fn walk_obus(pkt: &[u8], mut f: impl FnMut(u8, Option<&[u8]>, u32, u32)) {
     let mut off = 0usize;
     while off < pkt.len() {
         let b0 = pkt[off];
         let obu_type = (b0 >> 3) & 0x0F;
         let ext = b0 & 0x04 != 0;
         let has_size = b0 & 0x02 != 0;
+        // OBU extension byte: [temporal_id(3), spatial_id(5)].
+        let (temporal_id, spatial_id) = if ext {
+            let e = pkt[off + 1];
+            (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+        } else {
+            (0, 0)
+        };
         off += 1 + ext as usize;
         if !has_size {
-            f(obu_type, None);
+            f(obu_type, None, temporal_id, spatial_id);
             continue;
         }
         let (size, payload_off) = leb128(pkt, off);
         off = payload_off + size;
-        f(obu_type, Some(&pkt[payload_off..payload_off + size]));
+        f(obu_type, Some(&pkt[payload_off..payload_off + size]), temporal_id, spatial_id);
     }
 }
 
@@ -521,7 +528,7 @@ fn dump_av1(data: &[u8], max_frames: usize) {
     const RAW_PREFIX: usize = 96;
 
     for pkt in packets {
-        walk_obus(&pkt, |obu_type, payload| {
+        walk_obus(&pkt, |obu_type, payload, temporal_id, spatial_id| {
             let Some(payload) = payload else { return }; // temporal delimiter etc.
             if obu_type == 1 && sps.is_none() {
                 // Sequence header OBU.
@@ -543,7 +550,7 @@ fn dump_av1(data: &[u8], max_frames: usize) {
                 // FrameHeader OBU (type 3, show-existing frames) or full
                 // Frame OBU (type 6).
                 let sps = sps.clone().unwrap();
-                match parser.parse_frame_header(payload, &sps) {
+                match parser.parse_frame_header(payload, &sps, temporal_id, spatial_id) {
                     Ok(fh) => {
                         let pic = pic_idx;
                         pic_idx += 1;
@@ -554,7 +561,7 @@ fn dump_av1(data: &[u8], max_frames: usize) {
                         // bytes) must re-parse to identical key fields.
                         let prefix = &payload[..RAW_PREFIX.min(payload.len())];
                         let ok = parser
-                            .parse_frame_header(prefix, &sps)
+                            .parse_frame_header(prefix, &sps, temporal_id, spatial_id)
                             .map(|p| {
                                 p.frame_type == fh.frame_type
                                     && p.show_existing_frame == fh.show_existing_frame

@@ -1435,6 +1435,10 @@ pub struct Av1Frame {
     pub payload_start: u32,
     /// Size of the Frame OBU payload within `data`.
     pub payload_size: u32,
+    /// OBU extension temporal_id / spatial_id (0 when no extension byte).
+    /// Needed by the parser's buffer_removal_time gating.
+    pub temporal_id: u32,
+    pub spatial_id: u32,
 }
 
 /// Extract AV1 frames from IVF container or raw bitstream.
@@ -1483,6 +1487,8 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
                 frame_obu_payload: obu.payload,
                 payload_start: obu.payload_start,
                 payload_size: obu.payload_size,
+                temporal_id: obu.temporal_id,
+                spatial_id: obu.spatial_id,
             });
             frame_count += 1;
             if frames.len() >= max_obus {
@@ -1503,6 +1509,9 @@ struct FrameObuInfo {
     payload_start: u32,
     /// Size of the payload.
     payload_size: u32,
+    /// OBU extension temporal_id / spatial_id (0 when no extension byte).
+    temporal_id: u32,
+    spatial_id: u32,
 }
 
 /// Extract all Frame OBUs (type 6) and show_existing_frame FrameHeader OBUs
@@ -1548,10 +1557,19 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
+                // OBU extension byte: [temporal_id(3), spatial_id(5)].
+                let (temporal_id, spatial_id) = if ext == 1 {
+                    let e = packet[pos + 1];
+                    (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+                } else {
+                    (0, 0)
+                };
                 obus.push(FrameObuInfo {
                     payload: packet[payload_start..payload_end].to_vec(),
                     payload_start: payload_start as u32,
                     payload_size: (payload_end - payload_start) as u32,
+                    temporal_id,
+                    spatial_id,
                 });
             }
             let next = size_pos + size;

@@ -3615,6 +3615,10 @@ struct Av1FrameObu {
     /// The OBU payload (frame header + tile data for Frame OBUs; frame header
     /// only for show_existing FrameHeader OBUs).
     payload: Vec<u8>,
+    /// OBU extension temporal_id / spatial_id (0 when no extension byte).
+    /// Needed by the parser's buffer_removal_time gating.
+    temporal_id: u32,
+    spatial_id: u32,
 }
 
 /// Extract all Frame OBUs (type 6) and show-existing FrameHeader OBUs (type 3)
@@ -3658,8 +3662,17 @@ fn av1_extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
                 && (packet[size_pos] & 0x80) != 0;
             if is_frame || is_show_existing {
                 let payload_end = (size_pos + size).min(packet.len());
+                // OBU extension byte: [temporal_id(3), spatial_id(5)].
+                let (temporal_id, spatial_id) = if ext == 1 {
+                    let e = packet[pos + 1];
+                    (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+                } else {
+                    (0, 0)
+                };
                 obus.push(Av1FrameObu {
                     payload: packet[size_pos..payload_end].to_vec(),
+                    temporal_id,
+                    spatial_id,
                 });
             }
             let next = size_pos + size;
@@ -3679,7 +3692,7 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     let is_ivf = data.len() >= 32 && data[0..4] == *b"DKIF";
     let mut pos = if is_ivf { 32 } else { 0 };
     let mut sps_payload: Option<Vec<u8>> = None;
-    let mut frame_payload: Option<Vec<u8>> = None;
+    let mut frame_obu: Option<(Vec<u8>, u32, u32)> = None;
 
     loop {
         let payload: Vec<u8>;
@@ -3706,20 +3719,20 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
         {
             sps_payload = Some(s);
         }
-        if frame_payload.is_none()
+        if frame_obu.is_none()
             && let Some(obu) = av1_extract_frame_obus(&payload).into_iter().next()
         {
-            frame_payload = Some(obu.payload);
+            frame_obu = Some((obu.payload, obu.temporal_id, obu.spatial_id));
         }
-        if sps_payload.is_some() && frame_payload.is_some() {
+        if sps_payload.is_some() && frame_obu.is_some() {
             break;
         }
     }
 
     let sps_data = sps_payload
         .ok_or_else(|| Error::DecoderInit("AV1 sequence header OBU not found".to_string()))?;
-    let frame_data =
-        frame_payload.ok_or_else(|| Error::DecoderInit("No AV1 frame OBU found".to_string()))?;
+    let (frame_data, frame_temporal_id, frame_spatial_id) =
+        frame_obu.ok_or_else(|| Error::DecoderInit("No AV1 frame OBU found".to_string()))?;
 
     let mut parser = Av1Parser::new();
     parser
@@ -3789,7 +3802,7 @@ fn parse_av1_info(display: &Display, data: &[u8]) -> Result<StreamInfo> {
     // Parse the first frame header for the coded dimensions (this parser
     // instance is throwaway).
     let fh = parser
-        .parse_frame_header(&frame_data, &sps)
+        .parse_frame_header(&frame_data, &sps, frame_temporal_id, frame_spatial_id)
         .map_err(|e| Error::Parser(format!("Failed to parse AV1 frame dimensions: {e}")))?;
     let width = fh.frame_width;
     let height = fh.frame_height;
@@ -4212,7 +4225,9 @@ impl VaapiDecoder {
             let data = self.pending_data[self.parse_offset..].to_vec();
             self.parse_offset = self.pending_data.len();
             for obu in av1_extract_frame_obus(&data) {
-                if let Some(frame) = self.decode_av1_frame(&obu.payload, 0)? {
+                if let Some(frame) =
+                    self.decode_av1_frame(&obu.payload, obu.temporal_id, obu.spatial_id, 0)?
+                {
                     return Ok(Some(frame));
                 }
             }
@@ -4241,7 +4256,9 @@ impl VaapiDecoder {
                 self.pending_data[self.parse_offset + 12..self.parse_offset + 12 + size].to_vec();
             self.parse_offset += 12 + size;
             for obu in av1_extract_frame_obus(&payload) {
-                if let Some(frame) = self.decode_av1_frame(&obu.payload, pts)? {
+                if let Some(frame) =
+                    self.decode_av1_frame(&obu.payload, obu.temporal_id, obu.spatial_id, pts)?
+                {
                     return Ok(Some(frame));
                 }
             }
@@ -4250,7 +4267,13 @@ impl VaapiDecoder {
 
     /// Decode one AV1 frame OBU payload and, if it is displayed, return the
     /// decoded picture.
-    fn decode_av1_frame(&mut self, data: &[u8], timestamp: u64) -> Result<Option<DecodedFrame>> {
+    fn decode_av1_frame(
+        &mut self,
+        data: &[u8],
+        temporal_id: u32,
+        spatial_id: u32,
+        timestamp: u64,
+    ) -> Result<Option<DecodedFrame>> {
         let sps = self
             .stream
             .av1_sps
@@ -4262,7 +4285,7 @@ impl VaapiDecoder {
             .ok_or_else(|| Error::InvalidState("AV1 parser not initialized".to_string()))?;
 
         let fh = parser
-            .parse_frame_header(data, &sps)
+            .parse_frame_header(data, &sps, temporal_id, spatial_id)
             .map_err(|e| Error::Parser(e.to_string()))?;
 
         // show_existing_frame: no decode, no DPB change — re-display an

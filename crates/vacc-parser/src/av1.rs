@@ -649,11 +649,15 @@ impl Av1Parser {
 
             // operating_points_cnt_minus_1 (5 bits)
             let operating_points_cnt_minus_1 = r.read_bits(5)? as usize;
+            sps.operating_points_cnt_minus_1 = operating_points_cnt_minus_1 as u32;
+            sps.operating_point_idc = vec![0; operating_points_cnt_minus_1 + 1];
+            sps.decoder_model_present_for_this_op =
+                vec![false; operating_points_cnt_minus_1 + 1];
 
             // Parse each operating point
             for i in 0..=operating_points_cnt_minus_1 {
                 // operating_point_idc (12 bits)
-                let _operating_point_idc = r.read_bits(12)?;
+                sps.operating_point_idc[i] = r.read_bits(12)?;
 
                 // seq_level_idx (5 bits)
                 let seq_level_idx = r.read_bits(5)?;
@@ -669,6 +673,7 @@ impl Av1Parser {
                 // decoder_model_present_for_this_op if decoder_model_info_present_flag
                 if decoder_model_info_present_flag {
                     let decoder_model_present_for_this_op = r.read_bit()?;
+                    sps.decoder_model_present_for_this_op[i] = decoder_model_present_for_this_op;
                     if decoder_model_present_for_this_op {
                         // Parse operating parameters info
                         // Use buffer_delay_length_minus_1 from decoder_model_info per AV1 spec 5.3.2
@@ -860,10 +865,10 @@ impl Av1Parser {
         let _num_units_in_decoding_tick = r.read_bits(32)?;
 
         // buffer_removal_time_length_minus_1 (5 bits)
-        let _buffer_removal_time_length_minus_1 = r.read_bits(5)?;
+        sps.buffer_removal_time_length_minus_1 = r.read_bits(5)? as u8;
 
         // frame_presentation_time_length_minus_1 (5 bits)
-        let _frame_presentation_time_length_minus_1 = r.read_bits(5)?;
+        sps.frame_presentation_time_length_minus_1 = r.read_bits(5)? as u8;
 
         Ok(())
     }
@@ -1006,6 +1011,8 @@ impl Av1Parser {
         &mut self,
         obu_data: &[u8],
         sps: &vacc_core::picture::Av1Sps,
+        temporal_id: u32,
+        spatial_id: u32,
     ) -> ParserResult<Av1FrameHeader> {
         if obu_data.is_empty() || self.active_sps.is_none() {
             return Err(ParserError::InvalidBitstream);
@@ -1051,6 +1058,18 @@ impl Av1Parser {
         // 3. show_frame (1 bit)
         fh.show_frame = r.read_bit()?;
         let show_frame = fh.show_frame;
+
+        // temporal_point_info(): spec 5.9 — after show_frame, when
+        // show_frame && decoder_model_info_present_flag &&
+        // !equal_picture_interval, read frame_presentation_time f(n).
+        if show_frame
+            && sps.decoder_model_info_present_flag
+            && !sps.equal_picture_interval
+        {
+            let _frame_presentation_time =
+                r.read_bits((sps.frame_presentation_time_length_minus_1 + 1) as u8)?;
+        }
+
         fh.showable_frame = if show_frame {
             fh.frame_type != 0 // not KEY
         } else {
@@ -1175,6 +1194,29 @@ impl Av1Parser {
                 primary_ref,
                 r.position()
             );
+        }
+
+        // 12. buffer_removal_time(): spec 5.9 — when
+        // decoder_model_info_present_flag, read buffer_removal_time_present_flag
+        // plus per-operating-point BRT values gated by the OBU temporal/spatial
+        // ids (opPtIdc == 0 || inTemporal && inSpatial).
+        if sps.decoder_model_info_present_flag {
+            let brt_present = r.read_bit()?;
+            if brt_present {
+                let n = (sps.buffer_removal_time_length_minus_1 + 1) as u8;
+                for op in 0..=sps.operating_points_cnt_minus_1 {
+                    let op = op as usize;
+                    if !sps.decoder_model_present_for_this_op[op] {
+                        continue;
+                    }
+                    let idc = sps.operating_point_idc[op];
+                    let in_temporal = (idc >> temporal_id) & 1;
+                    let in_spatial = (idc >> (spatial_id + 8)) & 1;
+                    if idc == 0 || (in_temporal != 0 && in_spatial != 0) {
+                        let _buffer_removal_time = r.read_bits(n)?;
+                    }
+                }
+            }
         }
 
         // 13. refresh_frame_flags

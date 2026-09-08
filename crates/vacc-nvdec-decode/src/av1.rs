@@ -75,6 +75,10 @@ struct Av1FrameObu {
     /// The OBU payload (frame header + tile data for Frame OBUs; frame header
     /// only for show_existing FrameHeader OBUs).
     payload: Vec<u8>,
+    /// OBU extension temporal_id / spatial_id (0 when no extension byte).
+    /// Needed by the parser's buffer_removal_time gating.
+    temporal_id: u32,
+    spatial_id: u32,
 }
 
 /// Find the Sequence Header OBU (type 1) payload in a packet, if present.
@@ -158,8 +162,17 @@ fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
+                // OBU extension byte: [temporal_id(3), spatial_id(5)].
+                let (temporal_id, spatial_id) = if ext == 1 {
+                    let e = packet[pos + 1];
+                    (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+                } else {
+                    (0, 0)
+                };
                 obus.push(Av1FrameObu {
                     payload: packet[payload_start..payload_end].to_vec(),
+                    temporal_id,
+                    spatial_id,
                 });
             }
             let next = size_pos + size;
@@ -681,7 +694,7 @@ impl NvdecAv1Decoder {
                     }
                 }
                 for obu in extract_frame_obus(payload) {
-                    self.process_frame(&obu.payload, pts)?;
+                    self.process_frame(&obu.payload, obu.temporal_id, obu.spatial_id, pts)?;
                 }
                 self.parsed_offset += 12 + size;
             }
@@ -689,7 +702,7 @@ impl NvdecAv1Decoder {
             // Raw single-frame: process the whole buffer once, then mark consumed.
             if self.parsed_offset == 0 && !self.pending_data.is_empty() {
                 let data = self.pending_data.clone();
-                self.process_frame(&data, 0)?;
+                self.process_frame(&data, 0, 0, 0)?;
                 self.parsed_offset = self.pending_data.len();
             }
         }
@@ -731,7 +744,13 @@ impl NvdecAv1Decoder {
 
     /// Parse and decode one AV1 frame OBU payload. `packet_pts` is the IVF
     /// packet timestamp (in IVF timebase ticks) carrying this frame.
-    fn process_frame(&mut self, payload: &[u8], packet_pts: u64) -> NvdecResult<()> {
+    fn process_frame(
+        &mut self,
+        payload: &[u8],
+        temporal_id: u32,
+        spatial_id: u32,
+        packet_pts: u64,
+    ) -> NvdecResult<()> {
         let sps = match self.sps.lock().unwrap().clone() {
             Some(s) => s,
             // No SPS yet (e.g. first packet had no type-1 OBU); skip this OBU.
@@ -740,7 +759,7 @@ impl NvdecAv1Decoder {
 
         let fh = self
             .parser
-            .parse_frame_header(payload, &sps)
+            .parse_frame_header(payload, &sps, temporal_id, spatial_id)
             .map_err(|e| NvdecError::DecodeFailed(format!("parse_frame_header: {}", e)))?;
 
         // show_existing_frame: no decode, no DPB change — re-display an
