@@ -904,3 +904,87 @@ fn test_poc_field_order_cnt_for_cuvid_picparams() {
         );
     }
 }
+
+// ============================================================================
+// Interlaced field-picture tests (H.264 D.3.3.1 / D.3.3.2 / D.3.3.3)
+// ============================================================================
+
+/// Type 0, bottom-first field picture: the bitstream value (msb+lsb) is the
+/// BOTTOM field order count; calculate() must return the TOP field order
+/// count = lsb - OffsetForTopToBottomField (D.3.3.1).
+#[test]
+fn test_poc_type0_bottom_first_field() {
+    let mut sps = create_sps_poc_type_0(512);
+    sps.frame_mbs_only_flag = false;
+    sps.offset_for_top_to_bottom_field = 1;
+    let mut calc = PocCalculator::new();
+
+    // Bottom-first field: lsb=4 is the bottom POC; top = 4 - 1 = 3.
+    let mut slh = create_slice_header(0, 4, [0, 0], 1, 1);
+    slh.field_pic_flag = true;
+    slh.bottom_field = true;
+    assert_eq!(
+        calc.calculate(&sps, &slh, false),
+        3,
+        "type 0 bottom-first: top = lsb - offset"
+    );
+
+    // Top-first field: lsb=6 is the top POC (bottom would be 6 + delta_bottom).
+    let mut slh = create_slice_header(1, 6, [0, 0], 1, 1);
+    slh.field_pic_flag = true;
+    slh.bottom_field = false;
+    assert_eq!(
+        calc.calculate(&sps, &slh, false),
+        6,
+        "type 0 top-first: returns lsb"
+    );
+}
+
+/// Type 1, bottom-first field picture: the computed base value is already the
+/// TOP field POC; no OffsetForTopToBottomField is added (D.3.3.2).
+#[test]
+fn test_poc_type1_bottom_first_field() {
+    let mut sps = create_sps_poc_type_1(false, 0, vec![]);
+    sps.frame_mbs_only_flag = false;
+    sps.offset_for_top_to_bottom_field = 1;
+    let mut calc = PocCalculator::new();
+
+    // Top-first field: PrevFrameNum 0->1, POC = 1 + delta0(2) = 3.
+    let mut slh = create_slice_header(0, 0, [2, 0], 1, 1);
+    slh.field_pic_flag = true;
+    assert_eq!(
+        calc.calculate(&sps, &slh, false),
+        3,
+        "type 1 top-first field POC"
+    );
+
+    // Bottom-first field: PrevFrameNum 1->2, top POC = 2 + delta0(4) = 6
+    // (bottom would be 6 + offset; calculate() returns the top).
+    let mut slh = create_slice_header(1, 0, [4, 0], 1, 1);
+    slh.field_pic_flag = true;
+    slh.bottom_field = true;
+    assert_eq!(
+        calc.calculate(&sps, &slh, false),
+        6,
+        "type 1 bottom-first returns top POC (no offset added)"
+    );
+}
+
+/// Type 2: no offset is applied to either field (D.3.3.3).
+#[test]
+fn test_poc_type2_bottom_first_field() {
+    let mut sps = create_sps_poc_type_2(16);
+    sps.frame_mbs_only_flag = false;
+    sps.offset_for_top_to_bottom_field = 1;
+    let mut calc = PocCalculator::new();
+
+    // Bottom-first field, frame_num=3: POC = 3*2 = 6 (no offset).
+    let mut slh = create_slice_header(3, 0, [0, 0], 1, 1);
+    slh.field_pic_flag = true;
+    slh.bottom_field = true;
+    assert_eq!(
+        calc.calculate(&sps, &slh, true),
+        6,
+        "type 2 has no top/bottom offset"
+    );
+}

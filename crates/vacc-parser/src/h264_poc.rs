@@ -73,8 +73,12 @@ impl PocCalculator {
 
     /// Calculate the Picture Order Count for a slice.
     ///
-    /// Returns the POC value for the top field (or frame). For bottom fields,
-    /// add `sps.offset_for_top_to_bottom_field` to obtain the bottom field POC.
+    /// Returns the TOP field order count (the frame's presentation position).
+    /// For bottom fields, derive the bottom POC from it: type 0/1 frame and
+    /// top-first field pictures add `sps.offset_for_top_to_bottom_field` (type
+    /// 0 additionally adds `delta_pic_order_cnt_bottom`); a bottom-first field
+    /// picture's parsed value IS the bottom POC, so the top is one
+    /// `offset_for_top_to_bottom_field` earlier.
     pub fn calculate(&mut self, sps: &H264Sps, slh: &SliceHeader, is_reference: bool) -> i32 {
         // Update cycle count for POC Type 1
         self.num_ref_frames_in_pic_order_cnt_cycle = sps.num_ref_frames_in_pic_order_cnt_cycle;
@@ -86,8 +90,13 @@ impl PocCalculator {
             _ => 0,
         };
 
-        if slh.field_pic_flag && slh.bottom_field {
-            poc + sps.offset_for_top_to_bottom_field
+        // H.264 D.3.3.1: for a bottom-first FIELD picture the bitstream value
+        // (msb+lsb) is the BOTTOM field order count; the top field sits one
+        // OffsetForTopToBottomField earlier. Types 1 and 2 never add the
+        // offset to the top field (D.3.3.2's base value is already the top
+        // POC; D.3.3.3 has no offset at all).
+        if sps.pic_order_cnt_type == 0 && slh.field_pic_flag && slh.bottom_field {
+            poc - sps.offset_for_top_to_bottom_field
         } else {
             poc
         }
