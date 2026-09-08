@@ -808,7 +808,7 @@ impl H264Parser {
 
         // num_ref_idx_active_override_flag: present for P, SP and B slices
         // (H.264 spec 7.4.3: slice_type != I && slice_type != SI; matches
-        // ffmpeg cbs_h264_syntax_template.c).
+        // ffmpeg cbs_h264_syntax_template.c and ff_h264_parse_ref_count gating).
         if is_p || is_sp || is_b {
             slh.num_ref_idx_active_override_flag = r.read_bit()?;
             if slh.num_ref_idx_active_override_flag {
