@@ -2150,11 +2150,19 @@ impl VideoDecoder {
             cdef.cdef_uv_pri_strength = fh.cdef_uv_pri_strength;
             cdef.cdef_uv_sec_strength = fh.cdef_uv_sec_strength;
 
-            // Loop restoration (parser already stores remapped StdVideo values)
+            // Loop restoration (parser already stores remapped StdVideo type
+            // values). LoopRestorationSize is a code, not a pixel size:
+            // log2(px) - 5 (0: 32, 1: 64, 2: 128, 3: 256) — the same
+            // numbering cuviddec.h documents for lr_unit_size and the AV1
+            // encoder sample uses (log2(RESTORATION_TILESIZE_MAX >> 2) - 5).
             let lr = &mut picture_info_container.loop_restoration;
             for i in 0..3 {
                 lr.FrameRestorationType[i] = fh.loop_restoration_type[i] as u32;
-                lr.LoopRestorationSize[i] = fh.loop_restoration_size[i];
+                lr.LoopRestorationSize[i] = if fh.loop_restoration_type[i] != 0 {
+                    (fh.loop_restoration_size[i].trailing_zeros() - 5) as u16
+                } else {
+                    0
+                };
             }
 
             // Global motion: index 0 = identity, 1..7 from parser models 0..6

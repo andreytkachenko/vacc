@@ -397,11 +397,15 @@ pub fn build_cuvid_av1_picparams(
     loop_filter_flags |= (fh.delta_lf_multi as u8 & 1) << 5;
     av1.loop_filter_flags = loop_filter_flags;
 
-    // Loop restoration. The parser stores the spec codes directly
-    // (0: 32px, 1: 64px, 2: 128px, 3: 256px) — the same numbering
-    // cuviddec.h documents for `lr_unit_size`.
+    // Loop restoration. The parser stores spec pixel sizes (spec 5.9.20);
+    // cuviddec.h's lr_unit_size is a code: 0: 32, 1: 64, 2: 128, 3: 256
+    // (= log2(size / 32)).
     for i in 0..3 {
-        av1.lr_unit_size[i] = fh.loop_restoration_size[i] as u8;
+        av1.lr_unit_size[i] = if fh.loop_restoration_type[i] != 0 {
+            (fh.loop_restoration_size[i].trailing_zeros() - 5) as u8
+        } else {
+            0
+        };
         av1.lr_type[i] = fh.loop_restoration_type[i];
     }
 

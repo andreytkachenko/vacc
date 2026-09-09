@@ -4500,14 +4500,17 @@ fn build_av1_va_buffers(
     // unchanged.
     let lrd_type = |pl: usize| fh.loop_restoration_type[pl].min(3) as u16;
     // Raw spec shift values (VA derives the restoration unit size itself):
-    // lr_unit_shift = loop_restoration_size[0] - 1; lr_uv_shift is 1 iff the
-    // chroma size was shifted down from the luma size.
+    // lr_unit_shift = log2(luma_size / 64); lr_uv_shift is 1 iff the chroma
+    // size was shifted down from the luma size.
     let lr_unit_shift = if fh.uses_lr {
-        fh.loop_restoration_size[0].saturating_sub(1)
+        (fh.loop_restoration_size[0].trailing_zeros() - 6) as u16
     } else {
         0
     };
-    let lr_uv_shift = if fh.loop_restoration_size[1] < fh.loop_restoration_size[0] {
+    let lr_uv_shift = if fh.uses_lr
+        && !sps.mono_chrome
+        && fh.loop_restoration_size[1] < fh.loop_restoration_size[0]
+    {
         1
     } else {
         0

@@ -330,9 +330,11 @@ pub struct Av1FrameHeader {
     pub order_hints: [u8; 8],
     /// Loop restoration type per plane [y, u, v] (StdVideo enum values).
     pub loop_restoration_type: [u8; 3],
-    /// Loop restoration size spec code per plane [y, u, v]:
-    /// 0: 32px, 1: 64px, 2: 128px, 3: 256px (AV1 data-model numbering,
-    /// identical to `CUVIDAV1PICPARAMS.lr_unit_size`).
+    /// Loop restoration unit size in pixels per plane [y, u, v] (spec
+    /// 5.9.20): luma is one of {64, 128, 256}; chroma may additionally be
+    /// 32 when lr_uv_shift halves it. 0 when the frame uses no loop
+    /// restoration. Backends convert to their own numbering (e.g. cuvid's
+    /// lr_unit_size code = log2(px) - 5).
     pub loop_restoration_size: [u16; 3],
     /// Whether luma loop restoration is used.
     pub uses_lr: bool,
@@ -2347,10 +2349,6 @@ impl Av1Parser {
         }
         fh.uses_lr = use_lr;
         if use_lr {
-            let sb_size = if sps.use_128x128_superblock { 2 } else { 1 };
-            for pl in 0..n_planes {
-                fh.loop_restoration_size[pl] = sb_size as u16;
-            }
             let lr_unit_shift = if sps.use_128x128_superblock {
                 1 + r.read_bit()? as u16
             } else {
@@ -2360,26 +2358,29 @@ impl Av1Parser {
                 }
                 shift
             };
-            fh.loop_restoration_size[0] = 1 + lr_unit_shift;
+            // Spec 5.9.20: LoopRestorationSize[0] =
+            // RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift) -> {64,128,256}
+            // pixels.
+            fh.loop_restoration_size[0] = 256 >> (2 - lr_unit_shift);
         } else {
             for pl in 0..n_planes {
-                fh.loop_restoration_size[pl] = 3;
+                fh.loop_restoration_size[pl] = 0;
             }
         }
+        // Spec 5.9.20: the chroma restoration unit is half the luma unit
+        // when lr_uv_shift (4:2:0 with chroma LR only) -> a single pixel
+        // shift, not the double code-space shift of the old C++ reference.
         let mut lr_uv_shift = 0u16;
-        if !sps.mono_chrome {
-            if use_chroma_lr && sps.subsampling_x != 0 && sps.subsampling_y != 0 {
-                lr_uv_shift = r.read_bit()? as u16;
-                fh.loop_restoration_size[1] = fh.loop_restoration_size[0] - lr_uv_shift;
-                fh.loop_restoration_size[2] = fh.loop_restoration_size[1];
-            } else {
-                fh.loop_restoration_size[1] = fh.loop_restoration_size[0];
-                fh.loop_restoration_size[2] = fh.loop_restoration_size[0];
-            }
+        if !sps.mono_chrome
+            && use_chroma_lr
+            && sps.subsampling_x != 0
+            && sps.subsampling_y != 0
+        {
+            lr_uv_shift = r.read_bit()? as u16;
         }
-        // Match the NVIDIA reference decoder exactly: shift the luma size
-        // (not the already-adjusted chroma size) by uv_shift twice.
-        fh.loop_restoration_size[1] = (fh.loop_restoration_size[0] >> lr_uv_shift) >> lr_uv_shift;
+        for pl in 1..n_planes {
+            fh.loop_restoration_size[pl] = fh.loop_restoration_size[0] >> lr_uv_shift;
+        }
         Ok(())
     }
 

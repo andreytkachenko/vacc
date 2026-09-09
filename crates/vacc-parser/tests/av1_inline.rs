@@ -818,6 +818,86 @@ fn test_coded_lossless_uses_alt_q_feature() {
     assert_eq!(fh1.tx_mode, 1, "LARGEST");
 }
 
+/// KEY frame like synthetic_altq_key_frame but with loop restoration on all
+/// three planes: lr_unit_shift = 2 (luma 256px) and lr_uv_shift = 1 (chroma
+/// halved to 128px per spec 5.9.20). 102 bits.
+fn synthetic_lr_key_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(0, 2); // frame_type KEY
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(63, 6); // frame_width_minus_1 -> 64
+    w.write(35, 6); // frame_height_minus_1 -> 36
+    w.write(0, 1); // render_and_frame_size_different
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(16, 8); // base_q_index = 16
+    w.write(0, 1); // delta_q_present (base_q > 0)
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    w.write(0, 1); // segmentation_enabled
+    // loop_filter_params (non-lossless)
+    w.write(8, 6); // loop_filter_level[0]
+    w.write(8, 6); // loop_filter_level[1]
+    w.write(4, 6); // loop_filter_level_uv[0]
+    w.write(4, 6); // loop_filter_level_uv[1]
+    w.write(1, 3); // loop_filter_sharpness
+    w.write(0, 1); // loop_filter_delta_enabled
+    // cdef_params (cdef_bits=1 -> 2 levels)
+    w.write(1, 2); // cdef_damping
+    w.write(1, 2); // cdef_bits
+    for _ in 0..2 {
+        w.write(4, 4); // y_pri
+        w.write(1, 2); // y_sec
+        w.write(2, 4); // uv_pri
+        w.write(1, 2); // uv_sec
+    }
+    // lr_params: all planes RESTORE_SWITCHABLE, luma 256px, chroma 128px
+    w.write(1, 2); // lr_type y
+    w.write(1, 2); // lr_type u
+    w.write(1, 2); // lr_type v
+    w.write(1, 1); // lr_unit_shift bit 1
+    w.write(1, 1); // lr_unit_shift bit 2 -> shift 2 -> 256px
+    w.write(1, 1); // lr_uv_shift -> chroma halved to 128px
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reduced_tx_set
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_loop_restoration_unit_sizes_spec() {
+    let sps_bytes = synthetic_altq_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+
+    // Spec 5.9.20: luma size = 256 >> (2 - 2) = 256px; chroma is halved by
+    // lr_uv_shift = 1 -> 128px (a single pixel shift, not the double
+    // code-space shift of the old C++-inherited representation).
+    let (kf, kf_bits) = synthetic_lr_key_frame();
+    assert_eq!(kf_bits, 102, "LR key frame bit count");
+    let fh = parser.parse_frame_header(&kf, &sps, 0, 0).expect("parse");
+    assert!(fh.uses_lr);
+    assert_eq!(
+        fh.loop_restoration_size,
+        [256, 128, 128],
+        "spec pixel sizes per plane"
+    );
+
+    // No restoration: all lr_type NONE -> no size bits, sizes stay 0.
+    let (kf0, _) = synthetic_altq_key_frame();
+    let fh0 = parser.parse_frame_header(&kf0, &sps, 0, 0).expect("parse");
+    assert!(!fh0.uses_lr);
+    assert_eq!(fh0.loop_restoration_size, [0, 0, 0]);
+}
+
 // =====================================================================
 // Annex B (length-delimited) bitstream format (spec Annex B).
 //
