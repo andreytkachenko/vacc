@@ -4332,6 +4332,12 @@ impl VaapiDecoder {
             let dpb = parser.dpb_mut();
             if is_key || dpb.decoded_frames() == 0 {
                 dpb.reset_for_keyframe();
+                // The reset zeroes the per-buffer content state (segmentation
+                // feature data, loop-filter ref/mode deltas, global motion)
+                // that parse_frame_header already committed via update_content.
+                // Re-apply it so subsequent frames inherit the keyframe's state
+                // instead of zeros.
+                dpb.update_content(&fh);
                 0
             } else {
                 dpb.allocate_output_slot()

@@ -1435,6 +1435,11 @@ pub struct Av1Frame {
     pub payload_start: u32,
     /// Size of the Frame OBU payload within `data`.
     pub payload_size: u32,
+    /// Offset of the Frame OBU header byte within `data`. Packets may carry
+    /// multiple Frame OBUs (e.g. rav1e); the driver decodes the first Frame
+    /// OBU at or after `frameHeaderOffset`, so this must point at this frame's
+    /// OBU, not 0.
+    pub obu_start: u32,
     /// OBU extension temporal_id / spatial_id (0 when no extension byte).
     /// Needed by the parser's buffer_removal_time gating.
     pub temporal_id: u32,
@@ -1487,6 +1492,7 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
                 frame_obu_payload: obu.payload,
                 payload_start: obu.payload_start,
                 payload_size: obu.payload_size,
+                obu_start: obu.obu_start,
                 temporal_id: obu.temporal_id,
                 spatial_id: obu.spatial_id,
             });
@@ -1505,6 +1511,8 @@ struct FrameObuInfo {
     /// The OBU payload (frame header + tile data for Frame OBUs; frame header
     /// only for FrameHeader OBUs).
     payload: Vec<u8>,
+    /// Offset of the OBU header byte within the packet.
+    obu_start: u32,
     /// Offset of the payload within the packet.
     payload_start: u32,
     /// Size of the payload.
@@ -1566,6 +1574,7 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                 };
                 obus.push(FrameObuInfo {
                     payload: packet[payload_start..payload_end].to_vec(),
+                    obu_start: pos as u32,
                     payload_start: payload_start as u32,
                     payload_size: (payload_end - payload_start) as u32,
                     temporal_id,

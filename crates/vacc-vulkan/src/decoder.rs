@@ -1542,9 +1542,18 @@ impl VideoDecoder {
 
             let is_key_frame = fh.frame_type == 0; // KEY_FRAME
 
-            // Write bitstream data
+            // Write bitstream data. The driver decodes the FIRST Frame OBU it
+            // finds in the bitstream range (frameHeaderOffset is ignored on
+            // this driver), and rav1e packs multiple Frame OBUs into one IVF
+            // packet — submitting the whole packet makes every frame in the
+            // packet re-decode the first one. Copy just this frame's OBU
+            // (header + payload) to offset 0 instead; each decode fully
+            // completes (fence wait below) before the next write, so the
+            // shared buffer is safe to rewrite per frame.
             let bs_align = self.bs_buffer_size_alignment.max(1);
-            let bs_data: &[u8] = &av1_frame.data;
+            let obu_end = (av1_frame.payload_start as usize + av1_frame.payload_size as usize)
+                .min(av1_frame.data.len());
+            let bs_data: &[u8] = &av1_frame.data[av1_frame.obu_start as usize..obu_end];
             let actual_size = bs_data.len() as u64;
             let aligned_size = ((actual_size + bs_align - 1) & !(bs_align - 1)).max(bs_align);
             // TEMP DIAGNOSTIC (iteration 5): dump first bytes of frame 0 bitstream
@@ -1656,11 +1665,18 @@ impl VideoDecoder {
             let output_slot = if is_key_frame || is_first_frame {
                 if is_key_frame {
                     self.dpb_manager.invalidate_all();
-                    self.av1_parser
+                    let dpb = self
+                        .av1_parser
                         .as_mut()
                         .expect("AV1 parser initialized")
-                        .dpb_mut()
-                        .reset_for_keyframe();
+                        .dpb_mut();
+                    dpb.reset_for_keyframe();
+                    // The reset zeroes the per-buffer content state
+                    // (segmentation feature data, loop-filter ref/mode
+                    // deltas, global motion) that parse_frame_header already
+                    // committed via update_content. Re-apply it so the next
+                    // frame inherits the keyframe's state instead of zeros.
+                    dpb.update_content(&fh);
                 }
                 0
             } else {
@@ -2211,17 +2227,16 @@ impl VideoDecoder {
             // doesn't know where the tile data is -> decodes nothing -> zeros.
             //   tileOffsets[0] = frame header payload offset + consumed header bytes
             //   tileSizes[0]   = Frame OBU payload size - consumed header bytes
-            let tile_offset = av1_frame.payload_start + fh.frame_header_size;
+            // Bitstream buffer holds only this Frame OBU (see bs_data above),
+            // so tile offsets are relative to the OBU header byte.
+            let obu_hdr_bytes = av1_frame.payload_start - av1_frame.obu_start;
+            let tile_offset = obu_hdr_bytes + fh.frame_header_size;
             let tile_size = av1_frame.payload_size.saturating_sub(fh.frame_header_size);
             picture_info_container.tile_offsets[0] = tile_offset;
             picture_info_container.tile_sizes[0] = tile_size;
 
-            // Frame header offset: points to the start of the frame header data
-            // (the Frame OBU payload) within the bitstream buffer. The driver
-            // parses the frame header from the bitstream (it ignores the picture
-            // info we pass for the decode — verified by forcing base_q=0 with no
-            // effect). 0 matches the C++ reference and is the verified-working
-            // value on this driver.
+            // Frame header offset: 0 — the bitstream buffer starts at this
+            // frame's Frame OBU (see bs_data above). Matches the C++ reference.
             let frame_header_offset: u32 = 0;
 
             // DEBUG (iteration 26): comprehensive StdVideoDecodeAV1PictureInfo dump

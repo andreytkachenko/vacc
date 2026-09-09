@@ -215,6 +215,12 @@ pub fn build_cuvid_av1_picparams(
     // 1. Output slot: key frame / first frame -> slot 0 + reset DPB; else FIFO.
     let output_slot = if is_key || dpb.decoded_frames() == 0 {
         dpb.reset_for_keyframe();
+        // The reset zeroes the per-buffer content state (segmentation feature
+        // data, loop-filter ref/mode deltas, global motion) that
+        // parse_frame_header already committed via update_content. Re-apply it
+        // so this frame's inherited state (already read into `fh`) is not lost
+        // and subsequent frames inherit the keyframe's state, not zeros.
+        dpb.update_content(fh);
         0
     } else {
         dpb.allocate_output_slot()

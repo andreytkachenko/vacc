@@ -74,6 +74,13 @@ SAMPLES = [
     # 3 (film_grain_params) end-to-end. Decoded without grain application on
     # all backends (apply_grain forced 0) to stay pixel-identical to ffmpeg.
     ("av1_grain.ivf",               "av1",  "yuv420p"),
+    # rav1e (ffmpeg -c:v librav1e -rav1e-params segmentation_temporal=1:
+    # segmentation_spatial=1): SPS frame_id_numbers_present_flag=1, ~half the
+    # pictures are show-existing-frame OBUs, and two frames update signed
+    # segmentation feature data (ALT_Q). Exercises parser issues 4
+    # (su(1+bits) signed features), 7 (per-ref delta_frame_id_minus_1) and 9
+    # (show-existing display_frame_id) end-to-end.
+    ("av1_seg.ivf",                 "av1",  "yuv420p"),
 ]
 
 # backend -> supported codecs (all use the single unified `decode` binary)

@@ -2097,7 +2097,8 @@ impl Av1Parser {
                         let bits = feature_bits[feat];
                         if bits > 0 {
                             let val = if feature_signed[feat] {
-                                r.read_signed_bits(bits)? as i16
+                                // Spec 7.5.4: signed features are su(1 + bitsToRead).
+                                r.read_signed_bits(bits + 1)? as i16
                             } else {
                                 r.read_bits(bits)? as i16
                             };
