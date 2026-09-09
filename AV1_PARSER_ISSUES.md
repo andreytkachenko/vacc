@@ -1,10 +1,24 @@
-# AV1 parser issues (deferred)
+# AV1 parser issues — ALL FIXED (2026-09-08)
 
-Audit of `crates/vk-video-parser/src/av1.rs` against the AV1 bitstream spec, cros-codecs
+Audit of `crates/vacc-parser/src/av1.rs` against the AV1 bitstream spec, cros-codecs
 (`src/codec/av1/parser.rs`), and the NVIDIA `VulkanAV1Decoder.cpp` original that this file ports.
-Date: 2026-09-07. **AV1 is skipped from the current fix cycle** (no HW AV1 decode on V100,
-cuvid error 801; no parser unit tests exist for it). Everything below is deferred, with severity
-and verification notes so it can be picked up later.
+Original audit date: 2026-09-07. **All 10 issues fixed and committed on 2026-09-08**, each
+verified with a regression test (synthetic bitstreams in `crates/vacc-parser/tests/av1_inline.rs`
+where real samples don't exercise the path) and the full pixel-perfect verification matrix
+(`verify-all.py --samples av1 --max-frames 300`: 12/12 PASS on vulkan/vaapi/nvdec).
+
+Fix commits:
+| Issue | Commit |
+|---|---|
+| 1 + 2 (timing reads) | `80bebe9` |
+| 3 (film grain) | `3726ffc` |
+| 4 (signed seg features + keyframe DPB wipe) | `0cd6a0d` |
+| 5 (CodedLossless from ALT_Q) | `a9e7411` (plus GM-identity prerequisite `625e6bb`) |
+| 6 (Annex B unit accounting + probe) | `57311fb` |
+| 7 (per-ref delta_frame_id_minus_1) | `c890ddb` |
+| 8 (spec LR unit sizes + backend conversions) | `d3cdbb0` |
+| 9 (show-existing temporal_point_info) | `e0ea303` |
+| 10 (segmentation feature clipping) | `eb1f985` |
 
 Overall: `av1.rs` is a faithful port of the NVIDIA C++ reference on the core structural path —
 OBU headers, sequence header (incl. color config/mono_chrome), frame tag, short-signaling
@@ -15,7 +29,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 
 ## HIGH severity
 
-### 1. `temporal_point_info` (frame presentation time) never read
+### 1. `temporal_point_info` (frame presentation time) never read — FIXED (`80bebe9`)
 - Spec 5.9.2: after `show_frame`, when `show_frame && decoder_model_info_present_flag &&
   !equal_picture_interval`, `temporal_point_info()` = `frame_presentation_time f(n)`
   (n = `decoder_model_info` bits) MUST be read.
@@ -26,7 +40,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
   (`equal_picture_interval` instead of `!equal_picture_interval`), so do NOT copy it blindly;
   its show-existing-frame path (`parser.rs:3316-3319`) has the correct condition.
 
-### 2. `buffer_removal_time` block never read
+### 2. `buffer_removal_time` block never read — FIXED (`80bebe9`)
 - Spec: after `primary_ref_frame`, when `decoder_model_info_present_flag`:
   `buffer_removal_time_present_flag f(1)` + per-operation BRT values
   (with the `opPtIdc == 0 || (inTemporal && inSpatial)` gating).
@@ -34,7 +48,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 - C++ reads it (`VulkanAV1Decoder.cpp:1968-1976`); cros-codecs is spec-exact (`parser.rs:3510-3528`).
 - Impact: streams with BRT (most CBR/ABR AV1) desync.
 
-### 3. `film_grain_params` never read
+### 3. `film_grain_params` never read — FIXED (`3726ffc`)
 - Spec: `film_grain_params()` is the **last** element of `uncompressed_header`; when SPS
   `film_grain_params_present = 1` it starts with `apply_grain f(1)` + grain data.
 - vacc: `av1.rs:1448-1449` hardcodes `fh.apply_grain = false` ("not present in our SPS") and
@@ -45,7 +59,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
   — grain streams get a wrong tile offset and decode failure.
 - C++ parses it (`VulkanAV1Decoder.cpp:995-1010`); cros-codecs fully parses it (`parser.rs:3108-3248`).
 
-### 4. Segmentation signed-feature bit width off-by-one
+### 4. Segmentation signed-feature bit width off-by-one — FIXED (`0cd6a0d`)
 - Spec 5.9.14: signed features are `su(1 + bitsToRead)` — ALT_Q (bitsToRead=8) is **9 bits**.
 - vacc: `av1.rs:1938-1942` calls `r.read_signed_bits(bits)`, which reads exactly `bits`
   two's-complement bits (`bitreader.rs:86-93`) — one bit short per enabled signed feature.
@@ -57,7 +71,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
   `read_signed_bits(7)` (`av1.rs:2026-2035`) — so only the segmentation site was missed.
 - Impact: desync whenever any signed segmentation feature is enabled.
 
-### 5. CodedLossless computed from the wrong segment feature
+### 5. CodedLossless computed from the wrong segment feature — FIXED (`a9e7411`)
 - Spec (uncompressed header, per-segment quantization): `qindex += FeatureData[seg][SEG_LVL_ALT_Q]`
   — feature **0**.
 - vacc: `av1.rs:1367-1386` tests `segment_feature_enabled[i] & (1 << 2)` and adds
@@ -70,7 +84,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
   always ignoring ALT_Q, `VulkanAV1Decoder.cpp:2172-2174`); cros-codecs is spec-correct via
   `get_qindex`/`SEG_LVL_ALT_Q=0` (`parser.rs:3707-3728`).
 
-### 6. Annex B (start-code) unit accounting is an empty stub
+### 6. Annex B (start-code) unit accounting is an empty stub — FIXED (`57311fb`)
 - vacc: `av1.rs:536-539` — the `if let StreamFormat::AnnexB { .. }` block in `read_obu` is **empty**;
   `temporal_unit_consumed`/`frame_unit_consumed` are never incremented with OBU bytes
   (`current_annexb_obu_length` only counts size-field header bytes).
@@ -82,7 +96,7 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 
 ## MEDIUM severity
 
-### 7. Per-ref `delta_frame_id_minus_1` not read
+### 7. Per-ref `delta_frame_id_minus_1` not read — FIXED (`c890ddb`)
 - Spec: inside the 7-iteration ref loop, when `frame_id_numbers_present_flag`, each ref carries
   `delta_frame_id_minus_1 f(delta + 2)`.
 - vacc: `av1.rs:1261-1278` reads only `ref_frame_idx[0..7]` in both signaling modes.
@@ -91,7 +105,13 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 - cros-codecs and C++ read per-ref deltas (`parser.rs:3581-3608`, `VulkanAV1Decoder.cpp:2056-2077`).
 - Triggers only on SPSes with frame-ID numbers enabled (low-overhead / multi-layer encodes).
 
-### 8. Loop-restoration unit size stored non-spec; NVDEC consumer always falls back to 32x32
+### 8. Loop-restoration unit size stored non-spec — FIXED (`d3cdbb0`)
+Note: the original "NVDEC always falls back to 32x32" description was stale — by fix time the
+NVDEC consumer was a direct copy that happened to be correct for luma codes; the real bug was the
+non-spec stored representation plus the C++-inherited double chroma shift. The parser now stores
+spec pixel sizes ({64,128,256} luma; single-shift chroma) and each backend converts: NVDEC and
+Vulkan use code log2(px)-5 (0:32, 1:64, 2:128, 3:256 — confirmed against cuviddec.h and the AV1
+encoder sample), VAAPI derives raw spec shifts.
 - Bit reads are spec-correct in both repos (spec 5.9.20). But vacc stores a non-spec internal
   representation: `loop_restoration_size[0] = 1 + lr_unit_shift` ∈ {1,2,3}, with the
   C++-inherited double shift at `av1.rs:2158`.
@@ -105,13 +125,13 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 
 ## LOW severity
 
-### 9. show-existing-frame path truncation
+### 9. show-existing-frame path truncation — FIXED (`e0ea303`)
 - On `show_existing_frame`, vacc returns after `frame_to_show_map_idx f(3)` (`av1.rs:1018-1021`),
   skipping `temporal_point_info` and `display_frame_id f(idLen)`.
 - Harmless for HW decode (frame not decoded, `frame_header_size=0`), but the display-ID
   conformance check cros-codecs performs (`parser.rs:3325-3332`) is absent.
 
-### 10. No clipping of segmentation feature values
+### 10. No clipping of segmentation feature values — FIXED (`eb1f985`)
 - Spec applies `Clip3(-limit, limit, ...)` / `Clip3(0, limit, ...)`; vacc stores raw values
   (`av1.rs:1938-1943`). C++ clamps (`VulkanAV1Decoder.cpp:1396, 1399`); cros-codecs clips
   (`parser.rs:2532, 2536-2542`). Only observable on non-conforming streams.
@@ -144,13 +164,15 @@ common in real content — plus two segmentation logic bugs and an incomplete An
 - `current_frame_id` placement (`av1.rs:1108-1114`; `parser.rs:3435-3438`).
 - Superres bit reads (`av1.rs:1188-1202`; `parser.rs:1528-1551`).
 
-## Suggested verification plan when picked up
+## Verification actually performed (2026-09-08)
 
-AV1 has no HW decode path on this machine (V100, cuvid 801), so use parser-level verification:
-1. Add unit tests that parse every `samples/av1_*.ivf` end-to-end and assert frame count matches
-   `ffprobe -count_frames` + per-frame sanity (frame_type, dims, ref idx < 8, qindex range).
-2. Differential test against cros-codecs `Av1Parser` (its `codec` module builds with default
-   features, no backend deps) — parse each sample with both and compare per-frame fields.
-3. Generate feature-rich test samples to exercise the fixed paths: VFR + timing info
-   (temporal_point_info), BRT (CBR encode), film grain (`-film-grain-tables`), frame-ID numbers
-   (low-overhead encode), Annex B/MP4 container (start-code streams for issue 6).
+- Every fix landed with a regression test in `crates/vacc-parser/tests/av1_inline.rs` (99 tests
+total): real-sample end-to-end parses for the timing/grain/frame-ID paths, plus synthetic
+  bitstreams (hand-built SPS + frame headers via a BitWriter) for CodedLossless/ALT_Q, Annex B
+  two-temporal-unit streams, loop-restoration unit sizes, and segmentation clipping. Each synthetic
+  test was verified to FAIL on the pre-fix code.
+- Pixel-perfect verification on RTX 3060 (GA106): `verify-all.py --samples av1 --max-frames 300`
+  → 12/12 PASS (vulkan/vaapi/nvdec × av1_main, av1_high, av1_grain, av1_seg; professional is
+  hw-unsupported on this GPU). Samples: aomenc main/high/grain + rav1e `av1_seg.ivf`
+  (multi-OBU packets, GM, segmentation).
+- Workspace-wide test suite: 358 passed, 0 failed.
