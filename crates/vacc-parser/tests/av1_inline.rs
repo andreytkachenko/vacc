@@ -11,8 +11,8 @@
 //! rest inter frames with a cyclic last/golden/altref reference pattern.
 
 use vacc_core::codec::VideoCodec;
-use vacc_parser::av1::{Av1FrameHeader, Av1Parser};
-use vacc_parser::{DetectedVideoFormat, VideoParser};
+use vacc_parser::av1::{Av1FrameHeader, Av1Parser, ObuType};
+use vacc_parser::{DetectedVideoFormat, ParseResult, VideoParser};
 
 fn ivf_packets(data: &[u8]) -> Vec<&[u8]> {
     assert_eq!(&data[0..4], b"DKIF", "expected IVF container");
@@ -816,4 +816,132 @@ fn test_coded_lossless_uses_alt_q_feature() {
     assert_eq!(fh1.loop_filter_level[0], 8);
     assert_eq!(fh1.cdef_bits, 1);
     assert_eq!(fh1.tx_mode, 1, "LARGEST");
+}
+
+// =====================================================================
+// Annex B (length-delimited) bitstream format (spec Annex B).
+//
+//   bitstream()   { while more_data: temporal_unit_size leb128(); temporal_unit(sz) }
+//   temporal_unit { while sz>0: frame_unit_size leb128(); sz-=leb128bytes; frame_unit(fuz); sz-=fuz }
+//   frame_unit    { while sz>0: obu_length leb128(); sz-=leb128bytes; open_bitstream_unit(len); sz-=len }
+//
+// Each size field covers everything AFTER itself; obu_length covers the
+// whole OBU (header + payload). The first OBU of the first frame unit of
+// each temporal unit is a TemporalDelimiter. vacc's read_obu must keep
+// its temporal/frame unit consumed counters in sync with these sizes,
+// otherwise the next unit's leb128 is misread as an OBU length.
+// =====================================================================
+
+fn encode_leb128(v: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut v = v;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            break;
+        } else {
+            out.push(b | 0x80);
+        }
+    }
+    out
+}
+
+/// Build a length-delimited stream. `tus` is [temporal unit][frame unit]
+/// [OBU bytes]; each OBU is its full header + payload.
+fn build_annexb_stream(tus: &[Vec<Vec<Vec<u8>>>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for tu in tus {
+        let mut tu_body = Vec::new();
+        for fu in tu {
+            let mut fu_body = Vec::new();
+            for obu in fu {
+                fu_body.extend(encode_leb128(obu.len() as u32));
+                fu_body.extend(obu);
+            }
+            tu_body.extend(encode_leb128(fu_body.len() as u32));
+            tu_body.extend(&fu_body);
+        }
+        out.extend(encode_leb128(tu_body.len() as u32));
+        out.extend(tu_body);
+    }
+    out
+}
+
+/// Two temporal units: TU1 = [TD, SEQHDR, FRAME], TU2 = [TD, FRAME].
+/// Reuses the synthetic SPS / key-frame payloads from the issue-5 tests.
+fn annexb_test_stream() -> Vec<u8> {
+    let sps_payload = synthetic_altq_sps();
+    let (kf, _) = synthetic_altq_key_frame();
+    let td = vec![0x10u8]; // TemporalDelimiter: 0|0010|0|0
+    let seq = {
+        let mut v = vec![0x08u8]; // SequenceHeader: 0|0001|0|0
+        v.extend(&sps_payload);
+        v
+    };
+    let frame = {
+        let mut v = vec![0x30u8]; // Frame: 0|0110|0|0
+        v.extend(&kf);
+        v
+    };
+    build_annexb_stream(&[
+        vec![vec![td.clone(), seq, frame.clone()]],
+        vec![vec![td, frame]],
+    ])
+}
+
+#[test]
+fn test_annexb_probe_detects_format_and_parses_sps() {
+    let data = annexb_test_stream();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let packet = vacc_parser::bitstream::BitstreamPacket::new(data);
+    match parser.parse(&packet) {
+        Ok(ParseResult::ParameterSet { sps: Some(s), .. }) => {
+            let sps = s
+                .downcast_ref::<vacc_core::picture::Av1Sps>()
+                .expect("av1 sps");
+            assert!(sps.enable_cdef, "SPS must round-trip through Annex B walk");
+            assert!(sps.enable_restoration);
+        }
+        other => panic!("expected ParameterSet, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_annexb_unit_accounting_walk() {
+    let data = annexb_test_stream();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+
+    // Walk every OBU with successive sub-slices (the Annex B contract: the
+    // unit counters persist across calls, each slice starts where the
+    // previous read ended).
+    let mut consumed = 0usize;
+    let mut obus = Vec::new();
+    while let Ok(Some((header, start, size))) = parser.read_obu(&data[consumed..]) {
+        assert!(
+            consumed + start + size <= data.len(),
+            "OBU runs past end of stream"
+        );
+        obus.push(header.obu_type);
+        consumed += start + size;
+    }
+    assert_eq!(
+        obus,
+        vec![
+            ObuType::TemporalDelimiter,
+            ObuType::SequenceHeader,
+            ObuType::Frame,
+            ObuType::TemporalDelimiter,
+            ObuType::Frame,
+        ],
+        "OBU sequence across both temporal units"
+    );
+    assert_eq!(consumed, data.len(), "walk must end exactly at stream end");
 }

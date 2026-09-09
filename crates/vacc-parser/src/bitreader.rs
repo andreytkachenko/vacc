@@ -136,6 +136,16 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
+    /// Skip `n` whole bytes (8n stream bits), handling EPB if enabled.
+    /// Unlike `skip_bits`, works for any number of bytes and from any bit
+    /// position (a partially-read byte is consumed first).
+    pub fn skip_bytes(&mut self, n: usize) -> Result<(), ParserError> {
+        for _ in 0..n {
+            self.read_byte()?;
+        }
+        Ok(())
+    }
+
     /// Read an unsigned variable-length coded integer (uvlc) per AV1 spec 4.10.3.
     ///
     /// Format: leading_zeroes zeros, then a one bit, then leading_zeroes value bits.

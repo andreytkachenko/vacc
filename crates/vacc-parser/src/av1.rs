@@ -17,7 +17,7 @@ fn vacc_debug() -> bool {
 
 /// AV1 OBU types as defined in the AV1 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObuType {
+pub enum ObuType {
     Reserved = 0,
     SequenceHeader = 1,
     TemporalDelimiter = 2,
@@ -64,12 +64,12 @@ impl TryFrom<u8> for ObuType {
 
 /// OBU header parsed from the bitstream.
 #[derive(Debug, Clone)]
-struct ObuHeader {
-    obu_type: ObuType,
-    extension_flag: bool,
-    has_size_field: bool,
-    temporal_id: u32,
-    spatial_id: u32,
+pub struct ObuHeader {
+    pub obu_type: ObuType,
+    pub extension_flag: bool,
+    pub has_size_field: bool,
+    pub temporal_id: u32,
+    pub spatial_id: u32,
 }
 
 /// Fixed-size tile dimension array (64 entries). Wraps `[u16; 64]` because
@@ -471,9 +471,14 @@ impl Av1Parser {
             return false;
         }
 
-        // Try identifying a sequence and a frame.
-        if obu_length > 0 {
-            let _ = r.skip_bits((obu_length as u8).min(31) * 8);
+        // Skip the rest of the TD OBU. parse_obu_header already consumed
+        // the header bytes; per spec Annex B, obu_length covers the whole
+        // OBU (header + payload), so only the remaining payload bytes are
+        // left to skip. Skipping the full obu_length would overshoot by the
+        // header size and misalign every subsequent OBU in the probe.
+        let td_payload = (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
+        if td_payload > 0 && r.skip_bytes(td_payload).is_err() {
+            return false;
         }
 
         let mut num_bytes_read = 0;
@@ -481,37 +486,45 @@ impl Av1Parser {
         let mut seen_frame = false;
 
         loop {
+            let leb_start = r.position();
             let obu_length = match r.read_leb128() {
                 Ok(v) => v,
                 Err(_) => return false,
             };
+            // frame_unit_size covers everything after itself: the OBU
+            // length fields as well as the OBU bytes they describe.
+            num_bytes_read += (r.position() - leb_start) as usize / 8;
+            if obu_length == 0 {
+                return false;
+            }
+            num_bytes_read += obu_length as usize;
 
-            num_bytes_read += obu_length;
-
+            // Parse the OBU header in place (the stream is byte-aligned
+            // here) and skip its payload. The header bytes are already
+            // consumed by parse_obu_header, so only the payload remains.
+            let header = match Self::parse_obu_header(&mut r) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
             if !seen_sequence {
-                let mut obu_reader = BitReader::new(&data[r.position() as usize..], false);
-                if let Ok(header) = Self::parse_obu_header(&mut obu_reader) {
-                    seen_sequence = header.obu_type == ObuType::SequenceHeader;
-                }
+                seen_sequence = header.obu_type == ObuType::SequenceHeader;
             }
-
             if !seen_frame {
-                let mut obu_reader = BitReader::new(&data[r.position() as usize..], false);
-                if let Ok(header) = Self::parse_obu_header(&mut obu_reader) {
-                    seen_frame = matches!(header.obu_type, ObuType::Frame | ObuType::FrameHeader);
-                }
+                seen_frame = matches!(header.obu_type, ObuType::Frame | ObuType::FrameHeader);
             }
-
             if seen_sequence && seen_frame {
                 return true;
             }
 
-            if num_bytes_read >= frame_unit_size {
+            // The frame unit budget is exhausted without finding both a
+            // SequenceHeader and a Frame OBU: not an Annex B stream.
+            if num_bytes_read as u32 >= frame_unit_size {
                 return false;
             }
 
-            if obu_length > 0 {
-                let _ = r.skip_bits((obu_length as u8).min(31) * 8);
+            let payload = (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
+            if payload > 0 && r.skip_bytes(payload).is_err() {
+                return false;
             }
         }
     }
@@ -520,7 +533,8 @@ impl Av1Parser {
     fn parse_obu_header(r: &mut BitReader) -> Result<ObuHeader, ParserError> {
         let _obu_forbidden_bit = r.read_bit()?;
 
-        let obu_type = ObuType::try_from(r.read_bits(4)? as u8)?;
+        let type_raw = r.read_bits(4)?;
+        let obu_type = ObuType::try_from(type_raw as u8)?;
         let extension_flag = r.read_bit()?;
         let has_size_field = r.read_bit()?;
         let _obu_reserved_1bit = r.read_bit()?;
@@ -542,10 +556,18 @@ impl Av1Parser {
         Ok(header)
     }
 
-    /// Read one OBU from the bitstream, handling both Annex B and low-overhead formats.
+    /// Read one OBU from the bitstream, handling both Annex B and low-overhead
+    /// formats.
     ///
-    /// Returns (header, obu_data_start, obu_size) on success.
-    fn read_obu(&mut self, data: &[u8]) -> Result<Option<(ObuHeader, usize, usize)>, ParserError> {
+    /// For Annex B (length-delimited) streams, call with successive sub-slices
+    /// of the packet (`&data[consumed..]`, advancing `consumed` by the
+    /// returned start_offset + obu_size each time): the temporal/frame unit
+    /// counters persist across calls and each slice must begin where the
+    /// previous read ended.
+    ///
+    /// Returns (header, obu_data_start, obu_size) on success; None at the end
+    /// of data.
+    pub fn read_obu(&mut self, data: &[u8]) -> Result<Option<(ObuHeader, usize, usize)>, ParserError> {
         if data.is_empty() {
             return Ok(None);
         }
@@ -563,10 +585,20 @@ impl Av1Parser {
 
         let obu_length: Option<usize> = match &mut self.stream_format {
             StreamFormat::AnnexB(annexb_state) => {
-                Self::current_annexb_obu_length(&mut reader, annexb_state)?
+                let length = Self::current_annexb_obu_length(&mut reader, annexb_state)?;
+                // End of temporal unit / end of data: no OBU follows.
+                if length.is_none() {
+                    return Ok(None);
+                }
+                length
             }
             _ => None,
         };
+
+        // Bytes consumed from the slice start by the temporal/frame unit
+        // size fields (Annex B only; 0 for low-overhead). The OBU itself
+        // starts at this offset within the slice.
+        let unit_field_bytes = (reader.position() / 8) as usize;
 
         let header = Self::parse_obu_header(&mut reader)?;
 
@@ -577,10 +609,10 @@ impl Av1Parser {
         // OBU size is byte-aligned after the OBU header (1 or 2 bytes).
         // Skip to the correct byte offset directly.
         let header_bytes = 1usize + usize::from(header.extension_flag);
-        if data.len() <= header_bytes {
+        if data.len() <= unit_field_bytes + header_bytes {
             return Err(ParserError::InvalidBitstream);
         }
-        let mut size_reader = BitReader::new(&data[header_bytes..], false);
+        let mut size_reader = BitReader::new(&data[unit_field_bytes + header_bytes..], false);
 
         let obu_size: usize = if header.has_size_field {
             size_reader.read_leb128()? as usize
@@ -592,13 +624,27 @@ impl Av1Parser {
                 .ok_or(ParserError::InvalidBitstream)?
         };
 
-        // Update Annex B state if applicable
-        if let StreamFormat::AnnexB(ref mut _annexb_state) = self.stream_format {
-            // ...
-        }
-
         let size_bytes = (size_reader.position() / 8) as usize;
-        let start_offset = header_bytes + size_bytes;
+        // Offset of the OBU payload from the SLICE start: unit size fields
+        // (Annex B) + OBU header + the OBU's own size field, if any.
+        let start_offset = unit_field_bytes + header_bytes + size_bytes;
+
+        // Annex B (length-delimited) unit accounting (spec Annex B):
+        // temporal_unit_size covers everything after itself (frame-unit size
+        // fields + all OBU length fields + all OBU bytes) and
+        // frame_unit_size covers everything after itself (OBU length fields +
+        // all OBU bytes). The leb128 size-field bytes were already counted in
+        // current_annexb_obu_length; the OBU bytes themselves (header + its
+        // own size field, if any + payload) must be added here. Without this,
+        // the consumed counters stop short of the unit sizes, so new
+        // temporal/frame unit size fields are never read and the next unit's
+        // leb128 is misread as an OBU length — desynchronizing every
+        // length-delimited stream from the second frame unit onward.
+        if let StreamFormat::AnnexB(ref mut annexb_state) = self.stream_format {
+            let obu_total = (header_bytes + size_bytes + obu_size) as u32;
+            annexb_state.temporal_unit_consumed += obu_total;
+            annexb_state.frame_unit_consumed += obu_total;
+        }
 
         Ok(Some((header, start_offset, obu_size)))
     }
