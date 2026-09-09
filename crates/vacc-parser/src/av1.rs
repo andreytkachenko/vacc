@@ -2152,6 +2152,11 @@ impl Av1Parser {
             // feature bits: {8,6,6,6,6,3,0,0}, signed: {1,1,1,1,1,0,0,0}
             let feature_bits = [8u8, 6, 6, 6, 6, 3, 0, 0];
             let feature_signed = [true, true, true, true, true, false, false, false];
+            // Spec: Segmentation_Feature_Max = {255, MAX_LOOP_FILTER x4, 7, 0, 0}
+            // with MAX_LOOP_FILTER = 63; FeatureData[i][j] stores the clipped
+            // value (Clip3(-limit, limit, v) for signed, Clip3(0, limit, v)
+            // otherwise). Only non-conforming streams can exceed these.
+            let feature_max = [255i16, 63, 63, 63, 63, 7, 0, 0];
             for seg in 0..8 {
                 for feat in 0..8 {
                     let enabled = r.read_bit()?;
@@ -2160,10 +2165,11 @@ impl Av1Parser {
                         let bits = feature_bits[feat];
                         if bits > 0 {
                             let val = if feature_signed[feat] {
-                                // Spec 7.5.4: signed features are su(1 + bitsToRead).
-                                r.read_signed_bits(bits + 1)? as i16
+                                // Spec: signed features are su(1 + bitsToRead).
+                                (r.read_signed_bits(bits + 1)? as i16)
+                                    .clamp(-feature_max[feat], feature_max[feat])
                             } else {
-                                r.read_bits(bits)? as i16
+                                (r.read_bits(bits)? as i16).clamp(0, feature_max[feat])
                             };
                             fh.segment_feature_data[seg][feat] = val;
                         }

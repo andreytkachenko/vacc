@@ -782,6 +782,110 @@ fn synthetic_altq_inter_frame() -> (Vec<u8>, u32) {
     (w.into_bytes(), nbits)
 }
 
+/// INTER frame at 64x36 with segmentation enabled and segment 0 carrying
+/// out-of-range feature values: ALT_Q su(9) = -256 (limit +/-255) and
+/// REF_FRAME su(7) = -64 (limit +/-63). A conforming decoder must clip to
+/// -255 / -63. 213 bits.
+fn synthetic_segclip_inter_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(1, 2); // frame_type INTER
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // error_resilient_mode
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(7, 3); // primary_ref_frame NONE
+    w.write(0b01111111, 8); // refresh_frame_flags
+    for _ in 0..7 {
+        w.write(0, 3); // ref_frame_idx all 0
+    }
+    w.write(1, 1); // frame_size_with_refs: found_ref[0] (inherit 64x36)
+    w.write(0, 1); // allow_high_precision_mv
+    w.write(0, 1); // is_filter_switchable
+    w.write(0, 2); // interpolation_filter SPEED
+    w.write(0, 1); // is_motion_mode_switchable
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(0, 8); // base_q_index = 0
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    // segmentation: update_map/update_data inferred (primary_ref NONE)
+    w.write(1, 1); // segmentation_enabled
+    // segment 0: ALT_Q = -256 (clips to -255), REF_FRAME = -64 (clips to -63)
+    w.write(1, 1);
+    w.write(0b100000000, 9); // su(9) = -256
+    w.write(1, 1);
+    w.write(0b1000000, 7); // su(7) = -64
+    for _ in 0..6 {
+        w.write(0, 1);
+    }
+    // segments 1-7: all features disabled
+    for _ in 0..56 {
+        w.write(0, 1);
+    }
+    // loop_filter_params (emitted because CodedLossless=0: qindex = 0 + -255)
+    w.write(8, 6);
+    w.write(8, 6);
+    w.write(4, 6);
+    w.write(4, 6);
+    w.write(1, 3);
+    w.write(0, 1);
+    // cdef_params
+    w.write(1, 2);
+    w.write(1, 2);
+    for _ in 0..2 {
+        w.write(4, 4);
+        w.write(1, 2);
+        w.write(2, 4);
+        w.write(1, 2);
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reference_select
+    w.write(0, 1); // skip_mode
+    w.write(0, 1); // reduced_tx_set
+    // global_motion: primary NONE -> all 7 refs read, all IDENTITY
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_segmentation_feature_clipping() {
+    let sps_bytes = synthetic_altq_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+
+    // Spec: FeatureData[i][j] = Clip3(-limit, limit, v) for signed features
+    // with limits {255, MAX_LOOP_FILTER=63 x4, 7, 0, 0}.
+    let (ifm, if_bits) = synthetic_segclip_inter_frame();
+    assert_eq!(if_bits, 213, "seg-clip inter frame bit count");
+    let fh = parser.parse_frame_header(&ifm, &sps, 0, 0).expect("inter parse");
+    assert!(fh.segmentation_enabled);
+    assert_eq!(
+        fh.segment_feature_data[0][0],
+        -255,
+        "ALT_Q -256 must clip to -255"
+    );
+    assert_eq!(
+        fh.segment_feature_data[0][1],
+        -63,
+        "REF_FRAME -64 must clip to -63"
+    );
+    // Clipped ALT_Q keeps the frame non-lossless (qindex = 0 + -255 != 0).
+    assert!(!fh.coded_lossless);
+}
+
 #[test]
 fn test_coded_lossless_uses_alt_q_feature() {
     let sps_bytes = synthetic_altq_sps();
