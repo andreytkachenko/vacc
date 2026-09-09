@@ -1288,6 +1288,124 @@ fn test_per_ref_delta_frame_id() {
     assert_eq!(fh1.tx_mode, 1, "LARGEST");
 }
 
+/// SPS with frame ID numbers enabled AND decoder-model timing with
+/// non-uniform picture intervals: this makes the show-existing-frame path
+/// carry both temporal_point_info (fpt f(1)) and display_frame_id f(3).
+fn synthetic_showexisting_sps() -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write(0, 3); // seq_profile Main
+    w.write(0, 1); // still_picture
+    w.write(0, 1); // reduced_still_picture_header
+    w.write(1, 1); // timing_info_present_flag
+    w.write(30, 32); // num_units_in_display_tick
+    w.write(1000, 32); // time_scale
+    w.write(0, 1); // equal_picture_interval = 0 -> FPT read per frame
+    w.write(1, 1); // decoder_model_info_present_flag
+    w.write(0, 5); // buffer_delay_length_minus_1 (n=1)
+    w.write(30, 32); // num_units_in_decoding_tick
+    w.write(0, 5); // buffer_removal_time_length_minus_1 (n=1)
+    w.write(0, 5); // frame_presentation_time_length_minus_1 (n=1)
+    w.write(0, 1); // initial_display_delay_present_flag
+    w.write(0, 5); // operating_points_cnt_minus_1 = 0
+    w.write(0, 12); // op0 operating_point_idc
+    w.write(1, 5); // seq_level_idx
+    w.write(1, 1); // decoder_model_present_for_this_op
+    w.write(0, 1); // decoder_buffer_delay (n=1)
+    w.write(0, 1); // encoder_buffer_delay (n=1)
+    w.write(0, 1); // low_delay_mode_flag
+    w.write(5, 4); // frame_width_bits_minus_1 (6-bit widths)
+    w.write(5, 4); // frame_height_bits_minus_1
+    w.write(63, 6); // max_frame_width_minus_1 -> 64
+    w.write(35, 6); // max_frame_height_minus_1 -> 36
+    w.write(1, 1); // frame_id_numbers_present_flag
+    w.write(0, 4); // delta_frame_id_length_minus_2 = 0
+    w.write(0, 3); // additional_frame_id_length_minus_1 = 0 -> idLen = 3
+    w.write(0, 1); // use_128x128_superblock
+    w.write(0, 1); // enable_filter_intra
+    w.write(0, 1); // enable_intra_edge_filter
+    w.write(0, 1); // enable_interintra_compound
+    w.write(0, 1); // enable_masked_compound
+    w.write(0, 1); // enable_warped_motion
+    w.write(0, 1); // enable_dual_filter
+    w.write(0, 1); // enable_order_hint = 0
+    w.write(0, 1); // seq_choose_screen_content_tools = 0
+    w.write(0, 1); // seq_force_screen_content_tools = 0
+    w.write(0, 1); // enable_superres
+    w.write(0, 1); // enable_cdef
+    w.write(0, 1); // enable_restoration
+    // color_config (profile 0: implicit 4:2:0)
+    w.write(0, 1); // high_bitdepth
+    w.write(0, 1); // mono_chrome
+    w.write(0, 1); // color_description_present
+    w.write(0, 1); // color_range
+    w.write(0, 2); // chroma_sample_position
+    w.write(0, 1); // separate_uv_delta_q
+    w.write(0, 1); // film_grain_params_present = 0
+    // trailing bits: pad to byte boundary
+    w.write(1, 1);
+    if !w.bitpos.is_multiple_of(8) {
+        w.write(0, 8 - (w.bitpos % 8));
+    }
+    w.into_bytes()
+}
+
+/// show_existing_frame header: map_idx f(3) = 5, frame_presentation_time
+/// f(1) = 1, display_frame_id f(3) = 5. 8 bits total. The non-zero fpt bit
+/// guards the read position: if the parser skipped or misplaced either read,
+/// display_frame_id would land on a different value.
+fn synthetic_showexisting_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(1, 1); // show_existing_frame
+    w.write(5, 3); // frame_to_show_map_idx
+    w.write(1, 1); // frame_presentation_time (n=1)
+    w.write(5, 3); // display_frame_id (idLen = 3)
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_show_existing_frame_reads_tpi_and_display_id() {
+    let sps_bytes = synthetic_showexisting_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
+    assert!(sps.frame_id_numbers_present_flag);
+    assert!(sps.decoder_model_info_present_flag);
+    assert!(!sps.equal_picture_interval);
+
+    // Pre-fix the parser returned right after frame_to_show_map_idx, leaving
+    // temporal_point_info and display_frame_id unread.
+    let (sef, sef_bits) = synthetic_showexisting_frame();
+    assert_eq!(sef_bits, 8, "show-existing frame bit count");
+    let fh = parser
+        .parse_frame_header(&sef, &sps, 0, 0)
+        .expect("show-existing parse");
+    assert!(fh.show_existing_frame);
+    assert_eq!(fh.frame_to_show_map_idx, 5, "map idx round-trip");
+    assert_eq!(fh.display_frame_id, 5, "display_frame_id f(3) round-trip");
+    assert_eq!(fh.frame_header_size, 0, "show-existing frames are not decoded");
+
+    // Real-stream coverage: av1_seg.ivf (rav1e, multi-OBU packets) mixes
+    // show-existing pictures into the decode order; every one must parse with
+    // a valid map index. Its SPS has no frame ID numbers, so display_frame_id
+    // stays 0 there.
+    let data = include_bytes!("../../../assets/samples/av1_seg.ivf");
+    let (sps2, frames) = parse_all(data);
+    assert!(!sps2.frame_id_numbers_present_flag);
+    let show_existing: Vec<&Av1FrameHeader> =
+        frames.iter().filter(|f| f.show_existing_frame).collect();
+    assert!(show_existing.len() >= 50, "expected many show-existing pictures");
+    for f in show_existing {
+        assert!(f.frame_to_show_map_idx < 8, "valid map index");
+        assert_eq!(f.frame_header_size, 0);
+        assert_eq!(f.display_frame_id, 0, "no frame IDs in this stream");
+    }
+}
+
 /// KEY frame like synthetic_altq_key_frame but with loop restoration on all
 /// three planes: lr_unit_shift = 2 (luma 256px) and lr_uv_shift = 1 (chroma
 /// halved to 128px per spec 5.9.20). 102 bits.

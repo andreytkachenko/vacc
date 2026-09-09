@@ -151,6 +151,9 @@ pub struct Av1FrameHeader {
     pub show_existing_frame: bool,
     /// Frame to show (when show_existing_frame is true).
     pub frame_to_show_map_idx: u8,
+    /// display_frame_id f(idLen) read on the show-existing-frame path when
+    /// frame ID numbers are present (0 otherwise / not read).
+    pub display_frame_id: u32,
     /// Frame type: 0=KEY, 1=INTER, 2=INTRA_ONLY, 3=SWITCH
     pub frame_type: u8,
     /// Primary reference frame index.
@@ -1160,7 +1163,7 @@ impl Av1Parser {
             if sps.frame_id_numbers_present_flag {
                 let id_len =
                     sps.additional_frame_id_length_minus1 + sps.delta_frame_id_length_minus2 + 3;
-                let _display_frame_id = r.read_bits(id_len)?;
+                fh.display_frame_id = r.read_bits(id_len)?;
             }
             fh.frame_header_size = 0; // not decoded
             return Ok(fh);
