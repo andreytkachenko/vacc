@@ -502,7 +502,7 @@ fn walk_obus(pkt: &[u8], mut f: impl FnMut(u8, Option<&[u8]>, u32, u32)) {
         // OBU extension byte: [temporal_id(3), spatial_id(5)].
         let (temporal_id, spatial_id) = if ext {
             let e = pkt[off + 1];
-            (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+            (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32)
         } else {
             (0, 0)
         };

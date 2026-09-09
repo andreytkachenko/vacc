@@ -1150,7 +1150,7 @@ impl Av1Parser {
             // the decoder model is present and pictures are not equally spaced.
             if sps.decoder_model_info_present_flag && !sps.equal_picture_interval {
                 let _frame_presentation_time =
-                    r.read_bits((sps.frame_presentation_time_length_minus_1 + 1) as u8)?;
+                    r.read_bits(sps.frame_presentation_time_length_minus_1 + 1)?;
             }
             // Spec: display_frame_id f(idLen) when frame ID numbers are used.
             if sps.frame_id_numbers_present_flag {
@@ -1178,7 +1178,7 @@ impl Av1Parser {
             && !sps.equal_picture_interval
         {
             let _frame_presentation_time =
-                r.read_bits((sps.frame_presentation_time_length_minus_1 + 1) as u8)?;
+                r.read_bits(sps.frame_presentation_time_length_minus_1 + 1)?;
         }
 
         fh.showable_frame = if show_frame {
@@ -1314,7 +1314,7 @@ impl Av1Parser {
         if sps.decoder_model_info_present_flag {
             let brt_present = r.read_bit()?;
             if brt_present {
-                let n = (sps.buffer_removal_time_length_minus_1 + 1) as u8;
+                let n = sps.buffer_removal_time_length_minus_1 + 1;
                 for op in 0..=sps.operating_points_cnt_minus_1 {
                     let op = op as usize;
                     if !sps.decoder_model_present_for_this_op[op] {

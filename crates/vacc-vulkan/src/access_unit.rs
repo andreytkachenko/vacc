@@ -1568,7 +1568,7 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                 // OBU extension byte: [temporal_id(3), spatial_id(5)].
                 let (temporal_id, spatial_id) = if ext == 1 {
                     let e = packet[pos + 1];
-                    (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32)
+                    (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32)
                 } else {
                     (0, 0)
                 };

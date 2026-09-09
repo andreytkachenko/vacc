@@ -64,7 +64,7 @@ fn walk_obus(payload: &[u8]) -> Vec<(u8, u32, u32, &[u8])> {
         let ext_byte = if extension { Some(payload[i + 1]) } else { None };
         i += 1 + usize::from(extension);
         let (temporal_id, spatial_id) = match ext_byte {
-            Some(e) => (((e >> 5) & 0x7) as u32, ((e >> 0) & 0x1f) as u32),
+            Some(e) => (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32),
             None => (0, 0),
         };
         if has_size {
@@ -327,7 +327,7 @@ fn synthetic_timing_sps(op_count: usize, op1_idc: u32, grain_present: bool) -> V
     w.write(grain_present as u64, 1); // film_grain_params_present
     // trailing bits: 1 bit then zero pad to the byte boundary
     w.write(1, 1);
-    if w.bitpos % 8 != 0 {
+    if !w.bitpos.is_multiple_of(8) {
         w.write(0, 8 - (w.bitpos % 8));
     }
     w.into_bytes()
@@ -506,7 +506,7 @@ fn synthetic_grain_sps() -> Vec<u8> {
     w.write(1, 1); // film_grain_params_present = 1
     // trailing bits: 1 bit then zero pad to byte boundary
     w.write(1, 1);
-    if w.bitpos % 8 != 0 {
+    if !w.bitpos.is_multiple_of(8) {
         w.write(0, 8 - (w.bitpos % 8));
     }
     w.into_bytes()
@@ -654,7 +654,7 @@ fn synthetic_altq_sps() -> Vec<u8> {
     w.write(0, 1); // film_grain_params_present = 0
     // trailing bits: pad to byte boundary
     w.write(1, 1);
-    if w.bitpos % 8 != 0 {
+    if !w.bitpos.is_multiple_of(8) {
         w.write(0, 8 - (w.bitpos % 8));
     }
     w.into_bytes()
