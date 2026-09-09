@@ -478,7 +478,8 @@ impl Av1Parser {
         // OBU (header + payload), so only the remaining payload bytes are
         // left to skip. Skipping the full obu_length would overshoot by the
         // header size and misalign every subsequent OBU in the probe.
-        let td_payload = (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
+        let td_payload =
+            (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
         if td_payload > 0 && r.skip_bytes(td_payload).is_err() {
             return false;
         }
@@ -524,7 +525,8 @@ impl Av1Parser {
                 return false;
             }
 
-            let payload = (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
+            let payload =
+                (obu_length as usize).saturating_sub(1 + usize::from(header.extension_flag));
             if payload > 0 && r.skip_bytes(payload).is_err() {
                 return false;
             }
@@ -569,7 +571,10 @@ impl Av1Parser {
     ///
     /// Returns (header, obu_data_start, obu_size) on success; None at the end
     /// of data.
-    pub fn read_obu(&mut self, data: &[u8]) -> Result<Option<(ObuHeader, usize, usize)>, ParserError> {
+    pub fn read_obu(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Option<(ObuHeader, usize, usize)>, ParserError> {
         if data.is_empty() {
             return Ok(None);
         }
@@ -750,8 +755,7 @@ impl Av1Parser {
             let operating_points_cnt_minus_1 = r.read_bits(5)? as usize;
             sps.operating_points_cnt_minus_1 = operating_points_cnt_minus_1 as u32;
             sps.operating_point_idc = vec![0; operating_points_cnt_minus_1 + 1];
-            sps.decoder_model_present_for_this_op =
-                vec![false; operating_points_cnt_minus_1 + 1];
+            sps.decoder_model_present_for_this_op = vec![false; operating_points_cnt_minus_1 + 1];
 
             // Parse each operating point
             for i in 0..=operating_points_cnt_minus_1 {
@@ -1173,10 +1177,7 @@ impl Av1Parser {
         // temporal_point_info(): spec 5.9 — after show_frame, when
         // show_frame && decoder_model_info_present_flag &&
         // !equal_picture_interval, read frame_presentation_time f(n).
-        if show_frame
-            && sps.decoder_model_info_present_flag
-            && !sps.equal_picture_interval
-        {
+        if show_frame && sps.decoder_model_info_present_flag && !sps.equal_picture_interval {
             let _frame_presentation_time =
                 r.read_bits(sps.frame_presentation_time_length_minus_1 + 1)?;
         }
@@ -1679,7 +1680,11 @@ impl Av1Parser {
 
         grain.grain_seed = r.read_bits(16)? as u16;
         // update_grain is inferred 1 for non-INTER frames.
-        grain.update_grain = if fh.frame_type == 1 { r.read_bit()? } else { true };
+        grain.update_grain = if fh.frame_type == 1 {
+            r.read_bit()?
+        } else {
+            true
+        };
         if !grain.update_grain {
             grain.film_grain_params_ref_idx = r.read_bits(3)? as u8;
             // Params are loaded from the referenced frame; the bitstream
@@ -2377,11 +2382,7 @@ impl Av1Parser {
         // when lr_uv_shift (4:2:0 with chroma LR only) -> a single pixel
         // shift, not the double code-space shift of the old C++ reference.
         let mut lr_uv_shift = 0u16;
-        if !sps.mono_chrome
-            && use_chroma_lr
-            && sps.subsampling_x != 0
-            && sps.subsampling_y != 0
-        {
+        if !sps.mono_chrome && use_chroma_lr && sps.subsampling_x != 0 && sps.subsampling_y != 0 {
             lr_uv_shift = r.read_bit()? as u16;
         }
         for pl in 1..n_planes {

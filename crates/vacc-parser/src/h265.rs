@@ -391,8 +391,7 @@ impl H265Parser {
         curr_pic_ref_enabled: bool,
     ) -> usize {
         let strps = if info.short_term_ref_pic_set_sps_flag {
-            sps
-                .short_term_ref_pic_sets
+            sps.short_term_ref_pic_sets
                 .get(info.short_term_ref_pic_set_idx as usize)
         } else {
             info.slice_strps.as_ref()
@@ -3460,7 +3459,11 @@ mod tests {
         }
         /// se(v) per H.265 spec 7.4.2: codeNum = 2|v| (v >= 0) or 2|v|-1, then ue.
         fn se(&mut self, v: i32) {
-            let code_num = if v >= 0 { 2 * v as u32 } else { 2 * (-v as u32) - 1 };
+            let code_num = if v >= 0 {
+                2 * v as u32
+            } else {
+                2 * (-v as u32) - 1
+            };
             self.ue(code_num);
         }
         fn finish(&self) -> Vec<u8> {
@@ -3546,7 +3549,10 @@ mod tests {
         b.put(0, sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4); // pic_order_cnt_lsb = 0
         b.put(1, 1); // short_term_ref_pic_set_sps_flag
         if sps.num_short_term_ref_pic_sets > 1 {
-            b.put(0, (sps.num_short_term_ref_pic_sets as f64).log2().ceil() as u32);
+            b.put(
+                0,
+                (sps.num_short_term_ref_pic_sets as f64).log2().ceil() as u32,
+            );
         }
         if sps.long_term_ref_pics_present_flag {
             if sps.num_long_term_ref_pics_sps > 0 {
@@ -3673,10 +3679,7 @@ mod tests {
         // P slice: no L1 modification.
         assert!(info.ref_pic_lists_modification_l1.is_empty());
         // Active counts came from the PPS defaults (override flag = 0).
-        assert_eq!(
-            info.num_ref_idx_l0_active_minus1 as usize + 1,
-            n0
-        );
+        assert_eq!(info.num_ref_idx_l0_active_minus1 as usize + 1, n0);
     }
 
     /// NoRaslOutputFlag must be derived from the NAL unit type (spec 8.3.1),
@@ -3729,7 +3732,10 @@ mod tests {
             if sps.separate_colour_plane_flag {
                 b.put(0, 2); // colour_plane_id
             }
-            b.put(poc_lsb as u32, sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+            b.put(
+                poc_lsb as u32,
+                sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4,
+            );
             b.put(1, 1); // short_term_ref_pic_set_sps_flag (idx omitted: count == 1)
             if sps.long_term_ref_pics_present_flag {
                 if sps.num_long_term_ref_pics_sps > 0 {

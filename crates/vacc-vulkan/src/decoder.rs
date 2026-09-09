@@ -2182,9 +2182,11 @@ impl VideoDecoder {
             {
                 let g = &fh.film_grain;
                 let fg = &mut picture_info_container.film_grain;
-                fg.flags.set_chroma_scaling_from_luma(g.chroma_scaling_from_luma as u32);
+                fg.flags
+                    .set_chroma_scaling_from_luma(g.chroma_scaling_from_luma as u32);
                 fg.flags.set_overlap_flag(g.overlap_flag as u32);
-                fg.flags.set_clip_to_restricted_range(g.clip_to_restricted_range as u32);
+                fg.flags
+                    .set_clip_to_restricted_range(g.clip_to_restricted_range as u32);
                 fg.flags.set_update_grain(g.update_grain as u32);
                 fg.grain_scaling_minus_8 = g.grain_scaling_minus_8;
                 fg.ar_coeff_lag = g.ar_coeff_lag;

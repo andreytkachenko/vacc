@@ -61,7 +61,11 @@ fn walk_obus(payload: &[u8]) -> Vec<(u8, u32, u32, &[u8])> {
         let obu_type = (b0 >> 3) & 0xf;
         let extension = b0 >> 2 & 1 == 1;
         let has_size = b0 >> 1 & 1 == 1;
-        let ext_byte = if extension { Some(payload[i + 1]) } else { None };
+        let ext_byte = if extension {
+            Some(payload[i + 1])
+        } else {
+            None
+        };
         i += 1 + usize::from(extension);
         let (temporal_id, spatial_id) = match ext_byte {
             Some(e) => (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32),
@@ -595,7 +599,10 @@ fn test_film_grain_params_reads() {
     assert!(g.chroma_scaling_from_luma);
     assert_eq!(g.grain_scaling_minus_8, 2);
     assert_eq!(g.ar_coeff_lag, 1);
-    assert_eq!(&g.ar_coeffs_y_plus_128[..4], [0x7f_i8, 0x80_u8 as i8, 0x81_u8 as i8, 0x82_u8 as i8]);
+    assert_eq!(
+        &g.ar_coeffs_y_plus_128[..4],
+        [0x7f_i8, 0x80_u8 as i8, 0x81_u8 as i8, 0x82_u8 as i8]
+    );
     assert_eq!(&g.ar_coeffs_cb_plus_128[..5], [0, 1, 2, 3, 4]);
     assert_eq!(&g.ar_coeffs_cr_plus_128[..5], [5, 6, 7, 8, 9]);
     assert_eq!(g.ar_coeff_shift_minus_6, 1);
@@ -603,7 +610,6 @@ fn test_film_grain_params_reads() {
     assert!(g.overlap_flag);
     assert!(!g.clip_to_restricted_range);
 }
-
 
 // =====================================================================
 // Issue 5: CodedLossless must use SEG_LVL_ALT_Q (feature 0), not feature 2.
@@ -864,22 +870,24 @@ fn test_segmentation_feature_clipping() {
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
         .expect("init");
-    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
 
     // Spec: FeatureData[i][j] = Clip3(-limit, limit, v) for signed features
     // with limits {255, MAX_LOOP_FILTER=63 x4, 7, 0, 0}.
     let (ifm, if_bits) = synthetic_segclip_inter_frame();
     assert_eq!(if_bits, 213, "seg-clip inter frame bit count");
-    let fh = parser.parse_frame_header(&ifm, &sps, 0, 0).expect("inter parse");
+    let fh = parser
+        .parse_frame_header(&ifm, &sps, 0, 0)
+        .expect("inter parse");
     assert!(fh.segmentation_enabled);
     assert_eq!(
-        fh.segment_feature_data[0][0],
-        -255,
+        fh.segment_feature_data[0][0], -255,
         "ALT_Q -256 must clip to -255"
     );
     assert_eq!(
-        fh.segment_feature_data[0][1],
-        -63,
+        fh.segment_feature_data[0][1], -63,
         "REF_FRAME -64 must clip to -63"
     );
     // Clipped ALT_Q keeps the frame non-lossless (qindex = 0 + -255 != 0).
@@ -893,14 +901,18 @@ fn test_coded_lossless_uses_alt_q_feature() {
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
         .expect("init");
-    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
     assert!(sps.enable_cdef);
     assert!(sps.enable_restoration);
 
     // Key frame pins the SPS + intra layout (99 bits -> 13 header bytes).
     let (kf, kf_bits) = synthetic_altq_key_frame();
     assert_eq!(kf_bits, 99, "key frame bit count");
-    let fh0 = parser.parse_frame_header(&kf, &sps, 0, 0).expect("key parse");
+    let fh0 = parser
+        .parse_frame_header(&kf, &sps, 0, 0)
+        .expect("key parse");
     assert!(!fh0.coded_lossless);
     assert_eq!(fh0.frame_header_size, 13, "98 bits -> 13 header bytes");
 
@@ -910,10 +922,15 @@ fn test_coded_lossless_uses_alt_q_feature() {
     // concluded lossless and skipped them, desyncing the header size.
     let (ifm, if_bits) = synthetic_altq_inter_frame();
     assert_eq!(if_bits, 206, "inter frame bit count");
-    let fh1 = parser.parse_frame_header(&ifm, &sps, 0, 0).expect("inter parse");
+    let fh1 = parser
+        .parse_frame_header(&ifm, &sps, 0, 0)
+        .expect("inter parse");
     assert!(fh1.segmentation_enabled);
     assert_eq!(fh1.segment_feature_data[0][0], 5, "ALT_Q value round-trip");
-    assert!(!fh1.coded_lossless, "ALT_Q=+5 with base_q=0 must be non-lossless");
+    assert!(
+        !fh1.coded_lossless,
+        "ALT_Q=+5 with base_q=0 must be non-lossless"
+    );
     // Consumed blocks pin the sync: values must round-trip through the
     // non-lossless branches.
     assert_eq!(fh1.frame_header_size, 26, "206 bits -> 26 header bytes");
@@ -980,7 +997,9 @@ fn test_loop_restoration_unit_sizes_spec() {
     parser
         .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
         .expect("init");
-    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
 
     // Spec 5.9.20: luma size = 256 >> (2 - 2) = 256px; chroma is halved by
     // lr_uv_shift = 1 -> 128px (a single pixel shift, not the double

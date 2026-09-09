@@ -513,7 +513,12 @@ fn walk_obus(pkt: &[u8], mut f: impl FnMut(u8, Option<&[u8]>, u32, u32)) {
         }
         let (size, payload_off) = leb128(pkt, off);
         off = payload_off + size;
-        f(obu_type, Some(&pkt[payload_off..payload_off + size]), temporal_id, spatial_id);
+        f(
+            obu_type,
+            Some(&pkt[payload_off..payload_off + size]),
+            temporal_id,
+            spatial_id,
+        );
     }
 }
 
