@@ -4,7 +4,8 @@ Audit of `crates/vacc-parser/src/av1.rs` against the AV1 bitstream spec, cros-co
 (`src/codec/av1/parser.rs`), and the NVIDIA `VulkanAV1Decoder.cpp` original that this file ports.
 Original audit date: 2026-09-07. **All 10 issues fixed and committed on 2026-09-08**, each
 verified with a regression test (synthetic bitstreams in `crates/vacc-parser/tests/av1_inline.rs`
-where real samples don't exercise the path) and the full pixel-perfect verification matrix
+where real samples don't exercise the path; tests for issues 4, 7 and 9 were added on
+2026-09-09 — see below) and the full pixel-perfect verification matrix
 (`verify-all.py --samples av1 --max-frames 300`: 12/12 PASS on vulkan/vaapi/nvdec).
 
 Fix commits:
@@ -164,15 +165,35 @@ encoder sample), VAAPI derives raw spec shifts.
 - `current_frame_id` placement (`av1.rs:1108-1114`; `parser.rs:3435-3438`).
 - Superres bit reads (`av1.rs:1188-1202`; `parser.rs:1528-1551`).
 
-## Verification actually performed (2026-09-08)
+## Verification actually performed (2026-09-08; corrected 2026-09-09)
 
-- Every fix landed with a regression test in `crates/vacc-parser/tests/av1_inline.rs` (99 tests
-total): real-sample end-to-end parses for the timing/grain/frame-ID paths, plus synthetic
-  bitstreams (hand-built SPS + frame headers via a BitWriter) for CodedLossless/ALT_Q, Annex B
-  two-temporal-unit streams, loop-restoration unit sizes, and segmentation clipping. Each synthetic
-  test was verified to FAIL on the pre-fix code.
+- Regression tests in `crates/vacc-parser/tests/av1_inline.rs` (14 total). As of the
+  original 2026-09-08 audit, issues 4, 7 and 9 had **no** parser-level regression test
+  (only indirect pixel coverage via av1_seg.ivf); all three were added on 2026-09-09.
+  Every synthetic test was verified to FAIL on the pre-fix code:
+  - Issue 1+2 (TPI/BRT): `test_decoder_model_timing_reads`, `test_brt_operating_point_gating`
+    — synthetic timing SPS + KEY frame; `frame_header_size` pins exact bit consumption.
+  - Issue 3 (grain): `test_film_grain_params_reads`.
+  - Issue 4 (signed segmentation width): `test_segmentation_signed_feature_width`
+    — added 2026-09-09 (`3fc5d4b`).
+  - Issue 5 (CodedLossless feature index): `test_coded_lossless_uses_alt_q_feature`.
+  - Issue 6 (Annex B unit accounting): `test_annexb_probe_detects_format_and_parses_sps`,
+    `test_annexb_unit_accounting_walk`.
+  - Issue 7 (per-ref delta_frame_id): `test_per_ref_delta_frame_id` — added 2026-09-09
+    (`93e54e2`).
+  - Issue 8 (LR unit sizes): `test_loop_restoration_unit_sizes_spec`.
+  - Issue 9 (show-existing truncation): `test_show_existing_frame_reads_tpi_and_display_id`
+    — added 2026-09-09 (`107fd87`); `display_frame_id` is now stored in Av1FrameHeader.
+  - Issue 10 (clipping): `test_segmentation_feature_clipping`.
+  - Real-sample end-to-end: `test_sps_fields`, `test_first_frames`,
+    `test_full_stream_order_hints` (av1_main.ivf, 448 frames) plus the av1_seg.ivf
+    show-existing sweep inside the issue-9 test (99 show-existing pictures in 300 frames).
+- Frame-ID coverage note: none of the committed samples enable frame ID numbers
+  (verified 2026-09-09: all four AV1 SPSes have frame_id_numbers_present=0), so the
+  frame-ID paths (current_frame_id, per-ref deltas, display_frame_id) are covered by the
+  synthetic streams only.
 - Pixel-perfect verification on RTX 3060 (GA106): `verify-all.py --samples av1 --max-frames 300`
   → 12/12 PASS (vulkan/vaapi/nvdec × av1_main, av1_high, av1_grain, av1_seg; professional is
-  hw-unsupported on this GPU). Samples: aomenc main/high/grain + rav1e `av1_seg.ivf`
-  (multi-OBU packets, GM, segmentation).
-- Workspace-wide test suite: 358 passed, 0 failed.
+  hw-unsupported on this GPU). Re-run after each of the three 2026-09-09 test commits.
+  Samples: aomenc main/high/grain + rav1e `av1_seg.ivf` (multi-OBU packets, GM, segmentation).
+- Workspace-wide test suite: 361 passed, 0 failed (2026-09-09).
