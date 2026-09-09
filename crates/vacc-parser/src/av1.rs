@@ -1500,15 +1500,19 @@ impl Av1Parser {
         // 20. delta_q_params + 21. delta_lf_params
         self.parse_delta_q_lf(&mut r, &mut fh)?;
 
-        // 22. coded_lossless
+        // 22. coded_lossless. Per spec, qindex = get_qindex(1, seg) uses
+        // SEG_LVL_ALT_Q (feature index 0): base_q_idx + FeatureData[seg][0]
+        // when the feature is enabled, no clamping (libaom/cros-codecs match).
+        // The old code tested feature 2 (a loop-filter feature), so any frame
+        // whose ALT_Q state diverged from its ALT_LF_U state desynced the
+        // header (loop_filter/cdef/lr/tx_mode all branch on this flag).
         let mut coded_lossless = true;
         for i in 0..8 {
-            let qindex =
-                if fh.segmentation_enabled && (fh.segment_feature_enabled[i] & (1 << 2)) != 0 {
-                    (fh.base_q_index as i16 + fh.segment_feature_data[i][2]).clamp(0, 255)
-                } else {
-                    fh.base_q_index as i16
-                };
+            let qindex = if fh.segmentation_enabled && fh.segment_feature_enabled[i] & 1 != 0 {
+                fh.base_q_index as i16 + fh.segment_feature_data[i][0]
+            } else {
+                fh.base_q_index as i16
+            };
             if qindex != 0
                 || fh.delta_q_y_dc != 0
                 || fh.delta_q_u_dc != 0

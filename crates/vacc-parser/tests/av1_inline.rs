@@ -603,3 +603,217 @@ fn test_film_grain_params_reads() {
     assert!(g.overlap_flag);
     assert!(!g.clip_to_restricted_range);
 }
+
+
+// =====================================================================
+// Issue 5: CodedLossless must use SEG_LVL_ALT_Q (feature 0), not feature 2.
+// Synthetic stream: Main-profile SPS (CDEF + restoration enabled) + key
+// frame + inter frame with segmentation on, base_q=0, no delta Q, and
+// segment 0 carrying ALT_Q=+5 (qindex = 5 -> non-lossless per spec). The
+// old code tested feature 2 (disabled everywhere) and concluded lossless,
+// skipping the loop_filter/cdef/lr/tx_mode blocks that a conforming
+// encoder emits for a non-lossless frame -> header desync. No real sample
+// exercises this divergence (none has lossless segments), hence synthetic.
+// =====================================================================
+
+fn synthetic_altq_sps() -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write(0, 3); // seq_profile Main
+    w.write(0, 1); // still_picture
+    w.write(0, 1); // reduced_still_picture_header
+    w.write(0, 1); // timing_info_present_flag = 0
+    w.write(0, 1); // initial_display_delay_present_flag
+    w.write(0, 5); // operating_points_cnt_minus_1 = 0
+    w.write(0, 12); // op0 operating_point_idc
+    w.write(1, 5); // op0 seq_level_idx
+    w.write(5, 4); // frame_width_bits_minus_1 (6-bit widths)
+    w.write(5, 4); // frame_height_bits_minus_1
+    w.write(63, 6); // max_frame_width_minus_1 -> 64
+    w.write(35, 6); // max_frame_height_minus_1 -> 36
+    w.write(0, 1); // frame_id_numbers_present_flag
+    w.write(0, 1); // use_128x128_superblock
+    w.write(0, 1); // enable_filter_intra
+    w.write(0, 1); // enable_intra_edge_filter
+    w.write(0, 1); // enable_interintra_compound
+    w.write(0, 1); // enable_masked_compound
+    w.write(0, 1); // enable_warped_motion
+    w.write(0, 1); // enable_dual_filter
+    w.write(0, 1); // enable_order_hint = 0
+    w.write(0, 1); // seq_choose_screen_content_tools = 0
+    w.write(0, 1); // seq_force_screen_content_tools = 0
+    w.write(0, 1); // enable_superres
+    w.write(1, 1); // enable_cdef
+    w.write(1, 1); // enable_restoration
+    // color_config (profile 0: implicit 4:2:0)
+    w.write(0, 1); // high_bitdepth
+    w.write(0, 1); // mono_chrome
+    w.write(0, 1); // color_description_present
+    w.write(0, 1); // color_range
+    w.write(0, 2); // chroma_sample_position
+    w.write(0, 1); // separate_uv_delta_q
+    w.write(0, 1); // film_grain_params_present = 0
+    // trailing bits: pad to byte boundary
+    w.write(1, 1);
+    if w.bitpos % 8 != 0 {
+        w.write(0, 8 - (w.bitpos % 8));
+    }
+    w.into_bytes()
+}
+
+/// Non-lossless KEY frame (base_q=16, no segmentation) at 64x36. 99 bits
+/// -> frame_header_size 13. Single 64x64 superblock, so the uniform tile
+/// spacing read consumes no extra bits.
+fn synthetic_altq_key_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(0, 2); // frame_type KEY
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(63, 6); // frame_width_minus_1 -> 64
+    w.write(35, 6); // frame_height_minus_1 -> 36
+    w.write(0, 1); // render_and_frame_size_different
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(16, 8); // base_q_index = 16
+    w.write(0, 1); // delta_q_present (base_q > 0)
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    w.write(0, 1); // segmentation_enabled
+    // loop_filter_params (non-lossless)
+    w.write(8, 6); // loop_filter_level[0]
+    w.write(8, 6); // loop_filter_level[1]
+    w.write(4, 6); // loop_filter_level_uv[0]
+    w.write(4, 6); // loop_filter_level_uv[1]
+    w.write(1, 3); // loop_filter_sharpness
+    w.write(0, 1); // loop_filter_delta_enabled
+    // cdef_params (cdef_bits=1 -> 2 levels)
+    w.write(1, 2); // cdef_damping
+    w.write(1, 2); // cdef_bits
+    for _ in 0..2 {
+        w.write(4, 4); // y_pri
+        w.write(1, 2); // y_sec
+        w.write(2, 4); // uv_pri
+        w.write(1, 2); // uv_sec
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reduced_tx_set
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+/// INTER frame at 64x36: base_q=0, no delta Q, segmentation enabled with
+/// segment 0 ALT_Q=+5 (su(9)); every other feature disabled. A conforming
+/// encoder computes CodedLossless=0 here (qindex = 0+5 != 0) and emits the
+/// full loop_filter/cdef/lr/tx_mode blocks, which the parser must consume.
+/// 206 bits -> frame_header_size 26.
+fn synthetic_altq_inter_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(1, 2); // frame_type INTER
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // error_resilient_mode
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(7, 3); // primary_ref_frame NONE
+    w.write(0b01111111, 8); // refresh_frame_flags
+    for _ in 0..7 {
+        w.write(0, 3); // ref_frame_idx all 0
+    }
+    w.write(1, 1); // frame_size_with_refs: found_ref[0] (inherit 64x36)
+    w.write(0, 1); // allow_high_precision_mv
+    w.write(0, 1); // is_filter_switchable
+    w.write(0, 2); // interpolation_filter SPEED
+    w.write(0, 1); // is_motion_mode_switchable
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(0, 8); // base_q_index = 0
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    // segmentation: update_map/update_data inferred (primary_ref NONE)
+    w.write(1, 1); // segmentation_enabled
+    // segment 0: feature 0 (ALT_Q) enabled with value +5; rest disabled
+    w.write(1, 1);
+    w.write(5, 9); // su(9) = +5
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    // segments 1-7: all features disabled
+    for _ in 0..56 {
+        w.write(0, 1);
+    }
+    // loop_filter_params (emitted because CodedLossless=0)
+    w.write(8, 6);
+    w.write(8, 6);
+    w.write(4, 6);
+    w.write(4, 6);
+    w.write(1, 3);
+    w.write(0, 1);
+    // cdef_params
+    w.write(1, 2);
+    w.write(1, 2);
+    for _ in 0..2 {
+        w.write(4, 4);
+        w.write(1, 2);
+        w.write(2, 4);
+        w.write(1, 2);
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reference_select
+    w.write(0, 1); // skip_mode
+    w.write(0, 1); // reduced_tx_set
+    // global_motion: primary NONE -> all 7 refs read, all IDENTITY
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_coded_lossless_uses_alt_q_feature() {
+    let sps_bytes = synthetic_altq_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser.parse_sequence_header_obu(&sps_bytes).expect("SPS parse");
+    assert!(sps.enable_cdef);
+    assert!(sps.enable_restoration);
+
+    // Key frame pins the SPS + intra layout (99 bits -> 13 header bytes).
+    let (kf, kf_bits) = synthetic_altq_key_frame();
+    assert_eq!(kf_bits, 99, "key frame bit count");
+    let fh0 = parser.parse_frame_header(&kf, &sps, 0, 0).expect("key parse");
+    assert!(!fh0.coded_lossless);
+    assert_eq!(fh0.frame_header_size, 13, "98 bits -> 13 header bytes");
+
+    // Inter frame: base_q=0, no delta Q, seg0 ALT_Q=+5. Spec get_qindex(1, 0)
+    // = 0 + 5 = 5 != 0 -> CodedLossless = 0, so the loop_filter/cdef/lr/tx_mode
+    // blocks present in the stream must be consumed. The old feature-2 check
+    // concluded lossless and skipped them, desyncing the header size.
+    let (ifm, if_bits) = synthetic_altq_inter_frame();
+    assert_eq!(if_bits, 206, "inter frame bit count");
+    let fh1 = parser.parse_frame_header(&ifm, &sps, 0, 0).expect("inter parse");
+    assert!(fh1.segmentation_enabled);
+    assert_eq!(fh1.segment_feature_data[0][0], 5, "ALT_Q value round-trip");
+    assert!(!fh1.coded_lossless, "ALT_Q=+5 with base_q=0 must be non-lossless");
+    // Consumed blocks pin the sync: values must round-trip through the
+    // non-lossless branches.
+    assert_eq!(fh1.frame_header_size, 26, "206 bits -> 26 header bytes");
+    assert_eq!(fh1.loop_filter_level[0], 8);
+    assert_eq!(fh1.cdef_bits, 1);
+    assert_eq!(fh1.tx_mode, 1, "LARGEST");
+}
