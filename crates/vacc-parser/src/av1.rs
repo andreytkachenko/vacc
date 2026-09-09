@@ -1098,6 +1098,18 @@ impl Av1Parser {
         fh.show_existing_frame = r.read_bit()?;
         if fh.show_existing_frame {
             fh.frame_to_show_map_idx = r.read_bits(3)? as u8;
+            // Spec: temporal_point_info() after frame_to_show_map_idx when
+            // the decoder model is present and pictures are not equally spaced.
+            if sps.decoder_model_info_present_flag && !sps.equal_picture_interval {
+                let _frame_presentation_time =
+                    r.read_bits((sps.frame_presentation_time_length_minus_1 + 1) as u8)?;
+            }
+            // Spec: display_frame_id f(idLen) when frame ID numbers are used.
+            if sps.frame_id_numbers_present_flag {
+                let id_len =
+                    sps.additional_frame_id_length_minus1 + sps.delta_frame_id_length_minus2 + 3;
+                let _display_frame_id = r.read_bits(id_len)?;
+            }
             fh.frame_header_size = 0; // not decoded
             return Ok(fh);
         }
