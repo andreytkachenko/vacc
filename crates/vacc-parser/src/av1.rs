@@ -1401,6 +1401,18 @@ impl Av1Parser {
                 }
             }
 
+            // Spec: each of the 7 refs carries delta_frame_id_minus_1 =
+            // f(delta_frame_id_length_minus_2 + 2) when frame ID numbers are
+            // present — in BOTH short and full signaling modes (the read sits
+            // outside the ref_frame_idx conditional in the spec's ref loop).
+            // Parse-only: HW decoders track frame IDs from the bitstream.
+            if sps.frame_id_numbers_present_flag {
+                let n = sps.delta_frame_id_length_minus2 + 2;
+                for _ in 0..7 {
+                    r.read_bits(n)?;
+                }
+            }
+
             // frame_size (with refs if fso && !error_resilient)
             if fso && !error_resilient {
                 // frame_size_with_refs()
