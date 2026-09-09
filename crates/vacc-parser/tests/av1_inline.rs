@@ -819,7 +819,8 @@ fn synthetic_segclip_inter_frame() -> (Vec<u8>, u32) {
     w.write(0, 1); // using_qmatrix
     // segmentation: update_map/update_data inferred (primary_ref NONE)
     w.write(1, 1); // segmentation_enabled
-    // segment 0: ALT_Q = -256 (clips to -255), REF_FRAME = -64 (clips to -63)
+    // segment 0: feature 0 (ALT_Q, su(9)) = -256 (clips to -255),
+    // feature 1 (su(7)) = -64 (clips to -63)
     w.write(1, 1);
     w.write(0b100000000, 9); // su(9) = -256
     w.write(1, 1);
@@ -888,10 +889,136 @@ fn test_segmentation_feature_clipping() {
     );
     assert_eq!(
         fh.segment_feature_data[0][1], -63,
-        "REF_FRAME -64 must clip to -63"
+        "feature 1 su(7) = -64 must clip to -63"
     );
     // Clipped ALT_Q keeps the frame non-lossless (qindex = 0 + -255 != 0).
     assert!(!fh.coded_lossless);
+}
+
+/// INTER frame with two signed segmentation features enabled on segment 0:
+/// feature 0 (ALT_Q, su(1+8)) = -5 and feature 1 (su(1+6)) = -3. The pre-fix
+/// parser read only `bits` (not `1 + bits`) two's-complement bits per signed
+/// feature, corrupting both values and desyncing the rest of the header.
+/// qindex = 0 + (-5) != 0 keeps the frame non-lossless, so the full
+/// loop_filter/cdef/lr/tx_mode blocks follow. 213 bits -> frame_header_size 27.
+fn synthetic_signedseg_inter_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(1, 2); // frame_type INTER
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // error_resilient_mode
+    w.write(0, 1); // disable_cdf_update
+    w.write(1, 1); // frame_size_override_flag
+    w.write(7, 3); // primary_ref_frame NONE
+    w.write(0b01111111, 8); // refresh_frame_flags
+    for _ in 0..7 {
+        w.write(0, 3); // ref_frame_idx all 0
+    }
+    w.write(1, 1); // frame_size_with_refs: found_ref[0] (inherit 64x36)
+    w.write(0, 1); // allow_high_precision_mv
+    w.write(0, 1); // is_filter_switchable
+    w.write(0, 2); // interpolation_filter SPEED
+    w.write(0, 1); // is_motion_mode_switchable
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(0, 8); // base_q_index = 0
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    // segmentation: update_map/update_data inferred (primary_ref NONE)
+    w.write(1, 1); // segmentation_enabled
+    // segment 0: feature 0 su(9) = -5, feature 1 su(7) = -3; rest disabled
+    w.write(1, 1);
+    w.write(0b111111011, 9); // su(9) = -5 (two's complement)
+    w.write(1, 1);
+    w.write(0b1111101, 7); // su(7) = -3 (two's complement)
+    for _ in 0..6 {
+        w.write(0, 1);
+    }
+    // segments 1-7: all features disabled
+    for _ in 0..56 {
+        w.write(0, 1);
+    }
+    // loop_filter_params (emitted because CodedLossless=0: qindex = 0 + -5)
+    w.write(8, 6);
+    w.write(8, 6);
+    w.write(4, 6);
+    w.write(4, 6);
+    w.write(1, 3);
+    w.write(0, 1);
+    // cdef_params
+    w.write(1, 2);
+    w.write(1, 2);
+    for _ in 0..2 {
+        w.write(4, 4);
+        w.write(1, 2);
+        w.write(2, 4);
+        w.write(1, 2);
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reference_select
+    w.write(0, 1); // skip_mode
+    w.write(0, 1); // reduced_tx_set
+    // global_motion: primary NONE -> all 7 refs read, all IDENTITY
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_segmentation_signed_feature_width() {
+    let sps_bytes = synthetic_altq_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
+
+    // Key frame pins the DPB so the inter frame inherits 64x36.
+    let (kf, kf_bits) = synthetic_altq_key_frame();
+    assert_eq!(kf_bits, 99, "key frame bit count");
+    let fh0 = parser
+        .parse_frame_header(&kf, &sps, 0, 0)
+        .expect("key parse");
+    assert_eq!((fh0.frame_width, fh0.frame_height), (64, 36));
+
+    // Spec: signed segmentation features are su(1 + bitsToRead) — feature 0
+    // (8 bits) is read as 9 bits, feature 1 (6 bits) as 7 bits. The pre-fix
+    // parser read one bit short per enabled signed feature, corrupting the
+    // values and desyncing the rest of the header.
+    let (ifm, if_bits) = synthetic_signedseg_inter_frame();
+    assert_eq!(if_bits, 213, "signed-seg inter frame bit count");
+    let fh1 = parser
+        .parse_frame_header(&ifm, &sps, 0, 0)
+        .expect("inter parse");
+    assert!(fh1.segmentation_enabled);
+    assert_eq!(fh1.segment_feature_enabled[0], 0b11, "features 0+1 enabled");
+    assert_eq!(
+        fh1.segment_feature_data[0][0],
+        -5,
+        "ALT_Q su(9) = -5 round-trip"
+    );
+    assert_eq!(fh1.segment_feature_data[0][1], -3, "feature 1 su(7) = -3");
+    for seg in 1..8 {
+        assert_eq!(fh1.segment_feature_enabled[seg], 0);
+    }
+    // qindex = 0 + (-5) != 0 -> non-lossless: the LF/cdef/tx_mode blocks must
+    // be consumed and round-trip.
+    assert!(!fh1.coded_lossless);
+    assert_eq!(fh1.frame_header_size, 27, "213 bits -> 27 header bytes");
+    assert_eq!((fh1.frame_width, fh1.frame_height), (64, 36));
+    assert_eq!(fh1.loop_filter_level[0], 8);
+    assert_eq!(fh1.cdef_bits, 1);
+    assert_eq!(fh1.tx_mode, 1, "LARGEST");
 }
 
 #[test]
