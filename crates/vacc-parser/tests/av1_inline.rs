@@ -1066,6 +1066,228 @@ fn test_coded_lossless_uses_alt_q_feature() {
     assert_eq!(fh1.tx_mode, 1, "LARGEST");
 }
 
+/// SPS like synthetic_altq_sps but with frame ID numbers enabled:
+/// delta_frame_id_length_minus_2 = 0 (per-ref f(2)),
+/// additional_frame_id_length_minus_1 = 0 (idLen = 3).
+fn synthetic_frameid_sps() -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write(0, 3); // seq_profile Main
+    w.write(0, 1); // still_picture
+    w.write(0, 1); // reduced_still_picture_header
+    w.write(0, 1); // timing_info_present_flag = 0
+    w.write(0, 1); // initial_display_delay_present_flag
+    w.write(0, 5); // operating_points_cnt_minus_1 = 0
+    w.write(0, 12); // op0 operating_point_idc
+    w.write(1, 5); // op0 seq_level_idx
+    w.write(5, 4); // frame_width_bits_minus_1 (6-bit widths)
+    w.write(5, 4); // frame_height_bits_minus_1
+    w.write(63, 6); // max_frame_width_minus_1 -> 64
+    w.write(35, 6); // max_frame_height_minus_1 -> 36
+    w.write(1, 1); // frame_id_numbers_present_flag
+    w.write(0, 4); // delta_frame_id_length_minus_2 = 0 -> per-ref f(2)
+    w.write(0, 3); // additional_frame_id_length_minus_1 = 0 -> idLen = 3
+    w.write(0, 1); // use_128x128_superblock
+    w.write(0, 1); // enable_filter_intra
+    w.write(0, 1); // enable_intra_edge_filter
+    w.write(0, 1); // enable_interintra_compound
+    w.write(0, 1); // enable_masked_compound
+    w.write(0, 1); // enable_warped_motion
+    w.write(0, 1); // enable_dual_filter
+    w.write(0, 1); // enable_order_hint = 0
+    w.write(0, 1); // seq_choose_screen_content_tools = 0
+    w.write(0, 1); // seq_force_screen_content_tools = 0
+    w.write(0, 1); // enable_superres
+    w.write(1, 1); // enable_cdef
+    w.write(1, 1); // enable_restoration
+    // color_config (profile 0: implicit 4:2:0)
+    w.write(0, 1); // high_bitdepth
+    w.write(0, 1); // mono_chrome
+    w.write(0, 1); // color_description_present
+    w.write(0, 1); // color_range
+    w.write(0, 2); // chroma_sample_position
+    w.write(0, 1); // separate_uv_delta_q
+    w.write(0, 1); // film_grain_params_present = 0
+    // trailing bits: pad to byte boundary
+    w.write(1, 1);
+    if !w.bitpos.is_multiple_of(8) {
+        w.write(0, 8 - (w.bitpos % 8));
+    }
+    w.into_bytes()
+}
+
+/// synthetic_altq_key_frame plus current_frame_id f(3) (frame ID numbers
+/// present). 102 bits -> frame_header_size 13.
+fn synthetic_frameid_key_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(0, 2); // frame_type KEY
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // disable_cdf_update
+    w.write(2, 3); // current_frame_id (idLen = 3)
+    w.write(1, 1); // frame_size_override_flag
+    w.write(63, 6); // frame_width_minus_1 -> 64
+    w.write(35, 6); // frame_height_minus_1 -> 36
+    w.write(0, 1); // render_and_frame_size_different
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(16, 8); // base_q_index = 16
+    w.write(0, 1); // delta_q_present (base_q > 0)
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    w.write(0, 1); // segmentation_enabled
+    // loop_filter_params (non-lossless)
+    w.write(8, 6); // loop_filter_level[0]
+    w.write(8, 6); // loop_filter_level[1]
+    w.write(4, 6); // loop_filter_level_uv[0]
+    w.write(4, 6); // loop_filter_level_uv[1]
+    w.write(1, 3); // loop_filter_sharpness
+    w.write(0, 1); // loop_filter_delta_enabled
+    // cdef_params (cdef_bits=1 -> 2 levels)
+    w.write(1, 2); // cdef_damping
+    w.write(1, 2); // cdef_bits
+    for _ in 0..2 {
+        w.write(4, 4); // y_pri
+        w.write(1, 2); // y_sec
+        w.write(2, 4); // uv_pri
+        w.write(1, 2); // uv_sec
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reduced_tx_set
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+/// synthetic_altq_inter_frame plus current_frame_id f(3) and the per-ref
+/// delta_frame_id_minus_1 f(2) x7 block after the ref indices. 223 bits ->
+/// frame_header_size 28 (the pre-fix parser skipped the 14 per-ref bits and
+/// stopped at 209 bits -> 27 bytes).
+fn synthetic_frameid_inter_frame() -> (Vec<u8>, u32) {
+    let mut w = BitWriter::new();
+    w.write(0, 1); // show_existing_frame
+    w.write(1, 2); // frame_type INTER
+    w.write(1, 1); // show_frame
+    w.write(0, 1); // error_resilient_mode
+    w.write(0, 1); // disable_cdf_update
+    w.write(3, 3); // current_frame_id (idLen = 3)
+    w.write(1, 1); // frame_size_override_flag
+    w.write(7, 3); // primary_ref_frame NONE
+    w.write(0b01111111, 8); // refresh_frame_flags
+    for _ in 0..7 {
+        w.write(0, 3); // ref_frame_idx all 0
+    }
+    // per-ref delta_frame_id_minus_1 f(delta + 2) x7 (issue 7)
+    for v in [1u64, 2, 3, 0, 1, 2, 3] {
+        w.write(v, 2);
+    }
+    w.write(1, 1); // frame_size_with_refs: found_ref[0] (inherit 64x36)
+    w.write(0, 1); // allow_high_precision_mv
+    w.write(0, 1); // is_filter_switchable
+    w.write(0, 2); // interpolation_filter SPEED
+    w.write(0, 1); // is_motion_mode_switchable
+    w.write(0, 1); // disable_frame_end_update_cdf
+    w.write(1, 1); // uniform_tile_spacing_flag (single tile)
+    w.write(0, 8); // base_q_index = 0
+    w.write(0, 1); // delta_q_y_dc present
+    w.write(0, 1); // delta_q_u_dc present
+    w.write(0, 1); // delta_q_u_ac present
+    w.write(0, 1); // using_qmatrix
+    // segmentation: update_map/update_data inferred (primary_ref NONE)
+    w.write(1, 1); // segmentation_enabled
+    // segment 0: feature 0 (ALT_Q) enabled with value +5; rest disabled
+    w.write(1, 1);
+    w.write(5, 9); // su(9) = +5
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    // segments 1-7: all features disabled
+    for _ in 0..56 {
+        w.write(0, 1);
+    }
+    // loop_filter_params (emitted because CodedLossless=0)
+    w.write(8, 6);
+    w.write(8, 6);
+    w.write(4, 6);
+    w.write(4, 6);
+    w.write(1, 3);
+    w.write(0, 1);
+    // cdef_params
+    w.write(1, 2);
+    w.write(1, 2);
+    for _ in 0..2 {
+        w.write(4, 4);
+        w.write(1, 2);
+        w.write(2, 4);
+        w.write(1, 2);
+    }
+    // lr_params: all NONE
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 2);
+    w.write(0, 1); // tx_mode LARGEST
+    w.write(0, 1); // reference_select
+    w.write(0, 1); // skip_mode
+    w.write(0, 1); // reduced_tx_set
+    // global_motion: primary NONE -> all 7 refs read, all IDENTITY
+    for _ in 0..7 {
+        w.write(0, 1);
+    }
+    let nbits = w.bitpos;
+    (w.into_bytes(), nbits)
+}
+
+#[test]
+fn test_per_ref_delta_frame_id() {
+    let sps_bytes = synthetic_frameid_sps();
+    let mut parser = Av1Parser::new();
+    parser
+        .init(&DetectedVideoFormat::new(VideoCodec::DecodeAv1))
+        .expect("init");
+    let sps = parser
+        .parse_sequence_header_obu(&sps_bytes)
+        .expect("SPS parse");
+    assert!(sps.frame_id_numbers_present_flag);
+
+    // KEY frame: current_frame_id f(3) is consumed (102 bits -> 13 bytes).
+    let (kf, kf_bits) = synthetic_frameid_key_frame();
+    assert_eq!(kf_bits, 102, "frame-ID key frame bit count");
+    let fh0 = parser
+        .parse_frame_header(&kf, &sps, 0, 0)
+        .expect("key parse");
+    assert_eq!(fh0.frame_header_size, 13, "102 bits -> 13 header bytes");
+    assert_eq!((fh0.frame_width, fh0.frame_height), (64, 36));
+
+    // INTER frame: each of the 7 refs carries delta_frame_id_minus_1 f(2)
+    // when frame ID numbers are present. The pre-fix parser skipped those 14
+    // bits, so the header size lands 1 byte short and every later field is
+    // misaligned.
+    let (ifm, if_bits) = synthetic_frameid_inter_frame();
+    assert_eq!(if_bits, 223, "frame-ID inter frame bit count");
+    let fh1 = parser
+        .parse_frame_header(&ifm, &sps, 0, 0)
+        .expect("inter parse");
+    assert_eq!(
+        fh1.frame_header_size,
+        28,
+        "223 bits -> 28 header bytes (incl. 7 x f(2) per-ref deltas)"
+    );
+    assert_eq!((fh1.frame_width, fh1.frame_height), (64, 36), "inherited size");
+    assert_eq!(fh1.primary_ref_frame, 7, "NONE");
+    assert_eq!(fh1.refresh_frame_flags, 0b01111111);
+    assert_eq!(&fh1.ref_frame_idx[..], &[0; 7]);
+    // Fields after the per-ref deltas must round-trip: the parser stayed in
+    // sync through the whole header.
+    assert!(fh1.segmentation_enabled);
+    assert_eq!(fh1.segment_feature_data[0][0], 5, "ALT_Q value round-trip");
+    assert_eq!(fh1.loop_filter_level[0], 8);
+    assert_eq!(fh1.tx_mode, 1, "LARGEST");
+}
+
 /// KEY frame like synthetic_altq_key_frame but with loop restoration on all
 /// three planes: lr_unit_shift = 2 (luma 256px) and lr_uv_shift = 1 (chroma
 /// halved to 128px per spec 5.9.20). 102 bits.
