@@ -1577,7 +1577,18 @@ impl Av1Parser {
         // 30. reduced_tx_set
         fh.reduced_tx_set = r.read_bit()?;
 
-        // 31. global_motion (inter only)
+        // 31. global_motion (inter only). Per spec 7.31 GmType/gm_params start
+        // as IDENTITY for every reference; intra frames return without reading
+        // bits but still carry the identity models, which refresh_frame_flags
+        // commits to the DPB for later frames to inherit (C++
+        // VulkanAV1Decoder.cpp:2229-2235 resets to default_warp_params before
+        // the intra check). Leaving them at the struct default (zeros) made
+        // post-keyframe frames read GM params against zero prev models,
+        // wrapping the refsubexpfin recentering reference values.
+        for i in 0..7 {
+            fh.global_motion_type[i] = 0;
+            fh.global_motion_params[i] = [0, 0, 65536, 0, 0, 65536];
+        }
         if !frame_is_intra {
             self.parse_global_motion(&mut r, &mut fh, sps, primary_ref)?;
         }
