@@ -41,7 +41,7 @@ static const int invAngle[35] = {
 // refLeft[1..nTbS] = p[-1][0] .. p[-1][nTbS-1] (left column)
 // refLeft[nTbS+1..2*nTbS] = p[-1][nTbS] .. p[-1][2*nTbS-1] (bottom-left extension)
 
-static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
+void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
                                      int nTbS, int cIdx,
                                      int16_t* refTop, int16_t* refLeft) {
     auto& pic = *ctx.pic;
@@ -214,7 +214,7 @@ static void build_reference_samples(const DecodingContext& ctx, int x0, int y0,
 // Reference sample filtering (§8.4.4.2.3)
 // ============================================================
 
-static bool needs_filtering(int intra_mode, int log2BlkSize) {
+bool needs_filtering(int intra_mode, int log2BlkSize) {
     // §8.4.4.2.3: filterFlag = 0 when DC mode or nTbS == 4
     if (intra_mode == 1) return false; // INTRA_DC
     if (log2BlkSize == 2) return false; // nTbS == 4
@@ -229,7 +229,7 @@ static bool needs_filtering(int intra_mode, int log2BlkSize) {
     return false;
 }
 
-static void filter_reference_samples(int16_t* ref, int nTbS, bool biIntFlag,
+void filter_reference_samples(int16_t* ref, int nTbS, bool biIntFlag,
                                       int /*bitDepth*/) {
     if (biIntFlag) {
         // §8.4.4.2.3: bilinear interpolation between endpoints
@@ -260,7 +260,7 @@ static void filter_reference_samples(int16_t* ref, int nTbS, bool biIntFlag,
 // Planar prediction (mode 0) — §8.4.4.2.4
 // ============================================================
 
-static void predict_planar(const int16_t* refTop, const int16_t* refLeft,
+void predict_planar(const int16_t* refTop, const int16_t* refLeft,
                             int nTbS, int16_t* pred) {
     int log2N = 0;
     while ((1 << log2N) < nTbS) log2N++;
@@ -292,7 +292,7 @@ static void predict_planar(const int16_t* refTop, const int16_t* refLeft,
 // DC prediction (mode 1) — §8.4.4.2.5
 // ============================================================
 
-static void predict_dc(const int16_t* refTop, const int16_t* refLeft,
+void predict_dc(const int16_t* refTop, const int16_t* refLeft,
                         int nTbS, int log2BlkSize, int cIdx, int16_t* pred) {
     int sum = 0;
     for (int i = 1; i <= nTbS; i++) {
@@ -320,7 +320,7 @@ static void predict_dc(const int16_t* refTop, const int16_t* refLeft,
 // Angular prediction (modes 2-34) — §8.4.4.2.6
 // ============================================================
 
-static void predict_angular(const int16_t* refTop, const int16_t* refLeft,
+void predict_angular(const int16_t* refTop, const int16_t* refLeft,
                              int nTbS, int intra_mode, int cIdx, int bitDepth,
                              int16_t* pred) {
     int angle = intraPredAngle[intra_mode];

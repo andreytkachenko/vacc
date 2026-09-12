@@ -43,6 +43,8 @@ fn main() {
         "syntax/vps.cpp",
         // vacc driver (C API over the hevc.js core)
         "hevc_driver.cpp",
+        // Test-only oracles for differential Rust-vs-C++ kernel tests
+        "hevc_test_api.cpp",
     ] {
         cxx.file(src.join(file));
     }

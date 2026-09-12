@@ -42,7 +42,7 @@ static const int16_t chroma_filter[8][4] = {
 // Output in extended precision (not clipped to [0, 2^BitDepth-1])
 // ============================================================
 
-static void interpolate_luma(const Picture& refPic,
+void interpolate_luma(const Picture& refPic,
                               int xInt, int yInt, int xFrac, int yFrac,
                               int nPbW, int nPbH, int bitDepth,
                               int16_t* pred) {
@@ -130,7 +130,7 @@ static void interpolate_luma(const Picture& refPic,
 // Chroma interpolation — §8.5.3.3.3 (chroma part)
 // ============================================================
 
-static void interpolate_chroma(const Picture& refPic, int cIdx,
+void interpolate_chroma(const Picture& refPic, int cIdx,
                                 int xInt, int yInt, int xFrac, int yFrac,
                                 int nPbWC, int nPbHC, int bitDepth,
                                 int16_t* pred) {
@@ -212,7 +212,7 @@ static void interpolate_chroma(const Picture& refPic, int cIdx,
 // §8.5.3.3.4.2 — Default weighted sample prediction
 // ============================================================
 
-static void weighted_pred_default(int16_t* predL0, int16_t* predL1,
+void weighted_pred_default(const int16_t* predL0, const int16_t* predL1,
                                    bool flagL0, bool flagL1,
                                    int nSamples, int bitDepth,
                                    int16_t* output) {
@@ -243,7 +243,7 @@ static void weighted_pred_default(int16_t* predL0, int16_t* predL1,
 // §8.5.3.3.4.3 — Explicit weighted sample prediction
 // ============================================================
 
-static void weighted_pred_explicit(int16_t* predL0, int16_t* predL1,
+void weighted_pred_explicit(const int16_t* predL0, const int16_t* predL1,
                                     bool flagL0, bool flagL1,
                                     int refIdxL0, int refIdxL1,
                                     int cIdx, int nSamples, int bitDepth,

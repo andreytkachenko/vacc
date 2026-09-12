@@ -28,4 +28,27 @@ void perform_inter_prediction(DecodingContext& ctx,
                                bool predFlagL0, bool predFlagL1,
                                int16_t* pred_samples);
 
+// ============================================================
+// Kernels exposed for differential testing (hevc_test_api.h)
+// ============================================================
+
+struct PredWeightTable;
+
+// Luma 8-tap interpolation (§8.5.3.3.3). Output in extended precision.
+void interpolate_luma(const Picture& refPic, int xInt, int yInt, int xFrac, int yFrac,
+                      int nPbW, int nPbH, int bitDepth, int16_t* pred);
+
+// Chroma 4-tap interpolation (§8.5.3.3.3). Output in extended precision.
+void interpolate_chroma(const Picture& refPic, int cIdx, int xInt, int yInt, int xFrac, int yFrac,
+                        int nPbWC, int nPbHC, int bitDepth, int16_t* pred);
+
+// Default weighted sample prediction (§8.5.3.3.4.2).
+void weighted_pred_default(const int16_t* predL0, const int16_t* predL1, bool flagL0,
+                           bool flagL1, int nSamples, int bitDepth, int16_t* output);
+
+// Explicit weighted sample prediction (§8.5.3.3.4.3).
+void weighted_pred_explicit(const int16_t* predL0, const int16_t* predL1, bool flagL0,
+                            bool flagL1, int refIdxL0, int refIdxL1, int cIdx, int nSamples,
+                            int bitDepth, const PredWeightTable& pwt, int16_t* output);
+
 } // namespace hevc

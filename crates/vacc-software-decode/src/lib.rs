@@ -6,7 +6,10 @@
 
 mod error;
 mod ffi;
+#[cfg(test)]
+mod ffi_test;
 pub mod h265;
+pub mod hevc;
 
 pub use error::{Error, Result};
 pub use h265::SoftwareH265Decoder;
