@@ -1,7 +1,8 @@
 # vacc
 
-A Rust workspace for hardware-accelerated video decoding with three interchangeable backends:
-**Vulkan Video**, **NVIDIA NVDEC** (cuvid), and **VAAPI**. Based on the
+A Rust workspace for video decoding with five interchangeable backends:
+**Vulkan Video**, **NVIDIA NVDEC** (cuvid), **VAAPI**, and CPU software decoders
+(**edge264** for H.264, **hevc.js** for H.265). Based on the
 [Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
 
 Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see the
@@ -23,7 +24,8 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 │     vacc-vulkan    Vulkan Video (ash)                        │
 │     vacc-nvdec-decode  NVIDIA NVDEC via libnvcuvid (cuvid)        │
 │     vacc-vaapi-decode  VAAPI stateless decode                     │
-│     libva              Rust bindings for libva                   │
+│     vacc-sw-decode     CPU H.264 (vendored edge264 C core)        │
+│     vacc-software-decode CPU H.265 (hevc.js C++ core)              │
 │                                                                  │
 │   vacc-examples: decode  unified CLI: -b <backend> -i <file>     │
 └──────────────────────────────────────────────────────────────────┘
@@ -262,7 +264,8 @@ stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
 
 ```bash
 # Decode with a chosen backend; prints pts/size/pixel-hash per frame
-./target/release/examples/decode -b <vulkan|nvdec|vaapi> -i <file> [-n frames] [-o outdir]
+./target/release/examples/decode -b <vulkan|nvdec|vaapi|sw> -i <file> [-n frames] [-o outdir]
+# sw = CPU: H.264 via edge264, H.265 via hevc.js (codec auto-detected)
 ```
 
 ## Vulkan Extensions Required
@@ -287,11 +290,21 @@ stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
 cargo build --release --examples   # NOTE: --examples is required; plain builds don't rebuild it
 
 # Run the unified decode example (pts, size, pixel hash per frame)
-./target/release/examples/decode -b <vaapi|vulkan|nvdec> -i <file.ivf|h264|h265> [-n frames] [-o outdir]
+./target/release/examples/decode -b <vaapi|vulkan|nvdec|sw> -i <file.ivf|h264|h265> [-n frames] [-o outdir]
 ```
 
 Backend requirements: Vulkan Video device (VAAPI also works on the same stack), NVIDIA driver with
-`libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively.
+`libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively. `sw` needs nothing but a
+C/C++ toolchain — both cores are vendored and statically compiled.
+
+Each backend of the `decode` example is a cargo feature (all on by default), so a build can be
+trimmed to the backends you need:
+
+```bash
+cargo build --release -p vacc-examples --example decode --no-default-features --features "hevcjs vaapi"
+```
+
+Features: `edge264` (CPU H.264), `hevcjs` (CPU H.265), `nvdec`, `vaapi`, `vulkan`.
 
 ## Reference
 

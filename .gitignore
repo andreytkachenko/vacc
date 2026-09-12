@@ -5,3 +5,6 @@
 *.bin
 *.vp9
 .DS_Store
+
+# upstream reference checkouts (nested git repos); vendored copies live in crates/*
+third_party/

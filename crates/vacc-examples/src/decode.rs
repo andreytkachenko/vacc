@@ -14,15 +14,23 @@
 //!   presentation-order frame index on an assumed 1/30 s timebase.
 //!
 //! Usage:
-//!   cargo run --release -p examples --example decode -- -b <backend> -i <file> [-n max_frames] [-o outdir]
+//!   cargo run --release -p vacc-examples --example decode -- -b <backend> -i <file> [-n max_frames] [-o outdir]
 //!
-//! Backends: vaapi (H.264/H.265/VP9), vulkan (H.264/H.265/VP9/AV1),
-//! nvdec (H.264/H.265/VP9/AV1, requires an NVIDIA GPU).
+//! Backends (each is a cargo feature of this crate, all on by default):
+//!   vaapi    H.264/H.265/VP9 (Intel/AMD iGPU)
+//!   vulkan   H.264/H.265/VP9/AV1
+//!   nvdec    H.264/H.265/VP9/AV1 (NVIDIA GPU + CUDA driver)
+//!   edge264  CPU H.264, selected with -b sw (vendored edge264 C routines)
+//!   hevcjs   CPU H.265, selected with -b sw (hevc.js C++ core)
+//!
+//! Build with a subset of backends:
+//!   cargo run --release -p vacc-examples --example decode --no-default-features \
+//!       --features hevcjs -- -b sw -i file.h265
 //!
 //! Examples:
-//!   cargo run --release -p examples --example decode -- -b vulkan -i assets/samples/vp9_profile0.ivf
-//!   cargo run --release -p examples --example decode -- -b nvdec  -i samples/av1_gop1.ivf -n 30
-//!   cargo run --release -p examples --example decode -- -b vaapi  -i assets/born_trailer.h264
+//!   cargo run --release -p vacc-examples --example decode -- -b vulkan -i assets/samples/vp9_profile0.ivf
+//!   cargo run --release -p vacc-examples --example decode -- -b nvdec  -i samples/av1_gop1.ivf -n 30
+//!   cargo run --release -p vacc-examples --example decode -- -b vaapi  -i assets/born_trailer.h264
 
 use std::time::Instant;
 
@@ -31,20 +39,50 @@ use vacc_core::frame::{DecodedFrame as CoreFrame, PixelData, PixelPlane};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
+    #[cfg(feature = "vaapi")]
     Vaapi,
+    #[cfg(feature = "vulkan")]
     Vulkan,
+    #[cfg(feature = "nvdec")]
     Nvdec,
+    #[cfg(any(feature = "edge264", feature = "hevcjs"))]
+    Sw,
 }
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            #[cfg(feature = "vaapi")]
             Backend::Vaapi => "vaapi",
+            #[cfg(feature = "vulkan")]
             Backend::Vulkan => "vulkan",
+            #[cfg(feature = "nvdec")]
             Backend::Nvdec => "nvdec",
+            #[cfg(any(feature = "edge264", feature = "hevcjs"))]
+            Backend::Sw => "sw",
+            // No backend features enabled: the enum is empty, but `&Backend`
+            // is always considered inhabited.
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
         };
         f.write_str(s)
     }
+}
+
+/// Names of the backends compiled into this build, in `-b` order.
+const ENABLED_BACKENDS: &[&str] = &[
+    #[cfg(feature = "vaapi")]
+    "vaapi",
+    #[cfg(feature = "vulkan")]
+    "vulkan",
+    #[cfg(feature = "nvdec")]
+    "nvdec",
+    #[cfg(any(feature = "edge264", feature = "hevcjs"))]
+    "sw",
+];
+
+fn enabled_backends() -> Vec<&'static str> {
+    ENABLED_BACKENDS.to_vec()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +117,15 @@ struct Args {
 const MAX_FRAMES_DEFAULT: usize = 1_000_000;
 
 fn usage() -> ! {
+    let backends = enabled_backends().join("|");
     eprintln!(
-        "Usage: decode -b <vaapi|vulkan|nvdec> -i <file.ivf|h264|h265|vp9> [-n max_frames]\n\
+        "Usage: decode -b <{backends}> -i <file.ivf|h264|h265|vp9> [-n max_frames]\n\
          \n\
          Decodes the file and prints per display frame: pts (ms), size, and a\n\
          hash of the canonical planar YUV pixels.\n\
          \n\
          Options:\n\
-           -b, --backend <vaapi|vulkan|nvdec>   decode backend (required)\n\
+           -b, --backend <{backends}>   decode backend (required)\n\
            -i, --input <file>                   input file (required; IVF for VP9/AV1,\n\
                                                 raw Annex-B .h264/.h265 or .vp9 also accepted)\n\
            -n, --max-frames <N>                 stop after N display frames (default: all)\n\
@@ -115,13 +154,19 @@ fn parse_args() -> Args {
                     Some(v) => v,
                     None => usage(),
                 };
+                let expected = enabled_backends().join(", ");
                 backend = Some(match value.as_str() {
+                    #[cfg(feature = "vaapi")]
                     "vaapi" => Backend::Vaapi,
+                    #[cfg(feature = "vulkan")]
                     "vulkan" => Backend::Vulkan,
+                    #[cfg(feature = "nvdec")]
                     "nvdec" => Backend::Nvdec,
+                    #[cfg(any(feature = "edge264", feature = "hevcjs"))]
+                    "sw" => Backend::Sw,
                     other => die(&format!(
-                        "unknown backend '{}' (expected vaapi, vulkan or nvdec)",
-                        other
+                        "unknown backend '{}' (expected {})",
+                        other, expected
                     )),
                 });
             }
@@ -395,6 +440,7 @@ fn fmt_ms(v: f64) -> String {
 /// One decoded display frame, regardless of backend.
 enum Frame {
     Core(CoreFrame),
+    #[cfg(feature = "vulkan")]
     Vk(vacc_vulkan::DecodedFrame),
 }
 
@@ -403,6 +449,7 @@ impl Frame {
     fn size(&self) -> (u32, u32) {
         match self {
             Frame::Core(f) => (f.width, f.height),
+            #[cfg(feature = "vulkan")]
             Frame::Vk(f) => (f.display_width, f.display_height),
         }
     }
@@ -412,6 +459,7 @@ impl Frame {
     fn canonical_pixels(&self) -> Option<Vec<u8>> {
         match self {
             Frame::Core(f) => f.pixel_data.as_ref().map(canonical_core),
+            #[cfg(feature = "vulkan")]
             Frame::Vk(f) => Some(canonical_vk(f)),
         }
     }
@@ -454,7 +502,7 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
     // (bytes per sample, top-justified?)
     let (bps, top_justified) = match pd.format.as_str() {
         "P016" | "I420_16BIT" | "GRAY_16BIT" | "YUV444_16BIT" => (2, true),
-        "Y410P16" | "P010LE" | "P012LE" => (2, false),
+        "Y410P16" | "P010LE" | "P012LE" | "I420-10" => (2, false),
         _ => (1, false),
     };
 
@@ -506,6 +554,7 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
 
 /// Copy a cropped region of a Vulkan readback plane (samples per row =
 /// `stride_samples`) into `out`.
+#[cfg(feature = "vulkan")]
 #[allow(clippy::too_many_arguments)] // flat geometry args
 fn crop_plane(
     out: &mut Vec<u8>,
@@ -526,6 +575,7 @@ fn crop_plane(
 /// Chroma subsampling factor along one axis: 1 for full-resolution chroma
 /// (4:4:4/mono), 2 when the chroma plane is half the coded size (odd coded
 /// sizes round up, so compare against `coded - 1`).
+#[cfg(feature = "vulkan")]
 fn chroma_sub(coded: u32, chroma: u32) -> usize {
     if chroma == 0 || chroma >= coded {
         1
@@ -539,6 +589,7 @@ fn chroma_sub(coded: u32, chroma: u32) -> usize {
 /// Normalize a Vulkan `DecodedFrame` to canonical planar Y+U+V bytes,
 /// cropped to the display size. Planes are full coded size with
 /// `sample_size` bytes per sample.
+#[cfg(feature = "vulkan")]
 fn canonical_vk(frame: &vacc_vulkan::DecodedFrame) -> Vec<u8> {
     let bps = frame.pixels.sample_size as usize;
     let disp_w = frame.display_width as usize;
@@ -624,6 +675,7 @@ fn main() {
     if !std::path::Path::new(&args.input).exists() {
         die(&format!("file not found: {}", args.input));
     }
+    #[cfg(feature = "nvdec")]
     if args.backend == Backend::Nvdec && !vacc_nvdec_decode::is_available() {
         die("NVDEC not available on this system (NVIDIA GPU + CUDA driver required)");
     }
@@ -666,6 +718,7 @@ fn main() {
 
     let start = Instant::now();
     let frames: Vec<Frame> = match args.backend {
+        #[cfg(feature = "vulkan")]
         Backend::Vulkan => {
             let mut decoder = vacc_vulkan_decode::VulkanDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vulkan decoder init: {}", e)));
@@ -677,6 +730,7 @@ fn main() {
                 .map(Frame::Vk)
                 .collect()
         }
+        #[cfg(feature = "vaapi")]
         Backend::Vaapi => {
             let mut decoder = vacc_vaapi_decode::VaapiDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vaapi decoder init: {}", e)));
@@ -685,6 +739,7 @@ fn main() {
                 .map(Frame::Core)
                 .collect()
         }
+        #[cfg(feature = "nvdec")]
         Backend::Nvdec => {
             let frames = match codec {
                 Codec::H264 => {
@@ -707,6 +762,28 @@ fn main() {
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
+            };
+            frames.into_iter().map(Frame::Core).collect()
+        }
+        #[cfg(any(feature = "edge264", feature = "hevcjs"))]
+        Backend::Sw => {
+            let frames = match codec {
+                #[cfg(feature = "edge264")]
+                Codec::H264 => {
+                    let mut d = vacc_sw_decode::SwH264Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("sw decoder init: {}", e)));
+                    decode_all_core(&mut d, args.max_frames)
+                }
+                #[cfg(feature = "hevcjs")]
+                Codec::H265 => {
+                    let mut d = vacc_software_decode::SoftwareH265Decoder::new(data)
+                        .unwrap_or_else(|e| die(&format!("sw decoder init: {}", e)));
+                    decode_all_core(&mut d, args.max_frames)
+                }
+                other => die(&format!(
+                    "sw backend does not support {} in this build",
+                    other.name()
+                )),
             };
             frames.into_iter().map(Frame::Core).collect()
         }

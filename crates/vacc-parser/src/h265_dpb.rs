@@ -698,6 +698,25 @@ impl H265Dpb {
         self.slots.get(i).and_then(|s| s.valid.then_some(s.poc))
     }
 
+    /// Mark the picture in `slot` as displayed (clears `needed_for_output`).
+    ///
+    /// Backends that run their own display-order logic must call this for each
+    /// emitted picture so that unreferenced slots can be evicted by the next
+    /// `picture_start` even when the actual reordering depth stays below
+    /// `max_num_reorder_frames`.
+    pub fn mark_displayed(&mut self, slot: usize) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.needed_for_output = false;
+        }
+    }
+
+    /// Clear display-pending state on all slots (stream flush / end).
+    pub fn clear_display_pending(&mut self) {
+        for s in &mut self.slots {
+            s.needed_for_output = false;
+        }
+    }
+
     /// Full slot state (for backends keeping per-slot surface maps).
     pub fn slots(&self) -> &[H265DpbSlot] {
         &self.slots

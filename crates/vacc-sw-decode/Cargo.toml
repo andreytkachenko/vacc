@@ -1,0 +1,16 @@
+[package]
+name = "vacc-sw-decode"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Software H.264/AVC decoder: vacc-parser control plane + vendored edge264 slice-decode routines (C, statically linked)"
+links = "vacc_sw264"
+
+[dependencies]
+vacc-core = { workspace = true }
+vacc-parser = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+cc = "1"

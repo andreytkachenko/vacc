@@ -3467,7 +3467,7 @@ mod tests {
             self.ue(code_num);
         }
         fn finish(&self) -> Vec<u8> {
-            let n = (self.pos + 7) / 8;
+            let n = self.pos.div_ceil(8);
             self.bytes[..n as usize].to_vec()
         }
     }
@@ -3614,10 +3614,9 @@ mod tests {
         if pps.chroma_qp_offset_list_enabled_flag {
             b.put(0, 1); // cu_chroma_qp_offset_enabled_flag
         }
-        if pps.deblocking_filter_control_present_flag {
-            if pps.deblocking_filter_override_enabled_flag {
-                b.put(0, 1); // no override -> inherit PPS
-            }
+        if pps.deblocking_filter_control_present_flag && pps.deblocking_filter_override_enabled_flag
+        {
+            b.put(0, 1); // no override -> inherit PPS
         }
         if pps.pps_loop_filter_across_slices_enabled_flag
             && !pps.pps_deblocking_filter_disabled_flag

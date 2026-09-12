@@ -186,7 +186,7 @@ pub fn build_cuvid_vp9_picparams(
         for seg in 0..8 {
             for f in 0..4 {
                 vp9.segmentFeatureEnable[seg][f] = ((sg.feature_enabled[seg] >> f) & 1) as c_uchar;
-                vp9.segmentFeatureData[seg][f] = sg.feature_data[seg][f] as i16;
+                vp9.segmentFeatureData[seg][f] = sg.feature_data[seg][f];
             }
         }
         vp9.mb_segment_tree_probs = sg.segmentation_tree_probs;

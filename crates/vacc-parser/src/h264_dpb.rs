@@ -191,6 +191,17 @@ impl H264Dpb {
     /// free-slots step, then return the slot the current picture will be stored into
     /// (first empty slot, C++ C.4.5.1/4.5.2). Does NOT store the current yet.
     pub fn prepare_current(&mut self) -> usize {
+        self.prepare_current_avoiding(&[])
+    }
+
+    /// [`prepare_current`] that never returns (and never frees) a slot in `forbidden`
+    /// — the DPB slots this picture's slices still reference. H.264 guarantees at
+    /// least one unused buffer exists, so a valid slot is always found. Without this
+    /// guard the sliding window can unmark and free a reference that the current
+    /// slice still reads, and "first empty slot" hands back that same slot: the
+    /// picture then decodes INTO its own reference (aliasing), corrupting inter
+    /// prediction from the first P-frame onward.
+    pub fn prepare_current_avoiding(&mut self, forbidden: &[usize]) -> usize {
         let cur = self.cur.as_ref().expect("picture_start not called").clone();
         if cur.is_idr {
             // H.264 8.2.5: when the current picture is an IDR, all short-term
@@ -220,9 +231,11 @@ impl H264Dpb {
             }
         }
 
-        // Free slots that are not refs and not needed for output.
-        for s in &mut self.slots {
-            if s.state != 0 && !s.is_ref() && !s.needed_for_output {
+        // Free slots that are not refs, not needed for output, and not still
+        // referenced by the current picture (those must stay alive until this
+        // picture finishes decoding).
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if s.state != 0 && !s.is_ref() && !s.needed_for_output && !forbidden.contains(&i) {
                 *s = H264DpbSlot::empty();
             }
         }
@@ -234,9 +247,9 @@ impl H264Dpb {
             guard += 1;
         }
 
-        // First empty slot.
+        // First empty slot not referenced by the current picture.
         for i in 0..self.slots.len() {
-            if self.slots[i].state == 0 {
+            if self.slots[i].state == 0 && !forbidden.contains(&i) {
                 return i;
             }
         }

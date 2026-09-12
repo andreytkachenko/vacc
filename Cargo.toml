@@ -8,6 +8,8 @@ members = [
     "crates/vacc-vulkan-common",
     "crates/vacc-examples",
     "crates/vacc-vaapi-decode",
+    "crates/vacc-software-decode",
+    "crates/vacc-sw-decode",
 ]
 resolver = "2"
 
@@ -24,6 +26,8 @@ vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.1" }
 vacc-parser = { path = "crates/vacc-parser", version = "0.1.1" }
 vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.1" }
 vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.1" }
+vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.1" }
+vacc-sw-decode = { path = "crates/vacc-sw-decode", version = "0.1.1" }
 vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.1" }
 vacc-vulkan-common = { path = "crates/vacc-vulkan-common", version = "0.1.1" }
 ash = "0.38"

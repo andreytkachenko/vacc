@@ -1003,8 +1003,7 @@ fn test_segmentation_signed_feature_width() {
     assert!(fh1.segmentation_enabled);
     assert_eq!(fh1.segment_feature_enabled[0], 0b11, "features 0+1 enabled");
     assert_eq!(
-        fh1.segment_feature_data[0][0],
-        -5,
+        fh1.segment_feature_data[0][0], -5,
         "ALT_Q su(9) = -5 round-trip"
     );
     assert_eq!(fh1.segment_feature_data[0][1], -3, "feature 1 su(7) = -3");
@@ -1272,11 +1271,14 @@ fn test_per_ref_delta_frame_id() {
         .parse_frame_header(&ifm, &sps, 0, 0)
         .expect("inter parse");
     assert_eq!(
-        fh1.frame_header_size,
-        28,
+        fh1.frame_header_size, 28,
         "223 bits -> 28 header bytes (incl. 7 x f(2) per-ref deltas)"
     );
-    assert_eq!((fh1.frame_width, fh1.frame_height), (64, 36), "inherited size");
+    assert_eq!(
+        (fh1.frame_width, fh1.frame_height),
+        (64, 36),
+        "inherited size"
+    );
     assert_eq!(fh1.primary_ref_frame, 7, "NONE");
     assert_eq!(fh1.refresh_frame_flags, 0b01111111);
     assert_eq!(&fh1.ref_frame_idx[..], &[0; 7]);
@@ -1387,7 +1389,10 @@ fn test_show_existing_frame_reads_tpi_and_display_id() {
     assert!(fh.show_existing_frame);
     assert_eq!(fh.frame_to_show_map_idx, 5, "map idx round-trip");
     assert_eq!(fh.display_frame_id, 5, "display_frame_id f(3) round-trip");
-    assert_eq!(fh.frame_header_size, 0, "show-existing frames are not decoded");
+    assert_eq!(
+        fh.frame_header_size, 0,
+        "show-existing frames are not decoded"
+    );
 
     // Real-stream coverage: av1_seg.ivf (rav1e, multi-OBU packets) mixes
     // show-existing pictures into the decode order; every one must parse with
@@ -1398,7 +1403,10 @@ fn test_show_existing_frame_reads_tpi_and_display_id() {
     assert!(!sps2.frame_id_numbers_present_flag);
     let show_existing: Vec<&Av1FrameHeader> =
         frames.iter().filter(|f| f.show_existing_frame).collect();
-    assert!(show_existing.len() >= 50, "expected many show-existing pictures");
+    assert!(
+        show_existing.len() >= 50,
+        "expected many show-existing pictures"
+    );
     for f in show_existing {
         assert!(f.frame_to_show_map_idx < 8, "valid map index");
         assert_eq!(f.frame_header_size, 0);
