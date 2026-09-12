@@ -11,10 +11,14 @@
 #include "common/types.h"
 #include "decoding/cabac.h"
 #include "decoding/coding_tree.h"
+#include "decoding/dpb.h"
+#include "decoding/inter_prediction.h"
 #include "decoding/interpolation.h"
 #include "decoding/intra_prediction.h"
 #include "decoding/syntax_elements.h"
 #include "decoding/transform.h"
+#include "filters/deblocking.h"
+#include "filters/sao.h"
 #include "syntax/pps.h"
 #include "syntax/slice_header.h"
 #include "syntax/sps.h"
@@ -46,6 +50,106 @@ hevc::Picture make_test_picture(int cIdx, int w, int h, int stride, const uint16
     pic.stride[cIdx] = stride;
     pic.planes[cIdx].assign(plane, plane + static_cast<size_t>(stride) * h);
     return pic;
+}
+
+// SPS shared by the SAO and deblocking oracles. Min CB/TB are fixed at 4x4.
+hevc::SPS make_filter_sps(int picW, int picH, int ctbLog2SizeY, int subW, int subH,
+                          int chromaArrayType, int bitDepthY, int bitDepthC,
+                          int pcm_filter_disabled) {
+    hevc::SPS sps;
+    int ctbSize = 1 << ctbLog2SizeY;
+    sps.pic_width_in_luma_samples = static_cast<uint32_t>(picW);
+    sps.pic_height_in_luma_samples = static_cast<uint32_t>(picH);
+    sps.CtbSizeY = ctbSize;
+    sps.CtbLog2SizeY = ctbLog2SizeY;
+    sps.MinCbLog2SizeY = 2;
+    sps.MinCbSizeY = 4;
+    sps.MinTbLog2SizeY = 2;
+    sps.MinTbSizeY = 4;
+    sps.SubWidthC = subW;
+    sps.SubHeightC = subH;
+    sps.ChromaArrayType = chromaArrayType;
+    sps.BitDepthY = bitDepthY;
+    sps.BitDepthC = bitDepthC;
+    sps.pcm_loop_filter_disabled_flag = pcm_filter_disabled != 0;
+    sps.PicWidthInCtbsY = (picW + ctbSize - 1) / ctbSize;
+    sps.PicHeightInCtbsY = (picH + ctbSize - 1) / ctbSize;
+    // apply_sao's anySao quick check iterates PicSizeInCtbsY; the real parser
+    // derives it in SPS::parse, but the test SPS skips parsing.
+    sps.PicSizeInCtbsY = sps.PicWidthInCtbsY * sps.PicHeightInCtbsY;
+    return sps;
+}
+
+// PPS shared by the SAO and deblocking oracles.
+hevc::PPS make_filter_pps(int loop_filter_across_tiles, int pps_cb_qp_offset,
+                          int pps_cr_qp_offset, const uint8_t* tile_id,
+                          const int32_t* ctb_addr_rs_to_ts, int numCtbs) {
+    hevc::PPS pps;
+    pps.loop_filter_across_tiles_enabled_flag = loop_filter_across_tiles != 0;
+    pps.pps_cb_qp_offset = pps_cb_qp_offset;
+    pps.pps_cr_qp_offset = pps_cr_qp_offset;
+    if (tile_id && ctb_addr_rs_to_ts) {
+        for (int i = 0; i < numCtbs; i++) {
+            pps.TileId.push_back(tile_id[i]);
+            pps.CtbAddrRsToTs.push_back(ctb_addr_rs_to_ts[i]);
+        }
+    }
+    return pps;
+}
+
+// Picture with up to three planes filled from row-major buffers.
+hevc::Picture make_filter_picture(int picW, int picH, int subW, int subH,
+                                  int chromaArrayType,
+                                  const uint16_t* plane_y, int stride_y,
+                                  const uint16_t* plane_cb, int stride_cb,
+                                  const uint16_t* plane_cr, int stride_cr) {
+    hevc::Picture pic;
+    auto fill = [&](int c, const uint16_t* plane, int stride) {
+        int w = (c == 0) ? picW : picW / subW;
+        int h = (c == 0) ? picH : picH / subH;
+        pic.width[c] = w;
+        pic.height[c] = h;
+        pic.stride[c] = stride;
+        if (plane && w > 0 && h > 0)
+            pic.planes[c].assign(plane, plane + static_cast<size_t>(stride) * h);
+    };
+    fill(0, plane_y, stride_y);
+    if (chromaArrayType != 0) {
+        fill(1, plane_cb, stride_cb);
+        fill(2, plane_cr, stride_cr);
+    }
+    return pic;
+}
+
+// Per-min-CB (4x4) CU grid from flat [pred_mode, qp_y, is_pcm, bypass] quads.
+std::vector<hevc::CUInfo> make_cu_grid(int picW, int picH, const int32_t* cu_fields) {
+    int n = (picW / 4) * (picH / 4);
+    std::vector<hevc::CUInfo> cus(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+        const int32_t* f = cu_fields + 4 * i;
+        cus[i].pred_mode = (f[0] == 1) ? hevc::PredMode::MODE_INTRA
+                                       : hevc::PredMode::MODE_INTER;
+        cus[i].qp_y = f[1];
+        cus[i].is_pcm = f[2] != 0;
+        cus[i].cu_transquant_bypass = f[3] != 0;
+    }
+    return cus;
+}
+
+// Copy (possibly filtered) planes back out to the caller's buffers.
+void copy_planes_out(const hevc::Picture& pic, int chromaArrayType,
+                     int stride_y, int stride_cb, int stride_cr,
+                     int picW, int picH, int subW, int subH,
+                     uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr) {
+    std::memcpy(out_y, pic.planes[0].data(),
+                static_cast<size_t>(stride_y) * picH * sizeof(uint16_t));
+    if (chromaArrayType != 0) {
+        int ch = picH / subH;
+        std::memcpy(out_cb, pic.planes[1].data(),
+                    static_cast<size_t>(stride_cb) * ch * sizeof(uint16_t));
+        std::memcpy(out_cr, pic.planes[2].data(),
+                    static_cast<size_t>(stride_cr) * ch * sizeof(uint16_t));
+    }
 }
 
 } // namespace
@@ -283,6 +387,212 @@ int hevcdec_test_cabac_run(const uint8_t* data, int len_bytes,
         final_ctx[2 * i + 1] = cabac.context(i).valMps;
     }
     return n_out;
+}
+
+int hevcdec_test_sao_run(
+    int picW, int picH, int ctbLog2SizeY, int subW, int subH,
+    int chromaArrayType, int bitDepthY, int bitDepthC,
+    int sao_enabled, int pcm_filter_disabled,
+    int transquant_bypass_enabled, int loop_filter_across_tiles,
+    const uint8_t* tile_id, const int32_t* ctb_addr_rs_to_ts,
+    const uint16_t* plane_y, const uint16_t* plane_cb, const uint16_t* plane_cr,
+    int stride_y, int stride_cb, int stride_cr,
+    const uint8_t* slice_idx, int num_slices,
+    const uint8_t* slice_across_slices,
+    const int32_t* sao_params,
+    const uint8_t* cu_pcm, const uint8_t* cu_bypass,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr) {
+    if (picW <= 0 || picH <= 0 || ctbLog2SizeY < 5 || ctbLog2SizeY > 7 ||
+        !plane_y || !out_y || !sao_params)
+        return -1;
+
+    hevc::SPS sps = make_filter_sps(picW, picH, ctbLog2SizeY, subW, subH,
+                                    chromaArrayType, bitDepthY, bitDepthC,
+                                    pcm_filter_disabled);
+    sps.sample_adaptive_offset_enabled_flag = sao_enabled != 0;
+
+    int numCtbs = sps.PicWidthInCtbsY * sps.PicHeightInCtbsY;
+    hevc::PPS pps = make_filter_pps(loop_filter_across_tiles, 0, 0, tile_id,
+                                    ctb_addr_rs_to_ts, numCtbs);
+    pps.transquant_bypass_enabled_flag = transquant_bypass_enabled != 0;
+
+    hevc::Picture pic = make_filter_picture(picW, picH, subW, subH, chromaArrayType,
+                                            plane_y, stride_y, plane_cb, stride_cb,
+                                            plane_cr, stride_cr);
+
+    // Per-min-CB PCM/bypass flags (NULL input = all zero).
+    int minCbsW = picW / 4;
+    std::vector<hevc::CUInfo> cus(static_cast<size_t>(minCbsW) * (picH / 4));
+    for (int i = 0; i < static_cast<int>(cus.size()); i++) {
+        if (cu_pcm) cus[i].is_pcm = cu_pcm[i] != 0;
+        if (cu_bypass) cus[i].cu_transquant_bypass = cu_bypass[i] != 0;
+    }
+
+    // Per-slice headers (only the across-slices flag matters for SAO).
+    std::vector<hevc::SliceHeader> shs(num_slices);
+    for (int s = 0; s < num_slices; s++)
+        shs[s].slice_loop_filter_across_slices_enabled_flag = slice_across_slices[s] != 0;
+
+    std::vector<hevc::DecodingContext::SaoParams> saoParams(numCtbs);
+    for (int i = 0; i < numCtbs; i++) {
+        const int32_t* p = sao_params + 24 * i;
+        auto& sp = saoParams[i];
+        for (int c = 0; c < 3; c++) {
+            sp.sao_type_idx[c] = p[c];
+            sp.sao_eo_class[c] = p[3 + c];
+            sp.sao_band_position[c] = p[6 + c];
+            for (int k = 0; k < 5; k++)
+                sp.sao_offset_val[c][k] = p[9 + c * 5 + k];
+        }
+    }
+
+    std::vector<hevc::SliceHeader*> shPtrs(num_slices);
+    for (int s = 0; s < num_slices; s++) shPtrs[s] = &shs[s];
+
+    std::vector<uint16_t> backup[3];
+    hevc::SliceHeader fallbackSh;  // sh_at_ctb fallback when slice_idx is NULL
+    // DecodingContext::slice_idx is non-const (decoder-owned); copy it.
+    auto sliceIdxCopy = std::vector<uint8_t>();
+    if (slice_idx) sliceIdxCopy.assign(slice_idx, slice_idx + numCtbs);
+
+    hevc::DecodingContext ctx;
+    ctx.sps = &sps;
+    ctx.pps = &pps;
+    ctx.pic = &pic;
+    ctx.sh = &fallbackSh;
+    ctx.cu_info = cus.data();
+    ctx.cu_info_stride = minCbsW;
+    ctx.sao_params = saoParams.data();
+    ctx.sao_params_stride = sps.PicWidthInCtbsY;
+    ctx.sao_backup = backup;
+    if (slice_idx) {
+        ctx.slice_idx = sliceIdxCopy.data();
+        ctx.slice_headers = shPtrs.data();
+        ctx.num_slices = num_slices;
+    }
+
+    hevc::apply_sao(ctx);
+
+    copy_planes_out(pic, chromaArrayType, stride_y, stride_cb, stride_cr,
+                    picW, picH, subW, subH, out_y, out_cb, out_cr);
+    return 0;
+}
+
+int hevcdec_test_deblock_run(
+    int picW, int picH, int ctbLog2SizeY, int subW, int subH,
+    int chromaArrayType, int bitDepthY, int bitDepthC,
+    int pcm_filter_disabled,
+    int loop_filter_across_tiles,
+    const uint8_t* tile_id, const int32_t* ctb_addr_rs_to_ts,
+    int pps_cb_qp_offset, int pps_cr_qp_offset,
+    const uint16_t* plane_y, const uint16_t* plane_cb, const uint16_t* plane_cr,
+    int stride_y, int stride_cb, int stride_cr,
+    const uint8_t* slice_idx, int num_slices,
+    const int32_t* sh_params,
+    const int32_t* cu_fields,
+    const int32_t* motion,
+    const uint8_t* cbf_luma, const uint8_t* log2_tu_size,
+    const uint8_t* edge_v, const uint8_t* edge_h,
+    const int32_t* poc_l0, int n_ref_l0,
+    const int32_t* poc_l1, int n_ref_l1,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr) {
+    if (picW <= 0 || picH <= 0 || ctbLog2SizeY < 5 || ctbLog2SizeY > 7 ||
+        !plane_y || !out_y || !sh_params || !cu_fields || !motion ||
+        !cbf_luma || !log2_tu_size || !edge_v || !edge_h)
+        return -1;
+
+    hevc::SPS sps = make_filter_sps(picW, picH, ctbLog2SizeY, subW, subH,
+                                    chromaArrayType, bitDepthY, bitDepthC,
+                                    pcm_filter_disabled);
+
+    int numCtbs = sps.PicWidthInCtbsY * sps.PicHeightInCtbsY;
+    hevc::PPS pps = make_filter_pps(loop_filter_across_tiles, pps_cb_qp_offset,
+                                    pps_cr_qp_offset, tile_id, ctb_addr_rs_to_ts, numCtbs);
+
+    hevc::Picture pic = make_filter_picture(picW, picH, subW, subH, chromaArrayType,
+                                            plane_y, stride_y, plane_cb, stride_cb,
+                                            plane_cr, stride_cr);
+
+    auto cus = make_cu_grid(picW, picH, cu_fields);
+
+    // DecodingContext grid fields are non-const (the decoder writes them);
+    // copy the const test inputs.
+    int minCbsW = picW / 4;
+    int nTb = minCbsW * (picH / 4);
+    auto copyGrid = [nTb](const uint8_t* src) {
+        return std::vector<uint8_t>(src, src + static_cast<size_t>(nTb));
+    };
+    auto cbfGrid = copyGrid(cbf_luma);
+    auto tuGrid = copyGrid(log2_tu_size);
+    auto edgeV = copyGrid(edge_v);
+    auto edgeH = copyGrid(edge_h);
+    auto sliceIdxCopy = std::vector<uint8_t>();
+    if (slice_idx) sliceIdxCopy.assign(slice_idx, slice_idx + numCtbs);
+    std::vector<hevc::PUMotionInfo> mi(static_cast<size_t>(nTb));
+    for (int i = 0; i < nTb; i++) {
+        const int32_t* m = motion + 8 * i;
+        mi[i].mv[0] = {static_cast<int16_t>(m[0]), static_cast<int16_t>(m[1])};
+        mi[i].mv[1] = {static_cast<int16_t>(m[2]), static_cast<int16_t>(m[3])};
+        mi[i].ref_idx[0] = static_cast<int8_t>(m[4]);
+        mi[i].ref_idx[1] = static_cast<int8_t>(m[5]);
+        mi[i].pred_flag[0] = m[6] != 0;
+        mi[i].pred_flag[1] = m[7] != 0;
+    }
+
+    std::vector<hevc::SliceHeader> shs(num_slices);
+    for (int s = 0; s < num_slices; s++) {
+        const int32_t* f = sh_params + 4 * s;
+        shs[s].slice_deblocking_filter_disabled_flag = f[0] != 0;
+        shs[s].slice_loop_filter_across_slices_enabled_flag = f[1] != 0;
+        shs[s].slice_beta_offset_div2 = f[2];
+        shs[s].slice_tc_offset_div2 = f[3];
+    }
+
+    std::vector<hevc::SliceHeader*> shPtrs(num_slices);
+    for (int s = 0; s < num_slices; s++) shPtrs[s] = &shs[s];
+
+    hevc::DPB dpb;
+    {
+        std::vector<int32_t> pocs0;
+        if (n_ref_l0 > 0 && poc_l0) pocs0.assign(poc_l0, poc_l0 + n_ref_l0);
+        std::vector<int32_t> pocs1;
+        if (n_ref_l1 > 0 && poc_l1) pocs1.assign(poc_l1, poc_l1 + n_ref_l1);
+        dpb.test_set_ref_pic_lists(pocs0, pocs1);
+    }
+
+    // sh_at_ctb fallback (single-slice pictures) mirrors slice 0's parameters.
+    hevc::SliceHeader fallbackSh;
+    fallbackSh.slice_deblocking_filter_disabled_flag = sh_params[0] != 0;
+    fallbackSh.slice_loop_filter_across_slices_enabled_flag = sh_params[1] != 0;
+    fallbackSh.slice_beta_offset_div2 = sh_params[2];
+    fallbackSh.slice_tc_offset_div2 = sh_params[3];
+
+    hevc::DecodingContext ctx;
+    ctx.sps = &sps;
+    ctx.pps = &pps;
+    ctx.pic = &pic;
+    ctx.sh = &fallbackSh;
+    ctx.dpb = &dpb;
+    ctx.cu_info = cus.data();
+    ctx.cu_info_stride = minCbsW;
+    ctx.motion_info = mi.data();
+    ctx.motion_info_stride = minCbsW;
+    ctx.cbf_luma_grid = cbfGrid.data();
+    ctx.log2_tu_size_grid = tuGrid.data();
+    ctx.edge_flags_v = edgeV.data();
+    ctx.edge_flags_h = edgeH.data();
+    ctx.filter_grid_stride = minCbsW;
+    if (slice_idx) {
+        ctx.slice_idx = sliceIdxCopy.data();
+        ctx.slice_headers = shPtrs.data();
+        ctx.num_slices = num_slices;
+    }
+
+    hevc::apply_deblocking(ctx);
+
+    copy_planes_out(pic, chromaArrayType, stride_y, stride_cb, stride_cr,
+                    picW, picH, subW, subH, out_y, out_cb, out_cr);
+    return 0;
 }
 
 } // extern "C"

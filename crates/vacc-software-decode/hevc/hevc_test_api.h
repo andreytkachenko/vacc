@@ -122,6 +122,65 @@ int hevcdec_test_cabac_run(const uint8_t* data, int len_bytes,
                            uint16_t* final_range, uint16_t* final_offset,
                            uint8_t* final_ctx);
 
+/* SAO (§8.7.3) differential oracle — full apply_sao over a synthetic picture.
+ * picW/picH: luma dimensions; ctbLog2SizeY in 5..7; subW/subH chroma
+ * subsampling (1 or 2); chromaArrayType 0 = monochrome, 1 = 4:2:0.
+ * planes: three u16 buffers of stride_c * compH samples each (compW/compH =
+ * picW/picH divided by subW/subH for c > 0); for chromaArrayType == 0 only
+ * plane_y is read and out_cb/out_cr may be NULL.
+ * slice_idx: per-CTB slice index, PicSizeInCtbsY bytes; NULL = single slice.
+ * slice_across_slices: num_slices u8 flags (slice_loop_filter_across_slices).
+ * sao_params: flat int32 array, 24 ints per CTU in raster order:
+ *   [type_idx x3, eo_class x3, band_position x3, offset_val x3x5]
+ * cu_pcm / cu_bypass: per-min-CB (picW/4 * picH/4) u8 flags; NULL = all zero.
+ * tile_id / ctb_addr_rs_to_ts: PicSizeInCtbsY entries each; NULL = no tiles.
+ * Writes the filtered planes to out_*; returns 0 on success, -1 on bad args. */
+int hevcdec_test_sao_run(
+    int picW, int picH, int ctbLog2SizeY, int subW, int subH,
+    int chromaArrayType, int bitDepthY, int bitDepthC,
+    int sao_enabled, int pcm_filter_disabled,
+    int transquant_bypass_enabled, int loop_filter_across_tiles,
+    const uint8_t* tile_id, const int32_t* ctb_addr_rs_to_ts,
+    const uint16_t* plane_y, const uint16_t* plane_cb, const uint16_t* plane_cr,
+    int stride_y, int stride_cb, int stride_cr,
+    const uint8_t* slice_idx, int num_slices,
+    const uint8_t* slice_across_slices,
+    const int32_t* sao_params,
+    const uint8_t* cu_pcm, const uint8_t* cu_bypass,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr);
+
+/* Deblocking (§8.7.2) differential oracle — full apply_deblocking over a
+ * synthetic picture. Plane/slice/tile conventions as in hevcdec_test_sao_run
+ * (no sao_enabled; pcm_filter_disabled from the SPS).
+ * sh_params: flat int32, 4 per slice:
+ *   [deblocking_disabled, across_slices_enabled, beta_offset_div2, tc_offset_div2]
+ * cu_fields: flat int32, 4 per min-CB (picW/4 * picH/4):
+ *   [pred_mode (0 inter / 1 intra), qp_y, is_pcm, transquant_bypass]
+ * motion: flat int32, 8 per 4x4 block (picW/4 * picH/4):
+ *   [mvx_l0, mvy_l0, mvx_l1, mvy_l1, ref_idx_l0, ref_idx_l1, pred_flag_l0, pred_flag_l1]
+ * cbf_luma / log2_tu_size / edge_v / edge_h: u8 per 4x4 block.
+ * poc_l0 / poc_l1: reference picture POCs (n_ref_l0 / n_ref_l1 entries);
+ * NULL = empty list. Writes the filtered planes to out_*; returns 0 on
+ * success, -1 on bad args. */
+int hevcdec_test_deblock_run(
+    int picW, int picH, int ctbLog2SizeY, int subW, int subH,
+    int chromaArrayType, int bitDepthY, int bitDepthC,
+    int pcm_filter_disabled,
+    int loop_filter_across_tiles,
+    const uint8_t* tile_id, const int32_t* ctb_addr_rs_to_ts,
+    int pps_cb_qp_offset, int pps_cr_qp_offset,
+    const uint16_t* plane_y, const uint16_t* plane_cb, const uint16_t* plane_cr,
+    int stride_y, int stride_cb, int stride_cr,
+    const uint8_t* slice_idx, int num_slices,
+    const int32_t* sh_params,
+    const int32_t* cu_fields,
+    const int32_t* motion,
+    const uint8_t* cbf_luma, const uint8_t* log2_tu_size,
+    const uint8_t* edge_v, const uint8_t* edge_h,
+    const int32_t* poc_l0, int n_ref_l0,
+    const int32_t* poc_l1, int n_ref_l1,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr);
+
 #ifdef __cplusplus
 }
 #endif

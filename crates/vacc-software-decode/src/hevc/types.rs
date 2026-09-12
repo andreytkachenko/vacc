@@ -202,6 +202,25 @@ impl NalUnitHeader {
     }
 }
 
+/// View over one component plane (data + dims) — used by the loop filters,
+/// mirroring `Picture::planes[c]` / `width[c]` / `height[c]` / `stride[c]`.
+pub struct Plane<'a> {
+    pub data: &'a mut [u16],
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+}
+
+/// Tile layout for loop-filter boundary checks (PPS-derived). `None` at the
+/// call site means "no tiles" (empty `pps.TileId`).
+#[derive(Clone, Copy, Debug)]
+pub struct Tiles<'a> {
+    /// `TileId[ts]` — tile id per tile-scan address.
+    pub tile_id: &'a [i32],
+    /// `CtbAddrRsToTs` — raster CTB address -> tile-scan address.
+    pub ctb_addr_rs_to_ts: &'a [i32],
+}
+
 /// Sequence Parameter Set — subset of spec §7.4.3.2.1 fields consumed by the
 /// Rust kernels. Extended as later sprints port more of the decoder.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

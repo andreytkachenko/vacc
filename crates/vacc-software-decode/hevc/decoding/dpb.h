@@ -110,6 +110,26 @@ public:
     int num_ref_list0() const { return static_cast<int>(ref_pic_list0_.size()); }
     int num_ref_list1() const { return static_cast<int>(ref_pic_list1_.size()); }
 
+    // Test-only: install synthetic reference picture lists with the given POCs
+    // (hevc_test_api deblocking oracle; not part of the decode pipeline).
+    void test_set_ref_pic_lists(const std::vector<int32_t>& pocs0,
+                                const std::vector<int32_t>& pocs1) {
+        ref_pic_list0_.clear();
+        ref_pic_list1_.clear();
+        for (int32_t poc : pocs0) {
+            auto pic = std::make_shared<Picture>();
+            pic->poc = poc;
+            pictures_.push_back(pic);
+            ref_pic_list0_.push_back(RefPicListEntry{pic.get()});
+        }
+        for (int32_t poc : pocs1) {
+            auto pic = std::make_shared<Picture>();
+            pic->poc = poc;
+            pictures_.push_back(pic);
+            ref_pic_list1_.push_back(RefPicListEntry{pic.get()});
+        }
+    }
+
     // Collocated picture (valid after derive_colpic)
     Picture* col_pic() const { return col_pic_; }
     bool no_backward_pred_flag() const { return no_backward_pred_flag_; }
