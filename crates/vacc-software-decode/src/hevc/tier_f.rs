@@ -161,20 +161,6 @@ mod tests {
         let refs_l1 = to_entries(&lists.l1);
 
         let cur_poc = first_info.curr_pic_order_cnt_val;
-        if std::env::var_os("TIER_F_DEBUG").is_some() {
-            let st = first_info.slice_type;
-            let isr = first_info.is_reference;
-            let l0s: Vec<(i32, i32)> = refs_l0.iter().map(|e| (e.slot, e.poc)).collect();
-            let l1s: Vec<(i32, i32)> = refs_l1.iter().map(|e| (e.slot, e.poc)).collect();
-            let dpb_map: Vec<(usize, i32, bool)> = dpb
-                .slots()
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.valid)
-                .map(|(i, s)| (i, s.poc, s.is_ref))
-                .collect();
-            eprintln!("{prefix}: type={st} poc={cur_poc} ref={isr} l0={l0s:?} l1={l1s:?} dpb={dpb_map:?}");
-        }
         let pic = decode_picture(
             &sps,
             &pps,

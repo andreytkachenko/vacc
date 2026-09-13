@@ -3,6 +3,7 @@
 //! parameter parsing, and WPP parallel decode (§9.2.2) using rayon as the
 //! thread pool (replaces the C++ `ThreadPool`).
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex};
 
@@ -1742,6 +1743,87 @@ fn decode_transform_tree(
 }
 
 // ============================================================
+// Per-thread TU scratch (eliminates per-TU heap allocations)
+// ============================================================
+
+/// Max-TU (64×64) sample count; HEVC caps log2TrafoSize at 6.
+const MAX_TU_SAMPLES: usize = 64 * 64;
+
+/// Fixed offset of the zero slot: beyond the largest possible writable
+/// region (`4 * MAX_TU_SAMPLES`), so no visit layout can overlap it and its
+/// allocation-time zeros persist for all visit sizes.
+const ZERO_SLOT_OFFSET: usize = 4 * MAX_TU_SAMPLES;
+
+thread_local! {
+    /// Per-thread TU scratch. Layout for a visit with `n` samples:
+    /// `[0, n)` coefficients, `[n, 2n)` scaled, `[2n, 3n)` residual,
+    /// `[3n, 4n)` pred_samples, plus the zero slot at
+    /// `[ZERO_SLOT_OFFSET, ZERO_SLOT_OFFSET + n)`. Rayon reuses worker
+    /// threads, so capacity persists across frames and steady-state
+    /// allocation is zero.
+    static TU_SCRATCH: RefCell<Vec<i16>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Guard over per-thread TU scratch: four writable slots of `n` i16 samples
+/// (coefficients, scaled, residual, pred_samples) plus a zero slot.
+struct TuScratchGuard {
+    base: *mut i16,
+    n: usize,
+}
+
+/// Five disjoint slices over the TU scratch. The `zero` slot is never
+/// written to.
+struct TuSlots<'a> {
+    coefficients: &'a mut [i16],
+    scaled: &'a mut [i16],
+    residual: &'a mut [i16],
+    pred_samples: &'a mut [i16],
+    zero: &'a [i16],
+}
+
+impl TuScratchGuard {
+    /// # Safety
+    /// The caller must guarantee that no other code on the current thread
+    /// accesses the TU scratch cell while this guard is alive. This holds in
+    /// practice: `decode_transform_unit` is a leaf kernel (nothing it calls
+    /// re-enters the scratch accessor, so the buffer can never be reallocated
+    /// under us) and each rayon worker thread owns its own TLS cell.
+    unsafe fn new(n: usize) -> Self {
+        debug_assert!(n <= MAX_TU_SAMPLES, "TU larger than 64x64");
+        let base = TU_SCRATCH.with(|c| {
+            let mut v = c.borrow_mut();
+            // No per-visit zeroing: decode_residual_coding self-zeroes
+            // coefficients, perform_dequant covers all scaled positions, and
+            // the inverse transform / copy_from_slice cover residual. The
+            // zero slot lives beyond every writable region, so it stays at
+            // its allocation-time zeros. pred_samples is zeroed at its
+            // intra-prediction call sites (matching C++'s per-visit
+            // `int16_t pred_samples[64*64] = {}`); the inter path overwrites
+            // it fully.
+            if v.len() < ZERO_SLOT_OFFSET + n {
+                v.resize(ZERO_SLOT_OFFSET + n, 0);
+            }
+            v.as_mut_ptr()
+        });
+        Self { base, n }
+    }
+
+    fn slots(&mut self) -> TuSlots<'_> {
+        unsafe {
+            let base = self.base;
+            let n = self.n;
+            TuSlots {
+                coefficients: std::slice::from_raw_parts_mut(base, n),
+                scaled: std::slice::from_raw_parts_mut(base.add(n), n),
+                residual: std::slice::from_raw_parts_mut(base.add(2 * n), n),
+                pred_samples: std::slice::from_raw_parts_mut(base.add(3 * n), n),
+                zero: std::slice::from_raw_parts(base.add(ZERO_SLOT_OFFSET), n),
+            }
+        }
+    }
+}
+
+// ============================================================
 // transform_unit (§7.3.8.10)
 // ============================================================
 
@@ -1768,6 +1850,12 @@ fn decode_transform_unit(
     let cu_bypass = ctx.cu_at(x0, y0).cu_transquant_bypass;
 
     let tr_size = 1i32 << log2_trafo_size;
+    // Per-thread scratch for this TU visit (5 slots of tr_size^2 samples).
+    // `coefficients` is zeroed by decode_residual_coding itself; the other
+    // writable slots are fully overwritten by their producers, and `zero`
+    // is never written to.
+    let mut scratch = unsafe { TuScratchGuard::new((tr_size * tr_size) as usize) };
+    let TuSlots { coefficients, scaled, residual, pred_samples, zero } = scratch.slots();
 
     // QP delta
     if (cbf_luma || cbf_cb || cbf_cr) && pps.cu_qp_delta_enabled_flag && !ctx.is_cu_qp_delta_coded {
@@ -1780,21 +1868,17 @@ fn decode_transform_unit(
 
     // Luma residual
     if cbf_luma {
-        let mut coefficients = vec![0i16; (tr_size * tr_size) as usize];
-        let mut scaled = vec![0i16; (tr_size * tr_size) as usize];
-        let mut residual = vec![0i16; (tr_size * tr_size) as usize];
-
         let mut transform_skip = false;
         if pps.transform_skip_enabled_flag && !cu_bypass && log2_trafo_size <= 2 {
             transform_skip = decode_transform_skip_flag(ctx.cabac, 0) != 0;
         }
 
-        decode_residual_coding(ctx, x0, y0, log2_trafo_size, 0, &mut coefficients);
+        decode_residual_coding(ctx, x0, y0, log2_trafo_size, 0, coefficients);
 
         if !cu_bypass {
             let qp_prime = qp_y + sps.qp_bd_offset_y;
             let dq = dequant_params(ctx, cu_pred_mode);
-            perform_dequant(&dq, log2_trafo_size as u32, 0, qp_prime, &coefficients, &mut scaled);
+            perform_dequant(&dq, log2_trafo_size as u32, 0, qp_prime, coefficients, scaled);
 
             perform_transform_inverse(
                 log2_trafo_size as u32,
@@ -1802,17 +1886,19 @@ fn decode_transform_unit(
                 cu_pred_mode == PredMode::Intra,
                 transform_skip,
                 sps.bit_depth_y as u32,
-                &scaled,
-                &mut residual,
+                scaled,
+                residual,
             );
         } else {
-            residual.copy_from_slice(&coefficients);
+            residual.copy_from_slice(coefficients);
         }
 
         // Prediction for luma
-        let mut pred_samples = vec![0i16; (tr_size * tr_size) as usize];
         if cu_pred_mode == PredMode::Intra {
             let intra_mode = ctx.intra_mode_at(x0, y0);
+            // C++ zeroes pred_samples per visit; intra prediction does
+            // partial writes relying on zero-init.
+            pred_samples.fill(0);
             perform_intra_prediction(
                 ctx.pic,
                 ctx.sps,
@@ -1823,7 +1909,7 @@ fn decode_transform_unit(
                 0,
                 intra_mode,
                 ctx.slice_idx.as_deref(),
-                &mut pred_samples,
+                pred_samples,
             );
         } else {
             // Inter: pred already in picture from PU-level MC, read it back
@@ -1835,11 +1921,11 @@ fn decode_transform_unit(
         }
 
         // Reconstruct
-        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, &pred_samples, &residual);
+        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, residual);
     } else if cu_pred_mode == PredMode::Intra {
         // No residual but still need intra prediction
         let intra_mode = ctx.intra_mode_at(x0, y0);
-        let mut pred_samples = vec![0i16; (tr_size * tr_size) as usize];
+        pred_samples.fill(0);
         perform_intra_prediction(
             ctx.pic,
             ctx.sps,
@@ -1850,12 +1936,11 @@ fn decode_transform_unit(
             0,
             intra_mode,
             ctx.slice_idx.as_deref(),
-            &mut pred_samples,
+            pred_samples,
         );
 
         // Reconstruct with zero residual
-        let zero = vec![0i16; (tr_size * tr_size) as usize];
-        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, &pred_samples, &zero);
+        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, zero);
     }
 
     // Chroma residual (4:2:0: chroma TU is log2TrafoSize-1, min 2)
@@ -1874,9 +1959,10 @@ fn decode_transform_unit(
             for c_idx in 1..=2 {
                 let cbf_c = if c_idx == 1 { cbf_cb } else { cbf_cr };
                 if cbf_c {
-                    let mut coefficients = vec![0i16; (tr_size_c * tr_size_c) as usize];
-                    let mut scaled = vec![0i16; (tr_size_c * tr_size_c) as usize];
-                    let mut residual = vec![0i16; (tr_size_c * tr_size_c) as usize];
+                    let n_c = (tr_size_c * tr_size_c) as usize;
+                    let coefficients = &mut coefficients[..n_c];
+                    let scaled = &mut scaled[..n_c];
+                    let residual = &mut residual[..n_c];
 
                     let mut transform_skip = false;
                     if pps.transform_skip_enabled_flag
@@ -1886,7 +1972,7 @@ fn decode_transform_unit(
                         transform_skip = decode_transform_skip_flag(ctx.cabac, c_idx) != 0;
                     }
 
-                    decode_residual_coding(ctx, x_c, y_c, log2_trafo_size_c, c_idx, &mut coefficients);
+                    decode_residual_coding(ctx, x_c, y_c, log2_trafo_size_c, c_idx, coefficients);
 
                     if !cu_bypass {
                         // Chroma QP derivation
@@ -1911,8 +1997,8 @@ fn decode_transform_unit(
                             log2_trafo_size_c as u32,
                             c_idx as u32,
                             qp_prime_c,
-                            &coefficients,
-                            &mut scaled,
+                            coefficients,
+                            scaled,
                         );
                         perform_transform_inverse(
                             log2_trafo_size_c as u32,
@@ -1920,17 +2006,18 @@ fn decode_transform_unit(
                             cu_pred_mode == PredMode::Intra,
                             transform_skip,
                             sps.bit_depth_c as u32,
-                            &scaled,
-                            &mut residual,
+                            scaled,
+                            residual,
                         );
                     } else {
-                        residual.copy_from_slice(&coefficients);
+                        residual.copy_from_slice(coefficients);
                     }
 
                     // Chroma prediction
-                    let mut pred_samples = vec![0i16; (tr_size_c * tr_size_c) as usize];
+                    let pred_samples = &mut pred_samples[..n_c];
                     if cu_pred_mode == PredMode::Intra {
                         let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
+                        pred_samples.fill(0);
                         perform_intra_prediction(
                             ctx.pic,
                             ctx.sps,
@@ -1941,7 +2028,7 @@ fn decode_transform_unit(
                             c_idx,
                             chroma_mode,
                             ctx.slice_idx.as_deref(),
-                            &mut pred_samples,
+                            pred_samples,
                         );
                     } else {
                         // Inter: pred already written by PU-level MC
@@ -1955,10 +2042,12 @@ fn decode_transform_unit(
                         }
                     }
 
-                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, &pred_samples, &residual);
+                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, residual);
                 } else if cu_pred_mode == PredMode::Intra {
                     let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
-                    let mut pred_samples = vec![0i16; (tr_size_c * tr_size_c) as usize];
+                    let n_c = (tr_size_c * tr_size_c) as usize;
+                    let pred_samples = &mut pred_samples[..n_c];
+                    pred_samples.fill(0);
                     perform_intra_prediction(
                         ctx.pic,
                         ctx.sps,
@@ -1969,10 +2058,10 @@ fn decode_transform_unit(
                         c_idx,
                         chroma_mode,
                         ctx.slice_idx.as_deref(),
-                        &mut pred_samples,
+                        pred_samples,
                     );
-                    let zero = vec![0i16; (tr_size_c * tr_size_c) as usize];
-                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, &pred_samples, &zero);
+                    let zero = &zero[..n_c];
+                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, zero);
                 }
             }
         }

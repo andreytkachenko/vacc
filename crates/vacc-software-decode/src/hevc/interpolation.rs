@@ -82,10 +82,25 @@ pub fn interpolate_luma(
         && y_int + n_pb_h as i32 + 4 <= pic_h;
 
     if interior {
-        // Fast direct access (no bounds check) — used for interior PUs
-        let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
-        luma_interp_core(
-            ref_fn, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3, pred,
+        // Fast direct access (no bounds check) — SIMD FIR on x86_64 when the
+        // block width vectorizes, scalar core otherwise.
+        #[cfg(target_arch = "x86_64")]
+        if n_pb_w.is_multiple_of(4) {
+            // Interior bounds were checked above; SSE2 is x86_64 baseline.
+            sse2::luma_interior(
+                plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2,
+                shift3, pred,
+            );
+        } else {
+            luma_interior_scalar(
+                plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2,
+                shift3, pred,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        luma_interior_scalar(
+            plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3,
+            pred,
         );
     } else {
         // Safe clamped access — used for edge PUs
@@ -170,6 +185,30 @@ fn luma_interp_core<R: Fn(i32, i32) -> i32>(
     }
 }
 
+/// Interior scalar path (direct access, no clamping) — used on non-x86_64
+/// targets and when the block width does not vectorize.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn luma_interior_scalar(
+    plane: &[u16],
+    stride: i32,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    shift1: i32,
+    shift2: i32,
+    shift3: i32,
+    pred: &mut [i16],
+) {
+    let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
+    luma_interp_core(
+        ref_fn, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3, pred,
+    );
+}
+
 /// Chroma 4-tap interpolation — spec §8.5.3.3.3 (chroma part).
 /// Output in extended precision. `plane`: reference chroma samples for
 /// component `c_idx`, row-major with `stride` samples/row.
@@ -200,19 +239,25 @@ pub fn interpolate_chroma(
         && y_int + n_pb_hc as i32 + 2 <= pic_h;
 
     if interior {
-        let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
-        chroma_interp_core(
-            ref_fn,
-            x_int,
-            y_int,
-            x_frac,
-            y_frac,
-            n_pb_wc,
-            n_pb_hc,
-            shift1,
-            shift2,
-            shift3,
-            pred,
+        // Fast direct access (no bounds check) — SIMD FIR on x86_64 when the
+        // chroma block width vectorizes, scalar core otherwise.
+        #[cfg(target_arch = "x86_64")]
+        if n_pb_wc.is_multiple_of(4) {
+            // Interior bounds were checked above; SSE2 is x86_64 baseline.
+            sse2::chroma_interior(
+                plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
+                shift3, pred,
+            );
+        } else {
+            chroma_interior_scalar(
+                plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
+                shift3, pred,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        chroma_interior_scalar(
+            plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
+            shift3, pred,
         );
     } else {
         let ref_fn = |x: i32, y: i32| {
@@ -304,6 +349,40 @@ fn chroma_interp_core<R: Fn(i32, i32) -> i32>(
             }
         }
     }
+}
+
+/// Interior scalar path (direct access, no clamping) — used on non-x86_64
+/// targets and when the chroma block width does not vectorize.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn chroma_interior_scalar(
+    plane: &[u16],
+    stride: i32,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_wc: usize,
+    n_pb_hc: usize,
+    shift1: i32,
+    shift2: i32,
+    shift3: i32,
+    pred: &mut [i16],
+) {
+    let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
+    chroma_interp_core(
+        ref_fn,
+        x_int,
+        y_int,
+        x_frac,
+        y_frac,
+        n_pb_wc,
+        n_pb_hc,
+        shift1,
+        shift2,
+        shift3,
+        pred,
+    );
 }
 
 /// Luma MV decomposition — 1/4 pel precision.
@@ -448,6 +527,410 @@ pub fn weighted_pred_explicit(
                     + ((o0 + o1 + 1) << log2_wd))
                     >> (log2_wd + 1),
             ) as i16;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE2 interior kernels (x86_64).
+//
+// Byte-exact with the scalar cores above: horizontal-pass results are wrapped
+// to i16 before the vertical pass (`as i16` low-16-bit truncation == C++
+// `static_cast<int16_t>` on x86_64), and all arithmetic stays in i32 where
+// overflow is impossible:
+//   horizontal FIR lane: |2 · 4095 · 58| ≈ 4.7e5, hsum ≤ ~1.9e6
+//   vertical madd lane:  |32767 · 58| ≈ 1.9e6, 8-tap sum ≤ ~1.5e7
+//
+// The `[c, 0, c, 0]` madd pairing turns one `_mm_madd_epi16` into two
+// same-coefficient products (even/odd sample pairs), so the vertical pass
+// needs no 16→32 sign extension and stays on baseline SSE2. Callers route
+// here only when the block width is a multiple of 4; anything else uses the
+// scalar core.
+
+#[cfg(target_arch = "x86_64")]
+mod sse2 {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_loadu_si128,
+        _mm_madd_epi16, _mm_setr_epi16, _mm_setr_epi32, _mm_setzero_si128, _mm_slli_epi32,
+        _mm_srli_si128, _mm_shuffle_epi32, _mm_unpacklo_epi16, _mm_unpacklo_epi32,
+    };
+
+    use super::{CHROMA_FILTER, LUMA_FILTER};
+
+    /// Horizontal sum of 4 i32 lanes (result in lane 0).
+    #[inline(always)]
+    fn hsum4(v: __m128i) -> __m128i {
+        unsafe {
+            let a = _mm_add_epi32(v, _mm_shuffle_epi32::<0x4E>(v));
+            _mm_add_epi32(a, _mm_shuffle_epi32::<0x39>(a))
+        }
+    }
+
+    /// Zero-extend the low 4 i16 lanes to i32 (reference samples are < 2^15).
+    #[inline(always)]
+    fn zext4(v: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi16(v, _mm_setzero_si128()) }
+    }
+
+    /// Left-shift 4 i32 lanes by `n` (always 0..=6 in this module).
+    #[inline(always)]
+    fn slli32(v: __m128i, n: i32) -> __m128i {
+        match n {
+            0 => v,
+            1 => unsafe { _mm_slli_epi32::<1>(v) },
+            2 => unsafe { _mm_slli_epi32::<2>(v) },
+            3 => unsafe { _mm_slli_epi32::<3>(v) },
+            4 => unsafe { _mm_slli_epi32::<4>(v) },
+            5 => unsafe { _mm_slli_epi32::<5>(v) },
+            6 => unsafe { _mm_slli_epi32::<6>(v) },
+            _ => {
+                // Unreachable for our shift values; exact scalar fallback.
+                unsafe {
+                    let l0 = _mm_cvtsi128_si32(v);
+                    let l1 = _mm_cvtsi128_si32(_mm_srli_si128::<4>(v));
+                    let l2 = _mm_cvtsi128_si32(_mm_srli_si128::<8>(v));
+                    let l3 = _mm_cvtsi128_si32(_mm_srli_si128::<12>(v));
+                    _mm_setr_epi32(l0 << n, l1 << n, l2 << n, l3 << n)
+                }
+            }
+        }
+    }
+
+    /// Extract the 4 i32 lanes of `r` and write `(v >> shift) as i16` each —
+    /// same wrap semantics as the scalar cores.
+    #[inline(always)]
+    fn store4(r: __m128i, shift: i32, out: &mut [i16]) {
+        unsafe {
+            out[0] = (_mm_cvtsi128_si32(r) >> shift) as i16;
+            out[1] = (_mm_cvtsi128_si32(_mm_srli_si128::<4>(r)) >> shift) as i16;
+            out[2] = (_mm_cvtsi128_si32(_mm_srli_si128::<8>(r)) >> shift) as i16;
+            out[3] = (_mm_cvtsi128_si32(_mm_srli_si128::<12>(r)) >> shift) as i16;
+        }
+    }
+
+    /// Luma 8-tap horizontal FIR for one row. `base` must point at a row with
+    /// at least `out.len() + 7` valid u16 samples (interior guarantee).
+    #[inline]
+    fn luma_hfir_row(base: *const u16, f: [i16; 8], shift: i32, out: &mut [i16]) {
+        let c = unsafe { _mm_setr_epi16(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]) };
+        let mut x = 0usize;
+        while x + 4 <= out.len() {
+            for j in 0..4usize {
+                let v = unsafe {
+                    let s = _mm_loadu_si128(base.add(x + j) as *const __m128i);
+                    _mm_cvtsi128_si32(hsum4(_mm_madd_epi16(s, c)))
+                };
+                out[x + j] = (v >> shift) as i16;
+            }
+            x += 4;
+        }
+        while x < out.len() {
+            let mut sum = 0i32;
+            for (k, &tap) in f.iter().enumerate() {
+                sum += tap as i32 * unsafe { *base.add(x + k) } as i32;
+            }
+            out[x] = (sum >> shift) as i16;
+            x += 1;
+        }
+    }
+
+    /// Luma 8-tap vertical FIR over `tmp` (width `n`, multiple of 4, at least
+    /// `rows_out + 7` rows). Signed i16 inputs via the madd pairing.
+    #[inline]
+    fn luma_vfir(
+        tmp: &[i16],
+        n: usize,
+        rows_out: usize,
+        f: [i16; 8],
+        shift: i32,
+        out: &mut [i16],
+    ) {
+        let zero = unsafe { _mm_setzero_si128() };
+        let mut bevens = [zero; 8];
+        for k in 0..8usize {
+            bevens[k] = unsafe { _mm_setr_epi16(f[k], 0, f[k], 0, 0, 0, 0, 0) };
+        }
+        let mut y = 0usize;
+        while y < rows_out {
+            let mut x0 = 0usize;
+            while x0 + 4 <= n {
+                let (mut even_acc, mut odd_acc) = (zero, zero);
+                for (k, &bev) in bevens.iter().enumerate() {
+                    unsafe {
+                        let base = tmp.as_ptr().add((y + k) * n + x0);
+                        let v = _mm_loadl_epi64(base as *const __m128i); // [T0 T1 T2 T3 | 0 ..]
+                        even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
+                        odd_acc = _mm_add_epi32(
+                            odd_acc,
+                            _mm_madd_epi16(_mm_srli_si128::<2>(v), bev),
+                        );
+                    }
+                }
+                store4(
+                    unsafe { _mm_unpacklo_epi32(even_acc, odd_acc) },
+                    shift,
+                    &mut out[y * n + x0..y * n + x0 + 4],
+                );
+                x0 += 4;
+            }
+            y += 1;
+        }
+    }
+
+    /// Integer-MV copy with `<< shift3`, 4 samples at a time. `base` must
+    /// point at a row with at least `n` valid u16 samples.
+    #[inline]
+    fn copy_shifted(base: *const u16, n: usize, shift: i32, out: &mut [i16]) {
+        let mut x = 0usize;
+        while x + 4 <= n {
+            unsafe {
+                let v = _mm_loadl_epi64(base.add(x) as *const __m128i);
+                store4(slli32(zext4(v), shift), 0, &mut out[x..x + 4]);
+            }
+            x += 4;
+        }
+        while x < n {
+            let s = unsafe { *base.add(x) };
+            out[x] = ((s as i32) << shift) as i16;
+            x += 1;
+        }
+    }
+
+    /// Luma interior kernel — all four frac combinations, direct access.
+    /// Precondition: the interior bounds checked by `interpolate_luma` hold
+    /// (all reference accesses, including filter margins, are in range) and
+    /// `n_pb_w % 4 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn luma_interior(
+        plane: &[u16],
+        stride: i32,
+        x_int: i32,
+        y_int: i32,
+        x_frac: i32,
+        y_frac: i32,
+        n_pb_w: usize,
+        n_pb_h: usize,
+        shift1: i32,
+        shift2: i32,
+        shift3: i32,
+        pred: &mut [i16],
+    ) {
+        debug_assert_eq!(n_pb_w % 4, 0);
+        if x_frac == 0 && y_frac == 0 {
+            for y in 0..n_pb_h {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32) * stride + x_int) as usize)
+                };
+                copy_shifted(base, n_pb_w, shift3, &mut pred[y * n_pb_w..(y + 1) * n_pb_w]);
+            }
+        } else if y_frac == 0 {
+            let f = LUMA_FILTER[x_frac as usize];
+            for y in 0..n_pb_h {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32) * stride + (x_int - 3)) as usize)
+                };
+                luma_hfir_row(base, f, shift1, &mut pred[y * n_pb_w..(y + 1) * n_pb_w]);
+            }
+        } else if x_frac == 0 {
+            let f = LUMA_FILTER[y_frac as usize];
+            let zero = unsafe { _mm_setzero_si128() };
+            let mut bevens = [zero; 8];
+            for k in 0..8usize {
+                bevens[k] = unsafe { _mm_setr_epi16(f[k], 0, f[k], 0, 0, 0, 0, 0) };
+            }
+            for y in 0..n_pb_h {
+                let row_out = &mut pred[y * n_pb_w..(y + 1) * n_pb_w];
+                let mut x0 = 0usize;
+                while x0 + 4 <= n_pb_w {
+                    let (mut even_acc, mut odd_acc) = (zero, zero);
+                    for (k, &bev) in bevens.iter().enumerate() {
+                        unsafe {
+                            let base = plane.as_ptr().add(
+                                ((y_int + y as i32 + k as i32 - 3) * stride + x_int + x0 as i32)
+                                    as usize,
+                            );
+                            let v = _mm_loadl_epi64(base as *const __m128i);
+                            even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
+                            odd_acc = _mm_add_epi32(
+                                odd_acc,
+                                _mm_madd_epi16(_mm_srli_si128::<2>(v), bev),
+                            );
+                        }
+                    }
+                    store4(
+                        unsafe { _mm_unpacklo_epi32(even_acc, odd_acc) },
+                        shift1,
+                        &mut row_out[x0..x0 + 4],
+                    );
+                    x0 += 4;
+                }
+            }
+        } else {
+            let tmp_h = n_pb_h + 7;
+            debug_assert!(n_pb_w <= 64 && tmp_h <= 71);
+            let mut tmp = [0i16; 64 * 71];
+            let f_h = LUMA_FILTER[x_frac as usize];
+            for y in 0..tmp_h {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize)
+                };
+                luma_hfir_row(base, f_h, shift1, &mut tmp[y * n_pb_w..(y + 1) * n_pb_w]);
+            }
+            let f_v = LUMA_FILTER[y_frac as usize];
+            luma_vfir(&tmp, n_pb_w, n_pb_h, f_v, shift2, pred);
+        }
+    }
+
+    /// Chroma 4-tap horizontal FIR for one row. `base` must point at a row
+    /// with at least `out.len() + 3` valid u16 samples (interior guarantee).
+    #[inline]
+    fn chroma_hfir_row(base: *const u16, f: [i16; 4], shift: i32, out: &mut [i16]) {
+        let c = unsafe { _mm_setr_epi16(f[0], f[1], f[2], f[3], 0, 0, 0, 0) };
+        let mut x = 0usize;
+        while x + 4 <= out.len() {
+            for j in 0..4usize {
+                let v = unsafe {
+                    let s = _mm_loadl_epi64(base.add(x + j) as *const __m128i);
+                    _mm_cvtsi128_si32(hsum4(_mm_madd_epi16(s, c)))
+                };
+                out[x + j] = (v >> shift) as i16;
+            }
+            x += 4;
+        }
+        while x < out.len() {
+            let mut sum = 0i32;
+            for (k, &tap) in f.iter().enumerate() {
+                sum += tap as i32 * unsafe { *base.add(x + k) } as i32;
+            }
+            out[x] = (sum >> shift) as i16;
+            x += 1;
+        }
+    }
+
+    /// Chroma 4-tap vertical FIR over `tmp` (width `n`, multiple of 4, at
+    /// least `rows_out + 3` rows).
+    #[inline]
+    fn chroma_vfir(
+        tmp: &[i16],
+        n: usize,
+        rows_out: usize,
+        f: [i16; 4],
+        shift: i32,
+        out: &mut [i16],
+    ) {
+        let zero = unsafe { _mm_setzero_si128() };
+        let mut bevens = [zero; 4];
+        for k in 0..4usize {
+            bevens[k] = unsafe { _mm_setr_epi16(f[k], 0, f[k], 0, 0, 0, 0, 0) };
+        }
+        let mut y = 0usize;
+        while y < rows_out {
+            let mut x0 = 0usize;
+            while x0 + 4 <= n {
+                let (mut even_acc, mut odd_acc) = (zero, zero);
+                for (k, &bev) in bevens.iter().enumerate() {
+                    unsafe {
+                        let base = tmp.as_ptr().add((y + k) * n + x0);
+                        let v = _mm_loadl_epi64(base as *const __m128i); // [T0 T1 T2 T3 | 0 ..]
+                        even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
+                        odd_acc = _mm_add_epi32(
+                            odd_acc,
+                            _mm_madd_epi16(_mm_srli_si128::<2>(v), bev),
+                        );
+                    }
+                }
+                store4(
+                    unsafe { _mm_unpacklo_epi32(even_acc, odd_acc) },
+                    shift,
+                    &mut out[y * n + x0..y * n + x0 + 4],
+                );
+                x0 += 4;
+            }
+            y += 1;
+        }
+    }
+
+    /// Chroma interior kernel — all four frac combinations, direct access.
+    /// Precondition: the interior bounds checked by `interpolate_chroma` hold
+    /// and `n_pb_wc % 4 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn chroma_interior(
+        plane: &[u16],
+        stride: i32,
+        x_int: i32,
+        y_int: i32,
+        x_frac: i32,
+        y_frac: i32,
+        n_pb_wc: usize,
+        n_pb_hc: usize,
+        shift1: i32,
+        shift2: i32,
+        shift3: i32,
+        pred: &mut [i16],
+    ) {
+        debug_assert_eq!(n_pb_wc % 4, 0);
+        if x_frac == 0 && y_frac == 0 {
+            for y in 0..n_pb_hc {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32) * stride + x_int) as usize)
+                };
+                copy_shifted(base, n_pb_wc, shift3, &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc]);
+            }
+        } else if y_frac == 0 {
+            let f = CHROMA_FILTER[x_frac as usize];
+            for y in 0..n_pb_hc {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32) * stride + (x_int - 1)) as usize)
+                };
+                chroma_hfir_row(base, f, shift1, &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc]);
+            }
+        } else if x_frac == 0 {
+            let f = CHROMA_FILTER[y_frac as usize];
+            let zero = unsafe { _mm_setzero_si128() };
+            let mut bevens = [zero; 4];
+            for k in 0..4usize {
+                bevens[k] = unsafe { _mm_setr_epi16(f[k], 0, f[k], 0, 0, 0, 0, 0) };
+            }
+            for y in 0..n_pb_hc {
+                let row_out = &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc];
+                let mut x0 = 0usize;
+                while x0 + 4 <= n_pb_wc {
+                    let (mut even_acc, mut odd_acc) = (zero, zero);
+                    for (k, &bev) in bevens.iter().enumerate() {
+                        unsafe {
+                            let base = plane.as_ptr().add(
+                                ((y_int + y as i32 + k as i32 - 1) * stride + x_int + x0 as i32)
+                                    as usize,
+                            );
+                            let v = _mm_loadl_epi64(base as *const __m128i);
+                            even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
+                            odd_acc = _mm_add_epi32(
+                                odd_acc,
+                                _mm_madd_epi16(_mm_srli_si128::<2>(v), bev),
+                            );
+                        }
+                    }
+                    store4(
+                        unsafe { _mm_unpacklo_epi32(even_acc, odd_acc) },
+                        shift1,
+                        &mut row_out[x0..x0 + 4],
+                    );
+                    x0 += 4;
+                }
+            }
+        } else {
+            let tmp_h = n_pb_hc + 3;
+            debug_assert!(n_pb_wc <= 32 && tmp_h <= 35);
+            let mut tmp = [0i16; 32 * 35];
+            let f_h = CHROMA_FILTER[x_frac as usize];
+            for y in 0..tmp_h {
+                let base = unsafe {
+                    plane.as_ptr().add(((y_int + y as i32 - 1) * stride + (x_int - 1)) as usize)
+                };
+                chroma_hfir_row(base, f_h, shift1, &mut tmp[y * n_pb_wc..(y + 1) * n_pb_wc]);
+            }
+            let f_v = CHROMA_FILTER[y_frac as usize];
+            chroma_vfir(&tmp, n_pb_wc, n_pb_hc, f_v, shift2, pred);
         }
     }
 }

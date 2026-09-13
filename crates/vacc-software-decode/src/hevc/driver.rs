@@ -218,30 +218,6 @@ pub fn decode_picture(
         -1
     };
 
-    if std::env::var_os("TIER_F_DEBUG").is_some() {
-        let pwt = &first_sh.pred_weight_table;
-        eprintln!(
-            "  [drv] poc={cur_poc} type={:?} tmlvl={} colL0={} colIdx={} colPic={} noBwd={} l0={list0:?} l1={list1:?} \
-             wpred={} wbipred={} l2wd={} dcl2wd={} l0w0={} l0o0={} l0cw0={} l0co0={} l1w0={} l1o0={}",
-            first_sh.slice_type,
-            first_sh.slice_temporal_mvp_enabled_flag,
-            first_sh.collocated_from_l0_flag,
-            first_sh.collocated_ref_idx,
-            col_pic_idx,
-            no_backward,
-            pps.weighted_pred_flag,
-            pps.weighted_bipred_flag,
-            pwt.luma_log2_weight_denom,
-            pwt.delta_chroma_log2_weight_denom,
-            pwt.l0[0].luma_weight,
-            pwt.l0[0].luma_offset,
-            pwt.l0[0].chroma_weight[0],
-            pwt.l0[0].chroma_offset[0],
-            pwt.l1[0].luma_weight,
-            pwt.l1[0].luma_offset,
-        );
-    }
-
     let dpb = DpbView {
         pics: &pool,
         list0: &list0,
@@ -273,13 +249,6 @@ pub fn decode_picture(
         let sh_coded = (seg.header_bit_size as usize + 8) / 8;
         let epb_in_hdr = epb.iter().filter(|&&e| e < sh_coded + 2).count();
         let seek_target = sh_coded - epb_in_hdr;
-        if std::env::var_os("TIER_F_DEBUG").is_some() {
-            eprintln!(
-                "  [seek] poc={} seg={} header_bits={} sh_coded={} epb_in_hdr={} seek_target={} rbsp_len={}",
-                cur_poc, s, seg.header_bit_size, sh_coded, epb_in_hdr, seek_target, rbsp.len()
-            );
-        }
-
         let mut reader = BitstreamReader::new(&rbsp);
         reader.seek_to_byte(seek_target);
         let mut cabac = CabacEngine::new(&mut reader);

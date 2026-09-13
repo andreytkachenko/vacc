@@ -345,39 +345,65 @@ impl SoftwareH265Decoder {
     /// padded output `Planes` (bps bytes/sample, 16-aligned strides).
     fn picture_to_planes(&self, pic: &Picture) -> Planes {
         let bps = self.bps as usize;
-        let pack = |v: u16, dst: &mut [u8], off: usize| {
-            if bps == 1 {
-                dst[off] = v as u8;
-            } else {
-                dst[off] = v as u8;
-                dst[off + 1] = (v >> 8) as u8;
-            }
-        };
 
         let mut y = vec![0u8; self.coded_h as usize * self.ystride * bps + 16];
-        for yy in 0..pic.height[0] {
-            for xx in 0..pic.width[0] {
-                let v = pic.planes[0][(yy * pic.stride[0] + xx) as usize];
-                pack(v, &mut y, ((yy as usize) * self.ystride + xx as usize) * bps);
+        let w0 = pic.width[0] as usize;
+        if bps == 1 {
+            for yy in 0..pic.height[0] {
+                let row_s = (yy * pic.stride[0]) as usize;
+                let src = &pic.planes[0][row_s..row_s + w0];
+                let row_d = (yy as usize) * self.ystride;
+                for (d, s) in y[row_d..row_d + w0].iter_mut().zip(src) {
+                    *d = *s as u8;
+                }
+            }
+        } else {
+            for yy in 0..pic.height[0] {
+                let row_s = (yy * pic.stride[0]) as usize;
+                let src = &pic.planes[0][row_s..row_s + w0];
+                let row_d = (yy as usize) * self.ystride * bps;
+                for (xx, s) in src.iter().enumerate() {
+                    y[row_d + xx * bps] = *s as u8;
+                    y[row_d + xx * bps + 1] = (*s >> 8) as u8;
+                }
             }
         }
 
         let mut u = vec![0u8; self.chroma_h as usize * self.cstride * bps + 16];
         let mut v = vec![0u8; self.chroma_h as usize * self.cstride * bps + 16];
         if self.chroma_idc != 0 {
-            for yy in 0..pic.height[1] {
-                for xx in 0..pic.width[1] {
-                    let off = ((yy as usize) * self.cstride + xx as usize) * bps;
-                    pack(
-                        pic.planes[1][(yy * pic.stride[1] + xx) as usize],
-                        &mut u,
-                        off,
-                    );
-                    pack(
-                        pic.planes[2][(yy * pic.stride[2] + xx) as usize],
-                        &mut v,
-                        off,
-                    );
+            let w1 = pic.width[1] as usize;
+            if bps == 1 {
+                for yy in 0..pic.height[1] {
+                    let row_u = (yy * pic.stride[1]) as usize;
+                    let row_v = (yy * pic.stride[2]) as usize;
+                    let row_d = (yy as usize) * self.cstride;
+                    for (d, s) in u[row_d..row_d + w1]
+                        .iter_mut()
+                        .zip(&pic.planes[1][row_u..row_u + w1])
+                    {
+                        *d = *s as u8;
+                    }
+                    for (d, s) in v[row_d..row_d + w1]
+                        .iter_mut()
+                        .zip(&pic.planes[2][row_v..row_v + w1])
+                    {
+                        *d = *s as u8;
+                    }
+                }
+            } else {
+                for yy in 0..pic.height[1] {
+                    let row_u = (yy * pic.stride[1]) as usize;
+                    let row_v = (yy * pic.stride[2]) as usize;
+                    let row_d = (yy as usize) * self.cstride * bps;
+                    for (xx, s) in pic.planes[1][row_u..row_u + w1].iter().enumerate() {
+                        u[row_d + xx * bps] = *s as u8;
+                        u[row_d + xx * bps + 1] = (*s >> 8) as u8;
+                    }
+                    for (xx, s) in pic.planes[2][row_v..row_v + w1].iter().enumerate() {
+                        v[row_d + xx * bps] = *s as u8;
+                        v[row_d + xx * bps + 1] = (*s >> 8) as u8;
+                    }
                 }
             }
         }
