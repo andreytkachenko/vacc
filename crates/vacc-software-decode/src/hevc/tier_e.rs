@@ -272,6 +272,10 @@ fn sps_from_flat(f: &[i32]) -> Sps {
         max_transform_hierarchy_depth_inter: f[27],
         max_transform_hierarchy_depth_intra: f[28],
         cabac_bypass_alignment_enabled_flag: f[29] != 0,
+        // Not exported by the oracle flat array; the tier_e decode path does
+        // not apply in-loop filters, so these gates are irrelevant there.
+        sample_adaptive_offset_enabled_flag: true,
+        pcm_loop_filter_disabled_flag: false,
     }
 }
 

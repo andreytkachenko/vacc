@@ -275,6 +275,10 @@ pub struct Sps {
     pub max_transform_hierarchy_depth_intra: i32,
     /// SPS RExt flag — Main profile infers 0.
     pub cabac_bypass_alignment_enabled_flag: bool,
+    /// sample_adaptive_offset_enabled_flag (gates SAO application).
+    pub sample_adaptive_offset_enabled_flag: bool,
+    /// pcm_loop_filter_disabled_flag.
+    pub pcm_loop_filter_disabled_flag: bool,
 }
 
 /// Picture Parameter Set — fields consumed by the coding-tree kernels.
@@ -293,6 +297,8 @@ pub struct Pps {
     pub tiles_enabled_flag: bool,
     pub entropy_coding_sync_enabled_flag: bool,
     pub pps_loop_filter_across_slices_enabled_flag: bool,
+    /// loop_filter_across_tiles_enabled_flag.
+    pub loop_filter_across_tiles_enabled_flag: bool,
     pub log2_parallel_merge_level_minus2: i32,
 
     // Tile scan tables (derived, §6.5.1). Identity mapping when tiles are
@@ -327,6 +333,7 @@ impl Default for Pps {
             tiles_enabled_flag: false,
             entropy_coding_sync_enabled_flag: false,
             pps_loop_filter_across_slices_enabled_flag: false,
+            loop_filter_across_tiles_enabled_flag: false,
             log2_parallel_merge_level_minus2: 0,
             ctb_addr_rs_to_ts: Vec::new(),
             ctb_addr_ts_to_rs: Vec::new(),

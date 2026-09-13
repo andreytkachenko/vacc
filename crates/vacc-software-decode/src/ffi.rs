@@ -1,4 +1,6 @@
-//! FFI bindings to the hevc.js core driver (`hevc_driver.h`).
+//! FFI bindings to the C++ hevc.js core driver (`hevc_driver.h`), retained
+//! **only as the differential-test oracle** for the Rust `hevc` port (the
+//! production decode path is fully Rust; see `h265.rs`).
 
 use std::os::raw::c_int;
 
@@ -15,7 +17,6 @@ pub const HEVCDEC_OK: c_int = 0;
 unsafe extern "C" {
     pub fn hevcdec_create(nthreads: c_int) -> *mut hevcdec_context;
     pub fn hevcdec_destroy(ctx: *mut hevcdec_context);
-    pub fn hevcdec_reset(ctx: *mut hevcdec_context);
 
     pub fn hevcdec_decode_picture(
         ctx: *mut hevcdec_context,
@@ -28,6 +29,4 @@ unsafe extern "C" {
         out_v: *mut u8,
         out_vstride: c_int,
     ) -> c_int;
-
-    pub fn hevcdec_last_pic_poc(ctx: *mut hevcdec_context) -> c_int;
 }

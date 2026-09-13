@@ -97,9 +97,14 @@ pub struct DeblockCtx<'a> {
     /// Per-CTB slice index; None = single slice.
     pub slice_idx: Option<&'a [u8]>,
     pub sh: &'a [DeblockSliceParams],
-    // CU grid at min-CB (4x4) granularity, raster order.
+    // CU grid at min-CB granularity, raster order (C++ `cu_info`).
     pub cu: &'a [DeblockCu],
-    /// = picW / 4. Also the C++ motion_info_stride and filter_grid_stride.
+    /// CU grid stride = PicWidthInMinCbsY (C++ `cu_info_stride`). Distinct from
+    /// `grid_stride` when MinCbSize != MinTbSize.
+    pub cu_stride: i32,
+    /// MinCbLog2SizeY — the shift `cu_at` applies to luma coords.
+    pub min_cb_log2: i32,
+    /// = picW / MinTbSizeY. The C++ motion_info_stride and filter_grid_stride.
     pub grid_stride: i32,
     // Motion + filter grids at 4x4 granularity (stride = grid_stride).
     pub motion: &'a [MotionInfo],
@@ -119,7 +124,7 @@ impl<'a> DeblockCtx<'a> {
     /// CU info at a luma position (min-CB grid) — `DecodingContext::cu_at`.
     fn cu_at(&self, x: i32, y: i32) -> &DeblockCu {
         assert!(x >= 0 && y >= 0);
-        let idx = ((y >> 2) * self.grid_stride + (x >> 2)) as usize;
+        let idx = ((y >> self.min_cb_log2) * self.cu_stride + (x >> self.min_cb_log2)) as usize;
         &self.cu[idx]
     }
 
@@ -1042,6 +1047,8 @@ mod tests {
             slice_idx: if multi_slice { Some(&slice_idx) } else { None },
             sh: &sh_rs,
             cu: &cu_rs,
+            cu_stride: pic_w / 4,
+            min_cb_log2: 2,
             grid_stride: pic_w / 4,
             motion: &motion_rs,
             cbf_luma: &cbf_luma,
@@ -1214,6 +1221,8 @@ mod tests {
             slice_idx: None,
             sh: &sh,
             cu: &cu,
+            cu_stride: 16,
+            min_cb_log2: 2,
             grid_stride: 16,
             motion: &motion,
             cbf_luma: &zeros,

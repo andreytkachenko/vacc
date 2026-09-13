@@ -6,31 +6,32 @@
 //!   (`H265Parser`, `H265Dpb`) — the same state machines the other backends
 //!   use.
 //! - Pixel reconstruction (CABAC, intra/inter prediction, transform,
-//!   deblocking, SAO) runs in the hevc.js core via FFI (`ffi` /
-//!   `hevc_driver`). The C++ core keeps its own DPB of fully decoded pictures
-//!   (pixels + motion metadata) and resolves references from the bitstream;
-//!   each decoded picture is copied into a Rust-owned padded buffer.
+//!   deblocking, SAO) runs in the Rust `hevc` port (`driver::decode_picture`).
+//!   The `H265Dpb` resolves reference lists by POC/RPS; decoded pictures are
+//!   kept in a `PictureStore` (indexed by DPB slot) so later pictures can use
+//!   them as references, and each is copied into a Rust-owned padded buffer.
 //! - Output is reordered to display order: a frame is emitted once
 //!   `max_num_reorder_pics` (SPS) or more pictures have been decoded after it
 //!   (spec 7.4.6 bounds the decode/display delay).
 
 use std::collections::BTreeMap;
-use std::os::raw::c_int;
-use std::ptr::NonNull;
 
 use vacc_core::codec::VideoCodec;
 use vacc_core::decoder::{Decoder, DecoderInfo};
 use vacc_core::format::{ChromaSubsampling, ComponentBitDepth, VideoFormat};
 use vacc_core::frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane};
-use vacc_core::picture::H265Sps;
+use vacc_core::picture::{H265Pps, H265Sps};
 use vacc_core::session::Extent2D;
 
 use vacc_parser::h265::H265Parser;
 use vacc_parser::h265_dpb::H265Dpb;
-use vacc_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceHeader, VideoParser};
+use vacc_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceEntry, SliceHeader, VideoParser};
 
 use crate::error::{Error, Result};
-use crate::ffi;
+use crate::hevc::driver::{self, PictureStore, RefListEntry, SliceInput};
+use crate::hevc::picture::Picture;
+use crate::hevc::syntax_map;
+use crate::hevc::transform::ScalingListData;
 
 /// Safety cap for the Rust-side DPB slot count.
 const MAX_DPB_SLOTS: usize = 64;
@@ -58,13 +59,15 @@ struct BufferedFrame {
     planes: Planes,
 }
 
-/// Software H.265 decoder (CPU reconstruction via the hevc.js core).
+/// Software H.265 decoder (CPU reconstruction via the Rust `hevc` port).
 pub struct SoftwareH265Decoder {
-    ctx: NonNull<ffi::hevcdec_context>,
     parser: H265Parser,
     dpb: Option<H265Dpb>,
+    /// Decoded pictures indexed by DPB slot, for reference resolution.
+    store: PictureStore,
 
     sps: Option<H265Sps>,
+    pps: Option<H265Pps>,
 
     // Picture layout (valid once the SPS has been seen).
     layout_ready: bool,
@@ -144,9 +147,8 @@ impl SoftwareH265Decoder {
             .unwrap_or(false);
 
         if changed && self.layout_ready {
-            // Resolution/format change: wipe all state (C++ core re-parses its
-            // own SPS cache from the bitstream).
-            unsafe { ffi::hevcdec_reset(self.ctx.as_ptr()) };
+            // Resolution/format change: wipe all decoded state.
+            self.store = PictureStore::new(MAX_DPB_SLOTS);
             if let Some(dpb) = self.dpb.as_mut() {
                 dpb.invalidate_all();
                 dpb.clear_display_pending();
@@ -198,17 +200,6 @@ impl SoftwareH265Decoder {
         self.layout_ready = true;
     }
 
-    /// Allocate the padded output planes for one coded picture.
-    fn alloc_planes(&self) -> Planes {
-        let y_len = self.coded_h as usize * self.ystride * self.bps as usize + 16;
-        let c_len = self.chroma_h as usize * self.cstride * self.bps as usize + 16;
-        Planes {
-            y: vec![0u8; y_len],
-            u: vec![0u8; c_len],
-            v: vec![0u8; c_len],
-        }
-    }
-
     /// Unwrap the raw POC into a monotonic value across POC periods.
     fn unwrap_poc(&mut self, poc: i32) -> i32 {
         let period = self.poc_period;
@@ -225,68 +216,110 @@ impl SoftwareH265Decoder {
         poc + self.poc_cycle * period
     }
 
-    /// Decode one picture: stage it in the Rust DPB, inject the reference
-    /// planes into the C++ core, run reconstruction, store the result.
+    /// Decode one picture: stage it in the Rust DPB, resolve reference lists,
+    /// run the Rust reconstruction core, and track the result for display-order
+    /// presentation.
     fn decode_picture(
         &mut self,
-        au: &[u8],
+        slices: &[SliceEntry],
         first_info: &vacc_parser::h265::SliceHeaderInfo,
     ) -> Result<()> {
-        let sps = self
+        let sps_h = self
             .sps
             .clone()
             .ok_or_else(|| Error::InvalidState("SPS not available".to_string()))?;
+        let pps_h = self
+            .pps
+            .clone()
+            .ok_or_else(|| Error::InvalidState("PPS not available".to_string()))?;
         if !self.layout_ready {
             return Err(Error::InvalidState("picture layout not ready".to_string()));
         }
 
-        // --- Stage the current picture in the Rust DPB (spec 8.3.2) ---
-        let slot = {
+        // --- Stage in the Rust DPB (spec 8.3.2) + resolve reference lists ---
+        let (slot, refs_l0, refs_l1) = {
             let dpb = self
                 .dpb
                 .as_mut()
                 .ok_or_else(|| Error::InvalidState("DPB not initialized".to_string()))?;
-            dpb.picture_start(&sps, first_info, first_info.is_reference)
+            let slot = dpb.picture_start(&sps_h, first_info, first_info.is_reference);
+            let lists = dpb.build_ref_lists();
+            let entries = |v: &[vacc_parser::h265_dpb::H265RefPic]| -> Vec<RefListEntry> {
+                v.iter()
+                    .map(|r| RefListEntry {
+                        slot: r.slot,
+                        poc: r.poc,
+                        long_term: if r.slot >= 0 {
+                            dpb.slot_is_long_term(r.slot as usize)
+                        } else {
+                            false
+                        },
+                    })
+                    .collect()
+            };
+            (slot, entries(&lists.l0), entries(&lists.l1))
         };
 
-        // --- Run the C++ reconstruction core on the access unit ---
-        // Reference resolution happens inside the C++ core (its own DPB of
-        // fully decoded pictures, matched by POC from the bitstream).
-        let mut planes = self.alloc_planes();
-        let rc = unsafe {
-            ffi::hevcdec_decode_picture(
-                self.ctx.as_ptr(),
-                au.as_ptr(),
-                au.len(),
-                planes.y.as_mut_ptr(),
-                self.ystride as c_int,
-                planes.u.as_mut_ptr(),
-                self.cstride as c_int,
-                planes.v.as_mut_ptr(),
-                self.cstride as c_int,
-            )
+        // --- Map parameter sets + build per-segment slice inputs ---
+        let sps = syntax_map::map_sps(&sps_h);
+        let pps = syntax_map::map_pps(&pps_h, &sps);
+        let has_chroma = sps.chroma_array_type != 0;
+        let sps_scaling_enabled = sps_h.sps_scaling_list_data_present_flag;
+        let sps_scaling = if sps_scaling_enabled {
+            syntax_map::map_scaling_list(&sps_h.scaling_lists)
+        } else {
+            ScalingListData::default()
         };
-        if rc != ffi::HEVCDEC_OK {
-            return Err(Error::Core {
-                code: rc,
-                msg: "hevcdec_decode_picture failed".to_string(),
+        let pps_scaling_present = pps_h.pps_scaling_list_data_present_flag;
+        let pps_scaling = if pps_scaling_present {
+            syntax_map::map_scaling_list(&pps_h.scaling_lists)
+        } else {
+            ScalingListData::default()
+        };
+
+        // Dependent-slice inheritance from the last independent segment.
+        let mut last_independent: Option<&vacc_parser::h265::SliceHeaderInfo> = None;
+        let mut slice_inputs: Vec<SliceInput> = Vec::new();
+        for e in slices {
+            let Some(SliceHeader::H265(info)) = &e.slice_header else {
+                continue;
+            };
+            let sh = syntax_map::map_sh(info, last_independent, &pps_h, has_chroma);
+            let deblock = syntax_map::map_deblock_params(info, &pps_h);
+            slice_inputs.push(SliceInput {
+                nal: &e.nal_data,
+                sh,
+                deblock,
+                header_bit_size: info.header_bit_size,
             });
+            if !info.dependent_slice_segment_flag {
+                last_independent = Some(info);
+            }
+        }
+        if slice_inputs.is_empty() {
+            return Err(Error::Parser("no slice segments parsed".to_string()));
         }
 
-        // Cross-check the C++ core's POC computation against the Rust side.
-        let c_poc = unsafe { ffi::hevcdec_last_pic_poc(self.ctx.as_ptr()) };
-        if c_poc != first_info.curr_pic_order_cnt_val {
-            log::warn!(
-                "POC mismatch: rust={} cpp={}",
-                first_info.curr_pic_order_cnt_val,
-                c_poc
-            );
-        }
+        // --- Run the Rust reconstruction core ---
+        let pic = driver::decode_picture(
+            &sps,
+            &pps,
+            &slice_inputs,
+            &refs_l0,
+            &refs_l1,
+            &self.store,
+            first_info.curr_pic_order_cnt_val,
+            sps_scaling_enabled,
+            &sps_scaling,
+            pps_scaling_present,
+            &pps_scaling,
+        )
+        .map_err(|e| Error::Core { code: -1, msg: e })?;
 
-        // --- Commit to the Rust DPB (display state machine) ---
-        if let Some(dpb) = self.dpb.as_mut() {
-            dpb.commit_current(slot);
-        }
+        // --- Commit to the Rust DPB + store for future reference resolution ---
+        let planes = self.picture_to_planes(&pic);
+        self.dpb.as_mut().unwrap().commit_current(slot);
+        self.store.store(slot, pic);
 
         // --- Track for display-order presentation ---
         self.seq_counter += 1;
@@ -308,6 +341,50 @@ impl SoftwareH265Decoder {
         Ok(())
     }
 
+    /// Convert a reconstructed `Picture` (u16 samples, tight strides) into the
+    /// padded output `Planes` (bps bytes/sample, 16-aligned strides).
+    fn picture_to_planes(&self, pic: &Picture) -> Planes {
+        let bps = self.bps as usize;
+        let pack = |v: u16, dst: &mut [u8], off: usize| {
+            if bps == 1 {
+                dst[off] = v as u8;
+            } else {
+                dst[off] = v as u8;
+                dst[off + 1] = (v >> 8) as u8;
+            }
+        };
+
+        let mut y = vec![0u8; self.coded_h as usize * self.ystride * bps + 16];
+        for yy in 0..pic.height[0] {
+            for xx in 0..pic.width[0] {
+                let v = pic.planes[0][(yy * pic.stride[0] + xx) as usize];
+                pack(v, &mut y, ((yy as usize) * self.ystride + xx as usize) * bps);
+            }
+        }
+
+        let mut u = vec![0u8; self.chroma_h as usize * self.cstride * bps + 16];
+        let mut v = vec![0u8; self.chroma_h as usize * self.cstride * bps + 16];
+        if self.chroma_idc != 0 {
+            for yy in 0..pic.height[1] {
+                for xx in 0..pic.width[1] {
+                    let off = ((yy as usize) * self.cstride + xx as usize) * bps;
+                    pack(
+                        pic.planes[1][(yy * pic.stride[1] + xx) as usize],
+                        &mut u,
+                        off,
+                    );
+                    pack(
+                        pic.planes[2][(yy * pic.stride[2] + xx) as usize],
+                        &mut v,
+                        off,
+                    );
+                }
+            }
+        }
+
+        Planes { y, u, v }
+    }
+
     /// Parse pending data and decode the next picture, if a complete access
     /// unit is available. Returns `Ok(true)` when a picture was decoded.
     fn decode_next_picture(&mut self) -> Result<bool> {
@@ -320,15 +397,19 @@ impl SoftwareH265Decoder {
 
         loop {
             match self.parser.parse(&packet) {
-                Ok(ParseResult::ParameterSet { sps, .. }) => {
+                Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
                     if let Some(b) = sps
                         && let Some(s) = b.downcast_ref::<H265Sps>()
                     {
                         self.on_sps(s);
                     }
-                    // Raw PS NALs stay in the pending region: they are fed to
-                    // the C++ core together with the first slice of the next
-                    // picture (bytes_consumed covers them).
+                    if let Some(b) = pps
+                        && let Some(p) = b.downcast_ref::<H265Pps>()
+                    {
+                        self.pps = Some(p.clone());
+                    }
+                    // PS NALs stay in the pending region until the first slice
+                    // of the next picture (bytes_consumed covers them).
                     self.ps_pending = true;
                     continue;
                 }
@@ -350,13 +431,14 @@ impl SoftwareH265Decoder {
                             "bytes_consumed exceeds pending data".to_string(),
                         ));
                     }
-                    let au = self.pending_data[self.parse_offset..au_end].to_vec();
+                    // Clone slices + header info out (parser borrow ends here);
+                    // the Rust driver reads each slice's NAL bytes directly.
+                    let slices_owned = slices.clone();
+                    let info = first_info.clone();
                     self.parse_offset = au_end;
                     self.ps_pending = false;
 
-                    // Clone the header info out (parser borrow ends here).
-                    let info = first_info.clone();
-                    self.decode_picture(&au, &info)?;
+                    self.decode_picture(&slices_owned, &info)?;
                     return Ok(true);
                 }
                 Ok(ParseResult::Nothing) => {
@@ -493,7 +575,8 @@ impl SoftwareH265Decoder {
     }
 
     fn reset_state(&mut self) {
-        unsafe { ffi::hevcdec_reset(self.ctx.as_ptr()) };
+        self.store = PictureStore::new(MAX_DPB_SLOTS);
+        self.pps = None;
         self.parser.reset();
         if let Some(dpb) = self.dpb.as_mut() {
             dpb.invalidate_all();
@@ -519,21 +602,17 @@ impl Decoder for SoftwareH265Decoder {
             ));
         }
 
-        let ptr = unsafe { ffi::hevcdec_create(software_threads()) };
-        let ctx = NonNull::new(ptr).ok_or_else(|| {
-            Error::DecoderInit("failed to create C++ decoder context".to_string())
-        })?;
-
         let mut parser = H265Parser::new();
         parser
             .init(&DetectedVideoFormat::new(VideoCodec::DecodeH265))
             .map_err(|e| Error::Parser(e.to_string()))?;
 
         Ok(Self {
-            ctx,
             parser,
             dpb: None,
+            store: PictureStore::new(MAX_DPB_SLOTS),
             sps: None,
+            pps: None,
             layout_ready: false,
             coded_w: 0,
             coded_h: 0,
@@ -662,21 +741,310 @@ impl Decoder for SoftwareH265Decoder {
     }
 }
 
-impl Drop for SoftwareH265Decoder {
-    fn drop(&mut self) {
-        unsafe { ffi::hevcdec_destroy(self.ctx.as_ptr()) };
+#[cfg(test)]
+mod e2e_tests {
+    //! End-to-end gate for the production pipeline: `SoftwareH265Decoder`
+    //! (Rust parser + DPB + Rust reconstruction core + display-order reorder)
+    //! vs the C++ `hevcdec_decode_picture` core as ground truth, on real
+    //! streams. Frames are compared in display order, matched by POC.
+
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use vacc_core::decoder::Decoder;
+    use vacc_core::picture::H265Sps;
+    use vacc_parser::h265::H265Parser;
+    use vacc_parser::{BitstreamPacket, ParseResult, SliceHeader, VideoParser};
+
+    use crate::ffi;
+    use super::SoftwareH265Decoder;
+
+    fn sample_dir() -> Option<PathBuf> {
+        if let Ok(d) = std::env::var("VACC_SAMPLES_DIR") {
+            return Some(PathBuf::from(d));
+        }
+        let p = PathBuf::from("/home/atkachenko/apps/vacc/assets/samples");
+        p.is_dir().then_some(p)
+    }
+
+    /// Picture layout derived from the SPS (mirrors `on_sps`).
+    #[derive(Clone, Copy)]
+    struct Layout {
+        coded_w: u32,
+        coded_h: u32,
+        chroma_h: u32,
+        conf_left: u32, // luma samples
+        conf_right: u32,
+        conf_top: u32,
+        conf_bottom: u32,
+        sw: u32,
+        sh: u32,
+        bps: usize,
+        ystride: usize,
+        cstride: usize,
+        chroma_idc: u8,
+    }
+
+    fn layout_from_sps(sps: &H265Sps) -> Layout {
+        let (sw, sh) = match sps.chroma_format_idc {
+            0 => (1, 1),
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let w = sps.pic_width_in_luma_samples as u32;
+        let h = sps.pic_height_in_luma_samples as u32;
+        let bd = 8 + sps.bit_depth_luma_minus8 as u32;
+        Layout {
+            coded_w: w,
+            coded_h: h,
+            chroma_h: h.div_ceil(sh),
+            conf_left: sps.conf_win_left_offset * sw,
+            conf_right: sps.conf_win_right_offset * sw,
+            conf_top: sps.conf_win_top_offset * sh,
+            conf_bottom: sps.conf_win_bottom_offset * sh,
+            sw,
+            sh,
+            bps: if bd > 8 { 2 } else { 1 },
+            ystride: (w as usize).div_ceil(16) * 16,
+            cstride: (w.div_ceil(sw) as usize).div_ceil(16) * 16,
+            chroma_idc: sps.chroma_format_idc,
+        }
+    }
+
+    /// Coded-size ground-truth planes for one output picture.
+    struct RefFrame {
+        poc: i32,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    }
+
+    /// Decode the whole stream with the C++ core (one context across all AUs,
+    /// so its internal DPB evolves exactly as in a real decode) and collect
+    /// filtered planes for every AU whose `pic_output_flag` is set.
+    fn cpp_ground_truth(name: &str, data: &[u8]) -> (Vec<RefFrame>, Layout) {
+        let cpp_ctx = unsafe { ffi::hevcdec_create(0) };
+        assert!(!cpp_ctx.is_null(), "{name}: hevcdec_create failed");
+
+        let mut parser = H265Parser::new();
+        let mut layout: Option<Layout> = None;
+        let mut refs: Vec<RefFrame> = Vec::new();
+        let mut parse_offset = 0usize;
+
+        while parse_offset < data.len() {
+            let mut got_au = false;
+            'au: while parse_offset < data.len() {
+                let remaining = &data[parse_offset..];
+                let packet = BitstreamPacket::new(remaining.to_vec());
+                match parser.parse(&packet) {
+                    Ok(ParseResult::ParameterSet { sps, .. }) => {
+                        if let Some(b) = sps
+                            && let Some(s) = b.downcast_ref::<H265Sps>()
+                        {
+                            layout = Some(layout_from_sps(s));
+                        }
+                        // PS NALs stay in the pending region; re-parse for slices.
+                        continue 'au;
+                    }
+                    Ok(ParseResult::Slice {
+                        slices,
+                        bytes_consumed,
+                    }) => {
+                        if slices.is_empty() {
+                            break 'au;
+                        }
+                        let au_end = parse_offset + bytes_consumed;
+                        assert!(au_end <= data.len(), "{name}: bytes_consumed exceeds data");
+                        let au = &data[parse_offset..au_end];
+                        let first_info = match &slices[0].slice_header {
+                            Some(SliceHeader::H265(i)) => i,
+                            _ => panic!("{name}: no H265 slice header"),
+                        };
+                        let layout = layout
+                            .expect("SPS not ready for a picture");
+                        let mut out_y = vec![0u8; layout.coded_h as usize * layout.ystride * layout.bps + 16];
+                        let mut out_u = vec![0u8; layout.chroma_h as usize * layout.cstride * layout.bps + 16];
+                        let mut out_v = vec![0u8; layout.chroma_h as usize * layout.cstride * layout.bps + 16];
+                        let rc = unsafe {
+                            ffi::hevcdec_decode_picture(
+                                cpp_ctx,
+                                au.as_ptr(),
+                                au.len(),
+                                out_y.as_mut_ptr(),
+                                layout.ystride as i32,
+                                out_u.as_mut_ptr(),
+                                layout.cstride as i32,
+                                out_v.as_mut_ptr(),
+                                layout.cstride as i32,
+                            )
+                        };
+                        assert_eq!(rc, ffi::HEVCDEC_OK, "{name}: C++ decode failed ({rc})");
+                        if first_info.pic_output_flag {
+                            refs.push(RefFrame {
+                                poc: first_info.curr_pic_order_cnt_val,
+                                y: out_y,
+                                u: out_u,
+                                v: out_v,
+                            });
+                        }
+                        parse_offset = au_end;
+                        got_au = true;
+                        break 'au;
+                    }
+                    Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => break 'au,
+                    Err(e) => panic!("{name}: parse error: {e}"),
+                }
+            }
+            if !got_au {
+                break;
+            }
+        }
+
+        unsafe { ffi::hevcdec_destroy(cpp_ctx) };
+        (refs, layout.expect("no SPS in stream"))
+    }
+
+    /// Pack the coded-size C++ planes into a tight display-window buffer with
+    /// the exact layout of `build_frame` (Y, then U, then V; bps bytes per
+    /// sample, tight pitches).
+    fn pack_display(l: &Layout, rf: &RefFrame) -> Vec<u8> {
+        let cw = l.coded_w as usize - l.conf_left as usize - l.conf_right as usize;
+        let ch = l.coded_h as usize - l.conf_top as usize - l.conf_bottom as usize;
+        let x0 = (l.conf_left / l.sw) as usize;
+        let y0 = (l.conf_top / l.sh) as usize;
+        let cwidth = cw.div_ceil(l.sw as usize);
+        let cheight = ch.div_ceil(l.sh as usize);
+        let bps = l.bps;
+
+        let y_len = cw * ch * bps;
+        let c_len = cwidth * cheight * bps;
+        let mut buf = Vec::with_capacity(y_len + 2 * c_len);
+
+        for y in 0..ch {
+            let src = &rf.y[((y0 + y) * l.ystride + x0) * bps..];
+            buf.extend_from_slice(&src[..cw * bps]);
+        }
+        if l.chroma_idc != 0 {
+            for plane in [&rf.u, &rf.v] {
+                for y in 0..cheight {
+                    let row = &plane[((y0 + y) * l.cstride + x0) * bps..];
+                    buf.extend_from_slice(&row[..cwidth * bps]);
+                }
+            }
+        }
+        buf
+    }
+
+    fn first_buf_diff(name: &str, got: &[u8], want: &[u8]) {
+        assert_eq!(got.len(), want.len(), "{name}: buffer length {} != {}", got.len(), want.len());
+        let n = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+        assert!(
+            n == got.len(),
+            "{name}: first byte diff at offset {n} (got {:02x}, want {:02x})",
+            got[n],
+            want[n]
+        );
+    }
+
+    fn run_e2e(name: &str) {
+        let dir = match sample_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!("skip {name}: no samples dir (set VACC_SAMPLES_DIR)");
+                return;
+            }
+        };
+        let path = dir.join(format!("h265_{name}.h265"));
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skip {name}: {e}");
+                return;
+            }
+        };
+
+        // ---- Ground truth: C++ core decodes the whole stream ----
+        let (refs, layout) = cpp_ground_truth(name, &data);
+        let mut truth: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
+        for rf in &refs {
+            assert!(
+                truth.insert(rf.poc, pack_display(&layout, rf)).is_none(),
+                "{name}: duplicate POC {}",
+                rf.poc
+            );
+        }
+
+        // ---- Production decoder (same driving pattern as the app) ----
+        let mut dec = SoftwareH265Decoder::new(data).expect("decoder init");
+        let mut frames = Vec::new();
+        while let Some(f) = dec.decode().unwrap() {
+            frames.push(f);
+        }
+        frames.extend(dec.flush().unwrap());
+
+        assert_eq!(
+            frames.len(),
+            truth.len(),
+            "{name}: {} emitted frames vs {} output pictures",
+            frames.len(),
+            truth.len()
+        );
+
+        // Display order: POCs must be strictly increasing.
+        for pair in frames.windows(2) {
+            assert!(
+                pair[0].poc < pair[1].poc,
+                "{name}: display-order violation at frame {}: poc {} -> {}",
+                pair[1].frame_index,
+                pair[0].poc,
+                pair[1].poc
+            );
+        }
+
+        // Per-frame pixel comparison against the ground truth (by POC).
+        for f in &frames {
+            let pd = f.pixel_data.as_ref().expect("pixel data present");
+            let want = truth
+                .get(&f.poc)
+                .unwrap_or_else(|| panic!("{name}: no ground truth for poc {}", f.poc));
+            first_buf_diff(&format!("{name} poc {}", f.poc), &pd.buffer, want);
+        }
+
+        if !frames.is_empty() {
+            let cw = layout.coded_w - layout.conf_left - layout.conf_right;
+            let ch = layout.coded_h - layout.conf_top - layout.conf_bottom;
+            let expect_fmt = if layout.bps > 1 { "I420-10" } else { "I420" };
+            for f in &frames {
+                assert_eq!((f.width, f.height), (cw, ch), "{name}: frame size mismatch");
+                let pd = f.pixel_data.as_ref().unwrap();
+                assert_eq!(pd.format, expect_fmt, "{name}: pixel format mismatch");
+            }
+        }
+
+        println!("{name}: {} frames verified end-to-end (Rust pipeline == C++ core)", frames.len());
+    }
+
+    #[test]
+    fn e2e_main() {
+        run_e2e("main");
+    }
+
+    #[test]
+    fn e2e_main10() {
+        run_e2e("main10");
+    }
+
+    #[test]
+    fn e2e_cra() {
+        run_e2e("cra");
+    }
+
+    #[test]
+    fn e2e_msp() {
+        run_e2e("msp");
     }
 }
 
-fn software_threads() -> i32 {
-    // VACC_SW_THREADS overrides the worker thread count (0 = sequential).
-    if let Ok(v) = std::env::var("VACC_SW_THREADS")
-        && let Ok(n) = v.parse::<i32>()
-    {
-        return n.max(0);
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(4)
-        .clamp(1, 8)
-}
+

@@ -5,6 +5,9 @@
 //! in Rust on the shared `vacc-parser`.
 
 mod error;
+// The C++ hevc.js core is retained only as the differential-test oracle
+// (tier_e / tier_f); production reconstruction runs in the Rust `hevc` port.
+#[cfg(test)]
 mod ffi;
 #[cfg(test)]
 mod ffi_test;

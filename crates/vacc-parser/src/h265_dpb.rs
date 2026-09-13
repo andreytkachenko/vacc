@@ -397,21 +397,23 @@ impl H265Dpb {
 
     /// Stage the current picture and return the slot it will be stored into.
     ///
-    /// Applies, in order (spec 8.3.2):
-    /// - NoRaslOutput reset: an IRAP with NoRaslOutputFlag removes all
-    ///   reference pictures from the DPB;
+    /// Applies, in order (mirrors the C++ core's `alloc_picture` +
+    /// `evict_unused`, which never remove reference pictures):
     /// - marking: every RPS entry of the current picture (used OR future-use)
     ///   marks its DPB slot as referenced by the current access unit;
-    /// - eviction: unmarked slots that are not pending output are freed;
-    /// - allocation: the first empty slot is reserved for the current picture.
+    /// - eviction: non-reference pictures that are not referenced and not
+    ///   pending output are freed. Reference pictures persist across IRAPs
+    ///   (`no_output_of_prior_pics_flag` is parsed by the C++ core but has no
+    ///   effect on DPB eviction);
+    /// - allocation: the first empty slot is reserved for the current picture,
+    ///   growing the pool when all slots are occupied.
     pub fn picture_start(&mut self, sps: &H265Sps, info: &SliceHeaderInfo, is_ref: bool) -> usize {
         let resolved = resolve_refs(sps, info);
         let cur_poc = info.curr_pic_order_cnt_val;
 
         // 1. Clear reference marks from the previous access unit (FFmpeg
-        //    mark_ref(0) on all frames). For a NoRaslOutput IRAP the RPS is
-        //    empty, so every picture ends up unmarked below and is evicted —
-        //    implementing the spec 8.3.2 "remove all reference pictures" rule.
+        //    mark_ref(0) on all frames). Marks are per-AU: a picture stays in
+        //    the DPB across IRAPs as long as it is a reference (step 3).
         for s in &mut self.slots {
             s.referenced_by_curr = false;
             s.is_long_term = false;
@@ -464,26 +466,27 @@ impl H265Dpb {
             }
         }
 
-        // 3. Evict: unreferenced and not pending output.
+        // 3. Evict: non-reference pictures that are no longer pending output.
+        //    Reference pictures (RefPicFlag=1) are kept until the next IRAP /
+        //    long-term operation — a reference not used by the *current* pic may
+        //    still be used by a later one, so it must not be freed (mirrors the
+        //    C++ `DPB::evict_unused`, which never removes references).
         for s in &mut self.slots {
-            if s.valid && !s.referenced_by_curr && !s.needed_for_output {
+            if s.valid && !s.is_ref && !s.referenced_by_curr && !s.needed_for_output {
                 *s = H265DpbSlot::empty();
             }
         }
 
-        // 4. Reserve the first empty slot for the current picture.
-        let slot = self.slots.iter().position(|s| !s.valid).unwrap_or_else(|| {
-            // DPB full (non-conforming stream or undersized backend):
-            // recycle the oldest referenced slot rather than stall.
-            eprintln!("[H265DPB] WARNING: no free slot for poc={cur_poc}, recycling oldest");
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.valid)
-                .min_by_key(|(_, s)| s.poc)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        });
+        // 4. Reserve the first empty slot for the current picture, growing the
+        //    pool when it is exhausted (the C++ DPB is an unbounded vector of
+        //    pictures; short-term references accumulate until the next IRAP).
+        let slot = match self.slots.iter().position(|s| !s.valid) {
+            Some(i) => i,
+            None => {
+                self.slots.push(H265DpbSlot::empty());
+                self.slots.len() - 1
+            }
+        };
 
         self.cur = Some(H265CurPic {
             poc: cur_poc,
@@ -519,6 +522,14 @@ impl H265Dpb {
             });
         }
         lists
+    }
+
+    /// Whether the picture in `slot` is marked as a long-term reference by the
+    /// current access unit. Valid after `picture_start`, before
+    /// `commit_current` (the flag is cleared on commit). Returns false for an
+    /// invalid slot.
+    pub fn slot_is_long_term(&self, slot: usize) -> bool {
+        self.slots.get(slot).is_some_and(|s| s.valid && s.is_long_term)
     }
 
     /// Match the staged picture's RPS entries against DPB slots, returning
@@ -962,7 +973,9 @@ mod tests {
     }
 
     /// DPB lifecycle: IDR -> P -> B pyramid; verify marking, keep-alive of
-    /// unused RPS entries, eviction, and NoRaslOutput reset.
+    /// unused RPS entries, and reference persistence across an IRAP (the C++
+    /// core never evicts references; `no_output_of_prior_pics_flag` has no
+    /// effect on DPB eviction).
     #[test]
     fn dpb_lifecycle() {
         let sps = sps_with(4);
@@ -1038,7 +1051,10 @@ mod tests {
         let refs = dpb.get_references();
         assert!(refs.iter().any(|&i| dpb.slot_poc(i) == Some(0)));
 
-        // PIC 3: CRA with no_output_of_prior_pics=1 -> all refs removed.
+        // PIC 3: CRA with no_output_of_prior_pics=1. The C++ core parses the
+        // flag but never uses it for DPB eviction, and `evict_unused` never
+        // removes reference pictures — so every prior reference survives the
+        // IRAP (mirrored here).
         let mut info = SliceHeaderInfo::new();
         info.slice_type = 0; // I
         info.is_rap = true;
@@ -1048,7 +1064,7 @@ mod tests {
         info.short_term_ref_pic_set_sps_flag = false;
         info.slice_strps = Some(H265ShortTermRefPicSet::default()); // empty RPS
         let slot = dpb.picture_start(&sps, &info, true);
-        // After reset+eviction, only output-pending pics may remain.
+        // Empty RPS -> no references for the CRA itself.
         let lists = dpb.build_ref_lists();
         assert!(lists.l0.is_empty());
         dpb.commit_current(slot);
@@ -1057,24 +1073,27 @@ mod tests {
             .into_iter()
             .filter_map(|i| dpb.slot_poc(i))
             .collect();
-        // The CRA itself is the only reference now (old refs unmarked + evicted
-        // unless still pending output; with max_num_reorder_frames=0 they were
-        // bumped at each commit).
-        assert_eq!(live_refs, vec![8]);
+        // All prior references persist across the IRAP (C++ `evict_unused`
+        // never removes references).
+        assert_eq!(live_refs, vec![0, 1, 3, 8]);
     }
 
+    /// Eviction semantics (mirrors C++ `DPB::evict_unused`): a non-reference
+    /// picture that is no longer referenced and no longer pending output is
+    /// freed; reference pictures persist even when unused by the current pic.
     #[test]
     fn dpb_eviction_of_unreferenced() {
         let sps = sps_with(4);
         let mut dpb = H265Dpb::new(8);
 
-        // Two P pictures: POC 0, then POC 1 referencing POC 0.
+        // POC 0: IDR reference.
         let mut info = SliceHeaderInfo::new();
         info.is_idr = true;
         info.curr_pic_order_cnt_val = 0;
         let slot = dpb.picture_start(&sps, &info, true);
         dpb.commit_current(slot);
 
+        // P pictures each referencing POC-1.
         let mk_p = |poc: i32| {
             let mut info = SliceHeaderInfo::new();
             info.slice_type = 1;
@@ -1092,20 +1111,33 @@ mod tests {
             info
         };
 
+        // POC 1 (ref) references POC 0.
         let slot = dpb.picture_start(&sps, &mk_p(1), true);
         dpb.commit_current(slot);
 
-        // POC 2 references only POC 1 -> POC 0 is unreferenced and not pending
-        // output (bumped already) -> evicted.
-        let slot = dpb.picture_start(&sps, &mk_p(2), true);
+        // POC 2 (non-ref) references only POC 1.
+        let slot = dpb.picture_start(&sps, &mk_p(2), false);
         let lists = dpb.build_ref_lists();
         assert_eq!(lists.l0.len(), 1);
         assert_eq!(lists.l0[0].poc, 1);
         dpb.commit_current(slot);
 
+        // POC 3 (ref) references only POC 2: POC 2 stays marked for this AU
+        // even though it is not a reference.
+        let slot = dpb.picture_start(&sps, &mk_p(3), true);
+        dpb.commit_current(slot);
+
+        // POC 4 (ref) references only POC 3: POC 2 is now unreferenced, not
+        // pending output (bumped at its commit), and not a reference ->
+        // evicted. References POC 0/1 persist although unused by the current
+        // picture.
+        let slot = dpb.picture_start(&sps, &mk_p(4), true);
+        dpb.commit_current(slot);
+
         let pocs: Vec<i32> = (0..8).filter_map(|i| dpb.slot_poc(i)).collect();
-        assert!(!pocs.contains(&0), "POC 0 should be evicted: {pocs:?}");
-        assert!(pocs.contains(&1));
-        assert!(pocs.contains(&2));
+        assert!(!pocs.contains(&2), "POC 2 should be evicted: {pocs:?}");
+        for keep in [0, 1, 3, 4] {
+            assert!(pocs.contains(&keep), "POC {keep} missing: {pocs:?}");
+        }
     }
 }

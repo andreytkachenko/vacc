@@ -125,6 +125,11 @@ pub struct SliceHeaderInfo {
     /// Effective slice_loop_filter_across_slices_enabled_flag (PPS value when
     /// not read from the bitstream).
     pub slice_loop_filter_across_slices_enabled_flag: bool,
+    /// deblocking_filter_override_flag (only when PPS
+    /// deblocking_filter_override_enabled_flag; false otherwise). True means
+    /// `slice_deblocking_filter_disabled_flag` / beta / tc below were read
+    /// from the bitstream rather than inferred from the PPS.
+    pub deblocking_filter_override_flag: bool,
     /// num_entry_point_offsets / entry_point_offset_length (only present when
     /// PPS tiles or entropy_coding_sync is enabled; 0 otherwise).
     /// Per the current H.265 spec, entry_point_offset_length is coded as
@@ -206,6 +211,7 @@ impl SliceHeaderInfo {
             slice_beta_offset_div2: 0,
             slice_tc_offset_div2: 0,
             slice_loop_filter_across_slices_enabled_flag: false,
+            deblocking_filter_override_flag: false,
             num_entry_point_offsets: 0,
             entry_point_offset_length: 0,
             entry_point_offsets: Vec::new(),
@@ -1989,6 +1995,7 @@ impl H265Parser {
             } else {
                 false
             };
+            info.deblocking_filter_override_flag = override_flag;
             if override_flag {
                 info.slice_deblocking_filter_disabled_flag = r.read_bit()?;
                 if !info.slice_deblocking_filter_disabled_flag {

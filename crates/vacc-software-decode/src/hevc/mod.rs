@@ -13,6 +13,7 @@ pub mod cabac;
 pub mod cabac_tables;
 pub mod coding_tree;
 pub mod deblocking;
+pub mod driver;
 pub mod interpolation;
 pub mod inter_prediction;
 pub mod intra_prediction;
@@ -20,7 +21,10 @@ pub mod picture;
 pub mod residual_coding;
 pub mod sao;
 pub mod syntax_elements;
+pub mod syntax_map;
 #[cfg(test)]
 pub mod tier_e;
+#[cfg(test)]
+pub mod tier_f;
 pub mod transform;
 pub mod types;

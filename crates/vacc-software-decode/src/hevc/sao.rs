@@ -5,28 +5,24 @@
 
 use crate::hevc::types::{clip3, Plane, Tiles};
 
-/// SAO parameters for one CTU (spec §7.4.9).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SaoParams {
-    /// 0 = off, 1 = band offset, 2 = edge offset.
-    pub sao_type_idx: [i32; 3],
-    /// Derived offset values (spec §7.4.9.3).
-    pub sao_offset_val: [[i32; 5]; 3],
-    pub sao_band_position: [i32; 3],
-    pub sao_eo_class: [i32; 3],
-}
+/// SAO parameters for one CTU (spec §7.4.9). Canonical definition lives in
+/// [`crate::hevc::coding_tree`] (the coding-tree decode path writes these);
+/// re-exported here so the SAO filter consumes the same type.
+pub use crate::hevc::coding_tree::SaoParams;
 
 /// §8.7.3.2: EO class direction offsets.
 /// Class 0 (H): (-1,0)/(1,0); 1 (V): (0,-1)/(0,1); 2 (D135); 3 (D45).
 const EO_DX: [[i32; 2]; 4] = [[-1, 1], [0, 0], [-1, 1], [1, -1]];
 const EO_DY: [[i32; 2]; 4] = [[0, 0], [-1, 1], [-1, 1], [-1, 1]];
 
-/// Per-min-CB (4x4) flags for the PCM/transquant-bypass scan.
+/// Per-min-CB PCM/transquant-bypass flags (C++ `cu_info`, min-CB granularity).
 pub struct CuGrid<'a> {
     pub is_pcm: &'a [u8],
     pub bypass: &'a [u8],
-    /// picW / 4.
+    /// PicWidthInMinCbsY (C++ `cu_info_stride`).
     pub stride: i32,
+    /// MinCbSizeY — the divisor applied to luma coords when indexing.
+    pub min_cb: i32,
 }
 
 /// Context for `apply_sao` — mirrors the DecodingContext fields the C++
@@ -166,7 +162,7 @@ pub fn apply_sao(ctx: &SaoCtx, planes: &mut [Plane]) {
                 // Only scan when PCM or transquant_bypass are possible in this stream
                 let x_yctb = rx * ctb_size;
                 let y_yctb = ry * ctb_size;
-                let min_cb = 4; // sps.MinCbSizeY (spec-fixed)
+                let min_cb = ctx.cu.min_cb; // sps.MinCbSizeY
                 let cb_end_x = (x_yctb + ctb_size).min(ctx.pic_w);
                 let cb_end_y = (y_yctb + ctb_size).min(ctx.pic_h);
                 let mut cy = y_yctb;
@@ -284,7 +280,7 @@ pub fn apply_sao(ctx: &SaoCtx, planes: &mut [Plane]) {
                             let x_y = if c_idx == 0 { x_si } else { x_si * sub_w };
                             let y_y = if c_idx == 0 { y_sj } else { y_sj * sub_h };
                             if ctb_has_pcm_or_bypass {
-                                let idx = ((y_y / 4) * ctx.cu.stride + x_y / 4) as usize;
+                                let idx = ((y_y / ctx.cu.min_cb) * ctx.cu.stride + x_y / ctx.cu.min_cb) as usize;
                                 if (pcm_filter_disabled && ctx.cu.is_pcm[idx] != 0)
                                     || ctx.cu.bypass[idx] != 0
                                 {
@@ -437,7 +433,7 @@ pub fn apply_sao(ctx: &SaoCtx, planes: &mut [Plane]) {
                             if ctb_has_pcm_or_bypass {
                                 let x_y = if c_idx == 0 { x_si } else { x_si * sub_w };
                                 let y_y = if c_idx == 0 { y_sj } else { y_sj * sub_h };
-                                let idx = ((y_y / 4) * ctx.cu.stride + x_y / 4) as usize;
+                                let idx = ((y_y / ctx.cu.min_cb) * ctx.cu.stride + x_y / ctx.cu.min_cb) as usize;
                                 if (pcm_filter_disabled && ctx.cu.is_pcm[idx] != 0)
                                     || ctx.cu.bypass[idx] != 0
                                 {
@@ -623,7 +619,7 @@ mod tests {
         } else {
             None
         };
-        let cu = CuGrid { is_pcm: &cu_pcm, bypass: &cu_bypass, stride: pic_w / 4 };
+        let cu = CuGrid { is_pcm: &cu_pcm, bypass: &cu_bypass, stride: pic_w / 4, min_cb: 4 };
         let ctx = SaoCtx {
             sao_enabled: true,
             ctb_size,
@@ -804,7 +800,7 @@ mod tests {
         // sao_enabled = false: planes untouched.
         let mut plane = vec![3u16; 64 * 64];
         let sao_params = [SaoParams::default(); 1];
-        let cu = CuGrid { is_pcm: &[0; 256], bypass: &[0; 256], stride: 16 };
+        let cu = CuGrid { is_pcm: &[0; 256], bypass: &[0; 256], stride: 16, min_cb: 4 };
         let ctx = SaoCtx {
             sao_enabled: false,
             ctb_size: 64,
