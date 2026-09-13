@@ -13,7 +13,7 @@ pub enum Error {
     #[error("invalid state: {0}")]
     InvalidState(String),
 
-    #[error("C++ core error {code}: {msg}")]
+    #[error("decoder core error {code}: {msg}")]
     Core { code: i32, msg: String },
 
     #[error("decode failed: {0}")]

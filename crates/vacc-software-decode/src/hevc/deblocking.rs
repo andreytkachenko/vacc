@@ -1,13 +1,17 @@
 //! Port of `hevc/filters/deblocking.cpp` — deblocking filter, spec §8.7.2.
 //!
 //! Mirrors `hevc::apply_deblocking` control flow and arithmetic exactly;
-//! verified byte-for-byte against the C++ oracle via `hevcdec_test_deblock_run`.
+//! verified byte-for-byte against the C++ hevc.js oracle (since removed);
+//! outputs are now pinned by the SHA-256 goldens in `hevc::goldens`.
 //!
 //! NOTE: like the C++, this port assumes the plane buffers cover all samples
 //! the 8-pixel-aligned edge loop can touch. For picture dims with W/H mod 8
 //! in {1,2,3} the C++ reads/writes up to 3 samples past the last row/column
 //! (latent quirk — real streams have safe dims); Rust indexing would panic
 //! there instead of corrupting adjacent memory.
+
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
 
 use crate::hevc::types::{clip3, Mv, Plane, Tiles};
 
@@ -830,7 +834,7 @@ pub fn apply_deblocking(ctx: &DeblockCtx, planes: &mut [Plane]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
+    use crate::hevc::goldens;
 
     /// Deterministic xorshift64* RNG (same scheme as other kernel tests).
     struct Rng(u64);
@@ -854,13 +858,15 @@ mod tests {
         }
     }
 
-    /// One randomized deblocking scenario run through both implementations.
-    /// Picture dims stay multiples of 8 (safe region for the C++ edge loop).
+    /// One randomized deblocking scenario through the Rust implementation;
+    /// the filtered planes are appended to `out` (golden serialization).
+    /// Picture dims stay multiples of 8 (safe region for the edge loop).
     fn run_deblock_case(
         rng: &mut Rng,
         multi_slice: bool,
         use_tiles: bool,
         dense_pcm: bool,
+        out: &mut Vec<u8>,
     ) {
         let bit_depth = if rng.below(2) == 0 { 8 } else { 10 };
         let chroma_array_type = if rng.below(3) == 0 { 0 } else { 1 };
@@ -932,9 +938,6 @@ mod tests {
                 rs2ts.push(i);
             }
         }
-        // Byte-packed form for the C++ oracle (one byte per CTB).
-        let tile_id_bytes: Vec<u8> = tile_id.iter().map(|&t| t as u8).collect();
-
         // CU grid + motion + filter grids, per 4x4 block.
         let n_blocks = (pic_w / 4) * (pic_h / 4);
         let n_ref_l0 = rng.i32(3);
@@ -1071,108 +1074,83 @@ mod tests {
             ],
         );
 
-        // --- C++ oracle ---
-        let mut c_y = vec![0u16; (pic_w * pic_h) as usize];
-        let mut c_cb = vec![0u16; (comp_w * comp_h) as usize];
-        let mut c_cr = vec![0u16; (comp_w * comp_h) as usize];
-        unsafe {
-            let rc = ffi_test::hevcdec_test_deblock_run(
-                pic_w,
-                pic_h,
-                ctb_log2,
-                sub_w,
-                sub_h,
-                chroma_array_type,
-                bit_depth,
-                bit_depth,
-                ctx.pcm_filter_disabled as i32,
-                ctx.loop_filter_across_tiles as i32,
-                if use_tiles { tile_id_bytes.as_ptr() } else { std::ptr::null() },
-                if use_tiles { rs2ts.as_ptr() } else { std::ptr::null() },
-                ctx.pps_cb_qp_offset,
-                ctx.pps_cr_qp_offset,
-                plane_y.as_ptr(),
-                plane_cb.as_ptr(),
-                plane_cr.as_ptr(),
-                pic_w,
-                comp_w,
-                comp_w,
-                if multi_slice { slice_idx.as_ptr() } else { std::ptr::null() },
-                n_slices,
-                sh_params.as_ptr(),
-                cu_fields.as_ptr(),
-                motion.as_ptr(),
-                cbf_luma.as_ptr(),
-                log2_tu.as_ptr(),
-                edge_v.as_ptr(),
-                edge_h.as_ptr(),
-                if n_ref_l0 > 0 { poc_l0.as_ptr() } else { std::ptr::null() },
-                n_ref_l0,
-                if n_ref_l1 > 0 { poc_l1.as_ptr() } else { std::ptr::null() },
-                n_ref_l1,
-                c_y.as_mut_ptr(),
-                c_cb.as_mut_ptr(),
-                c_cr.as_mut_ptr(),
-            );
-            assert_eq!(rc, 0, "oracle rejected args");
+        // --- Golden output ---
+        for v in &out_y {
+            goldens::push_u16(out, *v);
         }
-
-        first_diff(&out_y, &c_y, pic_w, "luma");
         if chroma_array_type != 0 {
-            first_diff(&out_cb, &c_cb, comp_w, "Cb");
-            first_diff(&out_cr, &c_cr, comp_w, "Cr");
-        }
-    }
-
-    /// Byte-exactness check that reports the first differing sample instead of
-    /// dumping both full planes.
-    fn first_diff(a: &[u16], b: &[u16], w: i32, what: &str) {
-        assert_eq!(a.len(), b.len(), "{what}: length mismatch");
-        for i in 0..a.len() {
-            if a[i] != b[i] {
-                panic!(
-                    "{what}: first diff at x={} y={} (idx {}): rust={} cpp={}",
-                    (i as i32) % w,
-                    (i as i32) / w,
-                    i,
-                    a[i],
-                    b[i]
-                );
+            for v in &out_cb {
+                goldens::push_u16(out, *v);
+            }
+            for v in &out_cr {
+                goldens::push_u16(out, *v);
             }
         }
     }
 
-    #[test]
-    fn deblock_single_slice_matches_cpp() {
+    fn compute_deblock_single_slice() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0xdb01);
+        let mut buf = Vec::new();
         for _ in 0..80 {
-            run_deblock_case(&mut rng, false, false, false);
+            run_deblock_case(&mut rng, false, false, false, &mut buf);
         }
+        vec![("deblock::single_slice".to_string(), buf)]
     }
 
     #[test]
-    fn deblock_multi_slice_matches_cpp() {
+    fn deblock_single_slice_matches_golden() {
+        for (key, data) in compute_deblock_single_slice() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_deblock_multi_slice() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0xdb02);
+        let mut buf = Vec::new();
         for _ in 0..60 {
-            run_deblock_case(&mut rng, true, false, false);
+            run_deblock_case(&mut rng, true, false, false, &mut buf);
         }
+        vec![("deblock::multi_slice".to_string(), buf)]
     }
 
     #[test]
-    fn deblock_tiles_matches_cpp() {
+    fn deblock_multi_slice_matches_golden() {
+        for (key, data) in compute_deblock_multi_slice() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_deblock_tiles() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0xdb03);
+        let mut buf = Vec::new();
         for _ in 0..60 {
             let ms = rng.below(2) == 0;
-            run_deblock_case(&mut rng, ms, true, false);
+            run_deblock_case(&mut rng, ms, true, false, &mut buf);
         }
+        vec![("deblock::tiles".to_string(), buf)]
     }
 
     #[test]
-    fn deblock_pcm_bypass_matches_cpp() {
+    fn deblock_tiles_matches_golden() {
+        for (key, data) in compute_deblock_tiles() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_deblock_pcm_bypass() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0xdb04);
+        let mut buf = Vec::new();
         for _ in 0..50 {
             let ms = rng.below(2) == 0;
-            run_deblock_case(&mut rng, ms, false, true);
+            run_deblock_case(&mut rng, ms, false, true, &mut buf);
+        }
+        vec![("deblock::pcm_bypass".to_string(), buf)]
+    }
+
+    #[test]
+    fn deblock_pcm_bypass_matches_golden() {
+        for (key, data) in compute_deblock_pcm_bypass() {
+            goldens::assert_golden(&key, &data);
         }
     }
 
@@ -1237,5 +1215,22 @@ mod tests {
             &mut [Plane { data: &mut plane, width: 64, height: 64, stride: 64 }],
         );
         assert!(plane.iter().all(|&s| s == 7));
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_deblock_single_slice() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_deblock_multi_slice() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_deblock_tiles() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_deblock_pcm_bypass() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }

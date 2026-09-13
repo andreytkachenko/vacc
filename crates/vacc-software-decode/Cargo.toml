@@ -1,6 +1,6 @@
 [package]
 name = "vacc-software-decode"
-description = "Software (CPU) video decode backend for vacc, H.265 via the hevc.js core (MIT)"
+description = "Software (CPU) video decode backend for vacc, H.265 as a pure-Rust port of the hevc.js core (MIT)"
 license.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -12,6 +12,3 @@ vacc-parser = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
-
-[build-dependencies]
-cc = "1"

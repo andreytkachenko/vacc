@@ -25,7 +25,7 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 │     vacc-nvdec-decode  NVIDIA NVDEC via libnvcuvid (cuvid)        │
 │     vacc-vaapi-decode  VAAPI stateless decode                     │
 │     vacc-sw-decode     CPU H.264 (vendored edge264 C core)        │
-│     vacc-software-decode CPU H.265 (hevc.js C++ core)              │
+│     vacc-software-decode CPU H.265 (pure-Rust hevc.js port)       │
 │                                                                  │
 │   vacc-examples: decode  unified CLI: -b <backend> -i <file>     │
 └──────────────────────────────────────────────────────────────────┘

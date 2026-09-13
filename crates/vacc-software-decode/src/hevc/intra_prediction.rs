@@ -1,6 +1,9 @@
 //! Port of `hevc/decoding/intra_prediction.{h,cpp}` — intra prediction,
 //! spec §8.4.4.2 (35 modes: Planar, DC, Angular 2-34).
 
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
+
 use crate::hevc::picture::Picture;
 use crate::hevc::types::{clip3, Pps, Sps};
 
@@ -491,7 +494,7 @@ pub fn perform_intra_prediction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
+    use crate::hevc::goldens;
     use crate::hevc::types::ChromaFormat;
 
     /// Deterministic xorshift64* RNG (same scheme as bitreader tests).
@@ -552,11 +555,11 @@ mod tests {
         assert!(!needs_filtering(26, 5)); // dist 0
     }
 
-    #[test]
-    fn intra_prediction_matches_cpp() {
+    fn compute_intra() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5EED_0010);
         let pic_w = 64i32;
         let pic_h = 64i32;
+        let mut buf = Vec::new();
 
         for bit_depth in [8i32, 10] {
             let max_val = (1u32 << bit_depth) as u16;
@@ -609,29 +612,13 @@ mod tests {
                             for mode in 0..35i32 {
                                 let n_samples = (n_tbs * n_tbs) as usize;
                                 let mut pred_rs = vec![0i16; n_samples];
-                                let mut pred_cpp = vec![0i16; n_samples];
 
                                 perform_intra_prediction(
                                     &pic, &sps, &Pps::default(), x0, y0, log2_size, c_idx, mode,
                                     None, &mut pred_rs,
                                 );
-                                let rc = unsafe {
-                                    ffi_test::hevcdec_test_intra_predict(
-                                        pic_w, pic_h, ctb_size, 4, bit_depth, 1, 2, 2, 0, 1,
-                                        plane.as_ptr(), stride, x0, y0, log2_size, c_idx, mode,
-                                        pred_cpp.as_mut_ptr(),
-                                    )
-                                };
-                                assert_eq!(rc, 0);
-
-                                if pred_rs != pred_cpp {
-                                    let diff: Vec<usize> = (0..n_samples)
-                                        .filter(|&i| pred_rs[i] != pred_cpp[i])
-                                        .take(8)
-                                        .collect();
-                                    panic!(
-                                        "intra mismatch bd={bit_depth} ctb={ctb_size} cIdx={c_idx} mode={mode} size=2^{log2_size} pos=({x0},{y0}) first_diffs={diff:?}"
-                                    );
+                                for v in &pred_rs {
+                                    goldens::push_i16(&mut buf, *v);
                                 }
                             }
                         }
@@ -639,15 +626,23 @@ mod tests {
                 }
             }
         }
+        vec![("intra::prediction".to_string(), buf)]
     }
 
     #[test]
-    fn intra_smoothing_disabled_matches_cpp() {
-        // Same setup with intra_smoothing_disabled_flag = 1 (skips §8.4.4.2.3).
+    fn intra_prediction_matches_golden() {
+        for (key, data) in compute_intra() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_intra_smoothing_disabled() -> Vec<(String, Vec<u8>)> {
+        // intra_smoothing_disabled_flag = 1 (skips §8.4.4.2.3).
         let mut rng = Rng::new(0x5EED_0011);
         let pic_w = 64i32;
         let pic_h = 64i32;
         let bit_depth = 8;
+        let mut buf = Vec::new();
         let sps = Sps {
             pic_width_in_luma_samples: pic_w,
             pic_height_in_luma_samples: pic_h,
@@ -678,24 +673,25 @@ mod tests {
         for mode in [0i32, 1, 5, 10, 18, 26, 34] {
             let n_samples = (n_tbs * n_tbs) as usize;
             let mut pred_rs = vec![0i16; n_samples];
-            let mut pred_cpp = vec![0i16; n_samples];
 
             perform_intra_prediction(
                 &pic, &sps, &Pps::default(), x0, y0, log2_size, 0, mode, None, &mut pred_rs,
             );
-            let rc = unsafe {
-                ffi_test::hevcdec_test_intra_predict(
-                    pic_w, pic_h, 32, 4, bit_depth, 1, 2, 2, 1, 0,
-                    plane.as_ptr(), pic_w, x0, y0, log2_size, 0, mode, pred_cpp.as_mut_ptr(),
-                )
-            };
-            assert_eq!(rc, 0);
-            assert_eq!(pred_rs, pred_cpp, "mode={mode} smoothing disabled");
+            for v in &pred_rs {
+                goldens::push_i16(&mut buf, *v);
+            }
         }
+        vec![("intra::smoothing_disabled".to_string(), buf)]
     }
 
     #[test]
-    fn intra_constant_plane_biint_path_matches_cpp() {
+    fn intra_smoothing_disabled_matches_golden() {
+        for (key, data) in compute_intra_smoothing_disabled() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_intra_biint_path() -> Vec<(String, Vec<u8>)> {
         // Constant plane at the picture corner: all neighbours substitute to the
         // default value, top/left smoothness checks pass → biIntFlag = true for
         // 32x32 luma with strong smoothing (bilinear reference filtering path).
@@ -728,22 +724,25 @@ mod tests {
         pic.height[0] = pic_h;
         pic.stride[0] = pic_w;
 
+        let mut buf = Vec::new();
         for mode in [2i32, 10, 26, 34] {
             let n_samples = (n_tbs * n_tbs) as usize;
             let mut pred_rs = vec![0i16; n_samples];
-            let mut pred_cpp = vec![0i16; n_samples];
 
             perform_intra_prediction(
                 &pic, &sps, &Pps::default(), 0, 0, log2_size, 0, mode, None, &mut pred_rs,
             );
-            let rc = unsafe {
-                ffi_test::hevcdec_test_intra_predict(
-                    pic_w, pic_h, 64, 4, bit_depth, 1, 2, 2, 0, 1,
-                    plane.as_ptr(), pic_w, 0, 0, log2_size, 0, mode, pred_cpp.as_mut_ptr(),
-                )
-            };
-            assert_eq!(rc, 0);
-            assert_eq!(pred_rs, pred_cpp, "mode={mode} biInt path");
+            for v in &pred_rs {
+                goldens::push_i16(&mut buf, *v);
+            }
+        }
+        vec![("intra::constant_plane_biint".to_string(), buf)]
+    }
+
+    #[test]
+    fn intra_constant_plane_biint_path_matches_golden() {
+        for (key, data) in compute_intra_biint_path() {
+            goldens::assert_golden(&key, &data);
         }
     }
 
@@ -755,5 +754,19 @@ mod tests {
         pic.allocate(64, 64, ChromaFormat::Yuv420, 8, 8);
         assert_eq!(pic.width[1], 32);
         assert_eq!(pic.height[1], 32);
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_intra() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_intra_smoothing_disabled() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_intra_biint_path() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }

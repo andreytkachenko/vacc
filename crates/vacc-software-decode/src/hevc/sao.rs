@@ -1,7 +1,11 @@
 //! Port of `hevc/filters/sao.cpp` — Sample Adaptive Offset, spec §8.7.3.
 //!
 //! Mirrors `hevc::apply_sao` control flow and arithmetic exactly; verified
-//! byte-for-byte against the C++ oracle via `hevcdec_test_sao_run`.
+//! byte-for-byte against the C++ hevc.js oracle (since removed); outputs are
+//! now pinned by the SHA-256 goldens in `hevc::goldens`.
+
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
 
 use crate::hevc::types::{clip3, Plane, Tiles};
 
@@ -462,7 +466,7 @@ pub fn apply_sao(ctx: &SaoCtx, planes: &mut [Plane]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
+    use crate::hevc::goldens;
 
     /// Deterministic xorshift64* RNG (same scheme as other kernel tests).
     struct Rng(u64);
@@ -486,10 +490,17 @@ mod tests {
         }
     }
 
-    /// One randomized SAO scenario run through both implementations.
+    /// One randomized SAO scenario through the Rust implementation; the
+    /// filtered planes are appended to `out` (golden serialization).
     /// `multi_slice`/`use_tiles` exercise the slow path; `with_pcm` adds
     /// PCM/transquant-bypass CUs.
-    fn run_sao_case(rng: &mut Rng, multi_slice: bool, use_tiles: bool, with_pcm: bool) {
+    fn run_sao_case(
+        rng: &mut Rng,
+        multi_slice: bool,
+        use_tiles: bool,
+        with_pcm: bool,
+        out: &mut Vec<u8>,
+    ) {
         let bit_depth = if rng.below(2) == 0 { 8 } else { 10 };
         let chroma_array_type = if rng.below(4) == 0 { 0 } else { 1 };
         let (sub_w, sub_h) = if chroma_array_type == 0 { (1, 1) } else { (2, 2) };
@@ -595,9 +606,6 @@ mod tests {
                 rs2ts.push(i);
             }
         }
-        // Byte-packed form for the C++ oracle (one byte per CTB).
-        let tile_id_bytes: Vec<u8> = tile_id.iter().map(|&t| t as u8).collect();
-
         // --- Rust side ---
         let mut sao_params_rs = Vec::with_capacity(num_ctbs as usize);
         for ctb in 0..num_ctbs {
@@ -655,143 +663,67 @@ mod tests {
             ],
         );
 
-        // --- C++ oracle ---
-        let mut c_y = vec![0u16; (pic_w * pic_h) as usize];
-        let mut c_cb = vec![0u16; (comp_w * comp_h) as usize];
-        let mut c_cr = vec![0u16; (comp_w * comp_h) as usize];
-        unsafe {
-            let rc = ffi_test::hevcdec_test_sao_run(
-                pic_w,
-                pic_h,
-                ctb_log2,
-                sub_w,
-                sub_h,
-                chroma_array_type,
-                bit_depth,
-                bit_depth,
-                1,
-                ctx.pcm_filter_disabled as i32,
-                ctx.transquant_bypass_enabled as i32,
-                ctx.loop_filter_across_tiles as i32,
-                // The oracle takes one byte per CTB (C++ PPS::TileId is vector<int>
-                // but the test API is byte-packed); convert, don't reinterpret.
-                if use_tiles { tile_id_bytes.as_ptr() } else { std::ptr::null() },
-                if use_tiles { rs2ts.as_ptr() } else { std::ptr::null() },
-                plane_y.as_ptr(),
-                plane_cb.as_ptr(),
-                plane_cr.as_ptr(),
-                pic_w,
-                comp_w,
-                comp_w,
-                if multi_slice { slice_idx.as_ptr() } else { std::ptr::null() },
-                n_slices,
-                slice_across.as_ptr() as *const u8,
-                sao_params.as_ptr(),
-                if with_pcm { cu_pcm.as_ptr() } else { std::ptr::null() },
-                if with_pcm { cu_bypass.as_ptr() } else { std::ptr::null() },
-                c_y.as_mut_ptr(),
-                c_cb.as_mut_ptr(),
-                c_cr.as_mut_ptr(),
-            );
-            assert_eq!(rc, 0, "oracle rejected args");
+        // --- Golden output ---
+        for v in &out_y {
+            goldens::push_u16(out, *v);
         }
-
-        // Scenario summary for mismatch diagnostics.
-        let ctbs_dbg: Vec<String> = sao_params_rs
-            .iter()
-            .enumerate()
-            .map(|(i, sp)| {
-                format!(
-                    "CTB{}: type=[{}, {}, {}] eo=[{}, {}, {}] band=[{}, {}, {}] offY={:?}",
-                    i,
-                    sp.sao_type_idx[0],
-                    sp.sao_type_idx[1],
-                    sp.sao_type_idx[2],
-                    sp.sao_eo_class[0],
-                    sp.sao_eo_class[1],
-                    sp.sao_eo_class[2],
-                    sp.sao_band_position[0],
-                    sp.sao_band_position[1],
-                    sp.sao_band_position[2],
-                    sp.sao_offset_val[0],
-                )
-            })
-            .collect();
-        let dbg = format!(
-            "dims={}x{} ctb_log2={} sub={}/{} cat={} bd={} pcm_fd={} tqb={} across_tiles={} n_slices={} use_tiles={} slice_idx={:?}\n{}",
-            pic_w,
-            pic_h,
-            ctb_log2,
-            sub_w,
-            sub_h,
-            chroma_array_type,
-            bit_depth,
-            ctx.pcm_filter_disabled,
-            ctx.transquant_bypass_enabled,
-            ctx.loop_filter_across_tiles,
-            n_slices,
-            use_tiles,
-            if multi_slice { slice_idx.as_slice() } else { &[] },
-            ctbs_dbg.join("\n"),
-        );
-
-        first_diff(&out_y, &c_y, &plane_y, pic_w, "luma", &dbg);
         if chroma_array_type != 0 {
-            first_diff(&out_cb, &c_cb, &plane_cb, comp_w, "Cb", &dbg);
-            first_diff(&out_cr, &c_cr, &plane_cr, comp_w, "Cr", &dbg);
-        }
-    }
-
-    /// Byte-exactness check that reports the first differing sample plus a
-    /// small window of original/rust/cpp values instead of full planes.
-    fn first_diff(a: &[u16], b: &[u16], orig: &[u16], w: i32, what: &str, dbg: &str) {
-        assert_eq!(a.len(), b.len(), "{what}: length mismatch");
-        for i in 0..a.len() {
-            if a[i] != b[i] {
-                let lo = (i as i64 - 2).max(0) as usize;
-                let hi = (i as i64 + 3).min(a.len() as i64) as usize;
-                panic!(
-                    "{what}: first diff at x={} y={} (idx {}): rust={} cpp={} orig={}\nwindow[{}..{}]: orig={:?}\nrust={:?}\ncpp={:?}\n{}",
-                    (i as i32) % w,
-                    (i as i32) / w,
-                    i,
-                    a[i],
-                    b[i],
-                    orig[i],
-                    lo,
-                    hi,
-                    &orig[lo..hi],
-                    &a[lo..hi],
-                    &b[lo..hi],
-                    dbg
-                );
+            for v in &out_cb {
+                goldens::push_u16(out, *v);
+            }
+            for v in &out_cr {
+                goldens::push_u16(out, *v);
             }
         }
     }
 
-    #[test]
-    fn sao_fast_path_matches_cpp() {
+    fn compute_sao_fast_path() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5a01);
+        let mut buf = Vec::new();
         for _ in 0..80 {
-            run_sao_case(&mut rng, false, false, false);
+            run_sao_case(&mut rng, false, false, false, &mut buf);
         }
+        vec![("sao::fast_path".to_string(), buf)]
     }
 
     #[test]
-    fn sao_multi_slice_tiles_matches_cpp() {
+    fn sao_fast_path_matches_golden() {
+        for (key, data) in compute_sao_fast_path() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_sao_multi_slice_tiles() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5a02);
+        let mut buf = Vec::new();
         for _ in 0..80 {
-            run_sao_case(&mut rng, true, true, false);
+            run_sao_case(&mut rng, true, true, false, &mut buf);
         }
+        vec![("sao::multi_slice_tiles".to_string(), buf)]
     }
 
     #[test]
-    fn sao_pcm_bypass_matches_cpp() {
+    fn sao_multi_slice_tiles_matches_golden() {
+        for (key, data) in compute_sao_multi_slice_tiles() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_sao_pcm_bypass() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5a03);
+        let mut buf = Vec::new();
         for _ in 0..60 {
             let ms = rng.below(2) == 0;
             let tl = rng.below(2) == 0;
-            run_sao_case(&mut rng, ms, tl, true);
+            run_sao_case(&mut rng, ms, tl, true, &mut buf);
+        }
+        vec![("sao::pcm_bypass".to_string(), buf)]
+    }
+
+    #[test]
+    fn sao_pcm_bypass_matches_golden() {
+        for (key, data) in compute_sao_pcm_bypass() {
+            goldens::assert_golden(&key, &data);
         }
     }
 
@@ -825,5 +757,19 @@ mod tests {
         };
         apply_sao(&ctx, &mut [Plane { data: &mut plane, width: 64, height: 64, stride: 64 }]);
         assert!(plane.iter().all(|&s| s == 3));
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_sao_fast_path() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_sao_multi_slice_tiles() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_sao_pcm_bypass() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }

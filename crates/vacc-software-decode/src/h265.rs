@@ -89,8 +89,9 @@ pub struct SoftwareH265Decoder {
     // Pending input.
     pending_data: Vec<u8>,
     parse_offset: usize,
-    /// Parameter-set NALs are buffered in `pending_data` until the first
-    /// slice of a picture arrives, so the C++ core receives them raw.
+    /// Parameter-set NALs stay in `pending_data` until the first slice of
+    /// the next picture arrives (the parser's `bytes_consumed` for that
+    /// slice covers them).
     ps_pending: bool,
 
     // Display-order reorder state.
@@ -768,23 +769,23 @@ impl Decoder for SoftwareH265Decoder {
 }
 
 #[cfg(test)]
+pub(crate) use self::e2e_tests::golden_entries;
+
+#[cfg(test)]
 mod e2e_tests {
     //! End-to-end gate for the production pipeline: `SoftwareH265Decoder`
     //! (Rust parser + DPB + Rust reconstruction core + display-order reorder)
-    //! vs the C++ `hevcdec_decode_picture` core as ground truth, on real
-    //! streams. Frames are compared in display order, matched by POC.
+    //! on real streams. Every emitted frame's display buffer is pinned by a
+    //! SHA-256 golden generated from the build that verified byte-exact
+    //! agreement with the C++ core; the POC list itself is pinned too.
 
-    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
     use vacc_core::decoder::Decoder;
-    use vacc_core::picture::H265Sps;
-    use vacc_parser::h265::H265Parser;
-    use vacc_parser::{BitstreamPacket, ParseResult, SliceHeader, VideoParser};
 
-    use crate::ffi;
     use super::SoftwareH265Decoder;
+    use crate::hevc::goldens;
 
     fn sample_dir() -> Option<PathBuf> {
         if let Ok(d) = std::env::var("VACC_SAMPLES_DIR") {
@@ -794,192 +795,12 @@ mod e2e_tests {
         p.is_dir().then_some(p)
     }
 
-    /// Picture layout derived from the SPS (mirrors `on_sps`).
-    #[derive(Clone, Copy)]
-    struct Layout {
-        coded_w: u32,
-        coded_h: u32,
-        chroma_h: u32,
-        conf_left: u32, // luma samples
-        conf_right: u32,
-        conf_top: u32,
-        conf_bottom: u32,
-        sw: u32,
-        sh: u32,
-        bps: usize,
-        ystride: usize,
-        cstride: usize,
-        chroma_idc: u8,
-    }
-
-    fn layout_from_sps(sps: &H265Sps) -> Layout {
-        let (sw, sh) = match sps.chroma_format_idc {
-            0 => (1, 1),
-            1 => (2, 2),
-            2 => (2, 1),
-            _ => (1, 1),
-        };
-        let w = sps.pic_width_in_luma_samples as u32;
-        let h = sps.pic_height_in_luma_samples as u32;
-        let bd = 8 + sps.bit_depth_luma_minus8 as u32;
-        Layout {
-            coded_w: w,
-            coded_h: h,
-            chroma_h: h.div_ceil(sh),
-            conf_left: sps.conf_win_left_offset * sw,
-            conf_right: sps.conf_win_right_offset * sw,
-            conf_top: sps.conf_win_top_offset * sh,
-            conf_bottom: sps.conf_win_bottom_offset * sh,
-            sw,
-            sh,
-            bps: if bd > 8 { 2 } else { 1 },
-            ystride: (w as usize).div_ceil(16) * 16,
-            cstride: (w.div_ceil(sw) as usize).div_ceil(16) * 16,
-            chroma_idc: sps.chroma_format_idc,
-        }
-    }
-
-    /// Coded-size ground-truth planes for one output picture.
-    struct RefFrame {
-        poc: i32,
-        y: Vec<u8>,
-        u: Vec<u8>,
-        v: Vec<u8>,
-    }
-
-    /// Decode the whole stream with the C++ core (one context across all AUs,
-    /// so its internal DPB evolves exactly as in a real decode) and collect
-    /// filtered planes for every AU whose `pic_output_flag` is set.
-    fn cpp_ground_truth(name: &str, data: &[u8]) -> (Vec<RefFrame>, Layout) {
-        let cpp_ctx = unsafe { ffi::hevcdec_create(0) };
-        assert!(!cpp_ctx.is_null(), "{name}: hevcdec_create failed");
-
-        let mut parser = H265Parser::new();
-        let mut layout: Option<Layout> = None;
-        let mut refs: Vec<RefFrame> = Vec::new();
-        let mut parse_offset = 0usize;
-
-        while parse_offset < data.len() {
-            let mut got_au = false;
-            'au: while parse_offset < data.len() {
-                let remaining = &data[parse_offset..];
-                let packet = BitstreamPacket::new(remaining.to_vec());
-                match parser.parse(&packet) {
-                    Ok(ParseResult::ParameterSet { sps, .. }) => {
-                        if let Some(b) = sps
-                            && let Some(s) = b.downcast_ref::<H265Sps>()
-                        {
-                            layout = Some(layout_from_sps(s));
-                        }
-                        // PS NALs stay in the pending region; re-parse for slices.
-                        continue 'au;
-                    }
-                    Ok(ParseResult::Slice {
-                        slices,
-                        bytes_consumed,
-                    }) => {
-                        if slices.is_empty() {
-                            break 'au;
-                        }
-                        let au_end = parse_offset + bytes_consumed;
-                        assert!(au_end <= data.len(), "{name}: bytes_consumed exceeds data");
-                        let au = &data[parse_offset..au_end];
-                        let first_info = match &slices[0].slice_header {
-                            Some(SliceHeader::H265(i)) => i,
-                            _ => panic!("{name}: no H265 slice header"),
-                        };
-                        let layout = layout
-                            .expect("SPS not ready for a picture");
-                        let mut out_y = vec![0u8; layout.coded_h as usize * layout.ystride * layout.bps + 16];
-                        let mut out_u = vec![0u8; layout.chroma_h as usize * layout.cstride * layout.bps + 16];
-                        let mut out_v = vec![0u8; layout.chroma_h as usize * layout.cstride * layout.bps + 16];
-                        let rc = unsafe {
-                            ffi::hevcdec_decode_picture(
-                                cpp_ctx,
-                                au.as_ptr(),
-                                au.len(),
-                                out_y.as_mut_ptr(),
-                                layout.ystride as i32,
-                                out_u.as_mut_ptr(),
-                                layout.cstride as i32,
-                                out_v.as_mut_ptr(),
-                                layout.cstride as i32,
-                            )
-                        };
-                        assert_eq!(rc, ffi::HEVCDEC_OK, "{name}: C++ decode failed ({rc})");
-                        if first_info.pic_output_flag {
-                            refs.push(RefFrame {
-                                poc: first_info.curr_pic_order_cnt_val,
-                                y: out_y,
-                                u: out_u,
-                                v: out_v,
-                            });
-                        }
-                        parse_offset = au_end;
-                        got_au = true;
-                        break 'au;
-                    }
-                    Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => break 'au,
-                    Err(e) => panic!("{name}: parse error: {e}"),
-                }
-            }
-            if !got_au {
-                break;
-            }
-        }
-
-        unsafe { ffi::hevcdec_destroy(cpp_ctx) };
-        (refs, layout.expect("no SPS in stream"))
-    }
-
-    /// Pack the coded-size C++ planes into a tight display-window buffer with
-    /// the exact layout of `build_frame` (Y, then U, then V; bps bytes per
-    /// sample, tight pitches).
-    fn pack_display(l: &Layout, rf: &RefFrame) -> Vec<u8> {
-        let cw = l.coded_w as usize - l.conf_left as usize - l.conf_right as usize;
-        let ch = l.coded_h as usize - l.conf_top as usize - l.conf_bottom as usize;
-        let x0 = (l.conf_left / l.sw) as usize;
-        let y0 = (l.conf_top / l.sh) as usize;
-        let cwidth = cw.div_ceil(l.sw as usize);
-        let cheight = ch.div_ceil(l.sh as usize);
-        let bps = l.bps;
-
-        let y_len = cw * ch * bps;
-        let c_len = cwidth * cheight * bps;
-        let mut buf = Vec::with_capacity(y_len + 2 * c_len);
-
-        for y in 0..ch {
-            let src = &rf.y[((y0 + y) * l.ystride + x0) * bps..];
-            buf.extend_from_slice(&src[..cw * bps]);
-        }
-        if l.chroma_idc != 0 {
-            for plane in [&rf.u, &rf.v] {
-                for y in 0..cheight {
-                    let row = &plane[((y0 + y) * l.cstride + x0) * bps..];
-                    buf.extend_from_slice(&row[..cwidth * bps]);
-                }
-            }
-        }
-        buf
-    }
-
-    fn first_buf_diff(name: &str, got: &[u8], want: &[u8]) {
-        assert_eq!(got.len(), want.len(), "{name}: buffer length {} != {}", got.len(), want.len());
-        let n = got.iter().zip(want).take_while(|(a, b)| a == b).count();
-        assert!(
-            n == got.len(),
-            "{name}: first byte diff at offset {n} (got {:02x}, want {:02x})",
-            got[n],
-            want[n]
-        );
-    }
-
-    fn run_e2e(name: &str) {
+    fn run_e2e(name: &str) -> Option<Vec<(String, String)>> {
         let dir = match sample_dir() {
             Some(d) => d,
             None => {
                 eprintln!("skip {name}: no samples dir (set VACC_SAMPLES_DIR)");
-                return;
+                return None;
             }
         };
         let path = dir.join(format!("h265_{name}.h265"));
@@ -987,20 +808,9 @@ mod e2e_tests {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("skip {name}: {e}");
-                return;
+                return None;
             }
         };
-
-        // ---- Ground truth: C++ core decodes the whole stream ----
-        let (refs, layout) = cpp_ground_truth(name, &data);
-        let mut truth: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
-        for rf in &refs {
-            assert!(
-                truth.insert(rf.poc, pack_display(&layout, rf)).is_none(),
-                "{name}: duplicate POC {}",
-                rf.poc
-            );
-        }
 
         // ---- Production decoder (same driving pattern as the app) ----
         let mut dec = SoftwareH265Decoder::new(data).expect("decoder init");
@@ -1009,14 +819,6 @@ mod e2e_tests {
             frames.push(f);
         }
         frames.extend(dec.flush().unwrap());
-
-        assert_eq!(
-            frames.len(),
-            truth.len(),
-            "{name}: {} emitted frames vs {} output pictures",
-            frames.len(),
-            truth.len()
-        );
 
         // Display order: POCs must be strictly increasing.
         for pair in frames.windows(2) {
@@ -1029,47 +831,80 @@ mod e2e_tests {
             );
         }
 
-        // Per-frame pixel comparison against the ground truth (by POC).
-        for f in &frames {
-            let pd = f.pixel_data.as_ref().expect("pixel data present");
-            let want = truth
-                .get(&f.poc)
-                .unwrap_or_else(|| panic!("{name}: no ground truth for poc {}", f.poc));
-            first_buf_diff(&format!("{name} poc {}", f.poc), &pd.buffer, want);
-        }
-
+        // All frames must agree on size/format (content is pinned by goldens).
         if !frames.is_empty() {
-            let cw = layout.coded_w - layout.conf_left - layout.conf_right;
-            let ch = layout.coded_h - layout.conf_top - layout.conf_bottom;
-            let expect_fmt = if layout.bps > 1 { "I420-10" } else { "I420" };
+            let (w, h) = (frames[0].width, frames[0].height);
+            let fmt = frames[0]
+                .pixel_data
+                .as_ref()
+                .expect("pixel data present")
+                .format
+                .clone();
             for f in &frames {
-                assert_eq!((f.width, f.height), (cw, ch), "{name}: frame size mismatch");
+                assert_eq!((f.width, f.height), (w, h), "{name}: frame size mismatch");
                 let pd = f.pixel_data.as_ref().unwrap();
-                assert_eq!(pd.format, expect_fmt, "{name}: pixel format mismatch");
+                assert_eq!(pd.format, fmt, "{name}: pixel format mismatch");
             }
         }
 
-        println!("{name}: {} frames verified end-to-end (Rust pipeline == C++ core)", frames.len());
+        // ---- Golden hashes: per-frame display buffer + the POC list itself
+        // (pins frame count and order; a missing/extra frame changes it).
+        let mut pocs = Vec::new();
+        let mut entries = Vec::new();
+        for f in &frames {
+            pocs.push(f.poc);
+            let pd = f.pixel_data.as_ref().expect("pixel data present");
+            entries.push((
+                format!("e2e::{name}::poc{}", f.poc),
+                goldens::sha256_hex(&pd.buffer),
+            ));
+        }
+        let mut pocs_buf = Vec::new();
+        for p in &pocs {
+            goldens::push_i32(&mut pocs_buf, *p);
+        }
+        entries.push((format!("e2e::{name}::pocs"), goldens::sha256_hex(&pocs_buf)));
+
+        println!("{name}: {} frames verified end-to-end", frames.len());
+        Some(entries)
+    }
+
+    fn check_stream_goldens(name: &str) {
+        if let Some(entries) = run_e2e(name) {
+            for (key, hash) in entries {
+                goldens::assert_hash(&key, &hash);
+            }
+        }
     }
 
     #[test]
     fn e2e_main() {
-        run_e2e("main");
+        check_stream_goldens("main");
     }
 
     #[test]
     fn e2e_main10() {
-        run_e2e("main10");
+        check_stream_goldens("main10");
     }
 
     #[test]
     fn e2e_cra() {
-        run_e2e("cra");
+        check_stream_goldens("cra");
     }
 
     #[test]
     fn e2e_msp() {
-        run_e2e("msp");
+        check_stream_goldens("msp");
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for name in ["main", "main10", "cra", "msp"] {
+            if let Some(entries) = run_e2e(name) {
+                v.extend(entries);
+            }
+        }
+        v
     }
 }
 

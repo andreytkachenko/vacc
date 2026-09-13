@@ -1,16 +1,15 @@
-//! Tier F end-to-end differential: Rust pipeline (vacc-parser + hevc driver)
-//! vs the C++ `hevcdec_decode_picture` core, access unit by access unit on
-//! real streams.
+//! Tier F end-to-end golden tests: the full Rust pipeline (vacc-parser +
+//! hevc driver) on real streams, access unit by access unit.
 //!
 //! This validates the full Rust decode path — parser SPS/PPS/slice-header
 //! mapping (`syntax_map`), DPB reference resolution (`H265Dpb`), slice-data
 //! reconstruction (seek from `header_bit_size`, CABAC, prediction, residual),
-//! and the in-loop filters (deblocking + SAO) — i.e. everything needed to
-//! replace the C++ control plane byte-for-byte.
-//!
-//! Both sides decode the *same* AU bytes: the C++ core keeps its own DPB and
-//! resolves references internally; the Rust side drives the ported kernels
-//! from parser output. Output planes are compared sample-by-sample per AU.
+//! and the in-loop filters (deblocking + SAO). The filtered output planes are
+//! pinned per AU by SHA-256 goldens generated from the build that verified
+//! byte-exact agreement with the C++ core.
+
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
 
 #[cfg(test)]
 mod tests {
@@ -23,8 +22,8 @@ mod tests {
     use vacc_parser::h265_dpb::H265Dpb;
     use vacc_parser::{BitstreamPacket, ParseResult, SliceHeader, VideoParser};
 
-    use crate::ffi;
     use crate::hevc::driver::{decode_picture, PictureStore, RefListEntry, SliceInput};
+    use crate::hevc::goldens;
     use crate::hevc::syntax_map;
     use crate::hevc::transform::ScalingListData;
 
@@ -38,39 +37,30 @@ mod tests {
         p.is_dir().then_some(p)
     }
 
-    /// Per-plane sample comparison over the coded region, reporting the first
-    /// mismatches with (x,y) coordinates.
-    #[allow(clippy::too_many_arguments)] // flat per-plane compare; mirrors plane layout
-    fn first_diff(name: &str, cpp: &[u8], bps: usize, stride_c: usize, rust: &[u16], stride_r: usize, w: i32, h: i32) {
-        let mut n = 0usize;
-        let mut shown = Vec::new();
+    /// Pack the Rust plane's coded region into bps-byte LE samples — the exact
+    /// values the C++ comparison checked.
+    fn pack_region(plane: &[u16], stride: usize, w: i32, h: i32, bps: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity((w as usize) * (h as usize) * bps);
         for y in 0..h {
             for x in 0..w {
-                let ci = (y as usize) * stride_c + x as usize;
-                let cpp_v = if bps == 1 {
-                    cpp[ci] as u16
+                let v = plane[y as usize * stride + x as usize];
+                if bps == 1 {
+                    out.push(v as u8);
                 } else {
-                    u16::from_le_bytes([cpp[2 * ci], cpp[2 * ci + 1]])
-                };
-                let ri = (y as usize) * stride_r + x as usize;
-                if cpp_v != rust[ri] {
-                    n += 1;
-                    if shown.len() < 16 {
-                        shown.push(format!("({x},{y}) cpp={cpp_v} rust={}", rust[ri]));
-                    }
+                    out.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
-        assert_eq!(n, 0, "{name}: {n} sample mismatches, first: {}", shown.join(", "));
+        out
     }
 
-    /// Decode one AU with both backends and compare the filtered output.
+    /// Decode one AU with the Rust pipeline and return golden hashes of the
+    /// filtered output planes over the coded region.
     #[allow(clippy::too_many_arguments)] // test harness: mirrors the pipeline shape
     fn decode_and_compare(
         name: &str,
         au_idx: usize,
-        cpp_ctx: *mut ffi::hevcdec_context,
-        au: &[u8],
+        _au: &[u8],
         slices: &[vacc_parser::SliceEntry],
         sps_h: &H265Sps,
         pps_h: &H265Pps,
@@ -82,29 +72,10 @@ mod tests {
         chroma_w: u32,
         chroma_h: u32,
         bps: usize,
-        ystride: usize,
-        cstride: usize,
-    ) {
+        _ystride: usize,
+        _cstride: usize,
+    ) -> Vec<(String, String)> {
         let prefix = format!("{name} au {au_idx}");
-
-        // ---- C++ core (ground truth) ----
-        let mut out_y = vec![0u8; coded_h as usize * ystride * bps + 16];
-        let mut out_u = vec![0u8; chroma_h as usize * cstride * bps + 16];
-        let mut out_v = vec![0u8; chroma_h as usize * cstride * bps + 16];
-        let rc = unsafe {
-            ffi::hevcdec_decode_picture(
-                cpp_ctx,
-                au.as_ptr(),
-                au.len(),
-                out_y.as_mut_ptr(),
-                ystride as i32,
-                out_u.as_mut_ptr(),
-                cstride as i32,
-                out_v.as_mut_ptr(),
-                cstride as i32,
-            )
-        };
-        assert_eq!(rc, ffi::HEVCDEC_OK, "{prefix}: C++ decode failed ({rc})");
 
         // ---- Rust pipeline ----
         let sps = syntax_map::map_sps(sps_h);
@@ -176,51 +147,29 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{prefix}: Rust decode failed: {e}"));
 
-        // ---- Compare filtered planes over the coded region ----
-        first_diff(
-            &format!("{prefix}: Y"),
-            &out_y,
-            bps,
-            ystride,
-            &pic.planes[0],
-            pic.stride[0] as usize,
-            coded_w as i32,
-            coded_h as i32,
-        );
+        // ---- Golden hashes over the coded region ----
+        let mut entries = Vec::new();
+        let y = pack_region(&pic.planes[0], pic.stride[0] as usize, coded_w as i32, coded_h as i32, bps);
+        entries.push((format!("tier_f::{name}::au{au_idx}::y"), goldens::sha256_hex(&y)));
         if has_chroma {
-            first_diff(
-                &format!("{prefix}: Cb"),
-                &out_u,
-                bps,
-                cstride,
-                &pic.planes[1],
-                pic.stride[1] as usize,
-                chroma_w as i32,
-                chroma_h as i32,
-            );
-            first_diff(
-                &format!("{prefix}: Cr"),
-                &out_v,
-                bps,
-                cstride,
-                &pic.planes[2],
-                pic.stride[2] as usize,
-                chroma_w as i32,
-                chroma_h as i32,
-            );
+            let cb = pack_region(&pic.planes[1], pic.stride[1] as usize, chroma_w as i32, chroma_h as i32, bps);
+            entries.push((format!("tier_f::{name}::au{au_idx}::cb"), goldens::sha256_hex(&cb)));
+            let cr = pack_region(&pic.planes[2], pic.stride[2] as usize, chroma_w as i32, chroma_h as i32, bps);
+            entries.push((format!("tier_f::{name}::au{au_idx}::cr"), goldens::sha256_hex(&cr)));
         }
 
         // ---- Commit to the Rust DPB + picture store ----
         store.store(slot, pic);
         dpb.commit_current(slot);
+        entries
     }
 
-    fn run_stream(name: &str) {
+    fn run_stream(name: &str) -> Option<Vec<(String, String)>> {
         let dir = match sample_dir() {
             Some(d) => d,
             None => {
                 eprintln!("skip {name}: no samples dir (set VACC_SAMPLES_DIR)");
-                return;
+                return None;
             }
         };
         let path = dir.join(format!("h265_{name}.h265"));
@@ -228,12 +177,9 @@ mod tests {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("skip {name}: {e}");
-                return;
+                return None;
             }
         };
-
-        let cpp_ctx = unsafe { ffi::hevcdec_create(0) };
-        assert!(!cpp_ctx.is_null(), "{name}: hevcdec_create failed");
 
         let mut parser = H265Parser::new();
         let mut dpb: Option<H265Dpb> = None;
@@ -252,6 +198,7 @@ mod tests {
 
         let mut parse_offset = 0usize;
         let mut au_idx = 0usize;
+        let mut all_entries: Vec<(String, String)> = Vec::new();
 
         while parse_offset < data.len() {
             // Inner loop: consume parameter sets until a slice group (or end).
@@ -312,10 +259,9 @@ mod tests {
                         });
                         store.ensure(dpb.slots().len());
 
-                        decode_and_compare(
+                        let entries = decode_and_compare(
                             name,
                             au_idx,
-                            cpp_ctx,
                             au,
                             &slices_owned,
                             &sps_h,
@@ -331,6 +277,7 @@ mod tests {
                             ystride,
                             cstride,
                         );
+                        all_entries.extend(entries);
                         parse_offset = au_end;
                         au_idx += 1;
                         got_au = true;
@@ -346,8 +293,8 @@ mod tests {
             }
         }
 
-        unsafe { ffi::hevcdec_destroy(cpp_ctx) };
-        println!("{name}: {au_idx} access units verified (Rust == C++)");
+        println!("{name}: {au_idx} access units verified");
+        Some(all_entries)
     }
 
     /// Apply a newly parsed SPS: set up the picture layout and (re)create the
@@ -391,23 +338,41 @@ mod tests {
         *sps_h = Some(sps.clone());
     }
 
+    fn check_stream_goldens(name: &str) {
+        if let Some(entries) = run_stream(name) {
+            for (key, hash) in entries {
+                goldens::assert_hash(&key, &hash);
+            }
+        }
+    }
+
     #[test]
     fn tier_f_main() {
-        run_stream("main");
+        check_stream_goldens("main");
     }
 
     #[test]
     fn tier_f_main10() {
-        run_stream("main10");
+        check_stream_goldens("main10");
     }
 
     #[test]
     fn tier_f_cra() {
-        run_stream("cra");
+        check_stream_goldens("cra");
     }
 
     #[test]
     fn tier_f_msp() {
-        run_stream("msp");
+        check_stream_goldens("msp");
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for name in ["main", "main10", "cra", "msp"] {
+            if let Some(entries) = run_stream(name) {
+                v.extend(entries);
+            }
+        }
+        v
     }
 }

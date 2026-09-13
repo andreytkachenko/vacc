@@ -2,6 +2,9 @@
 //! decoding, spec §9.3.2, §9.3.3. Each function decodes one syntax element
 //! using the appropriate binarization and context model(s).
 
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
+
 use crate::hevc::cabac::CabacEngine;
 use crate::hevc::cabac_tables::{
     CTX_ABS_MVD_GREATER0, CTX_ABS_MVD_GREATER1, CTX_CBF_CHROMA, CTX_CBF_LUMA,
@@ -494,8 +497,9 @@ pub fn decode_mvd(cabac: &mut CabacEngine) -> Mv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
     use crate::hevc::bitreader::BitstreamReader;
+    use crate::hevc::goldens;
+
     use crate::hevc::cabac::CabacEngine;
     use crate::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
     use crate::hevc::types::PredMode;
@@ -518,8 +522,8 @@ mod tests {
         }
     }
 
-    /// Mirror of the C++ oracle op dispatch (`hevc_test_api.cpp`
-    /// `hevcdec_test_cabac_run`). Must stay in lockstep with that switch.
+    /// Op dispatch mirrors the C++ hevc.js test oracle (`hevc_test_api.cpp`,
+    /// since removed); op codes keep that historical numbering.
     fn run_ops_rust(
         data: &[u8],
         slice_type: i32,
@@ -622,11 +626,21 @@ mod tests {
         (out, final_range, final_offset, final_ctx)
     }
 
-    #[test]
-    fn cabac_syntax_matches_cpp() {
+    /// Serialize one op run's full state (outputs + final range/offset/contexts).
+    fn push_run_state(out: &mut Vec<u8>, res: &(Vec<i32>, u16, u16, Vec<u8>)) {
+        for v in &res.0 {
+            goldens::push_i32(out, *v);
+        }
+        goldens::push_u16(out, res.1);
+        goldens::push_u16(out, res.2);
+        out.extend_from_slice(&res.3);
+    }
+
+    fn compute_cabac_syntax() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x000C_ABAC_0001);
         const ITERS: u32 = 400;
-        for it in 0..ITERS {
+        let mut buf = Vec::new();
+        for _it in 0..ITERS {
             // Random bitstream (4 KiB). The first byte is kept <= 0xFE so the CABAC
             // init offset (first 9 bits) is < 510 = initial range: a valid init state.
             // (offset >= range at init is a latent quirk that corrupts the segment and
@@ -655,82 +669,29 @@ mod tests {
                 args.push(rng.below(1u64 << 24) as i32);
             }
 
-            let (out_rs, range_rs, offset_rs, ctx_rs) =
-                run_ops_rust(&data, slice_type, qp, cabac_init_flag, &ops, &args);
+            let res = run_ops_rust(&data, slice_type, qp, cabac_init_flag, &ops, &args);
+            push_run_state(&mut buf, &res);
+        }
+        vec![("cabac::syntax".to_string(), buf)]
+    }
 
-            const MAX_OUT: usize = 256;
-            let mut out_cpp = vec![0i32; MAX_OUT];
-            let mut final_range: u16 = 0;
-            let mut final_offset: u16 = 0;
-            let mut final_ctx = vec![0u8; NUM_CABAC_CONTEXTS * 2];
-            let n_out = unsafe {
-                ffi_test::hevcdec_test_cabac_run(
-                    data.as_ptr(),
-                    data.len() as i32,
-                    slice_type,
-                    qp,
-                    cabac_init_flag as i32,
-                    ops.as_ptr(),
-                    args.as_ptr(),
-                    n_ops as i32,
-                    out_cpp.as_mut_ptr(),
-                    MAX_OUT as i32,
-                    &mut final_range,
-                    &mut final_offset,
-                    final_ctx.as_mut_ptr(),
-                )
-            };
-            assert!(n_out >= 0, "oracle failed rc={} (iter {})", n_out, it);
-
-            out_cpp.truncate(n_out as usize);
-            assert_eq!(
-                out_rs, out_cpp,
-                "bin outputs diverge (iter {}, slice_type={}, qp={}, init={})",
-                it, slice_type, qp, cabac_init_flag
-            );
-            assert_eq!(range_rs, final_range, "final range diverges (iter {})", it);
-            assert_eq!(offset_rs, final_offset, "final offset diverges (iter {})", it);
-            assert_eq!(ctx_rs, final_ctx, "final contexts diverge (iter {})", it);
+    #[test]
+    fn cabac_syntax_matches_golden() {
+        for (key, data) in compute_cabac_syntax() {
+            goldens::assert_golden(&key, &data);
         }
     }
 
-    /// Long pure-bypass sequence: verifies decode_bypass stays in lockstep with C++
-    /// over hundreds of consecutive bypass bins (exercises offset/range trajectories).
-    #[test]
-    fn long_bypass_sequence_matches_cpp() {
+    /// Long pure-bypass sequence: exercises decode_bypass over hundreds of
+    /// consecutive bypass bins (offset/range trajectories).
+    fn compute_long_bypass() -> Vec<(String, Vec<u8>)> {
         // Deterministic bitstream (0xA5 = 10100101 repeating).
         let data = vec![0xA5u8; 256];
         const N: usize = 600;
         let ops = vec![1u8; N]; // op 1 = decode_bypass
         let args = vec![0i32; N];
 
-        let (out_rs, range_rs, offset_rs, ctx_rs) =
-            run_ops_rust(&data, 2, 26, false, &ops, &args);
-
-        const MAX_OUT: usize = 1024;
-        let mut out_cpp = vec![0i32; MAX_OUT];
-        let mut final_range: u16 = 0;
-        let mut final_offset: u16 = 0;
-        let mut final_ctx = vec![0u8; NUM_CABAC_CONTEXTS * 2];
-        let n_out = unsafe {
-            ffi_test::hevcdec_test_cabac_run(
-                data.as_ptr(),
-                data.len() as i32,
-                2,
-                26,
-                0,
-                ops.as_ptr(),
-                args.as_ptr(),
-                N as i32,
-                out_cpp.as_mut_ptr(),
-                MAX_OUT as i32,
-                &mut final_range,
-                &mut final_offset,
-                final_ctx.as_mut_ptr(),
-            )
-        };
-        assert!(n_out >= 0, "oracle failed rc={}", n_out);
-        out_cpp.truncate(n_out as usize);
+        let res = run_ops_rust(&data, 2, 26, false, &ops, &args);
 
         // A pure bypass sequence with range in [256,511] and a valid init (offset <
         // range) cannot produce runs longer than ~log2(range); guard against the
@@ -744,12 +705,28 @@ mod tests {
             }
             best
         };
-        assert!(max_run(&out_rs) < 32, "anomalous bypass run (invariant corruption)");
+        assert!(max_run(&res.0) < 32, "anomalous bypass run (invariant corruption)");
 
-        assert_eq!(out_rs, out_cpp, "bypass sequence diverges");
-        assert_eq!(range_rs, final_range);
-        assert_eq!(offset_rs, final_offset);
-        assert_eq!(ctx_rs, final_ctx);
+        let mut buf = Vec::new();
+        push_run_state(&mut buf, &res);
+        vec![("cabac::long_bypass".to_string(), buf)]
+    }
+
+    #[test]
+    fn long_bypass_sequence_matches_golden() {
+        for (key, data) in compute_long_bypass() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_cabac_syntax() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_long_bypass() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }
-

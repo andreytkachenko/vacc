@@ -6,6 +6,9 @@
 //! resolves reference pictures from the DPB) is ported with the inter
 //! prediction layer; these kernels are its building blocks.
 
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
+
 use crate::hevc::types::{clip3, Mv};
 
 /// Luma 8-tap interpolation filter coefficients — Table 8-1.
@@ -938,7 +941,7 @@ mod sse2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
+    use crate::hevc::goldens;
 
     /// Deterministic xorshift64* RNG (same scheme as bitreader tests).
     struct Rng(u64);
@@ -984,17 +987,17 @@ mod tests {
         assert_eq!(chroma_mv_position(0, 0, Mv { x: -8, y: 8 }), (-1, 1, 0, 0));
     }
 
-    #[test]
-    fn luma_interpolation_matches_cpp() {
+    fn compute_luma_interp() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5EED_0001);
         let pic_w = 64i32;
         let pic_h = 64i32;
         let stride = pic_w;
         let plane: Vec<u16> = (0..pic_w * pic_h).map(|_| rng.below(1024) as u16).collect();
+        let mut buf = Vec::new();
 
         for &(n_pb_w, n_pb_h) in &[(4usize, 4), (8, 16), (16, 8), (32, 32), (64, 64)] {
             for bit_depth in [8i32, 10] {
-                for iter in 0..40 {
+                for _iter in 0..40 {
                     // xInt/yInt span negative (clamped), interior, and edge positions.
                     let x_int = rng.below(pic_w as u64 + 16) as i32 - 8;
                     let y_int = rng.below(pic_h as u64 + 16) as i32 - 8;
@@ -1003,45 +1006,38 @@ mod tests {
 
                     let n_samples = n_pb_w * n_pb_h;
                     let mut pred_rs = vec![0i16; n_samples];
-                    let mut pred_cpp = vec![0i16; n_samples];
 
                     interpolate_luma(
                         &plane, pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
                         n_pb_w, n_pb_h, bit_depth, &mut pred_rs,
                     );
-                    let rc = unsafe {
-                        ffi_test::hevcdec_test_interpolate_luma(
-                            plane.as_ptr(), pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
-                            n_pb_w as i32, n_pb_h as i32, bit_depth, pred_cpp.as_mut_ptr(),
-                        )
-                    };
-                    assert_eq!(rc, 0);
-
-                    if pred_rs != pred_cpp {
-                        let diff: Vec<usize> = (0..n_samples)
-                            .filter(|&i| pred_rs[i] != pred_cpp[i])
-                            .take(8)
-                            .collect();
-                        panic!(
-                            "luma mismatch bd={bit_depth} size={n_pb_w}x{n_pb_h} pos=({x_int},{y_int}) frac=({x_frac},{y_frac}) iter={iter} first_diffs={diff:?}"
-                        );
+                    for v in &pred_rs {
+                        goldens::push_i16(&mut buf, *v);
                     }
                 }
             }
         }
+        vec![("interp::luma".to_string(), buf)]
     }
 
     #[test]
-    fn chroma_interpolation_matches_cpp() {
+    fn luma_interpolation_matches_golden() {
+        for (key, data) in compute_luma_interp() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_chroma_interp() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5EED_0002);
         let pic_w = 32i32;
         let pic_h = 16i32;
         let stride = pic_w;
         let plane: Vec<u16> = (0..pic_w * pic_h).map(|_| rng.below(1024) as u16).collect();
+        let mut buf = Vec::new();
 
         for &(n_pb_wc, n_pb_hc) in &[(4usize, 4), (8, 8), (16, 16), (32, 16)] {
             for bit_depth in [8i32, 10] {
-                for iter in 0..40 {
+                for _iter in 0..40 {
                     let x_int = rng.below(pic_w as u64 + 8) as i32 - 4;
                     let y_int = rng.below(pic_h as u64 + 8) as i32 - 4;
                     let x_frac = rng.below(8) as i32;
@@ -1049,78 +1045,50 @@ mod tests {
 
                     let n_samples = n_pb_wc * n_pb_hc;
                     let mut pred_rs = vec![0i16; n_samples];
-                    let mut pred_cpp = vec![0i16; n_samples];
 
                     interpolate_chroma(
                         &plane, 1, pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
                         n_pb_wc, n_pb_hc, bit_depth, &mut pred_rs,
                     );
-                    let rc = unsafe {
-                        ffi_test::hevcdec_test_interpolate_chroma(
-                            plane.as_ptr(), 1, pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
-                            n_pb_wc as i32, n_pb_hc as i32, bit_depth, pred_cpp.as_mut_ptr(),
-                        )
-                    };
-                    assert_eq!(rc, 0);
-
-                    if pred_rs != pred_cpp {
-                        let diff: Vec<usize> = (0..n_samples)
-                            .filter(|&i| pred_rs[i] != pred_cpp[i])
-                            .take(8)
-                            .collect();
-                        panic!(
-                            "chroma mismatch bd={bit_depth} size={n_pb_wc}x{n_pb_hc} pos=({x_int},{y_int}) frac=({x_frac},{y_frac}) iter={iter} first_diffs={diff:?}"
-                        );
+                    for v in &pred_rs {
+                        goldens::push_i16(&mut buf, *v);
                     }
                 }
             }
         }
+        vec![("interp::chroma".to_string(), buf)]
     }
 
-    fn random_pwt(
-        rng: &mut Rng,
-        log2_denom: u32,
-    ) -> (PredWeightTable, [i16; 32], [i16; 32], [i16; 64], [i16; 64]) {
+    #[test]
+    fn chroma_interpolation_matches_golden() {
+        for (key, data) in compute_chroma_interp() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    /// Random weight table (same RNG draw order as the original oracle test).
+    fn random_pwt(rng: &mut Rng, log2_denom: u32) -> PredWeightTable {
         let mut pwt = PredWeightTable {
             luma_log2_weight_denom: log2_denom,
             ..Default::default()
         };
-        let mut w_luma = [0i16; 32];
-        let mut o_luma = [0i16; 32];
-        let mut w_chroma = [0i16; 64];
-        let mut o_chroma = [0i16; 64];
-        for list in 0..2 {
-            for r in 0..16 {
-                let lw = (rng.below(65) as i32 - 32) as i16;
-                let lo = (rng.below(41) as i32 - 20) as i16;
-                w_luma[list * 16 + r] = lw;
-                o_luma[list * 16 + r] = lo;
-                for c in 0..2 {
-                    let cw = (rng.below(65) as i32 - 32) as i16;
-                    let co = (rng.below(41) as i32 - 20) as i16;
-                    w_chroma[(list * 2 + c) * 16 + r] = cw;
-                    o_chroma[(list * 2 + c) * 16 + r] = co;
-                }
-            }
-        }
-        // Fill the Rust PWT from the same flat arrays the oracle receives.
         for list in 0..2 {
             let dst = if list == 0 { &mut pwt.l0 } else { &mut pwt.l1 };
-            for r in 0..16 {
-                dst[r].luma_weight = w_luma[list * 16 + r];
-                dst[r].luma_offset = o_luma[list * 16 + r];
+            for entry in dst.iter_mut() {
+                entry.luma_weight = (rng.below(65) as i32 - 32) as i16;
+                entry.luma_offset = (rng.below(41) as i32 - 20) as i16;
                 for c in 0..2 {
-                    dst[r].chroma_weight[c] = w_chroma[(list * 2 + c) * 16 + r];
-                    dst[r].chroma_offset[c] = o_chroma[(list * 2 + c) * 16 + r];
+                    entry.chroma_weight[c] = (rng.below(65) as i32 - 32) as i16;
+                    entry.chroma_offset[c] = (rng.below(41) as i32 - 20) as i16;
                 }
             }
         }
-        (pwt, w_luma, o_luma, w_chroma, o_chroma)
+        pwt
     }
 
-    #[test]
-    fn weighted_pred_default_matches_cpp() {
+    fn compute_weighted_pred_default() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5EED_0003);
+        let mut buf = Vec::new();
         for bit_depth in [8i32, 10] {
             for &(flag_l0, flag_l1) in &[(true, false), (false, true), (true, true)] {
                 for _iter in 0..20 {
@@ -1129,33 +1097,35 @@ mod tests {
                     let pred_l1: Vec<i16> = (0..n_samples).map(|_| (rng.below(4097) as i32 - 2048) as i16).collect();
 
                     let mut out_rs = vec![0i16; n_samples];
-                    let mut out_cpp = vec![0i16; n_samples];
 
                     weighted_pred_default(
                         &pred_l0, &pred_l1, flag_l0, flag_l1, n_samples as i32, bit_depth,
                         &mut out_rs,
                     );
-                    let rc = unsafe {
-                        ffi_test::hevcdec_test_weighted_pred_default(
-                            pred_l0.as_ptr(), pred_l1.as_ptr(), flag_l0 as i32, flag_l1 as i32,
-                            n_samples as i32, bit_depth, out_cpp.as_mut_ptr(),
-                        )
-                    };
-                    assert_eq!(rc, 0);
-                    assert_eq!(out_rs, out_cpp, "bd={bit_depth} flags=({flag_l0},{flag_l1})");
+                    for v in &out_rs {
+                        goldens::push_i16(&mut buf, *v);
+                    }
                 }
             }
         }
+        vec![("interp::weighted_pred_default".to_string(), buf)]
     }
 
     #[test]
-    fn weighted_pred_explicit_matches_cpp() {
+    fn weighted_pred_default_matches_golden() {
+        for (key, data) in compute_weighted_pred_default() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_weighted_pred_explicit() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(0x5EED_0004);
+        let mut buf = Vec::new();
         for bit_depth in [8i32, 10] {
             for log2_denom in 0..3u32 {
                 for c_idx in 0..3i32 {
                     for &(flag_l0, flag_l1) in &[(true, false), (false, true), (true, true)] {
-                        let (pwt, w_luma, o_luma, w_chroma, o_chroma) = random_pwt(&mut rng, log2_denom);
+                        let pwt = random_pwt(&mut rng, log2_denom);
                         let ref_idx_l0 = if rng.below(4) == 0 { -1 } else { rng.below(2) as i32 };
                         let ref_idx_l1 = if rng.below(4) == 0 { -1 } else { rng.below(2) as i32 };
 
@@ -1164,29 +1134,42 @@ mod tests {
                         let pred_l1: Vec<i16> = (0..n_samples).map(|_| (rng.below(4097) as i32 - 2048) as i16).collect();
 
                         let mut out_rs = vec![0i16; n_samples];
-                        let mut out_cpp = vec![0i16; n_samples];
 
                         weighted_pred_explicit(
                             &pred_l0, &pred_l1, flag_l0, flag_l1, ref_idx_l0, ref_idx_l1,
                             c_idx, n_samples as i32, bit_depth, &pwt, &mut out_rs,
                         );
-                        let rc = unsafe {
-                            ffi_test::hevcdec_test_weighted_pred_explicit(
-                                pred_l0.as_ptr(), pred_l1.as_ptr(), flag_l0 as i32, flag_l1 as i32,
-                                ref_idx_l0, ref_idx_l1, c_idx, n_samples as i32, bit_depth,
-                                log2_denom, 0,
-                                w_luma.as_ptr(), o_luma.as_ptr(), w_chroma.as_ptr(), o_chroma.as_ptr(),
-                                out_cpp.as_mut_ptr(),
-                            )
-                        };
-                        assert_eq!(rc, 0);
-                        assert_eq!(
-                            out_rs, out_cpp,
-                            "bd={bit_depth} cIdx={c_idx} log2Denom={log2_denom} flags=({flag_l0},{flag_l1}) idx=({ref_idx_l0},{ref_idx_l1})"
-                        );
+                        for v in &out_rs {
+                            goldens::push_i16(&mut buf, *v);
+                        }
                     }
                 }
             }
         }
+        vec![("interp::weighted_pred_explicit".to_string(), buf)]
+    }
+
+    #[test]
+    fn weighted_pred_explicit_matches_golden() {
+        for (key, data) in compute_weighted_pred_explicit() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_luma_interp() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_chroma_interp() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_weighted_pred_default() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_weighted_pred_explicit() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }

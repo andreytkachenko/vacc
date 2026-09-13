@@ -3,7 +3,11 @@
 //!
 //! Bit-for-bit port of the hevc.js implementation: same butterfly structures,
 //! same shift/rounding, same i32/i64 split in dequantization. Verified
-//! differentially against the C++ core via the `hevcdec_test_*` FFI exports.
+//! differentially against the C++ hevc.js core (since removed); outputs are
+//! now pinned by the SHA-256 goldens in `hevc::goldens`.
+
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
 
 use crate::hevc::cabac_tables::LEVEL_SCALE;
 use crate::hevc::types::{clip3, PredMode};
@@ -543,7 +547,7 @@ pub fn perform_transform_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test;
+    use crate::hevc::goldens;
 
     /// Deterministic PRNG (splitmix64).
     struct Rng(u64);
@@ -584,104 +588,46 @@ mod tests {
         s
     }
 
-    // ---- C++ oracle wrappers --------------------------------------------
+    // ---- Golden tests -----------------------------------------------------
+    // Outputs are pinned by SHA-256 goldens generated from the build that
+    // verified byte-exact agreement with the C++ oracle.
 
-    fn oracle_transform_inverse(
-        log2: u32,
-        c_idx: u32,
-        is_intra: bool,
-        skip: bool,
-        bit_depth: u32,
-        scaled: &[i16],
-    ) -> Vec<i16> {
-        let mut out = vec![0i16; scaled.len()];
-        let rc = unsafe {
-            ffi_test::hevcdec_test_transform_inverse(
-                log2 as i32,
-                c_idx as i32,
-                is_intra as i32,
-                skip as i32,
-                bit_depth as i32,
-                scaled.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        assert_eq!(rc, 0);
-        out
-    }
-
-    #[allow(clippy::too_many_arguments)] // mirrors the C++ oracle signature
-    fn oracle_dequant(
-        bit_depth_luma: u32,
-        bit_depth_chroma: u32,
-        c_idx: u32,
-        log2: u32,
-        qp: i32,
-        cu_is_intra: bool,
-        use_sl: bool,
-        pps_present: bool,
-        sl: Option<(&[u8; 1536], &[u8; 12])>,
-        pps_sl: Option<(&[u8; 1536], &[u8; 12])>,
-        coefficients: &[i16],
-    ) -> Vec<i16> {
-        let mut out = vec![0i16; coefficients.len()];
-        let rc = unsafe {
-            ffi_test::hevcdec_test_dequant(
-                bit_depth_luma as i32,
-                bit_depth_chroma as i32,
-                c_idx as i32,
-                log2 as i32,
-                qp,
-                cu_is_intra as i32,
-                use_sl as i32,
-                pps_present as i32,
-                sl.map_or(std::ptr::null(), |s| s.0.as_ptr()),
-                sl.map_or(std::ptr::null(), |s| s.1.as_ptr()),
-                pps_sl.map_or(std::ptr::null(), |s| s.0.as_ptr()),
-                pps_sl.map_or(std::ptr::null(), |s| s.1.as_ptr()),
-                coefficients.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        assert_eq!(rc, 0);
-        out
-    }
-
-    // ---- Differential tests ----------------------------------------------
-
-    #[test]
-    fn transform_inverse_matches_cpp() {
+    fn compute_transform_inverse() -> Vec<(String, Vec<u8>)> {
         let mut rng = Rng::new(42);
+        let mut buf = Vec::new();
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
             for c_idx in 0..3u32 {
                 for is_intra in [false, true] {
                     for skip in [false, true] {
                         for bit_depth in [8u32, 10] {
-                            for iter in 0..50 {
+                            for _iter in 0..50 {
                                 let coeffs: Vec<i16> = (0..n).map(|_| random_coeff(&mut rng)).collect();
                                 let mut rust_out = vec![0i16; n];
                                 perform_transform_inverse(
                                     log2, c_idx, is_intra, skip, bit_depth, &coeffs, &mut rust_out,
                                 );
-                                let cpp_out = oracle_transform_inverse(
-                                    log2, c_idx, is_intra, skip, bit_depth, &coeffs,
-                                );
-                                assert_eq!(
-                                    rust_out, cpp_out,
-                                    "log2={log2} cIdx={c_idx} intra={is_intra} \
-                                     skip={skip} bd={bit_depth} iter={iter}"
-                                );
+                                for v in &rust_out {
+                                    goldens::push_i16(&mut buf, *v);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        vec![("transform::inverse".to_string(), buf)]
     }
 
     #[test]
-    fn dequant_matches_cpp_flat() {
+    fn transform_inverse_matches_golden() {
+        for (key, data) in compute_transform_inverse() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_dequant_flat() -> Vec<(String, Vec<u8>)> {
+        let mut buf = Vec::new();
         let mut rng = Rng::new(7);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
@@ -692,7 +638,7 @@ mod tests {
                         continue;
                     }
                     for cu_is_intra in [false, true] {
-                        for iter in 0..10 {
+                        for _iter in 0..10 {
                             let coeffs: Vec<i16> = (0..n).map(|_| random_coeff(&mut rng)).collect();
                             let mut rust_out = vec![0i16; n];
                             let sps_sl = ScalingListData::default();
@@ -706,23 +652,26 @@ mod tests {
                                 cu_pred_mode: if cu_is_intra { PredMode::Intra } else { PredMode::Inter },
                             };
                             perform_dequant(&params, log2, c_idx, qp, &coeffs, &mut rust_out);
-                            let cpp_out = oracle_dequant(
-                                8, 8, c_idx, log2, qp, cu_is_intra, false, false,
-                                None, None, &coeffs,
-                            );
-                            assert_eq!(
-                                rust_out, cpp_out,
-                                "log2={log2} cIdx={c_idx} qp={qp} intra={cu_is_intra} iter={iter}"
-                            );
+                            for v in &rust_out {
+                                goldens::push_i16(&mut buf, *v);
+                            }
                         }
                     }
                 }
             }
         }
+        vec![("transform::dequant_flat".to_string(), buf)]
     }
 
     #[test]
-    fn dequant_matches_cpp_scaling_lists() {
+    fn dequant_matches_golden_flat() {
+        for (key, data) in compute_dequant_flat() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_dequant_scaling_lists() -> Vec<(String, Vec<u8>)> {
+        let mut buf = Vec::new();
         let mut rng = Rng::new(11);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
@@ -730,7 +679,7 @@ mod tests {
                 for bit_depth in [8u32, 10] {
                     for cu_is_intra in [false, true] {
                         for pps_present in [false, true] {
-                            for iter in 0..5 {
+                            for _iter in 0..5 {
                                 // Random scaling lists (full u8 range, including
                                 // zeros to exercise the DC override m==0 -> 16).
                                 let sl: ([u8; 1536], [u8; 12]) = (
@@ -759,30 +708,28 @@ mod tests {
                                 };
                                 perform_dequant(&params, log2, c_idx, 26, &coeffs, &mut rust_out);
 
-                                let cpp_out = oracle_dequant(
-                                    bit_depth, bit_depth, c_idx, log2, 26, cu_is_intra, true,
-                                    pps_present,
-                                    Some((&sl.0, &sl.1)),
-                                    Some((&pps_sl.0, &pps_sl.1)),
-                                    &coeffs,
-                                );
-                                assert_eq!(
-                                    rust_out, cpp_out,
-                                    "log2={log2} cIdx={c_idx} bd={bit_depth} \
-                                     intra={cu_is_intra} pps={pps_present} iter={iter}"
-                                );
+                                for v in &rust_out {
+                                    goldens::push_i16(&mut buf, *v);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        vec![("transform::dequant_scaling_lists".to_string(), buf)]
     }
 
     #[test]
-    fn dequant_matches_cpp_default_scaling_lists() {
-        // NULL scaling list pointers -> C++ uses spec defaults; Rust uses
-        // ScalingListData::set_defaults().
+    fn dequant_matches_golden_scaling_lists() {
+        for (key, data) in compute_dequant_scaling_lists() {
+            goldens::assert_golden(&key, &data);
+        }
+    }
+
+    fn compute_dequant_default_lists() -> Vec<(String, Vec<u8>)> {
+        // Spec-default scaling lists (ScalingListData::set_defaults()).
+        let mut buf = Vec::new();
         let mut rng = Rng::new(13);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
@@ -805,15 +752,19 @@ mod tests {
                         cu_pred_mode: if cu_is_intra { PredMode::Intra } else { PredMode::Inter },
                     };
                     perform_dequant(&params, log2, c_idx, 34, &coeffs, &mut rust_out);
-                    let cpp_out = oracle_dequant(
-                        8, 8, c_idx, log2, 34, cu_is_intra, true, false, None, None, &coeffs,
-                    );
-                    assert_eq!(
-                        rust_out, cpp_out,
-                        "log2={log2} cIdx={c_idx} intra={cu_is_intra}"
-                    );
+                    for v in &rust_out {
+                        goldens::push_i16(&mut buf, *v);
+                    }
                 }
             }
+        }
+        vec![("transform::dequant_default_lists".to_string(), buf)]
+    }
+
+    #[test]
+    fn dequant_matches_golden_default_lists() {
+        for (key, data) in compute_dequant_default_lists() {
+            goldens::assert_golden(&key, &data);
         }
     }
 
@@ -842,5 +793,22 @@ mod tests {
         assert_eq!(sl.scaling_list[21], DEFAULT_8X8_INTER);
         assert_eq!(sl.scaling_list[19], [0u8; 64]);
         assert!(sl.scaling_list_dc.iter().all(|&v| v == 16));
+    }
+
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for (k, b) in compute_transform_inverse() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_dequant_flat() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_dequant_scaling_lists() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        for (k, b) in compute_dequant_default_lists() {
+            v.push((k, goldens::sha256_hex(&b)));
+        }
+        v
     }
 }
