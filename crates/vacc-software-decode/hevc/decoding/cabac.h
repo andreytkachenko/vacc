@@ -15,6 +15,10 @@
 #include "common/types.h"
 #include "decoding/cabac_tables.h"
 
+#ifdef HEVC_DEBUG
+#include "common/debug.h"
+#endif
+
 namespace hevc {
 
 // Single CABAC context (AD-005)
@@ -65,6 +69,9 @@ public:
 
 #ifdef HEVC_DEBUG
         bin_count_++;
+        if (bin_count_ < 20000)
+            HEVC_LOG(CABAC, "decision ctx=%d bin=%d range=%d offset=%d", ctxIdx, binVal,
+                     ivlCurrRange_, ivlOffset_);
 #endif
         return binVal;
     }
@@ -79,6 +86,8 @@ public:
 
 #ifdef HEVC_DEBUG
         bin_count_++;
+        if (bin_count_ < 20000)
+            HEVC_LOG(CABAC, "bypass bin=%d", val);
 #endif
         return val;
     }
@@ -94,6 +103,10 @@ public:
             int val = (ivlOffset_ >= ivlCurrRange_);
             ivlOffset_ -= ivlCurrRange_ & static_cast<uint16_t>(-val);
             value = (value << 1) | val;
+#ifdef HEVC_DEBUG
+            if (bin_count_ < 20000)
+                HEVC_LOG(CABAC, "bypass bin=%d", val);
+#endif
         }
 
 #ifdef HEVC_DEBUG

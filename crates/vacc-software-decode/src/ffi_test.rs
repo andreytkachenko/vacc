@@ -197,4 +197,63 @@ unsafe extern "C" {
         out_cb: *mut u16,
         out_cr: *mut u16,
     ) -> i32;
+
+    pub fn hevcdec_test_parse_sps_pps(
+        sps_nal: *const u8,
+        sps_len: i32,
+        pps_nal: *const u8,
+        pps_len: i32,
+        out_sps: *mut i32,
+        out_pps: *mut i32,
+    ) -> i32;
+
+    pub fn hevcdec_test_frame_new(
+        sps_nal: *const u8,
+        sps_len: i32,
+        pps_nal: *const u8,
+        pps_len: i32,
+        cur_poc: i32,
+        n_refs: i32,
+        ref_poc: *const i32,
+        ref_st_ref: *const i32,
+        ref_lt_ref: *const i32,
+        ref_y: *const u16,
+        ref_cb: *const u16,
+        ref_cr: *const u16,
+        ref_motion: *const i32,
+        ref_refpoc: *const i32,
+        list0_idx: *const i32,
+        n_list0: i32,
+        list1_idx: *const i32,
+        n_list1: i32,
+        col_pic_idx: i32,
+        no_backward_pred: i32,
+        out_sps: *mut i32,
+        out_pps: *mut i32,
+        out_state: *mut *mut std::ffi::c_void,
+    ) -> i32;
+
+    pub fn hevcdec_test_frame_decode(
+        state: *mut std::ffi::c_void,
+        vcl_nals: *const u8,
+        vcl_len: i32,
+        out_n_segments: *mut i32,
+        out_sh: *mut i32,
+        out_final_bit_pos: *mut u32,
+        out_y: *mut u16,
+        out_cb: *mut u16,
+        out_cr: *mut u16,
+        out_cu_info: *mut i32,
+        out_intra_luma: *mut i32,
+        out_intra_chroma: *mut i32,
+        out_motion: *mut i32,
+        out_cbf_luma: *mut u8,
+        out_log2_tu: *mut u8,
+        out_edge_v: *mut u8,
+        out_edge_h: *mut u8,
+        out_sao_params: *mut i32,
+        out_slice_idx: *mut u8,
+    ) -> i32;
+
+    pub fn hevcdec_test_frame_free(state: *mut std::ffi::c_void);
 }

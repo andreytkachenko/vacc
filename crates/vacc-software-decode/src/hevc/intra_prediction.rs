@@ -2,7 +2,7 @@
 //! spec §8.4.4.2 (35 modes: Planar, DC, Angular 2-34).
 
 use crate::hevc::picture::Picture;
-use crate::hevc::types::{clip3, Sps};
+use crate::hevc::types::{clip3, Pps, Sps};
 
 /// Intra prediction angle tables (Table 8-4, 8-5).
 pub const INTRA_PRED_ANGLE: [i32; 35] = [
@@ -34,16 +34,20 @@ fn zscan_addr(bx: i32, by: i32) -> u32 {
 ///
 /// Availability: a sample is available if it belongs to a previously decoded
 /// CTU (raster order) or precedes the current TU in Z-scan order at min-TB
-/// granularity within the same CTU. Single slice, no tiles — matching the
-/// C++ oracle configuration; multi-slice/tile checks (§6.4.1) are added with
-/// the full decoder context port.
+/// granularity within the same CTU. Cross-CTU samples additionally require
+/// the same slice and tile as the current CTU (§6.4.1); `slice_idx` is the
+/// per-CTU slice-index array (None = single slice), `pps` provides the tile
+/// scan tables.
+#[allow(clippy::too_many_arguments)] // faithful port of the C++ signature
 pub fn build_reference_samples(
     pic: &Picture,
     sps: &Sps,
+    pps: &Pps,
     x0: i32,
     y0: i32,
     n_tbs: i32,
     c_idx: i32,
+    slice_idx: Option<&[u8]>,
 ) -> (Vec<i16>, Vec<i16>) {
     let (pic_w, pic_h) = if c_idx == 0 {
         (sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples)
@@ -88,14 +92,28 @@ pub fn build_reference_samples(
         let ref_ctb_x = rx / ctb_size;
         let ref_ctb_y = ry / ctb_size;
 
-        // Different CTU: available if the CTU precedes in raster order.
+        // Different CTU: available if the CTU precedes in raster order
+        // AND is in the same slice/tile (§6.4.1).
         if ref_ctb_x != cur_ctb_x || ref_ctb_y != cur_ctb_y {
             let ref_ctb_addr = ref_ctb_y * sps.pic_width_in_ctbs_y + ref_ctb_x;
             let cur_ctb_addr = cur_ctb_y * sps.pic_width_in_ctbs_y + cur_ctb_x;
             if ref_ctb_addr >= cur_ctb_addr {
                 return false;
             }
-            // §6.4.1: single slice, no tiles — available.
+            // §6.4.1: SliceAddrRs must match
+            if let Some(si) = slice_idx
+                && si[ref_ctb_addr as usize] != si[cur_ctb_addr as usize]
+            {
+                return false;
+            }
+            // §6.4.1: TileId must match
+            if !pps.tile_id.is_empty() {
+                let ts_ref = pps.ctb_addr_rs_to_ts[ref_ctb_addr as usize];
+                let ts_cur = pps.ctb_addr_rs_to_ts[cur_ctb_addr as usize];
+                if pps.tile_id[ts_ref as usize] != pps.tile_id[ts_cur as usize] {
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -410,18 +428,21 @@ pub fn predict_angular(
 pub fn perform_intra_prediction(
     pic: &Picture,
     sps: &Sps,
+    pps: &Pps,
     x0: i32,
     y0: i32,
     log2_pred_size: i32,
     c_idx: i32,
     intra_mode: i32,
+    slice_idx: Option<&[u8]>,
     pred: &mut [i16],
 ) {
     let n_tbs = 1 << log2_pred_size;
     let bit_depth = if c_idx == 0 { sps.bit_depth_y } else { sps.bit_depth_c };
 
     // Build reference samples
-    let (mut ref_top, mut ref_left) = build_reference_samples(pic, sps, x0, y0, n_tbs, c_idx);
+    let (mut ref_top, mut ref_left) =
+        build_reference_samples(pic, sps, pps, x0, y0, n_tbs, c_idx, slice_idx);
 
     // §8.4.4.2.3: Reference sample filtering
     // Spec: filtering applies when intra_smoothing_disabled_flag == 0 AND
@@ -553,6 +574,7 @@ mod tests {
                     sub_height_c: 2,
                     intra_smoothing_disabled_flag: false,
                     strong_intra_smoothing_enabled_flag: true,
+                    ..Default::default()
                 };
 
                 // Positions exercise: picture corner (no neighbours), top edge,
@@ -590,7 +612,8 @@ mod tests {
                                 let mut pred_cpp = vec![0i16; n_samples];
 
                                 perform_intra_prediction(
-                                    &pic, &sps, x0, y0, log2_size, c_idx, mode, &mut pred_rs,
+                                    &pic, &sps, &Pps::default(), x0, y0, log2_size, c_idx, mode,
+                                    None, &mut pred_rs,
                                 );
                                 let rc = unsafe {
                                     ffi_test::hevcdec_test_intra_predict(
@@ -638,6 +661,7 @@ mod tests {
             sub_height_c: 2,
             intra_smoothing_disabled_flag: true,
             strong_intra_smoothing_enabled_flag: false,
+            ..Default::default()
         };
 
         let (x0, y0) = (16i32, 4);
@@ -656,7 +680,9 @@ mod tests {
             let mut pred_rs = vec![0i16; n_samples];
             let mut pred_cpp = vec![0i16; n_samples];
 
-            perform_intra_prediction(&pic, &sps, x0, y0, log2_size, 0, mode, &mut pred_rs);
+            perform_intra_prediction(
+                &pic, &sps, &Pps::default(), x0, y0, log2_size, 0, mode, None, &mut pred_rs,
+            );
             let rc = unsafe {
                 ffi_test::hevcdec_test_intra_predict(
                     pic_w, pic_h, 32, 4, bit_depth, 1, 2, 2, 1, 0,
@@ -689,6 +715,7 @@ mod tests {
             sub_height_c: 2,
             intra_smoothing_disabled_flag: false,
             strong_intra_smoothing_enabled_flag: true,
+            ..Default::default()
         };
 
         let n_tbs = 32;
@@ -706,7 +733,9 @@ mod tests {
             let mut pred_rs = vec![0i16; n_samples];
             let mut pred_cpp = vec![0i16; n_samples];
 
-            perform_intra_prediction(&pic, &sps, 0, 0, log2_size, 0, mode, &mut pred_rs);
+            perform_intra_prediction(
+                &pic, &sps, &Pps::default(), 0, 0, log2_size, 0, mode, None, &mut pred_rs,
+            );
             let rc = unsafe {
                 ffi_test::hevcdec_test_intra_predict(
                     pic_w, pic_h, 64, 4, bit_depth, 1, 2, 2, 0, 1,

@@ -229,6 +229,11 @@ impl<'a> BitstreamReader<'a> {
         self.bit_pos
     }
 
+    /// Current byte position (bit position / 8).
+    pub fn byte_position(&self) -> usize {
+        self.bit_pos / 8
+    }
+
     pub fn bits_remaining(&self) -> usize {
         (self.size * 8).saturating_sub(self.bit_pos)
     }

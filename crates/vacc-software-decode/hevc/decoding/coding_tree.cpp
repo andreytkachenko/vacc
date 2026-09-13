@@ -585,6 +585,9 @@ bool decode_slice_segment_data(DecodingContext& ctx, BitstreamReader& bs,
         int sliceType = static_cast<int>(sh.slice_type);
         cabac.init_contexts(sliceType, sh.SliceQpY, sh.cabac_init_flag);
     }
+#ifdef HEVC_DEBUG
+    cabac.reset_bin_count();
+#endif
     cabac.init_decoder(bs);
 
     // Init QP
@@ -1049,6 +1052,8 @@ void decode_coding_unit(DecodingContext& ctx, int x0, int y0, int log2CbSize) {
     // §8.6.1: Derive QpY for this CU. Uses CuQpDeltaVal (0 if not coded).
     int qpY = derive_qp_y(ctx, x0, y0);
     ctx.QpY_prev = qpY;
+    HEVC_LOG(TREE, "QPY (%d,%d) %dx%d qp=%d prev=%d", x0, y0, cbSize, cbSize, qpY,
+             static_cast<int>(ctx.QpY_prev));
 
     // Store QP in grid (will be updated after cu_qp_delta if needed)
     for (int j = 0; j < n; j++)
@@ -1211,6 +1216,9 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
         int x1 = x0 + (1 << (log2TrafoSize - 1));
         int y1 = y0 + (1 << (log2TrafoSize - 1));
 
+        HEVC_LOG(TREE, "TT (%d,%d) log2=%d depth=%d split=1 cbf_cb=%d cbf_cr=%d", x0, y0,
+                 log2TrafoSize, trafoDepth, (int)cbf_cb, (int)cbf_cr);
+
         decode_transform_tree(ctx, x0, y0, x0, y0, log2TrafoSize - 1,
                               trafoDepth + 1, 0, cbf_cb, cbf_cr);
         decode_transform_tree(ctx, x1, y0, x0, y0, log2TrafoSize - 1,
@@ -1226,6 +1234,9 @@ void decode_transform_tree(DecodingContext& ctx, int x0, int y0,
             cbf_cb || cbf_cr) {
             cbf_luma = decode_cbf_luma(cabac, trafoDepth);
         }
+
+        HEVC_LOG(TREE, "TU (%d,%d) log2=%d depth=%d cbf_luma=%d cbf_cb=%d cbf_cr=%d",
+                 x0, y0, log2TrafoSize, trafoDepth, (int)cbf_luma, (int)cbf_cb, (int)cbf_cr);
 
         decode_transform_unit(ctx, x0, y0, xBase, yBase, log2TrafoSize, trafoDepth, blkIdx,
                               cbf_luma, cbf_cb, cbf_cr);

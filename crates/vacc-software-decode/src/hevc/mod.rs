@@ -11,11 +11,16 @@
 pub mod bitreader;
 pub mod cabac;
 pub mod cabac_tables;
+pub mod coding_tree;
 pub mod deblocking;
 pub mod interpolation;
+pub mod inter_prediction;
 pub mod intra_prediction;
 pub mod picture;
+pub mod residual_coding;
 pub mod sao;
 pub mod syntax_elements;
+#[cfg(test)]
+pub mod tier_e;
 pub mod transform;
 pub mod types;

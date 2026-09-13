@@ -4,7 +4,27 @@
 //! (`write_yuv`) and the TMVP motion-info storage belong to the pipeline and
 //! TMVP (inter prediction) layers respectively, and are ported later.
 
-use crate::hevc::types::{sub_height_c, sub_width_c, ChromaFormat};
+use crate::hevc::types::{sub_height_c, sub_width_c, ChromaFormat, Mv};
+
+/// Per-PU motion information at min-PU (4x4) granularity — spec §8.5.3.
+/// Mirrors C++ `PUMotionInfo` / `Picture::PUMotionInfoCompact`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PuMotionInfo {
+    pub mv: [Mv; 2],
+    /// -1 = list not present.
+    pub ref_idx: [i8; 2],
+    pub pred_flag: [bool; 2],
+}
+
+impl Default for PuMotionInfo {
+    fn default() -> Self {
+        PuMotionInfo {
+            mv: [Mv::default(), Mv::default()],
+            ref_idx: [-1, -1],
+            pred_flag: [false, false],
+        }
+    }
+}
 
 /// Picture buffer — planar YUV layout (AD-002), spec §6.1.
 #[derive(Clone)]
@@ -40,6 +60,12 @@ pub struct Picture {
     pub used_for_short_term_ref: bool,
     pub used_for_long_term_ref: bool,
     pub needed_for_output: bool,
+
+    // Inter: per-PU motion info for TMVP (stored after decoding).
+    pub motion_info_buf: Vec<PuMotionInfo>,
+    pub motion_info_stride: i32,
+    // Ref POC lists (snapshot at decode time, for TMVP MV scaling).
+    pub ref_poc: [Vec<i32>; 2],
 }
 
 impl Default for Picture {
@@ -63,6 +89,9 @@ impl Default for Picture {
             used_for_short_term_ref: false,
             used_for_long_term_ref: false,
             needed_for_output: false,
+            motion_info_buf: Vec::new(),
+            motion_info_stride: 0,
+            ref_poc: [Vec::new(), Vec::new()],
         }
     }
 }

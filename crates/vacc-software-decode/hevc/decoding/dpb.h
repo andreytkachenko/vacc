@@ -130,6 +130,26 @@ public:
         }
     }
 
+    // Test-only: install fully-populated synthetic reference pictures
+    // (hevc_test_api slice-segment oracle; not part of the decode pipeline).
+    // `pics` are kept alive by the DPB. list0/list1 hold pool indices into
+    // `pics` (-1 = no reference at that entry); col_pic_idx is a pool index or -1.
+    void test_install_ref_pics(std::vector<std::shared_ptr<Picture>> pics,
+                               const std::vector<int>& list0,
+                               const std::vector<int>& list1,
+                               int col_pic_idx, bool no_backward_pred) {
+        ref_pic_list0_.clear();
+        ref_pic_list1_.clear();
+        for (int idx : list0)
+            ref_pic_list0_.push_back(RefPicListEntry{idx >= 0 ? pics[idx].get() : nullptr});
+        for (int idx : list1)
+            ref_pic_list1_.push_back(RefPicListEntry{idx >= 0 ? pics[idx].get() : nullptr});
+        col_pic_ = col_pic_idx >= 0 ? pics[col_pic_idx].get() : nullptr;
+        no_backward_pred_flag_ = no_backward_pred;
+        pictures_.insert(pictures_.end(), std::make_move_iterator(pics.begin()),
+                         std::make_move_iterator(pics.end()));
+    }
+
     // Collocated picture (valid after derive_colpic)
     Picture* col_pic() const { return col_pic_; }
     bool no_backward_pred_flag() const { return no_backward_pred_flag_; }

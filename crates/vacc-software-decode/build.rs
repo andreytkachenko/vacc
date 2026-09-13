@@ -17,6 +17,11 @@ fn main() {
         .warnings(false)
         .opt_level(2);
 
+    // Test-only: enable HEVC_LOG diagnostics (HEVC_DEBUG_FILTER selects category).
+    if std::env::var("HEVC_DEBUG").is_ok() {
+        cxx.flag_if_supported("-DHEVC_DEBUG");
+    }
+
     for file in [
         // hevc.js core (MIT, see hevc/LICENSE)
         "bitstream/bitstream_reader.cpp",
@@ -53,4 +58,5 @@ fn main() {
 
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rerun-if-changed=hevc");
+    println!("cargo:rerun-if-env-changed=HEVC_DEBUG");
 }

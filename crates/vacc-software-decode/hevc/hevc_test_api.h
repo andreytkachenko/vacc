@@ -181,6 +181,109 @@ int hevcdec_test_deblock_run(
     const int32_t* poc_l1, int n_ref_l1,
     uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr);
 
+/* ---- Tier E: slice-segment replay oracle ------------------------------
+ *
+ * Differential oracle for the Rust coding_tree / residual_coding /
+ * inter_prediction ports. Replays one picture's slice segments through the
+ * C++ decode_slice_segment_data with fully synthetic reference pictures
+ * (caller-provided, identical on both sides), so outputs are comparable
+ * byte-for-byte without decoding prior frames.
+ *
+ * Flat layouts (int32 arrays):
+ *   SPS_FLAT (30): picW, picH, bitDepthY, bitDepthC, chromaArrayType,
+ *     ctbSizeY, minTbSizeY, picWidthInCtbsY, subW, subH,
+ *     intraSmoothingDisabled, strongIntraSmoothing, minCbLog2SizeY,
+ *     ctbLog2SizeY, minCbSizeY, picHeightInCtbsY, picSizeInCtbsY,
+ *     minTbLog2SizeY, maxTbLog2SizeY, qpBdOffsetY, qpBdOffsetC,
+ *     ampEnabled, pcmEnabled, pcmBitDepthLumaMinus1, pcmBitDepthChromaMinus1,
+ *     log2MinIpcmCbSizeY, log2MaxIpcmCbSizeY, maxTrHIERarchDepthInter,
+ *     maxTransformHierarchyDepthIntra, cabacBypassAlignment
+ *   PPS_FLAT (48): signDataHiding, transformSkip, cuQpDelta,
+ *     diffCuQpDeltaDepth, ppsCbQpOffset, ppsCrQpOffset, weightedPred,
+ *     weightedBipred, transquantBypass, tilesEnabled, entropyCodingSync,
+ *     loopFilterAcrossSlices, log2ParallelMergeLevelMinus2,
+ *     numTileColumnsMinus1, numTileRowsMinus1, uniformSpacing,
+ *     columnWidthMinus1[16] (0-padded), rowHeightMinus1[16] (0-padded)
+ *   SH_FLAT (343): sliceSegmentAddress, dependentSliceSegmentFlag,
+ *     sliceType (0=B,1=P,2=I), picOutputFlag, sliceTemporalMvpEnabled,
+ *     sliceSaoLumaFlag, sliceSaoChromaFlag, numRefIdxL0ActiveMinus1,
+ *     numRefIdxL1ActiveMinus1, mvdL1Zero, cabacInitFlag,
+ *     collocatedFromL0Flag, collocatedRefIdx, fiveMinusMaxNumMergeCand,
+ *     sliceQpDelta, sliceCbQpOffset, sliceCrQpOffset, sliceQpY (derived),
+ *     maxNumMergeCand (derived), numEntryPointOffsets,
+ *     sliceHeaderCodedSize (coded NAL offset of slice data start),
+ *     lumaLog2WeightDenom, deltaChromaLog2WeightDenom,
+ *     then per list(0,1) x ref(0..15): lumaWeightFlag, chromaWeightFlag,
+ *     lumaWeight, lumaOffset, cbWeight, cbOffset, crWeight, crOffset
+ *
+ * Reference pool (n_refs entries), all content caller-generated:
+ *   ref_poc[r], ref_st_ref[r] (0/1), ref_lt_ref[r] (0/1)
+ *   ref_y  [r][picW * picH]            (stride = picW)
+ *   ref_cb [r][compW * compH]          (stride = compW; compW = picW/subW)
+ *   ref_cr [r][compW * compH]
+ *   ref_motion [r][modeGridW*modeGridH*8]: per 4x4 block
+ *     mvx0, mvy0, refIdx0, predFlag0, mvx1, mvy1, refIdx1, predFlag1
+ *   ref_refpoc [r][2][16] (0-padded)
+ * list0_idx/list1_idx: pool indices (-1 = no reference), length n_list0/n_list1.
+ * col_pic_idx: pool index of the collocated picture or -1.
+ *
+ * Returns 0 on success; -1 bad arguments / parse failure; -2 unsupported
+ * feature (scaling lists, tiles, dependent slice segments, separate colour
+ * planes); -3 slice header decode failure; -4 slice data decode failure. */
+
+#define HEVCDEC_TEST_SPS_FLAT 30
+#define HEVCDEC_TEST_PPS_FLAT 48
+#define HEVCDEC_TEST_SH_FLAT 343
+#define HEVCDEC_TEST_MAX_SEGS 16
+
+int hevcdec_test_parse_sps_pps(const uint8_t* sps_nal, int sps_len,
+                               const uint8_t* pps_nal, int pps_len,
+                               int32_t* out_sps, int32_t* out_pps);
+
+int hevcdec_test_frame_new(
+    const uint8_t* sps_nal, int sps_len,
+    const uint8_t* pps_nal, int pps_len,
+    int cur_poc,
+    int n_refs,
+    const int32_t* ref_poc, const int32_t* ref_st_ref, const int32_t* ref_lt_ref,
+    const uint16_t* ref_y, const uint16_t* ref_cb, const uint16_t* ref_cr,
+    const int32_t* ref_motion, const int32_t* ref_refpoc,
+    const int32_t* list0_idx, int n_list0,
+    const int32_t* list1_idx, int n_list1,
+    int col_pic_idx, int no_backward_pred,
+    int32_t* out_sps, int32_t* out_pps,
+    void** out_state);
+
+/* Decode all slice segments of one picture (concatenated raw VCL NAL bytes)
+ * in the frame state created by hevcdec_test_frame_new. Grids/plane outputs
+ * are the full-picture state after the last segment:
+ *   out_y/out_cb/out_cr:  plane samples, stride = width
+ *   out_cu_info:  [minCbsW*minCbsH*8] per min-CB: predMode, partMode,
+ *                 log2CbSize, intraModeLuma, qpY, isPcm, transquantBypass,
+ *                 mergeFlag
+ *   out_intra_luma / out_intra_chroma: [modeGridW*modeGridH]
+ *   out_motion:   [modeGridW*modeGridH*8] (same layout as ref_motion)
+ *   out_cbf_luma / out_log2_tu / out_edge_v / out_edge_h: [modeGridW*modeGridH] u8
+ *   out_sao_params: [ctbCount*24] per CTU: typeIdx[3], eoClass[3],
+ *                   bandPosition[3], offsetVal[3][5]
+ *   out_slice_idx: [ctbCount] u8
+ * Per segment s (0..out_n_segments-1): out_sh[s*SH_FLAT..] and
+ * out_final_bit_pos[s] = RBSP bit position after the segment's slice data. */
+int hevcdec_test_frame_decode(
+    void* state,
+    const uint8_t* vcl_nals, int vcl_len,
+    int* out_n_segments,
+    int32_t* out_sh, uint32_t* out_final_bit_pos,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr,
+    int32_t* out_cu_info,
+    int32_t* out_intra_luma, int32_t* out_intra_chroma,
+    int32_t* out_motion,
+    uint8_t* out_cbf_luma, uint8_t* out_log2_tu,
+    uint8_t* out_edge_v, uint8_t* out_edge_h,
+    int32_t* out_sao_params, uint8_t* out_slice_idx);
+
+void hevcdec_test_frame_free(void* state);
+
 #ifdef __cplusplus
 }
 #endif

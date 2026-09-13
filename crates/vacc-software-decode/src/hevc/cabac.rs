@@ -24,6 +24,8 @@ pub struct CabacEngine<'bs> {
     range: u16,
     offset: u16,
     bs: &'bs mut BitstreamReader<'bs>,
+    /// Test-only bin counter for differential tracing.
+    dbg_bin_count: u32,
 }
 
 impl<'bs> CabacEngine<'bs> {
@@ -33,6 +35,7 @@ impl<'bs> CabacEngine<'bs> {
             range: 0,
             offset: 0,
             bs,
+            dbg_bin_count: 0,
         }
     }
 
@@ -112,6 +115,11 @@ impl<'bs> CabacEngine<'bs> {
         };
 
         self.renormalize();
+        if crate::hevc::coding_tree::hevc_trace() && self.dbg_bin_count < 20000 {
+            eprintln!("RUST decision ctx={} bin={} range={} offset={}",
+                ctx_idx, bin_val, self.range, self.offset);
+        }
+        self.dbg_bin_count += 1;
         bin_val
     }
 
@@ -122,6 +130,10 @@ impl<'bs> CabacEngine<'bs> {
         // Branchless: avoid unpredictable branch on 50/50 bypass bins.
         let val = (self.offset >= self.range) as i32;
         self.offset -= self.range & (-(val) as i16 as u16);
+        if crate::hevc::coding_tree::hevc_trace() && self.dbg_bin_count < 20000 {
+            eprintln!("RUST bypass bin={}", val);
+        }
+        self.dbg_bin_count += 1;
         val
     }
 
@@ -138,7 +150,11 @@ impl<'bs> CabacEngine<'bs> {
             let val = (self.offset >= self.range) as i32;
             self.offset -= self.range & (-(val) as i16 as u16);
             value = (value << 1) | val;
+            if crate::hevc::coding_tree::hevc_trace() && self.dbg_bin_count < 20000 {
+                eprintln!("RUST bypass bin={}", val);
+            }
         }
+        self.dbg_bin_count += num_bins as u32;
         value
     }
 
@@ -173,6 +189,17 @@ impl<'bs> CabacEngine<'bs> {
     }
     pub fn load_contexts(&mut self, src: &[CabacContext]) {
         self.contexts.copy_from_slice(src);
+    }
+
+    /// Raw pointer to the context array (WPP save path).
+    pub fn contexts_ptr(&self) -> *const CabacContext {
+        self.contexts.as_ptr()
+    }
+
+    /// Access to the underlying bitstream reader (raw-bit reads such as PCM
+    /// sample access and byte alignment).
+    pub fn bitstream(&mut self) -> &mut BitstreamReader<'bs> {
+        self.bs
     }
 
     /// Debug accessors (mirror the C++ `dbg_*`).

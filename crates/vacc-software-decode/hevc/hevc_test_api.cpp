@@ -5,9 +5,13 @@
 
 #include "hevc_test_api.h"
 
+#include <cstdio>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #include "bitstream/bitstream_reader.h"
+#include "bitstream/nal_unit.h"
 #include "common/types.h"
 #include "decoding/cabac.h"
 #include "decoding/coding_tree.h"
@@ -594,5 +598,457 @@ int hevcdec_test_deblock_run(
                     picW, picH, subW, subH, out_y, out_cb, out_cr);
     return 0;
 }
+
+// ============================================================
+// Tier E: slice-segment replay oracle
+// ============================================================
+
+namespace {
+
+// Frame-level state for the slice-segment replay oracle.
+struct TestFrameState {
+    hevc::SPS sps;
+    hevc::PPS pps;
+    hevc::DPB dpb;
+    std::vector<std::shared_ptr<hevc::Picture>> ref_pics;
+
+    hevc::DecodingContext ctx;
+    hevc::CabacEngine cabac;
+    std::vector<hevc::CUInfo> cu_info_buf;
+    std::vector<int> intra_mode_buf;
+    std::vector<int> chroma_mode_buf;
+    std::vector<hevc::PUMotionInfo> motion_info_buf;
+    std::vector<uint8_t> cbf_luma_buf;
+    std::vector<uint8_t> log2_tu_buf;
+    std::vector<uint8_t> edge_v_buf;
+    std::vector<uint8_t> edge_h_buf;
+    std::vector<hevc::DecodingContext::SaoParams> sao_params_buf;
+    std::vector<uint8_t> slice_idx_buf;
+    std::vector<hevc::SliceHeader> slice_headers;
+    std::vector<const hevc::SliceHeader*> slice_header_ptrs;
+
+    int picW = 0, picH = 0;
+    int compW = 0, compH = 0;
+    int modeGridW = 0, modeGridH = 0;
+    int minCbsW = 0, minCbsH = 0;
+    int ctbCount = 0;
+};
+
+// Parse SPS/PPS NALs and flatten them. Returns 0 on success, -1 parse
+// failure, -2 unsupported feature (the Rust port has no path for these yet).
+int parse_and_flatten_ps(const uint8_t* sps_nal, int sps_len,
+                         const uint8_t* pps_nal, int pps_len,
+                         hevc::SPS& sps_out, hevc::PPS& pps_out,
+                         int32_t* out_sps, int32_t* out_pps) {
+    if (!sps_nal || !pps_nal || sps_len <= 0 || pps_len <= 0) return -1;
+    hevc::NalParser parser;
+    auto sps_nals = parser.parse(sps_nal, static_cast<size_t>(sps_len));
+    auto pps_nals = parser.parse(pps_nal, static_cast<size_t>(pps_len));
+    if (sps_nals.size() != 1 || pps_nals.size() != 1) return -1;
+
+    {
+        hevc::BitstreamReader bs(sps_nals[0].rbsp.data(), sps_nals[0].rbsp.size());
+        if (!sps_out.parse(bs)) return -1;
+    }
+    {
+        hevc::BitstreamReader bs(pps_nals[0].rbsp.data(), pps_nals[0].rbsp.size());
+        if (!pps_out.parse(bs, sps_out)) return -1;
+    }
+
+    if (sps_out.scaling_list_enabled_flag || pps_out.pps_scaling_list_data_present_flag ||
+        pps_out.tiles_enabled_flag || pps_out.dependent_slice_segments_enabled_flag ||
+        sps_out.separate_colour_plane_flag) return -2;
+
+    // Flatten SPS (HEVCDEC_TEST_SPS_FLAT)
+    int32_t* o = out_sps;
+    o[0] = static_cast<int32_t>(sps_out.pic_width_in_luma_samples);
+    o[1] = static_cast<int32_t>(sps_out.pic_height_in_luma_samples);
+    o[2] = sps_out.BitDepthY;
+    o[3] = sps_out.BitDepthC;
+    o[4] = sps_out.ChromaArrayType;
+    o[5] = sps_out.CtbSizeY;
+    o[6] = sps_out.MinTbSizeY;
+    o[7] = sps_out.PicWidthInCtbsY;
+    o[8] = sps_out.SubWidthC;
+    o[9] = sps_out.SubHeightC;
+    o[10] = sps_out.intra_smoothing_disabled_flag;
+    o[11] = sps_out.strong_intra_smoothing_enabled_flag;
+    o[12] = sps_out.MinCbLog2SizeY;
+    o[13] = sps_out.CtbLog2SizeY;
+    o[14] = sps_out.MinCbSizeY;
+    o[15] = sps_out.PicHeightInCtbsY;
+    o[16] = sps_out.PicSizeInCtbsY;
+    o[17] = sps_out.MinTbLog2SizeY;
+    o[18] = sps_out.MaxTbLog2SizeY;
+    o[19] = sps_out.QpBdOffsetY;
+    o[20] = sps_out.QpBdOffsetC;
+    o[21] = sps_out.amp_enabled_flag;
+    o[22] = sps_out.pcm_enabled_flag;
+    o[23] = sps_out.pcm_sample_bit_depth_luma_minus1;
+    o[24] = sps_out.pcm_sample_bit_depth_chroma_minus1;
+    o[25] = sps_out.Log2MinIpcmCbSizeY;
+    o[26] = sps_out.Log2MaxIpcmCbSizeY;
+    o[27] = static_cast<int32_t>(sps_out.max_transform_hierarchy_depth_inter);
+    o[28] = static_cast<int32_t>(sps_out.max_transform_hierarchy_depth_intra);
+    o[29] = sps_out.cabac_bypass_alignment_enabled_flag;
+
+    // Flatten PPS (HEVCDEC_TEST_PPS_FLAT)
+    o = out_pps;
+    o[0] = pps_out.sign_data_hiding_enabled_flag;
+    o[1] = pps_out.transform_skip_enabled_flag;
+    o[2] = pps_out.cu_qp_delta_enabled_flag;
+    o[3] = static_cast<int32_t>(pps_out.diff_cu_qp_delta_depth);
+    o[4] = pps_out.pps_cb_qp_offset;
+    o[5] = pps_out.pps_cr_qp_offset;
+    o[6] = pps_out.weighted_pred_flag;
+    o[7] = pps_out.weighted_bipred_flag;
+    o[8] = pps_out.transquant_bypass_enabled_flag;
+    o[9] = pps_out.tiles_enabled_flag;
+    o[10] = pps_out.entropy_coding_sync_enabled_flag;
+    o[11] = pps_out.pps_loop_filter_across_slices_enabled_flag;
+    o[12] = static_cast<int32_t>(pps_out.log2_parallel_merge_level_minus2);
+    o[13] = static_cast<int32_t>(pps_out.num_tile_columns_minus1);
+    o[14] = static_cast<int32_t>(pps_out.num_tile_rows_minus1);
+    o[15] = pps_out.uniform_spacing_flag;
+    for (int i = 0; i < 16; i++) {
+        o[16 + i] = i < static_cast<int>(pps_out.column_width_minus1.size())
+                        ? static_cast<int32_t>(pps_out.column_width_minus1[i]) : 0;
+        o[32 + i] = i < static_cast<int>(pps_out.row_height_minus1.size())
+                        ? static_cast<int32_t>(pps_out.row_height_minus1[i]) : 0;
+    }
+    return 0;
+}
+
+} // namespace
+
+int hevcdec_test_frame_new(
+    const uint8_t* sps_nal, int sps_len,
+    const uint8_t* pps_nal, int pps_len,
+    int cur_poc,
+    int n_refs,
+    const int32_t* ref_poc, const int32_t* ref_st_ref, const int32_t* ref_lt_ref,
+    const uint16_t* ref_y, const uint16_t* ref_cb, const uint16_t* ref_cr,
+    const int32_t* ref_motion, const int32_t* ref_refpoc,
+    const int32_t* list0_idx, int n_list0,
+    const int32_t* list1_idx, int n_list1,
+    int col_pic_idx, int no_backward_pred,
+    int32_t* out_sps, int32_t* out_pps,
+    void** out_state) {
+    if (!sps_nal || !pps_nal || sps_len <= 0 || pps_len <= 0 || n_refs <= 0 ||
+        n_refs > 32 || n_list0 < 0 || n_list0 > 16 || n_list1 < 0 || n_list1 > 16 ||
+        col_pic_idx < -1 || !out_sps || !out_pps || !out_state) return -1;
+
+    hevc::SPS sps;
+    hevc::PPS pps;
+    int rc = parse_and_flatten_ps(sps_nal, sps_len, pps_nal, pps_len, sps, pps,
+                                  out_sps, out_pps);
+    if (rc != 0) return rc;
+
+    auto* st = new TestFrameState();
+    st->sps = std::move(sps);
+    st->pps = std::move(pps);
+
+    const int picW = static_cast<int>(st->sps.pic_width_in_luma_samples);
+    const int picH = static_cast<int>(st->sps.pic_height_in_luma_samples);
+    st->picW = picW;
+    st->picH = picH;
+    st->compW = picW / st->sps.SubWidthC;
+    st->compH = picH / st->sps.SubHeightC;
+    st->modeGridW = picW / st->sps.MinTbSizeY;
+    st->modeGridH = picH / st->sps.MinTbSizeY;
+    st->minCbsW = st->sps.PicWidthInMinCbsY;
+    st->minCbsH = st->sps.PicHeightInMinCbsY;
+    st->ctbCount = st->sps.PicSizeInCtbsY;
+
+    // Synthetic reference picture pool
+    hevc::ChromaFormat fmt = static_cast<hevc::ChromaFormat>(st->sps.chroma_format_idc);
+    const size_t modeGrid = static_cast<size_t>(st->modeGridW) * st->modeGridH;
+    for (int r = 0; r < n_refs; r++) {
+        auto pic = std::make_shared<hevc::Picture>();
+        pic->allocate(picW, picH, fmt, st->sps.BitDepthY, st->sps.BitDepthC);
+        const uint16_t* src[3] = {
+            ref_y + static_cast<size_t>(r) * picW * picH,
+            ref_cb + static_cast<size_t>(r) * st->compW * st->compH,
+            ref_cr + static_cast<size_t>(r) * st->compW * st->compH,
+        };
+        for (int c = 0; c < 3; c++) {
+            if (pic->width[c] > 0) {
+                std::memcpy(pic->planes[c].data(), src[c],
+                            static_cast<size_t>(pic->stride[c]) * pic->height[c] * sizeof(uint16_t));
+            }
+        }
+        pic->poc = ref_poc[r];
+        pic->used_for_short_term_ref = ref_st_ref[r] != 0;
+        pic->used_for_long_term_ref = ref_lt_ref[r] != 0;
+        pic->motion_info_buf.resize(modeGrid);
+        const int32_t* rm = ref_motion + static_cast<size_t>(r) * modeGrid * 8;
+        for (size_t b = 0; b < modeGrid; b++) {
+            auto& mi = pic->motion_info_buf[b];
+            mi.mv_x[0] = static_cast<int16_t>(rm[b * 8 + 0]);
+            mi.mv_y[0] = static_cast<int16_t>(rm[b * 8 + 1]);
+            mi.ref_idx[0] = static_cast<int8_t>(rm[b * 8 + 2]);
+            mi.pred_flag[0] = rm[b * 8 + 3] != 0;
+            mi.mv_x[1] = static_cast<int16_t>(rm[b * 8 + 4]);
+            mi.mv_y[1] = static_cast<int16_t>(rm[b * 8 + 5]);
+            mi.ref_idx[1] = static_cast<int8_t>(rm[b * 8 + 6]);
+            mi.pred_flag[1] = rm[b * 8 + 7] != 0;
+        }
+        pic->motion_info_stride = st->modeGridW;
+        for (int l = 0; l < 2; l++) {
+            pic->ref_poc[l].clear();
+            for (int k = 0; k < 16; k++)
+                pic->ref_poc[l].push_back(ref_refpoc[r * 32 + l * 16 + k]);
+        }
+        st->ref_pics.push_back(std::move(pic));
+    }
+
+    std::vector<int> l0, l1;
+    for (int i = 0; i < n_list0; i++) l0.push_back(list0_idx[i]);
+    for (int i = 0; i < n_list1; i++) l1.push_back(list1_idx[i]);
+    st->dpb.test_install_ref_pics(st->ref_pics, l0, l1, col_pic_idx, no_backward_pred != 0);
+
+    // Current picture (planes allocated by the DPB)
+    hevc::Picture* pic = st->dpb.alloc_picture(picW, picH, fmt, st->sps.BitDepthY,
+                                               st->sps.BitDepthC);
+    pic->poc = cur_poc;
+    pic->motion_info_buf.assign(modeGrid, hevc::Picture::PUMotionInfoCompact{});
+    pic->motion_info_stride = st->modeGridW;
+
+    // Per-picture grids (mirrors Decoder::decode_picture)
+    st->cu_info_buf.assign(static_cast<size_t>(st->minCbsW) * st->minCbsH, hevc::CUInfo{});
+    st->intra_mode_buf.assign(modeGrid, 1);   // DC default
+    st->chroma_mode_buf.assign(modeGrid, 0);  // planar default
+    st->motion_info_buf.assign(modeGrid, hevc::PUMotionInfo{});
+    st->cbf_luma_buf.assign(modeGrid, 0);
+    st->log2_tu_buf.assign(modeGrid, static_cast<uint8_t>(st->sps.CtbLog2SizeY));
+    st->edge_v_buf.assign(modeGrid, 0);
+    st->edge_h_buf.assign(modeGrid, 0);
+    st->sao_params_buf.assign(st->ctbCount, hevc::DecodingContext::SaoParams{});
+    st->slice_idx_buf.assign(st->ctbCount, 0);
+    st->slice_headers.resize(HEVCDEC_TEST_MAX_SEGS);
+
+    // Decoding context. No thread pool: always the serial path — the Rust
+    // side compares both its serial and WPP paths against this.
+    hevc::DecodingContext& ctx = st->ctx;
+    ctx.sps = &st->sps;
+    ctx.pps = &st->pps;
+    ctx.cabac = &st->cabac;
+    ctx.pic = pic;
+    ctx.dpb = &st->dpb;
+    ctx.cu_info = st->cu_info_buf.data();
+    ctx.cu_info_stride = st->minCbsW;
+    ctx.intra_pred_mode_y = st->intra_mode_buf.data();
+    ctx.intra_pred_mode_c = st->chroma_mode_buf.data();
+    ctx.intra_pred_mode_stride = st->modeGridW;
+    ctx.motion_info = st->motion_info_buf.data();
+    ctx.motion_info_stride = st->modeGridW;
+    ctx.cbf_luma_grid = st->cbf_luma_buf.data();
+    ctx.log2_tu_size_grid = st->log2_tu_buf.data();
+    ctx.edge_flags_v = st->edge_v_buf.data();
+    ctx.edge_flags_h = st->edge_h_buf.data();
+    ctx.filter_grid_stride = st->modeGridW;
+    ctx.sao_params = st->sao_params_buf.data();
+    ctx.sao_params_stride = st->sps.PicWidthInCtbsY;
+    ctx.slice_idx = st->slice_idx_buf.data();
+    ctx.wpp_contexts_available = false;
+    ctx.thread_pool = nullptr;
+
+    *out_state = st;
+    return 0;
+}
+
+int hevcdec_test_frame_decode(
+    void* vstate,
+    const uint8_t* vcl_nals, int vcl_len,
+    int* out_n_segments,
+    int32_t* out_sh, uint32_t* out_final_bit_pos,
+    uint16_t* out_y, uint16_t* out_cb, uint16_t* out_cr,
+    int32_t* out_cu_info,
+    int32_t* out_intra_luma, int32_t* out_intra_chroma,
+    int32_t* out_motion,
+    uint8_t* out_cbf_luma, uint8_t* out_log2_tu,
+    uint8_t* out_edge_v, uint8_t* out_edge_h,
+    int32_t* out_sao_params, uint8_t* out_slice_idx) {
+    auto* st = static_cast<TestFrameState*>(vstate);
+    if (!st || !vcl_nals || vcl_len <= 0 || !out_n_segments || !out_sh ||
+        !out_final_bit_pos || !out_y || !out_cu_info || !out_intra_luma ||
+        !out_intra_chroma || !out_motion || !out_cbf_luma || !out_log2_tu ||
+        !out_edge_v || !out_edge_h || !out_sao_params || !out_slice_idx) return -1;
+
+    hevc::NalParser parser;
+    auto nals = parser.parse(vcl_nals, static_cast<size_t>(vcl_len));
+    if (nals.empty() || nals.size() > HEVCDEC_TEST_MAX_SEGS) return -1;
+
+    hevc::SPS& sps = st->sps;
+    hevc::PPS& pps = st->pps;
+    hevc::DecodingContext& ctx = st->ctx;
+
+    // Parse all slice headers first; dependent segments inherit from the last
+    // independent one (§7.4.7.1, mirrors Decoder::decode_picture).
+    int last_independent = 0;
+    for (size_t s = 0; s < nals.size(); s++) {
+        hevc::SliceHeader sh;
+        hevc::BitstreamReader bs(nals[s].rbsp.data(), nals[s].rbsp.size());
+        if (!sh.parse(bs, sps, pps, nals[s].header.nal_unit_type,
+                      nals[s].header.TemporalId())) return -3;
+        if (sh.dependent_slice_segment_flag) {
+            uint32_t saved_address = sh.slice_segment_address;
+            bool saved_dependent = sh.dependent_slice_segment_flag;
+            bool saved_first = sh.first_slice_segment_in_pic_flag;
+            st->slice_headers[s] = st->slice_headers[last_independent];
+            st->slice_headers[s].slice_segment_address = saved_address;
+            st->slice_headers[s].dependent_slice_segment_flag = saved_dependent;
+            st->slice_headers[s].first_slice_segment_in_pic_flag = saved_first;
+        } else {
+            st->slice_headers[s] = std::move(sh);
+            last_independent = static_cast<int>(s);
+        }
+    }
+    st->slice_header_ptrs.resize(nals.size());
+    for (size_t s = 0; s < nals.size(); s++) st->slice_header_ptrs[s] = &st->slice_headers[s];
+    ctx.slice_headers = st->slice_header_ptrs.data();
+    ctx.num_slices = static_cast<int>(nals.size());
+
+    for (size_t s = 0; s < nals.size(); s++) {
+        const auto& nal = nals[s];
+        ctx.sh = &st->slice_headers[s];
+        ctx.current_slice_idx = static_cast<int>(s);
+
+        // Re-parse the slice header to advance the bitstream position.
+        hevc::BitstreamReader bs(nal.rbsp.data(), nal.rbsp.size());
+        {
+            hevc::SliceHeader sh_skip;
+            (void)sh_skip.parse(bs, sps, pps, nal.header.nal_unit_type,
+                                nal.header.TemporalId());
+        }
+        if (!bs.byte_aligned()) bs.byte_alignment();
+        size_t slice_header_coded_size = bs.byte_position();
+        for (size_t ep : nal.epb_positions)
+            if (ep < slice_header_coded_size + 2) slice_header_coded_size++;
+
+        fprintf(stderr, "[TEST] seg %zu rbsp_pos=%zu sh_coded=%zu n_epb=%zu eps=%u\n", s,
+                bs.byte_position(), slice_header_coded_size, nal.epb_positions.size(),
+                st->slice_headers[s].num_entry_point_offsets);
+
+        if (!hevc::decode_slice_segment_data(ctx, bs, nal.epb_positions,
+                                             slice_header_coded_size))
+            return -4;
+
+        // Flatten the slice header for the Rust side.
+        const auto& sh = st->slice_headers[s];
+        int32_t* o = out_sh + s * HEVCDEC_TEST_SH_FLAT;
+        o[0] = static_cast<int32_t>(sh.slice_segment_address);
+        o[1] = sh.dependent_slice_segment_flag;
+        o[2] = static_cast<int32_t>(sh.slice_type);
+        o[3] = sh.pic_output_flag;
+        o[4] = sh.slice_temporal_mvp_enabled_flag;
+        o[5] = sh.slice_sao_luma_flag;
+        o[6] = sh.slice_sao_chroma_flag;
+        o[7] = static_cast<int32_t>(sh.num_ref_idx_l0_active_minus1);
+        o[8] = static_cast<int32_t>(sh.num_ref_idx_l1_active_minus1);
+        o[9] = sh.mvd_l1_zero_flag;
+        o[10] = sh.cabac_init_flag;
+        o[11] = sh.collocated_from_l0_flag;
+        o[12] = static_cast<int32_t>(sh.collocated_ref_idx);
+        o[13] = static_cast<int32_t>(sh.five_minus_max_num_merge_cand);
+        o[14] = sh.slice_qp_delta;
+        o[15] = sh.slice_cb_qp_offset;
+        o[16] = sh.slice_cr_qp_offset;
+        o[17] = sh.SliceQpY;
+        o[18] = sh.MaxNumMergeCand;
+        o[19] = static_cast<int32_t>(sh.num_entry_point_offsets);
+        o[20] = static_cast<int32_t>(slice_header_coded_size);
+        o[21] = static_cast<int32_t>(sh.pred_weight_table.luma_log2_weight_denom);
+        o[22] = sh.pred_weight_table.delta_chroma_log2_weight_denom;
+        int32_t* w = o + 23;
+        for (int list = 0; list < 2; list++) {
+            const auto& arr = (list == 0) ? sh.pred_weight_table.l0 : sh.pred_weight_table.l1;
+            for (int r = 0; r < 16; r++, w += 8) {
+                w[0] = arr[r].luma_weight_flag;
+                w[1] = arr[r].chroma_weight_flag;
+                w[2] = arr[r].luma_weight;
+                w[3] = arr[r].luma_offset;
+                w[4] = arr[r].chroma_weight[0];
+                w[5] = arr[r].chroma_offset[0];
+                w[6] = arr[r].chroma_weight[1];
+                w[7] = arr[r].chroma_offset[1];
+            }
+        }
+        for (int i = 0; i < 64; i++) {
+            o[279 + i] = i < static_cast<int>(sh.num_entry_point_offsets)
+                             ? static_cast<int32_t>(sh.entry_point_offset_minus1[i]) : 0;
+        }
+        out_final_bit_pos[s] = static_cast<uint32_t>(bs.bits_read());
+    }
+
+    // Copy out the full picture state.
+    hevc::Picture& pic = *ctx.pic;
+    std::memcpy(out_y, pic.planes[0].data(),
+                static_cast<size_t>(st->picW) * st->picH * sizeof(uint16_t));
+    if (st->sps.ChromaArrayType > 0) {
+        std::memcpy(out_cb, pic.planes[1].data(),
+                    static_cast<size_t>(st->compW) * st->compH * sizeof(uint16_t));
+        std::memcpy(out_cr, pic.planes[2].data(),
+                    static_cast<size_t>(st->compW) * st->compH * sizeof(uint16_t));
+    }
+
+    const size_t minCbs = static_cast<size_t>(st->minCbsW) * st->minCbsH;
+    for (size_t i = 0; i < minCbs; i++) {
+        const auto& cu = st->cu_info_buf[i];
+        out_cu_info[i * 8 + 0] = static_cast<int32_t>(cu.pred_mode);
+        out_cu_info[i * 8 + 1] = static_cast<int32_t>(cu.part_mode);
+        out_cu_info[i * 8 + 2] = cu.log2CbSize;
+        out_cu_info[i * 8 + 3] = cu.intra_mode_luma;
+        out_cu_info[i * 8 + 4] = cu.qp_y;
+        out_cu_info[i * 8 + 5] = cu.is_pcm;
+        out_cu_info[i * 8 + 6] = cu.cu_transquant_bypass;
+        out_cu_info[i * 8 + 7] = cu.merge_flag;
+    }
+
+    const size_t modeGrid = static_cast<size_t>(st->modeGridW) * st->modeGridH;
+    std::memcpy(out_intra_luma, st->intra_mode_buf.data(), modeGrid * sizeof(int32_t));
+    std::memcpy(out_intra_chroma, st->chroma_mode_buf.data(), modeGrid * sizeof(int32_t));
+    for (size_t b = 0; b < modeGrid; b++) {
+        const auto& mi = st->motion_info_buf[b];
+        out_motion[b * 8 + 0] = mi.mv[0].x;
+        out_motion[b * 8 + 1] = mi.mv[0].y;
+        out_motion[b * 8 + 2] = mi.ref_idx[0];
+        out_motion[b * 8 + 3] = mi.pred_flag[0];
+        out_motion[b * 8 + 4] = mi.mv[1].x;
+        out_motion[b * 8 + 5] = mi.mv[1].y;
+        out_motion[b * 8 + 6] = mi.ref_idx[1];
+        out_motion[b * 8 + 7] = mi.pred_flag[1];
+    }
+    std::memcpy(out_cbf_luma, st->cbf_luma_buf.data(), modeGrid);
+    std::memcpy(out_log2_tu, st->log2_tu_buf.data(), modeGrid);
+    std::memcpy(out_edge_v, st->edge_v_buf.data(), modeGrid);
+    std::memcpy(out_edge_h, st->edge_h_buf.data(), modeGrid);
+
+    for (int c = 0; c < st->ctbCount; c++) {
+        const auto& sp = st->sao_params_buf[c];
+        int32_t* o = out_sao_params + c * 24;
+        for (int k = 0; k < 3; k++) o[k] = sp.sao_type_idx[k];
+        for (int k = 0; k < 3; k++) o[3 + k] = sp.sao_eo_class[k];
+        for (int k = 0; k < 3; k++) o[6 + k] = sp.sao_band_position[k];
+        for (int k = 0; k < 3; k++)
+            for (int j = 0; j < 5; j++) o[9 + k * 5 + j] = sp.sao_offset_val[k][j];
+    }
+    std::memcpy(out_slice_idx, st->slice_idx_buf.data(), st->ctbCount);
+
+    *out_n_segments = static_cast<int>(nals.size());
+    return 0;
+}
+
+int hevcdec_test_parse_sps_pps(const uint8_t* sps_nal, int sps_len,
+                               const uint8_t* pps_nal, int pps_len,
+                               int32_t* out_sps, int32_t* out_pps) {
+    if (!out_sps || !out_pps) return -1;
+    hevc::SPS sps;
+    hevc::PPS pps;
+    return parse_and_flatten_ps(sps_nal, sps_len, pps_nal, pps_len, sps, pps,
+                                out_sps, out_pps);
+}
+
+void hevcdec_test_frame_free(void* vstate) { delete static_cast<TestFrameState*>(vstate); }
 
 } // extern "C"

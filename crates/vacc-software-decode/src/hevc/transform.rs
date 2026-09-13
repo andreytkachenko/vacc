@@ -405,7 +405,10 @@ pub fn perform_dequant(
     let bd_shift = bit_depth as i32 + log2_trafo_size as i32 + 10 - 15;
     let add = if bd_shift > 0 { 1i64 << (bd_shift - 1) } else { 0 };
 
-    debug_assert!((0..=63).contains(&qp), "QP must be in [0, 63]");
+    debug_assert!(
+        (0..=63).contains(&qp),
+        "QP out of range: {qp} (c_idx={c_idx}, log2={log2_trafo_size})"
+    );
     let qp_per = qp / 6;
     let scale = LEVEL_SCALE[(qp % 6) as usize];
 
