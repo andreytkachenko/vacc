@@ -1468,8 +1468,30 @@ pub fn run_rust_deblock(
 ) -> (Vec<u8>, Vec<u8>) {
     let mut y = y_in.to_vec();
     let mut c = c_in.to_vec();
+    run_rust_deblock_inplace(
+        mb_state,
+        filter_edges,
+        entropy_coding_mode_flag,
+        filter_offset_a,
+        filter_offset_b,
+        &mut y,
+        &mut c,
+    );
+    (y, c)
+}
+
+/// In-place core: filters the canonical window planes `y`/`c` in place.
+pub fn run_rust_deblock_inplace(
+    mb_state: &[u8],
+    filter_edges: i32,
+    entropy_coding_mode_flag: i32,
+    filter_offset_a: i32,
+    filter_offset_b: i32,
+    y: &mut [u8],
+    c: &mut [u8],
+) {
     if filter_edges == 0 {
-        return (y, c); // deblock_mb returns early
+        return; // deblock_mb returns early
     }
     let mut mbs = [
         parse_mb(&mb_state[0..202]),
@@ -1483,13 +1505,9 @@ pub fn run_rust_deblock(
         filter_offset_a,
         filter_offset_b,
     );
-    deblock_y(&mut y, &mbs, &alpha, &beta, &tC0_s, filter_edges);
-    deblock_cbcr(&mut c, &mbs, &alpha, &beta, &tC0_s, filter_edges);
-    (y, c)
+    deblock_y(y, &mbs, &alpha, &beta, &tC0_s, filter_edges);
+    deblock_cbcr(c, &mbs, &alpha, &beta, &tC0_s, filter_edges);
 }
-
-const LY_PLANE: usize = 96 * LY_STRIDE;
-const LC_PLANE: usize = 96 * LC_STRIDE;
 
 /// Location of an MB's pixel window in a real frame plane. `x`/`y`: the MB's
 /// top-left luma sample (luma) or Cb row-0 sample (chroma), in units of
@@ -1507,11 +1525,16 @@ pub struct DeblockRect {
 
 /// In-slice deblock of one macroblock (row-lag / slice-tail call sites).
 /// Copies the pixel window around the MB from the real frame planes into the
-/// canonical planes, runs the fuzz-verified `run_rust_deblock`, and copies the
-/// filtered window back. Window parts outside the frame are zero-filled; C's
-/// filter_edges gating (boundary edges disabled at frame edges) guarantees
-/// those pixels are never read or written. `lc == None`: no chroma plane
-/// (4:0:0); the chroma pass is skipped (C reads a non-existent plane there).
+/// reusable canonical window buffers (`dblk_y`/`dblk_c`, MB origin at
+/// (LY_ROW, LY_COL) / (LC_ROW, LC_COL)), runs the fuzz-verified
+/// `run_rust_deblock_inplace`, and copies the filtered window back.
+///
+/// Interior MBs (full 20x20 luma / 20x10 chroma footprint inside the frame)
+/// use bounds-check-free row copies. Edge MBs zero the in-window region first
+/// (emulating C's zero padding — the kernel never reads outside the filled
+/// window, proven by golden + poison runs) and use clamped copies.
+/// `lc == None`: no chroma plane (4:0:0); the chroma pass is skipped (C reads
+/// a non-existent plane there).
 #[allow(clippy::too_many_arguments)]
 pub fn deblock_mb_inplace(
     mb_state: &[u8; 606],
@@ -1519,6 +1542,8 @@ pub fn deblock_mb_inplace(
     entropy_coding_mode_flag: i32,
     filter_offset_a: i32,
     filter_offset_b: i32,
+    dblk_y: &mut [u8],
+    dblk_c: &mut [u8],
     y_plane: &mut [u8],
     ly: &DeblockRect,
     c_plane: &mut [u8],
@@ -1527,66 +1552,143 @@ pub fn deblock_mb_inplace(
     if filter_edges == 0 {
         return; // deblock_mb returns early
     }
-    let mut y = [0u8; LY_PLANE];
-    let mut c = [0u8; LC_PLANE];
+    // The filter's read/write footprint (MB-relative): luma rows/cols -4..15,
+    // chroma buffer rows -4..15 / cols -2..7; nothing else is ever touched.
+    let interior = ly.x >= 4 && ly.y >= 4 && ly.x + 16 <= ly.w && ly.y + 16 <= ly.h;
+    if !interior {
+        // Zero the in-window region: out-of-frame corners must be zero (C's
+        // padding emulation) and stale bytes from the previous MB must not
+        // leak into the filter.
+        for r in -4isize..16 {
+            let row = ((LY_ROW as isize + r) * LY_STRIDE as isize) as usize;
+            dblk_y[row + (LY_COL - 4)..row + LY_COL + 16].fill(0);
+            if lc.is_some() {
+                let crow = ((LC_ROW as isize + r) * LC_STRIDE as isize) as usize;
+                dblk_c[crow + (LC_COL - 2)..crow + LC_COL + 8].fill(0);
+            }
+        }
+    }
     // Luma window: 20x20 at MB-relative (-4..15) — the filter's read
     // footprint (vertical edges read cols -4..15 x rows 0..15, horizontal
     // edges read rows -4..15 x cols 0..15). Writes are a subset of this.
-    for r in -4isize..16 {
-        for col in -4isize..16 {
-            let sr = ly.y as isize + r;
-            let sc = ly.x as isize + col;
-            if (0..ly.h as isize).contains(&sr) && (0..ly.w as isize).contains(&sc) {
-                y[((LY_ROW as isize + r) * LY_STRIDE as isize + (LY_COL as isize + col))
-                    as usize] = y_plane[(sr * ly.stride as isize + sc) as usize];
+    if interior {
+        for r in 0..20usize {
+            let srow = (ly.y as isize + r as isize - 4) * ly.stride as isize + (ly.x as isize - 4);
+            let drow =
+                (LY_ROW as isize + r as isize - 4) * LY_STRIDE as isize + (LY_COL as isize - 4);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    y_plane.as_ptr().add(srow as usize),
+                    dblk_y.as_mut_ptr().add(drow as usize),
+                    20,
+                );
+            }
+        }
+    } else {
+        for r in -4isize..16 {
+            for col in -4isize..16 {
+                let sr = ly.y as isize + r;
+                let sc = ly.x as isize + col;
+                if (0..ly.h as isize).contains(&sr) && (0..ly.w as isize).contains(&sc) {
+                    dblk_y[((LY_ROW as isize + r) * LY_STRIDE as isize + (LY_COL as isize + col))
+                        as usize] = y_plane[(sr * ly.stride as isize + sc) as usize];
+                }
             }
         }
     }
     if let Some(lc) = lc {
         // Chroma window: buffer rows -4..15 (vertical edges read all 16
         // buffer rows), cols -2..7 (horizontal edges read all 8 chroma cols).
-        for r in -4isize..16 {
-            for col in -2isize..8 {
-                let sr = lc.y as isize + r;
-                let sc = lc.x as isize + col;
-                if (0..lc.h as isize).contains(&sr) && (0..lc.w as isize).contains(&sc) {
-                    c[((LC_ROW as isize + r) * LC_STRIDE as isize + (LC_COL as isize + col))
-                        as usize] = c_plane[(sr * lc.stride as isize + sc) as usize];
+        if interior {
+            for r in 0..20usize {
+                let srow =
+                    (lc.y as isize + r as isize - 4) * lc.stride as isize + (lc.x as isize - 2);
+                let drow =
+                    (LC_ROW as isize + r as isize - 4) * LC_STRIDE as isize + (LC_COL as isize - 2);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        c_plane.as_ptr().add(srow as usize),
+                        dblk_c.as_mut_ptr().add(drow as usize),
+                        10,
+                    );
+                }
+            }
+        } else {
+            for r in -4isize..16 {
+                for col in -2isize..8 {
+                    let sr = lc.y as isize + r;
+                    let sc = lc.x as isize + col;
+                    if (0..lc.h as isize).contains(&sr) && (0..lc.w as isize).contains(&sc) {
+                        dblk_c[((LC_ROW as isize + r) * LC_STRIDE as isize
+                            + (LC_COL as isize + col)) as usize] =
+                            c_plane[(sr * lc.stride as isize + sc) as usize];
+                    }
                 }
             }
         }
     }
-    let (y_out, c_out) = run_rust_deblock(
+    run_rust_deblock_inplace(
         mb_state,
         filter_edges,
         entropy_coding_mode_flag,
         filter_offset_a,
         filter_offset_b,
-        &y,
-        &c,
+        dblk_y,
+        dblk_c,
     );
     // Copy the same window back (the filter only writes inside it).
-    for r in -4isize..16 {
-        for col in -4isize..16 {
-            let sr = ly.y as isize + r;
-            let sc = ly.x as isize + col;
-            if (0..ly.h as isize).contains(&sr) && (0..ly.w as isize).contains(&sc) {
-                y_plane[(sr * ly.stride as isize + sc) as usize] =
-                    y_out[((LY_ROW as isize + r) * LY_STRIDE as isize + (LY_COL as isize + col))
-                        as usize];
+    if interior {
+        for r in 0..20usize {
+            let srow =
+                (LY_ROW as isize + r as isize - 4) * LY_STRIDE as isize + (LY_COL as isize - 4);
+            let drow = (ly.y as isize + r as isize - 4) * ly.stride as isize + (ly.x as isize - 4);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    dblk_y.as_ptr().add(srow as usize),
+                    y_plane.as_mut_ptr().add(drow as usize),
+                    20,
+                );
+            }
+        }
+    } else {
+        for r in -4isize..16 {
+            for col in -4isize..16 {
+                let sr = ly.y as isize + r;
+                let sc = ly.x as isize + col;
+                if (0..ly.h as isize).contains(&sr) && (0..ly.w as isize).contains(&sc) {
+                    y_plane[(sr * ly.stride as isize + sc) as usize] =
+                        dblk_y[((LY_ROW as isize + r) * LY_STRIDE as isize
+                            + (LY_COL as isize + col)) as usize];
+                }
             }
         }
     }
     if let Some(lc) = lc {
-        for r in -4isize..16 {
-            for col in -2isize..8 {
-                let sr = lc.y as isize + r;
-                let sc = lc.x as isize + col;
-                if (0..lc.h as isize).contains(&sr) && (0..lc.w as isize).contains(&sc) {
-                    c_plane[(sr * lc.stride as isize + sc) as usize] = c_out[((LC_ROW as isize + r)
-                        * LC_STRIDE as isize
-                        + (LC_COL as isize + col))
-                        as usize];
+        if interior {
+            for r in 0..20usize {
+                let srow =
+                    (LC_ROW as isize + r as isize - 4) * LC_STRIDE as isize + (LC_COL as isize - 2);
+                let drow =
+                    (lc.y as isize + r as isize - 4) * lc.stride as isize + (lc.x as isize - 2);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        dblk_c.as_ptr().add(srow as usize),
+                        c_plane.as_mut_ptr().add(drow as usize),
+                        10,
+                    );
+                }
+            }
+        } else {
+            for r in -4isize..16 {
+                for col in -2isize..8 {
+                    let sr = lc.y as isize + r;
+                    let sc = lc.x as isize + col;
+                    if (0..lc.h as isize).contains(&sr) && (0..lc.w as isize).contains(&sc) {
+                        c_plane[(sr * lc.stride as isize + sc) as usize] =
+                            dblk_c[((LC_ROW as isize + r) * LC_STRIDE as isize
+                                + (LC_COL as isize + col))
+                                as usize];
+                    }
                 }
             }
         }
@@ -1816,12 +1918,16 @@ mod prim_tests {
 
             let mut y_a = y_in.clone();
             let mut c_a = c_in.clone();
+            let mut dblk_y = [0u8; DEBLOCK_LY_SIZE];
+            let mut dblk_c = [0u8; DEBLOCK_LC_SIZE];
             deblock_mb_inplace(
                 &mb_state,
                 fe,
                 entropy,
                 off_a,
                 off_b,
+                &mut dblk_y,
+                &mut dblk_c,
                 &mut y_a,
                 &ly,
                 &mut c_a,
@@ -1829,8 +1935,8 @@ mod prim_tests {
             );
 
             // Reference: canonical run over a zero-filled window copy.
-            let mut y_win = [0u8; LY_PLANE];
-            let mut c_win = [0u8; LC_PLANE];
+            let mut y_win = [0u8; DEBLOCK_LY_SIZE];
+            let mut c_win = [0u8; DEBLOCK_LC_SIZE];
             for r in -4isize..16 {
                 for col in -4isize..16 {
                     let sr = ly.y as isize + r;
@@ -1999,7 +2105,21 @@ mod prim_tests {
             w: 32,
             h: 48,
         };
-        deblock_mb_inplace(&[0; 606], 0, 0, 0, 0, &mut y, &ly, &mut c, Some(&lc));
+        let mut dblk_y = [0u8; DEBLOCK_LY_SIZE];
+        let mut dblk_c = [0u8; DEBLOCK_LC_SIZE];
+        deblock_mb_inplace(
+            &[0; 606],
+            0,
+            0,
+            0,
+            0,
+            &mut dblk_y,
+            &mut dblk_c,
+            &mut y,
+            &ly,
+            &mut c,
+            Some(&lc),
+        );
         assert_eq!(y, [7u8; 64 * 48]);
         assert_eq!(c, [9u8; 32 * 48]);
     }

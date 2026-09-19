@@ -124,7 +124,7 @@ pub fn inter_luma(
 /// For i16-range values that is a plain shift for k < 15 and sign-saturation
 /// beyond; `v` is always in the i16 range here.
 #[inline]
-fn sra_machine(v: i32, k: u32) -> i32 {
+pub(super) fn sra_machine(v: i32, k: u32) -> i32 {
     if k < 15 {
         v >> k
     } else if v < 0 {

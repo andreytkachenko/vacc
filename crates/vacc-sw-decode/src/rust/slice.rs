@@ -16,7 +16,7 @@
 
 use super::bits::{SliceBits, shld};
 use super::cabac::Cabac;
-use super::deblock::{DeblockRect, deblock_mb_inplace};
+use super::deblock::{DEBLOCK_LC_SIZE, DEBLOCK_LY_SIZE, DeblockRect, deblock_mb_inplace};
 use super::inter;
 use super::intra::{
     I4X4_DC, I4X4_DC_A, I4X4_DC_AB, I4X4_DC_B, I4X4_DDL, I4X4_DDL_C, I4X4_DDR, I4X4_H, I4X4_HD,
@@ -302,6 +302,15 @@ pub struct SliceContext<'a> {
     /// `PIXEL_MARGIN`) of each DPB slot, indexed by `mb->refPic`. Null for
     /// empty slots. All buffers share the same stride/plane layout.
     pub ref_plane_bases: Vec<*const u8>,
+    /// Inter MC neighborhood scratch (replaces per-block heap Vecs): max luma
+    /// neighborhood (16+5)*(16+5) = 441 bytes, max chroma 9*2*9 = 162 bytes.
+    pub mc_y: [u8; 441],
+    pub mc_c: [u8; 162],
+    /// Reusable deblock window buffers (MB origin at row 48 col 32 / chroma
+    /// buffer row 48 col 8): avoids per-MB zeroing and Vec traffic. The
+    /// kernel never reads outside the filled 20x20 luma / 20x10 chroma window.
+    pub dblk_y: [u8; DEBLOCK_LY_SIZE],
+    pub dblk_c: [u8; DEBLOCK_LC_SIZE],
 
     // scaling / deblock parameters (C `t.pps.weightScale*`, `t.FilterOffset*`,
     // `t.next_deblock_addr`)
@@ -358,7 +367,105 @@ impl<'a> SliceContext<'a> {
     fn plane_off(&self, p: *const u8) -> usize {
         (p as usize - self.samples_base as usize) + PIXEL_MARGIN
     }
+}
 
+/// Copy `n` samples from source column `x0` of the plane row `src_row`
+/// (width `swide`) into `dst`, clamping at the picture edges (columns 0 /
+/// swide-1) — the per-row form of the neighborhood gather's per-pixel clamp.
+#[inline]
+fn copy_clamped_row(dst: &mut [u8], src_row: *const u8, x0: i32, swide: i32, n: usize) {
+    let mut c = 0usize;
+    while c < n && (x0 + c as i32) < 0 {
+        dst[c] = unsafe { *src_row };
+        c += 1;
+    }
+    let mut end = n;
+    while end > c && (x0 + end as i32 - 1) >= swide {
+        end -= 1;
+    }
+    if end > c {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_row.add((x0 + c as i32) as usize),
+                dst.as_mut_ptr().add(c),
+                end - c,
+            );
+        };
+        c = end;
+    }
+    while c < n {
+        dst[c] = unsafe { *src_row.add((swide - 1) as usize) };
+        c += 1;
+    }
+}
+
+/// wod weighting for one MC sample, matching `inter_luma` / `inter_chroma`
+/// bit-for-bit: luma shifts arithmetically by `sh`; chroma uses
+/// `sra_machine` semantics. Identity when (wq, wp, oy, sh) = (0, 1, 0, 0).
+#[inline]
+fn mc_weight(p: u8, q: u8, wq: i32, wp: i32, oy: i32, sh: u32, chroma: bool) -> u8 {
+    let s = (q as i32 * wq + p as i32 * wp).clamp(i16::MIN as i32, i16::MAX as i32);
+    let v = (s + oy).clamp(i16::MIN as i32, i16::MAX as i32);
+    let v = if chroma {
+        inter::sra_machine(v, sh)
+    } else {
+        v >> sh
+    };
+    v.clamp(0, 255) as u8
+}
+
+/// One integer-pel MC row: clamped copy + wod weighting (see `mc_weight`).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn mc_int_row(
+    dst_row: *mut u8,
+    src_row: *const u8,
+    x0: i32,
+    swide: i32,
+    n: usize,
+    wq: i32,
+    wp: i32,
+    oy: i32,
+    sh: u32,
+    chroma: bool,
+) {
+    let weighted = !(wq == 0 && wp == 1 && oy == 0 && sh == 0);
+    let mut c = 0usize;
+    while c < n && (x0 + c as i32) < 0 {
+        let p = unsafe { *src_row };
+        unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+        c += 1;
+    }
+    let mut end = n;
+    while end > c && (x0 + end as i32 - 1) >= swide {
+        end -= 1;
+    }
+    if end > c {
+        if !weighted {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_row.add((x0 + c as i32) as usize),
+                    dst_row.add(c),
+                    end - c,
+                );
+            };
+        } else {
+            while c < end {
+                let p = unsafe { *src_row.add((x0 + c as i32) as usize) };
+                unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+                c += 1;
+            }
+        }
+        c = end;
+    }
+    while c < n {
+        let p = unsafe { *src_row.add((swide - 1) as usize) };
+        unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+        c += 1;
+    }
+}
+
+impl SliceContext<'_> {
     /// C `decode_inter` (edge264_inter.c:1108): motion-compensate one inter
     /// block into `samples_mb`. `i` indexes the MV pair `mvs[2*i]/[2*i+1]` and
     /// the 8x8-region reference `refIdx[i>>2]`/`refPic[i>>2]`; the 4x4-block
@@ -500,37 +607,9 @@ impl<'a> SliceContext<'a> {
             }
         }
 
-        // Luma neighborhood: ref rows yInt-2..yInt+h+2, cols xInt-2..xInt+w+2,
-        // clamped at picture edges. C takes a direct pointer when the
-        // mode-dependent window is in bounds and builds an edge buffer
-        // otherwise; both produce these same per-pixel clamped values.
         let wu = w as usize;
         let hu = h as usize;
-        let mut src_y = vec![0u8; (hu + 5) * (wu + 5)];
-        for r in 0..hu + 5 {
-            let ry = (y_int_y - 2 + r as i32).clamp(0, height_y - 1);
-            let roff = (ry * stride_y as i32) as usize;
-            for c in 0..wu + 5 {
-                let cx = (x_int_y - 2 + c as i32).clamp(0, width_y - 1) as usize;
-                src_y[r * (wu + 5) + c] = unsafe { *ref_base.add(roff + cx) };
-            }
-        }
-
-        // Chroma neighborhood: interleaved Cb/Cr ref rows yInt_C..yInt_C+h/2,
-        // cols xInt_C..xInt_C+cw, same clamping (C edge_buf_l path).
         let cw = wu / 2;
-        let mut src_c = vec![0u8; (hu / 2 + 1) * 2 * (cw + 1)];
-        for k in 0..hu / 2 + 1 {
-            let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
-            let roff = (ry * stride_c as i32) as usize;
-            for c in 0..cw + 1 {
-                let cx = (x_int_c + c as i32).clamp(0, width_y / 2 - 1) as usize;
-                let cb = roff + cx + self.plane_size_y as usize;
-                src_c[(2 * k) * (cw + 1) + c] = unsafe { *ref_base.add(cb) };
-                src_c[(2 * k + 1) * (cw + 1) + c] = unsafe { *ref_base.add(cb + stride_c / 2) };
-            }
-        }
-
         // chroma prediction first (C order; the dst regions don't overlap)
         let off_c = self.plane_off(self.samples_mb[1])
             + (Y444[i4x4] as usize >> 1) * stride_c
@@ -541,28 +620,152 @@ impl<'a> SliceContext<'a> {
             + Y444[i4x4] as usize * stride_y
             + X444[i4x4] as usize;
         let len_y = (hu - 1) * stride_y + wu;
-        let plane = self.plane_slice();
-        inter::inter_chroma(
-            &src_c,
-            &mut plane[off_c..off_c + len_c],
-            wu,
-            hu,
-            (x & 7) as u32,
-            (y & 7) as u32,
-            cw + 1,
-            stride_c / 2,
-            &wod,
-        );
-        inter::inter_luma(
-            &src_y,
-            &mut plane[off_y..off_y + len_y],
-            wu,
-            hu,
-            ((y & 3) as u32) * 4 + (x & 3) as u32,
-            wu + 5,
-            stride_y,
-            &wod,
-        );
+        // Raw pointers for the plane region and the MC neighborhood scratch:
+        // the writes below would otherwise fight the borrow checker over
+        // `plane_slice()`'s `&mut self`.
+        let base = self.pixel_margin_base;
+        let src_y = self.mc_y.as_mut_ptr();
+        let src_c = self.mc_c.as_mut_ptr();
+
+        // Integer-pel fast path: a clamped byte copy — C's SIMD row-copy
+        // path. Edge clamping is per-row, not per-pixel; the no-weight case is
+        // a plain copy of the interior run. Luma is integer at x&3 == 0 &&
+        // y&3 == 0, but chroma needs x&7 == 0 && y&7 == 0: an integer luma pel
+        // with x&7 == 4 (e.g. MV x = 4) sits at a half chroma pel, where the
+        // bilinear is a true average, not a direct sample.
+        let luma_int = (x & 3) == 0 && (y & 3) == 0;
+        let chroma_int = (x & 7) == 0 && (y & 7) == 0;
+
+        // Chroma prediction first (C order; the dst regions don't overlap).
+        if chroma_int {
+            for k in 0..(hu / 2) {
+                for (pi, wi, oi) in [(0usize, 4usize, 6usize), (1usize, 5usize, 7usize)] {
+                    let (wq_c, wp_c) = (
+                        (wod[wi] & 0xFF) as i8 as i32,
+                        ((wod[wi] >> 8) & 0xFF) as i8 as i32,
+                    );
+                    let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
+                    let soff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
+                    mc_int_row(
+                        unsafe { base.add(off_c + (2 * k + pi) * (stride_c / 2)) },
+                        unsafe { ref_base.add(soff + pi * (stride_c / 2)) },
+                        x_int_c,
+                        width_y / 2,
+                        cw,
+                        wq_c,
+                        wp_c,
+                        wod[oi] as i32,
+                        wod[3] as u32,
+                        true,
+                    );
+                }
+            }
+        } else {
+            // Half chroma pel: gather the clamped neighborhood (C edge_buf_c
+            // semantics), then run the bilinear.
+            for k in 0..hu / 2 + 1 {
+                let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
+                let roff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
+                copy_clamped_row(
+                    unsafe {
+                        std::slice::from_raw_parts_mut(src_c.add((2 * k) * (cw + 1)), cw + 1)
+                    },
+                    unsafe { ref_base.add(roff) },
+                    x_int_c,
+                    width_y / 2,
+                    cw + 1,
+                );
+                copy_clamped_row(
+                    unsafe {
+                        std::slice::from_raw_parts_mut(src_c.add((2 * k + 1) * (cw + 1)), cw + 1)
+                    },
+                    unsafe { ref_base.add(roff + stride_c / 2) },
+                    x_int_c,
+                    width_y / 2,
+                    cw + 1,
+                );
+            }
+            inter::inter_chroma(
+                unsafe { std::slice::from_raw_parts(src_c, (hu / 2 + 1) * 2 * (cw + 1)) },
+                unsafe { std::slice::from_raw_parts_mut(base.add(off_c), len_c) },
+                wu,
+                hu,
+                (x & 7) as u32,
+                (y & 7) as u32,
+                cw + 1,
+                stride_c / 2,
+                &wod,
+            );
+        }
+
+        // Luma prediction.
+        if luma_int {
+            let (wq, wp) = (
+                (wod[0] & 0xFF) as i8 as i32,
+                ((wod[0] >> 8) & 0xFF) as i8 as i32,
+            );
+            for r in 0..hu {
+                let ry = (y_int_y + r as i32).clamp(0, height_y - 1);
+                mc_int_row(
+                    unsafe { base.add(off_y + r * stride_y) },
+                    unsafe { ref_base.add((ry * stride_y as i32) as usize) },
+                    x_int_y,
+                    width_y,
+                    wu,
+                    wq,
+                    wp,
+                    wod[1] as i32,
+                    wod[2] as u32,
+                    false,
+                );
+            }
+        } else {
+            // Fractional luma pel. Interior blocks read the neighborhood
+            // directly from the reference plane (C's non-edge path — no
+            // clamping needed); edge blocks gather the clamped neighborhood
+            // into scratch (C edge_buf_l semantics). Then run the 6-tap filter.
+            // The 6-tap filter reads relative rows/cols -2..h+2 / -2..w+2, so
+            // absolute extents reach (x_int_y + wu + 2, y_int_y + hu + 2);
+            // both must stay inside the frame for a direct read.
+            let interior = x_int_y >= 2
+                && x_int_y + wu as i32 + 2 < width_y
+                && y_int_y >= 2
+                && y_int_y + hu as i32 + 2 < height_y;
+            if !interior {
+                for r in 0..hu + 5 {
+                    let ry = (y_int_y - 2 + r as i32).clamp(0, height_y - 1);
+                    copy_clamped_row(
+                        unsafe { std::slice::from_raw_parts_mut(src_y.add(r * (wu + 5)), wu + 5) },
+                        unsafe { ref_base.add((ry * stride_y as i32) as usize) },
+                        x_int_y - 2,
+                        width_y,
+                        wu + 5,
+                    );
+                }
+            }
+            let src_luma = if interior {
+                // Full read extent: rows yInt-2..yInt+h+1, cols xInt-2..xInt+w+2
+                // at the real stride — inside the ref plane by `interior`.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        ref_base.add(((y_int_y - 2) * stride_y as i32 + (x_int_y - 2)) as usize),
+                        (hu + 4) * stride_y + wu + 5,
+                    )
+                }
+            } else {
+                unsafe { std::slice::from_raw_parts(src_y, (hu + 5) * (wu + 5)) }
+            };
+            inter::inter_luma(
+                src_luma,
+                unsafe { std::slice::from_raw_parts_mut(base.add(off_y), len_y) },
+                wu,
+                hu,
+                ((y & 3) as u32) * 4 + (x & 3) as u32,
+                if interior { stride_y } else { wu + 5 },
+                stride_y,
+                &wod,
+            );
+        }
     }
 
     /// C `deblock_mb(ctx)` for the macroblock at buffer position `pos` (row-lag
@@ -610,7 +813,14 @@ impl<'a> SliceContext<'a> {
         let off_b = self.filter_offset_b;
         let plane_size_y = self.plane_size_y as usize;
 
-        let region = self.plane_slice();
+        // plane_slice via the raw base pointer (same as the helper): keeps
+        // these borrows disjoint from `dblk_y`/`dblk_c` below.
+        let region = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.pixel_margin_base,
+                PIXEL_MARGIN + self.plane_size_y as usize + self.plane_size_c as usize,
+            )
+        };
         let (y_plane, c_plane) = {
             let (_, rest) = region.split_at_mut(PIXEL_MARGIN);
             rest.split_at_mut(plane_size_y)
@@ -621,6 +831,8 @@ impl<'a> SliceContext<'a> {
             entropy,
             off_a,
             off_b,
+            &mut self.dblk_y,
+            &mut self.dblk_c,
             y_plane,
             &ly,
             c_plane,
