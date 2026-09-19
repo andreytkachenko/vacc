@@ -2,7 +2,7 @@
 
 A Rust workspace for video decoding with five interchangeable backends:
 **Vulkan Video**, **NVIDIA NVDEC** (cuvid), **VAAPI**, and CPU software decoders
-(**edge264** for H.264, **hevc.js** for H.265). Based on the
+(pure-Rust H.264 core ported from edge264, **hevc.js** for H.265). Based on the
 [Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
 
 Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see the
@@ -24,7 +24,7 @@ byte-exact (verified against FFmpeg, 300 frames per sample).
 │     vacc-vulkan    Vulkan Video (ash)                        │
 │     vacc-nvdec-decode  NVIDIA NVDEC via libnvcuvid (cuvid)        │
 │     vacc-vaapi-decode  VAAPI stateless decode                     │
-│     vacc-sw-decode     CPU H.264 (vendored edge264 C core)        │
+│     vacc-sw-decode     CPU H.264 (pure-Rust core, edge264 port)   │
 │     vacc-software-decode CPU H.265 (pure-Rust hevc.js port)       │
 │                                                                  │
 │   vacc-examples: decode  unified CLI: -b <backend> -i <file>     │
@@ -265,7 +265,7 @@ stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
 ```bash
 # Decode with a chosen backend; prints pts/size/pixel-hash per frame
 ./target/release/examples/decode -b <vulkan|nvdec|vaapi|sw> -i <file> [-n frames] [-o outdir]
-# sw = CPU: H.264 via edge264, H.265 via hevc.js (codec auto-detected)
+# sw = CPU: H.264 pure-Rust (edge264 port), H.265 via hevc.js (codec auto-detected)
 ```
 
 ## Vulkan Extensions Required

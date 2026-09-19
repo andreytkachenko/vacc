@@ -6,13 +6,14 @@
 //! - [`PocCalculator`] — picture order count (types 0/1/2)
 //! - `h264_reflist::build_ref_pic_lists` — spec 8.2.3.1+8.2.3.2 ref lists
 //!
-//! Data plane: the vendored edge264 C slice-decode routines (macroblock
-//! parse, intra/inter prediction, transform, deblocking), statically linked
-//! and driven per-slice through the FFI in [`crate::ffi`].
+//! Data plane: the pure-Rust slice-decode core in [`crate::rust`] (macroblock
+//! parse, intra/inter prediction, transform, deblocking), driven per-slice.
+//! Ported bit-exactly from the edge264 C routines; every output is pinned to
+//! golden hashes (`src/rust/golden_data.rs`).
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use vacc_core::codec::VideoCodec as CoreVideoCodec;
@@ -28,7 +29,11 @@ use vacc_parser::h264_poc::PocCalculator;
 use vacc_parser::h264_reflist::RefPicLists;
 use vacc_parser::{DetectedVideoFormat, ParseResult, SliceEntry, SliceHeader, VideoParser};
 
-use crate::ffi::{self, Sw264Frame, Sw264Pps, Sw264Slice, Sw264Sps};
+use crate::rust::bits::SliceBits;
+use crate::rust::cabac::Cabac;
+use crate::rust::slice::{
+    PIXEL_MARGIN, RustMb, RustMbFlags, SLICEDATA_RECORD_LEN, SliceContext, UNAVAIL_MB,
+};
 
 /// 16-byte-aligned zero-initialized buffer (edge264 performs aligned SIMD
 /// loads on sample planes; strides are multiples of 16 by construction).
@@ -82,10 +87,8 @@ pub enum Error {
     Alloc,
 }
 
-/// Software H.264 decoder: vacc-parser control plane + edge264 C data plane.
+/// Software H.264 decoder: vacc-parser control plane + pure-Rust data plane.
 pub struct SwH264Decoder {
-    /// C decoder core (single translation unit, statically linked).
-    cdec: Option<NonNull<c_void>>,
     /// Common parser (SPS/PPS/slice headers).
     parser: H264Parser,
     /// Common DPB.
@@ -109,15 +112,17 @@ pub struct SwH264Decoder {
     sub_wc: u32,
     sub_hc: u32,
 
-    // Per-DPB-slot storage: one contiguous block per slot holding the sample
-    // planes (Y + Cb/Cr) immediately followed by the macroblock array —
-    // mirroring edge264's internal_alloc. The inter prediction filter may
-    // read up to a couple of rows past the chroma plane end; upstream relies
-    // on the adjacent mb array absorbing those overreads, so the two must not
-    // be separate allocations.
+    // Per-DPB-slot storage: one contiguous block per slot holding a leading
+    // zero margin (PIXEL_MARGIN) followed by the sample planes (Y + Cb/Cr)
+    // plus a trailing overread margin. The inter prediction filter may read
+    // up to a couple of rows past the chroma plane end; the margins absorb
+    // those reads (upstream UB in the C core).
     n_slots: usize,
     slot_planes: Vec<Option<AlignedBuf>>,
-    mb_size: usize,
+    /// Per-slot macroblock arrays. A slot's flip bit toggles on every frame
+    /// start; a freshly (re)allocated array has recovery_bits == 0 and its
+    /// flip bit is reset, so the per-MB sentinel detects stale state.
+    slot_mbs: Vec<Option<Vec<RustMb>>>,
     mbs_per_frame: usize,
 
     // Input buffering.
@@ -130,6 +135,27 @@ pub struct SwH264Decoder {
     reorder_watermark: i64,
     pending_key: i64,
     pending_frames: VecDeque<(i64, DecodedFrame)>,
+
+    /// Per-slice macroblock parse-record capture, armed via
+    /// [`SwH264Decoder::arm_mb_dump`] (test-only).
+    mb_dump: RefCell<MbDump>,
+    /// Flip-bit sentinels per DPB slot (see `slot_mbs`).
+    flip_bits: u32,
+    /// Deblock progress (`next_deblock_addr`): reset per frame at frame start,
+    /// updated after each slice; i32::MAX once the whole frame is deblocked.
+    dec_next: i32,
+    /// Total MBs set at frame start, never decremented (upstream); 0 means
+    /// every MB has been decoded.
+    remaining_mbs: i32,
+}
+
+/// Record-capture gate + collected per-slice parse records.
+#[derive(Default)]
+struct MbDump {
+    /// True while capture is armed (see [`SwH264Decoder::arm_mb_dump`]).
+    armed: bool,
+    /// Per-slice parse records (golden-pinned).
+    records: Vec<Vec<u8>>,
 }
 
 impl SwH264Decoder {
@@ -180,7 +206,6 @@ impl SwH264Decoder {
         parser.reset();
 
         let mut dec = Self {
-            cdec: None,
             parser,
             dpb: H264Dpb::new(0, 0, 0, 0),
             poc_calc: PocCalculator::new(),
@@ -198,7 +223,7 @@ impl SwH264Decoder {
             sub_hc: 2,
             n_slots: 0,
             slot_planes: Vec::new(),
-            mb_size: unsafe { ffi::sw264_macroblock_size() },
+            slot_mbs: Vec::new(),
             mbs_per_frame: 0,
             pending_data: data,
             parse_offset: 0,
@@ -207,6 +232,10 @@ impl SwH264Decoder {
             reorder_watermark: i64::MIN,
             pending_key: 0,
             pending_frames: VecDeque::new(),
+            mb_dump: RefCell::default(),
+            flip_bits: 0,
+            dec_next: 0,
+            remaining_mbs: 0,
         };
         dec.init_sequence(&sps)?;
         Ok(dec)
@@ -251,56 +280,6 @@ impl SwH264Decoder {
             ));
         }
 
-        // Allocate the C decoder core once.
-        if self.cdec.is_none() {
-            let raw = unsafe { ffi::sw264_alloc() };
-            if raw.is_null() {
-                return Err(Error::Alloc);
-            }
-            self.cdec = Some(NonNull::new(raw).ok_or(Error::Alloc)?);
-        }
-
-        // Push the SPS to the C side and get the computed frame format.
-        let c = self.cdec_raw()?;
-        let sw_sps = Sw264Sps {
-            chroma_format_idc: sps.chroma_format_idc as i8,
-            chroma_array_type: if sps.separate_colour_plane_flag {
-                0
-            } else {
-                sps.chroma_format_idc as i8
-            },
-            bit_depth_y: (8 + sps.bit_depth_luma_minus8) as i8,
-            bit_depth_c: (8 + sps.bit_depth_chroma_minus8) as i8,
-            pic_width_in_mbs: sps.pic_width_in_mbs_minus1 + 1,
-            pic_height_in_mbs: (sps.pic_height_in_map_units_minus1 + 1) as i16,
-            frame_crop_offsets: [
-                sps.frame_crop_top_offset as i16,
-                sps.frame_crop_right_offset as i16,
-                sps.frame_crop_bottom_offset as i16,
-                sps.frame_crop_left_offset as i16,
-            ],
-            log2_max_frame_num: (4 + sps.log2_max_frame_num_minus4) as i8,
-            pic_order_cnt_type: sps.pic_order_cnt_type as i8,
-            max_num_ref_frames: sps.max_num_ref_frames.min(16) as i8,
-            direct_8x8_inference_flag: sps.direct_8x8_inference_flag as i8,
-            seq_scaling_matrix_present: sps.seq_scaling_matrix_present_flag as i32,
-            scaling_list_4x4: sps.scaling_list_4x4,
-            scaling_list_8x8: sps.scaling_list_8x8,
-        };
-        let mut sy = 0i32;
-        let mut sc = 0i32;
-        let mut py = 0i32;
-        let mut pc = 0i32;
-        let rc =
-            unsafe { ffi::sw264_set_sps(c.as_ptr(), &sw_sps, &mut sy, &mut sc, &mut py, &mut pc) };
-        if rc != 0 {
-            return Err(Error::SliceDecode(rc));
-        }
-        self.stride_y = sy as u32;
-        self.stride_c = sc as u32;
-        self.plane_size_y = py as u32;
-        self.plane_size_c = pc as u32;
-
         // Coded size is a multiple of 16 (macroblocks). Per spec 8.3.1 the raw
         // frame_crop_*_offset values are multiplied by SubWidthC / SubHeightC
         // (Table 8-2) to yield the luma-sample crop; the chroma crop start is
@@ -321,6 +300,27 @@ impl SwH264Decoder {
         self.disp_w = self.coded_w.saturating_sub(sub_wc * (crop_l + crop_r));
         self.disp_h = self.coded_h.saturating_sub(sub_hc * (crop_t + crop_b));
 
+        // Frame format (stride/plane sizes) — port of the C core's
+        // sw264_set_sps. 8-bit only and 4:4:4 rejected above, so the chroma
+        // stride is always `width` (+8 if a multiple of 4096).
+        let mut stride_y = self.coded_w;
+        if stride_y.is_multiple_of(2048) {
+            stride_y += 16;
+        }
+        let mut stride_c = self.coded_w;
+        if stride_c.is_multiple_of(4096) {
+            stride_c += 8;
+        }
+        self.stride_y = stride_y;
+        self.stride_c = stride_c;
+        self.plane_size_y = stride_y * self.coded_h;
+        self.plane_size_c = stride_c
+            * if sps.chroma_format_idc == 1 {
+                self.coded_h / 2
+            } else {
+                self.coded_h
+            };
+
         // DPB sizing (same scheme as the VAAPI backend).
         let max_dpb = sps.max_num_ref_frames.clamp(1, 16) as usize;
         self.n_slots = max_dpb.max(4) + 4;
@@ -337,42 +337,44 @@ impl SwH264Decoder {
 
         self.mbs_per_frame = (self.coded_w / 16 + 1) as usize * ((self.coded_h / 16) as usize) - 1;
         self.slot_planes = (0..self.n_slots).map(|_| None).collect();
+        self.slot_mbs = vec![None; self.n_slots];
+        self.flip_bits = 0;
+        self.dec_next = 0;
+        self.remaining_mbs = 0;
         self.poc_calc.reset();
         Ok(())
-    }
-
-    fn cdec_raw(&self) -> Result<NonNull<c_void>, Error> {
-        self.cdec
-            .ok_or(Error::InvalidState("C decoder not initialized"))
     }
 
     /// Size of the sample-plane part of a slot block (planes + overread margin).
     fn plane_block_size(&self) -> usize {
         // Upstream: plane_size_Y + plane_size_C + 16. Keep a slightly larger
-        // margin; anything beyond it lands in the adjacent mb array anyway.
+        // margin; the inter filter may read past the chroma plane end.
         (self.plane_size_y + self.plane_size_c + 32) as usize
     }
 
-    /// Allocate (lazily, once) the contiguous plane + mb storage for a DPB slot.
+    /// Allocate (lazily, once) the plane + macroblock storage for a DPB slot.
     fn ensure_slot_storage(&mut self, slot: usize) -> Result<(), Error> {
-        let total = self.plane_block_size() + self.mbs_per_frame * self.mb_size;
         if self.slot_planes[slot].is_none() {
-            let buf = AlignedBuf::new(total).ok_or(Error::Alloc)?;
-            // Upstream alloc_frame fills each row's trailing padding macroblock
-            // slot with unavail_mb; column-0 MBs read it as their left neighbor.
-            unsafe {
-                ffi::sw264_init_mb_buffer(
-                    buf.as_mut_ptr().add(self.plane_block_size()) as *mut c_void,
-                    (self.coded_w / 16) as i32,
-                    (self.coded_h / 16) as i32,
-                );
+            // Leading zero margin so the intra kernels' edge reads (upstream UB
+            // in the C core) stay in valid memory; trailing overread margin via
+            // plane_block_size.
+            let buf =
+                AlignedBuf::new(PIXEL_MARGIN + self.plane_block_size()).ok_or(Error::Alloc)?;
+            // Each row's trailing padding macroblock slot is unavail_mb;
+            // column-0 MBs read it as their left neighbor. A freshly zeroed mb
+            // array has recovery_bits == 0, so reset this slot's flip-bit
+            // sentinel to 0 too; otherwise stale toggle history can match the
+            // fresh array and the sentinel aborts the slice after 0 macroblocks
+            // (e.g. after an IDR frees and re-allocates the slot).
+            let w = (self.coded_w / 16) as usize;
+            let mut v = vec![RustMb::default(); self.mbs_per_frame];
+            for i in (0..self.mbs_per_frame).step_by(w + 1) {
+                if i + w < self.mbs_per_frame {
+                    v[i + w] = UNAVAIL_MB;
+                }
             }
-            // A freshly zeroed mb array has recovery_bits == 0, so reset this
-            // slot's flip-bit sentinel to 0 too; otherwise stale toggle history
-            // can match the fresh array and the sentinel aborts the slice after
-            // 0 macroblocks (e.g. after an IDR frees and re-allocates the slot).
-            let c = self.cdec_raw()?;
-            unsafe { ffi::sw264_reset_slot_flip(c.as_ptr(), slot as i32) };
+            self.flip_bits &= !(1u32 << slot);
+            self.slot_mbs[slot] = Some(v);
             self.slot_planes[slot] = Some(buf);
         }
         Ok(())
@@ -409,24 +411,7 @@ impl SwH264Decoder {
                             .downcast_ref::<H264Pps>()
                             .ok_or_else(|| Error::Parser("bad PPS type".into()))?
                             .clone();
-                        self.pps = Some(new_pps.clone());
-                        // Push the PPS to the C side.
-                        let c = self.cdec_raw()?;
-                        let sw_pps = Sw264Pps {
-                            entropy_coding_mode_flag: new_pps.entropy_coding_mode_flag as i8,
-                            num_ref_idx_active: [
-                                (new_pps.num_ref_idx_l0_default_active_minus1 + 1) as i8,
-                                (new_pps.num_ref_idx_l1_default_active_minus1 + 1) as i8,
-                            ],
-                            weighted_pred_flag: new_pps.weighted_pred_flag as i8,
-                            weighted_bipred_idc: new_pps.weighted_bipred_idc as i8,
-                            qp_prime_y: (26 + new_pps.pic_init_qp_minus26) as i8,
-                            chroma_qp_index_offset: new_pps.chroma_qp_index_offset as i8,
-                            second_chroma_qp_index_offset: new_pps.second_chroma_qp_index_offset
-                                as i8,
-                            transform_8x8_mode_flag: new_pps.transform_8x8_mode_flag as i8,
-                        };
-                        unsafe { ffi::sw264_set_pps(c.as_ptr(), &sw_pps) };
+                        self.pps = Some(new_pps);
                     }
                     continue;
                 }
@@ -450,10 +435,9 @@ impl SwH264Decoder {
     }
 
     /// Decode one complete picture (all its slices) using the common DPB/POC
-    /// state and the C slice-decode core.
+    /// state and the Rust slice-decode core.
     fn decode_h264_frame(&mut self, slices: &[SliceEntry]) -> Result<Option<DecodedFrame>, Error> {
         let sps = self.sps.as_ref().ok_or(Error::InvalidState("no SPS"))?;
-        let c = self.cdec_raw()?;
 
         // Frame-level parameters from the first slice header.
         let first_slh = match &slices[0].slice_header {
@@ -532,7 +516,8 @@ impl SwH264Decoder {
                     &first_slh.ref_pic_list_modification_l1[..],
                 ),
             };
-            slice_lists.push(self.dpb.build_ref_lists(st, l0m1, l1m1, mod_l0, mod_l1));
+            let lists = self.dpb.build_ref_lists(st, l0m1, l1m1, mod_l0, mod_l1);
+            slice_lists.push(lists);
         }
 
         // Determine the storage slot BEFORE decoding: prepare_current_avoiding
@@ -559,30 +544,11 @@ impl SwH264Decoder {
         // per-slot frame_flip_bit sentinel (toggling on every reuse) detects
         // stale MB state; zeroing recovery_bits per frame would defeat it.
 
-        // Long-term reference mask over DPB slots (for B-slice direct mode).
-        let mut long_term_frames = 0u32;
-        for (i, s) in self.dpb.slots.iter().enumerate() {
-            if s.state != 0 && s.marking == MARKING_LONG {
-                long_term_frames |= 1 << i;
-            }
-        }
-
-        // Per-frame setup for the C core.
-        let mut fr = Sw264Frame::new();
-        fr.n_slots = self.n_slots as i32;
-        fr.long_term_frames = long_term_frames;
-        for (i, plane) in self.slot_planes.iter().enumerate() {
-            if let Some(p) = plane {
-                fr.planes[i] = p.as_ptr();
-                fr.mb_arrays[i] =
-                    unsafe { p.as_ptr().add(self.plane_block_size()) } as *const c_void;
-            }
-        }
-        let curr = self.slot_planes[slot].as_ref().unwrap();
-        fr.curr_plane = curr.as_mut_ptr();
-        fr.curr_mb = unsafe { curr.as_mut_ptr().add(self.plane_block_size()) } as *mut c_void;
-        fr.curr_slot = slot as i32;
-        unsafe { ffi::sw264_frame_start(c.as_ptr(), &fr) };
+        // Per-frame setup: toggle the slot's flip-bit sentinel and reset the
+        // deblock progress (next_deblock_addr = 0, remaining_mbs = W*H).
+        self.flip_bits ^= 1u32 << slot;
+        self.dec_next = 0;
+        self.remaining_mbs = (self.coded_w / 16) as i32 * (self.coded_h / 16) as i32;
 
         // Decode every slice of the picture.
         for (idx, s) in slices.iter().enumerate() {
@@ -594,7 +560,7 @@ impl SwH264Decoder {
             if st > 2 {
                 return Err(Error::Unsupported("SP/SI slices".into()));
             }
-            self.decode_slice(c.as_ptr(), h, &slices[idx], &slice_lists[idx], poc)?;
+            self.dec_next = self.decode_slice(h, &slices[idx], &slice_lists[idx], poc, slot)?;
         }
 
         // Commit the picture to the common DPB (post-decode marking + display).
@@ -604,6 +570,7 @@ impl SwH264Decoder {
         for (i, s) in self.dpb.slots.iter().enumerate() {
             if s.state == 0 {
                 self.slot_planes[i] = None;
+                self.slot_mbs[i] = None;
             }
         }
 
@@ -633,99 +600,111 @@ impl SwH264Decoder {
         Ok(Some(frame))
     }
 
-    /// Decode one slice through the C core.
+    /// Arm per-slice macroblock parse-record capture: one record per decoded
+    /// slice (308 bytes per macroblock) is collected for golden pinning.
+    /// Test-only.
+    #[cfg(test)]
+    pub fn arm_mb_dump(&self) {
+        self.mb_dump.borrow_mut().armed = true;
+    }
+
+    /// Collect the per-slice parse records captured since [`arm_mb_dump`],
+    /// one entry per decoded slice. Test-only.
+    #[cfg(test)]
+    pub fn take_rust_records(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.mb_dump.borrow_mut().records)
+    }
+
+    /// Decode one slice through the Rust core; updates the shared deblock
+    /// progress (`dec_next`) and returns it. When record capture is armed
+    /// (test-only), the per-MB record stream (`CurrMbAddr` u32 + 304-byte
+    /// macroblock per MB) is collected as well.
     fn decode_slice(
         &self,
-        c: *mut c_void,
         h: &vacc_parser::h264::SliceHeader,
         entry: &SliceEntry,
         lists: &RefPicLists,
         poc: i32,
-    ) -> Result<(), Error> {
-        let pps = self.pps.as_ref().ok_or(Error::InvalidState("no PPS"))?;
+        slot: usize,
+    ) -> Result<i32, Error> {
+        let dec_next = self.dec_next;
         let sps = self.sps.as_ref().ok_or(Error::InvalidState("no SPS"))?;
+        let pps = self.pps.as_ref().ok_or(Error::InvalidState("no PPS"))?;
         let st = h.slice_type % 5;
 
-        // Slice data: raw NAL bytes (EPB intact — the C bitstream reader
-        // removes emulation prevention bytes on the fly), with head/tail guard
-        // bytes for the SIMD byte loader. The common parser extends a NAL with
-        // the leading 0x00 of a following start code; a valid H.264 NAL never
-        // ends in 0x00, so a trailing zero is always that extra byte.
-        //
-        // Guard bytes MUST be non-zero: get_bytes() loads a 16-byte chunk from
-        // CPB-2 (a 2-byte lookback for on-the-fly EPB removal) and strips any
-        // `00 00 n<=3` pattern. If the guard were zero, the first read at the
-        // NAL header would see [00 00 <nal_hdr>] and — when nal_hdr <= 0x03 —
-        // strip the NAL header as a false EPB, corrupting the bitstream.
+        // Same guarded payload as the C path, with >= 18 bytes of headroom
+        // (SliceBits::new requirement; cabac_start's reclaim walks back to
+        // cpb-4). Guard bytes are non-zero for the same EPB reason.
         let mut nal = entry.nal_data.clone();
         if nal.last() == Some(&0) {
             nal.pop();
         }
-        let mut buf = vec![0xFFu8; 16 + nal.len() + 16];
-        buf[16..16 + nal.len()].copy_from_slice(&nal);
-
-        // The C core primes its bit reader at the NAL header and skips to the
-        // slice data at bit offset 8 + slice-header bits (EPB-stripped space,
-        // matching the parser's header_bit_size — not necessarily byte-aligned).
+        let mut buf = vec![0xFFu8; 24 + nal.len() + 16];
+        buf[24..24 + nal.len()].copy_from_slice(&nal);
         let skip_bits = 8 + h.header_bit_size as u32;
-        if skip_bits >= nal.len() as u32 * 8 {
-            return Err(Error::InvalidState("slice data out of bounds"));
+
+        // Prime the reader at the NAL header and skip to the slice data,
+        // exactly like sw264_decode_slice (msb = 1 << 63, refill, get_u1 x N).
+        let mut bits = SliceBits::new(&buf, 24, nal.len());
+        for _ in 0..skip_bits {
+            let _ = bits.get_u1();
         }
 
-        let mut sl = Sw264Slice::new();
-        sl.first_mb_in_slice = h.first_mb_in_slice;
-        sl.slice_type = st as i8;
-        sl.field_pic_flag = h.field_pic_flag as i8;
-        sl.bottom_field_flag = (h.field_pic_flag && h.bottom_field) as i8;
-        sl.nal_ref_idc_ne = (h.nal_ref_idc != 0) as i8;
-        sl.direct_spatial_mv_pred_flag = h.direct_spatial_mv_pred_flag as i8;
-        sl.disable_deblocking_filter_idc = h.disable_deblocking_filter_idc;
-        sl.filter_offset_a =
-            (h.slice_alpha_c0_offset_div2 * 2).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-        sl.filter_offset_b =
-            (h.slice_beta_offset_div2 * 2).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-        // C expects the 1-based table index (I: 0, P/B: 1 + ue value).
-        sl.cabac_init_idc = if st == 2 {
+        let mbs = self
+            .slot_mbs
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidState("no mb buffer for slot"))?;
+        // B slices: collocated picture mb array (RefPicList1[0]).
+        let col_slot = if st == 1 {
+            lists.l1.first().map(|r| r.slot)
+        } else {
+            None
+        };
+
+        let qp_y = (26 + pps.pic_init_qp_minus26 + h.slice_qp_delta).clamp(0, 51) as i16;
+        let cabac_init_idc = if st == 2 {
             0
         } else {
             1 + h.cabac_init_idc as i8
         };
-        let qp_prime = 26 + pps.pic_init_qp_minus26;
-        sl.qp_y = (qp_prime + h.slice_qp_delta).clamp(0, 51) as i16;
-        sl.num_ref_idx_active = [
-            (h.num_ref_idx_l0_active_minus1 + 1) as i8,
-            (h.num_ref_idx_l1_active_minus1 + 1) as i8,
-        ];
-        let base = buf.as_ptr();
-        sl.data = unsafe { base.add(16) }; // NAL start
-        sl.skip_bits = skip_bits;
-        sl.end = unsafe { base.add(16 + nal.len()) };
 
-        // Reference picture lists: DPB slot indices in spec order.
-        for (i, r) in lists.l0.iter().enumerate() {
-            sl.refpic_list[0][i] = r.slot as i8;
-        }
-        for (i, r) in lists.l1.iter().enumerate() {
-            sl.refpic_list[1][i] = r.slot as i8;
-        }
-
-        // Per-slot POC difference (B-slice direct mode / implicit weights).
+        // Per-slot POC differences (B-slice direct mode / implicit weights).
+        let mut diff_poc = [0i16; 32];
         for (i, s) in self.dpb.slots.iter().enumerate() {
-            sl.diff_poc[i] = if s.state == 0 {
+            diff_poc[i] = if s.state == 0 {
                 0
             } else {
                 (poc - s.poc) as i16
             };
         }
 
-        // Weighted prediction: the common parser already fills the per-ref
-        // tables with explicit values or inferred defaults. Layout in the C
-        // task: L0 refs at [0..n0), L1 refs at [32..32+n1).
+        // Long-term reference mask (same DPB state as at frame start: the
+        // current picture is committed only after all slices are decoded).
+        let mut long_term_frames = 0u32;
+        for (i, s) in self.dpb.slots.iter().enumerate() {
+            if s.state != 0 && s.marking == MARKING_LONG {
+                long_term_frames |= 1 << i;
+            }
+        }
+
+        let mut ref_pic_list = [[0i8; 32]; 2];
+        for (i, r) in lists.l0.iter().enumerate() {
+            ref_pic_list[0][i] = r.slot as i8;
+        }
+        for (i, r) in lists.l1.iter().enumerate() {
+            ref_pic_list[1][i] = r.slot as i8;
+        }
+
+        // Weighted prediction: same table materialization as the C path above
+        // (L0 refs at [0..n0), L1 refs at [32..32+n1)).
         let has_pw_table =
             (st == 0 && pps.weighted_pred_flag) || (st == 1 && pps.weighted_bipred_idc == 1);
+        let (mut explicit_weights, mut explicit_offsets) = ([[0i16; 64]; 3], [[0i8; 64]; 3]);
+        let (mut luma_log2_weight_denom, mut chroma_log2_weight_denom) = (0i8, 0i8);
         if has_pw_table {
-            sl.luma_log2_weight_denom = h.luma_log2_weight_denom as i8;
-            sl.chroma_log2_weight_denom = h.chroma_log2_weight_denom as i8;
+            luma_log2_weight_denom = h.luma_log2_weight_denom as i8;
+            chroma_log2_weight_denom = h.chroma_log2_weight_denom as i8;
             let n0 = h.num_ref_idx_l0_active_minus1 as usize + 1;
             let n1 = if st == 1 {
                 h.num_ref_idx_l1_active_minus1 as usize + 1
@@ -733,39 +712,272 @@ impl SwH264Decoder {
                 0
             };
             for i in 0..n0 {
-                sl.explicit_weights[0][i] = h.luma_weight_l0[i];
-                sl.explicit_offsets[0][i] = h.luma_offset_l0[i] as i8;
-                sl.explicit_weights[1][i] = h.chroma_weight_l0[i][0];
-                sl.explicit_offsets[1][i] = h.chroma_offset_l0[i][0] as i8;
-                sl.explicit_weights[2][i] = h.chroma_weight_l0[i][1];
-                sl.explicit_offsets[2][i] = h.chroma_offset_l0[i][1] as i8;
+                explicit_weights[0][i] = h.luma_weight_l0[i];
+                explicit_offsets[0][i] = h.luma_offset_l0[i] as i8;
+                explicit_weights[1][i] = h.chroma_weight_l0[i][0];
+                explicit_offsets[1][i] = h.chroma_offset_l0[i][0] as i8;
+                explicit_weights[2][i] = h.chroma_weight_l0[i][1];
+                explicit_offsets[2][i] = h.chroma_offset_l0[i][1] as i8;
             }
             for i in 0..n1 {
-                sl.explicit_weights[0][32 + i] = h.luma_weight_l1[i];
-                sl.explicit_offsets[0][32 + i] = h.luma_offset_l1[i] as i8;
-                sl.explicit_weights[1][32 + i] = h.chroma_weight_l1[i][0];
-                sl.explicit_offsets[1][32 + i] = h.chroma_offset_l1[i][0] as i8;
-                sl.explicit_weights[2][32 + i] = h.chroma_weight_l1[i][1];
-                sl.explicit_offsets[2][32 + i] = h.chroma_offset_l1[i][1] as i8;
+                explicit_weights[0][32 + i] = h.luma_weight_l1[i];
+                explicit_offsets[0][32 + i] = h.luma_offset_l1[i] as i8;
+                explicit_weights[1][32 + i] = h.chroma_weight_l1[i][0];
+                explicit_offsets[1][32 + i] = h.chroma_offset_l1[i][0] as i8;
+                explicit_weights[2][32 + i] = h.chroma_weight_l1[i][1];
+                explicit_offsets[2][32 + i] = h.chroma_offset_l1[i][1] as i8;
             }
-        } else if st == 1 && pps.weighted_bipred_idc == 2 {
-            // Implicit B weights: the C core computes them from diff_poc;
-            // mirror FFmpeg's convention for the unused explicit tables.
-            sl.luma_log2_weight_denom = 5;
-            sl.chroma_log2_weight_denom = if sps.chroma_format_idc != 0 { 5 } else { 0 };
         }
 
-        let rc = unsafe { ffi::sw264_decode_slice(c, &sl) };
-        if rc != 0 {
-            return Err(Error::SliceDecode(rc));
+        // Reference planes for inter MC (C `t.samples_buffers`).
+        let ref_plane_bases: Vec<*const u8> = self
+            .slot_planes
+            .iter()
+            .map(|p| {
+                p.as_ref().map_or(std::ptr::null(), |b| unsafe {
+                    b.as_ptr().add(PIXEL_MARGIN)
+                })
+            })
+            .collect();
+
+        let mut ctx = SliceContext {
+            bits,
+            cabac: Cabac::new(),
+            is_cabac: pps.entropy_coding_mode_flag,
+            mb_buffer: mbs.as_ptr() as *mut RustMb,
+            mb_pos: 0,
+            mb_col: std::ptr::null(),
+            mb_col_buffer: match col_slot {
+                Some(s) => self
+                    .slot_mbs
+                    .get(s)
+                    .and_then(Option::as_ref)
+                    .map_or(std::ptr::null(), |v| v.as_ptr()),
+                None => std::ptr::null(),
+            },
+            mb_dump: std::ptr::null_mut(),
+            mb_dump_off: 0,
+            mb_dump_cap: 0,
+            mb_a: std::ptr::null(),
+            mb_b: std::ptr::null(),
+            mb_c: std::ptr::null(),
+            mb_d: std::ptr::null(),
+            pic_width_in_mbs: sps.pic_width_in_mbs_minus1 as i16 + 1,
+            pic_height_in_mbs: (sps.pic_height_in_map_units_minus1 + 1) as i16,
+            first_mb_in_slice: h.first_mb_in_slice,
+            slice_type: st as i8,
+            cabac_init_idc,
+            frame_flip_bit: ((self.flip_bits >> slot) & 1) as i8,
+            disable_deblocking_filter_idc: h.disable_deblocking_filter_idc,
+            chroma_array_type: if sps.separate_colour_plane_flag {
+                0
+            } else {
+                sps.chroma_format_idc as i8
+            },
+            direct_spatial_mv_pred_flag: h.direct_spatial_mv_pred_flag as i8,
+            direct_8x8_inference_flag: sps.direct_8x8_inference_flag as i8,
+            num_ref_idx_active: [
+                (h.num_ref_idx_l0_active_minus1 + 1) as i8,
+                (h.num_ref_idx_l1_active_minus1 + 1) as i8,
+            ],
+            pps_transform_8x8_mode_flag: pps.transform_8x8_mode_flag as i8,
+            // P slices: weighted_bipred_idc follows weighted_pred_flag.
+            weighted_bipred_idc: if st == 0 {
+                pps.weighted_pred_flag as i8
+            } else {
+                pps.weighted_bipred_idc as i8
+            },
+            luma_log2_weight_denom,
+            chroma_log2_weight_denom,
+            explicit_weights,
+            explicit_offsets,
+            implicit_weights: [[0u8; 32]; 32],
+            ref_pic_list,
+            diff_poc,
+            prev_long_term_frames: long_term_frames,
+            qp_y,
+            chroma_qp_index_offset: pps.chroma_qp_index_offset as i8,
+            second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset as i8,
+            mbx: 0,
+            mby: 0,
+            curr_mb_addr: 0,
+            mb_skip_run: -1,
+            col_short_term: false,
+            inc: RustMbFlags::default(),
+            unavail4x4: [0; 48],
+            nc_inc: [[0; 16]; 3],
+            a4x4_int8: [0; 16],
+            b4x4_int8: [0; 16],
+            acbcr_int8: [0; 16],
+            bcbcr_int8: [0; 16],
+            refidx4x4_c: [0; 16],
+            absmvd_a: [0; 16],
+            absmvd_b: [0; 16],
+            mvs_a: [0; 16],
+            mvs_b: [0; 16],
+            mvs_c: [0; 16],
+            mvs_d: [0; 16],
+            transform_8x8_mode_flag: 0,
+            num_ref_idx_mask: 0,
+            dist_scale_factor: [0; 32],
+            clip_ref_idx: [0; 8],
+            map_pic_to_list0: [0; 32],
+            ctx_idx_offsets: [0; 4],
+            coeff_abs_inc: [0; 8],
+            sig_inc: [0; 64],
+            last_inc: [0; 64],
+            scan: [0; 64],
+            qp_c: [[0; 64]; 2],
+            c: [0; 64],
+            mb_qp_delta_nz: 0,
+            qp_s: [0; 4],
+            bit_depth: [
+                (8 + sps.bit_depth_luma_minus8) as u32,
+                (8 + sps.bit_depth_chroma_minus8) as u32,
+                (8 + sps.bit_depth_chroma_minus8) as u32,
+            ],
+            pixel_margin_base: self
+                .slot_planes
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map_or(std::ptr::null_mut(), AlignedBuf::as_mut_ptr),
+            samples_base: self
+                .slot_planes
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map_or(std::ptr::null_mut(), |b| unsafe {
+                    b.as_mut_ptr().add(PIXEL_MARGIN)
+                }),
+            stride: [self.stride_y as u16, self.stride_c as u16],
+            plane_size_y: self.plane_size_y,
+            plane_size_c: self.plane_size_c,
+            coded_w: self.coded_w,
+            coded_h: self.coded_h,
+            samples_mb: [std::ptr::null_mut(); 3],
+            ref_plane_bases,
+            ws4: if sps.seq_scaling_matrix_present_flag {
+                // C memcpys the 96 spec-ordered bytes straight into
+                // weightScale4x4 (the kernel then indexes plane+inter*3).
+                std::array::from_fn(|i| std::array::from_fn(|j| sps.scaling_list_4x4[i][j] as i8))
+            } else {
+                [[16i8; 16]; 6]
+            },
+            ws8: if sps.seq_scaling_matrix_present_flag {
+                // C memcpys 384 bytes from a field that only holds the two
+                // luma lists (latent OOB read upstream); the Cb/Cr slots are
+                // UB there. We fill them with the flat list — out of Tier E
+                // scope (no in-scope stream has scaling lists).
+                let mut ws = [[16i8; 64]; 6];
+                for (dst, src) in ws[..2].iter_mut().zip(sps.scaling_list_8x8.iter()) {
+                    dst.copy_from_slice(&src.map(|v| v as i8));
+                }
+                ws
+            } else {
+                [[16i8; 64]; 6]
+            },
+            filter_offset_a: h.slice_alpha_c0_offset_div2 * 2,
+            filter_offset_b: h.slice_beta_offset_div2 * 2,
+            // C vacc_sw264.c L1132.
+            next_deblock_addr: if dec_next == h.first_mb_in_slice as i32
+                || h.disable_deblocking_filter_idc == 2
+            {
+                h.first_mb_in_slice as i32
+            } else {
+                i32::MIN
+            },
+        };
+        ctx.initialize_context();
+
+        // Per-slice parse-record capture (armed via `arm_mb_dump`); the core
+        // skips writes when the target is null.
+        let mut rec_buf: Option<Vec<u8>> = self
+            .mb_dump
+            .borrow()
+            .armed
+            .then(|| vec![0u8; self.mbs_per_frame * SLICEDATA_RECORD_LEN]);
+        ctx.mb_dump = rec_buf
+            .as_mut()
+            .map_or(std::ptr::null_mut(), Vec::as_mut_ptr);
+        ctx.mb_dump_cap = rec_buf.as_ref().map_or(0, Vec::len);
+
+        if ctx.is_cabac {
+            // cabac_alignment_one_bit: a good probability to catch random errors.
+            if ctx.cabac.start(&mut ctx.bits) {
+                return Err(Error::SliceDecode(114)); // EBADMSG, as the C core
+            }
+            ctx.cabac.init(qp_y as u8, cabac_init_idc as usize);
+            ctx.mb_qp_delta_nz = 0;
+        } else {
+            ctx.mb_skip_run = -1;
         }
-        Ok(())
+
+        ctx.parse_slice_data();
+
+        // C vacc_sw264.c L1202-1227: deblock the rest of the MBs in this slice
+        // (for a single-slice frame this is the entire last row).
+        if ctx.next_deblock_addr >= 0 {
+            ctx.next_deblock_addr = ctx.next_deblock_addr.max(ctx.first_mb_in_slice as i32);
+            ctx.deblock_range(ctx.curr_mb_addr);
+        }
+
+        // E0 plumbing check: samples_mb must track the closed-form position of
+        // (mbx, mby) — C initialises and advances it identically, so any drift
+        // in the per-MB advance arithmetic shows up here on every slice.
+        let base = ctx.samples_base as usize;
+        let mbx = ctx.mbx as i64;
+        let mby = ctx.mby as i64;
+        let sy = self.stride_y as i64;
+        let sc = self.stride_c as i64;
+        assert_eq!(
+            ctx.samples_mb[0] as usize - base,
+            ((mbx + mby * sy) * 16) as usize,
+            "samples_mb[0] drift at mbx={mbx} mby={mby}"
+        );
+        assert_eq!(
+            ctx.samples_mb[1] as usize - base,
+            ((mbx + mby * sc) * 8 + self.plane_size_y as i64) as usize,
+            "samples_mb[1] drift at mbx={mbx} mby={mby}"
+        );
+        assert_eq!(
+            ctx.samples_mb[2] as usize - base,
+            ((mbx + mby * sc) * 8 + self.plane_size_y as i64) as usize
+                + (self.stride_c / 2) as usize,
+            "samples_mb[2] drift at mbx={mbx} mby={mby}"
+        );
+
+        // Update the shared deblock progress (C vacc_sw264.c L1230).
+        let mut dec_next_out = if dec_next >= h.first_mb_in_slice as i32
+            && !(h.disable_deblocking_filter_idc == 0 && ctx.next_deblock_addr < 0)
+        {
+            ctx.curr_mb_addr
+        } else {
+            dec_next
+        };
+
+        // C vacc_sw264.c L1235-1265: deblock the rest of the frame if all MBs
+        // have been decoded (remaining_mbs = W*H, never decremented upstream),
+        // then signal completion.
+        let remaining_mbs = self.remaining_mbs - (ctx.curr_mb_addr - ctx.first_mb_in_slice as i32);
+        if remaining_mbs == 0 {
+            ctx.next_deblock_addr = dec_next_out;
+            let total = (ctx.pic_width_in_mbs as i32) * (ctx.pic_height_in_mbs as i32);
+            if ctx.next_deblock_addr < total {
+                ctx.deblock_range(total);
+            }
+            dec_next_out = i32::MAX;
+        }
+        if let Some(mut buf) = rec_buf {
+            buf.truncate(ctx.mb_dump_off);
+            self.mb_dump.borrow_mut().records.push(buf);
+        }
+        Ok(dec_next_out)
     }
 
     /// Copy the cropped display area out of a DPB slot plane into I420.
     fn extract_frame(&self, slot: usize) -> PixelData {
         let plane = self.slot_planes[slot].as_ref().expect("slot plane");
-        let base = plane.as_ptr();
+        // Slot planes carry a leading zero margin before the Y plane.
+        let base = unsafe { plane.as_ptr().add(PIXEL_MARGIN) };
         let sps = self.sps.as_ref().unwrap();
         let idc = sps.chroma_format_idc;
         // Luma crop start = SubWidthC/SubHeightC * raw offset (spec 8.3.1);
@@ -953,6 +1165,10 @@ impl Decoder for SwH264Decoder {
         self.poc_calc.reset();
         self.parser.reset();
         self.slot_planes = (0..self.n_slots).map(|_| None).collect();
+        self.slot_mbs = vec![None; self.n_slots];
+        self.flip_bits = 0;
+        self.dec_next = 0;
+        self.remaining_mbs = 0;
         self.pending_data.clear();
         self.parse_offset = 0;
         self.frame_count = 0;
@@ -963,10 +1179,177 @@ impl Decoder for SwH264Decoder {
     }
 }
 
-impl Drop for SwH264Decoder {
-    fn drop(&mut self) {
-        if let Some(c) = self.cdec {
-            unsafe { ffi::sw264_free(&mut c.as_ptr()) };
+#[cfg(test)]
+pub(crate) use self::tests::golden_entries;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/samples/");
+        std::fs::read(format!("{path}{name}")).unwrap()
+    }
+
+    fn dump_smoke(name: &str) {
+        let data = sample(name);
+        let mut dec = SwH264Decoder::new(data).unwrap();
+        // Coded macroblocks per frame (the `mbs_per_frame` field is the
+        // padded buffer capacity, not the raster MB count).
+        let coded = dec.info().coded_size;
+        let mbs = (coded.width as usize / 16) * (coded.height as usize / 16);
+        dec.arm_mb_dump();
+
+        let mut frames = 0usize;
+        while let Some(_frame) = dec.decode().unwrap() {
+            frames += 1;
         }
+        frames += dec.flush().unwrap().len();
+        assert!(frames > 0, "{name}: no frames decoded");
+
+        let records = dec.take_rust_records();
+        assert!(!records.is_empty(), "{name}: no slices recorded");
+        let mut total_mbs = 0usize;
+        for rec in &records {
+            assert_eq!(rec.len() % SLICEDATA_RECORD_LEN, 0);
+            let n = rec.len() / SLICEDATA_RECORD_LEN;
+            total_mbs += n;
+            for i in 0..n {
+                let addr = u32::from_le_bytes(rec[i * 308..i * 308 + 4].try_into().unwrap());
+                if i > 0 {
+                    let prev = u32::from_le_bytes(
+                        rec[(i - 1) * 308..(i - 1) * 308 + 4].try_into().unwrap(),
+                    );
+                    assert_eq!(addr, prev + 1, "{name}: non-contiguous mb addr in slice");
+                }
+            }
+        }
+        assert_eq!(total_mbs, frames * mbs, "{name}: MB total mismatch");
+    }
+
+    /// Scope invariant for the Tier E pixel oracle: every bundled stream the
+    /// 8-bit 4:2:0/mono C core accepts uses default (all-16) dequant scaling
+    /// lists. Streams with `seq_scaling_matrix_present_flag == 1` are out of
+    /// scope — the C core's 384-byte memcpy of a 128-byte SPS field would be
+    /// an OOB read there, so matching it is neither possible nor desired.
+    #[test]
+    fn stream_scope_8bit_no_scaling_lists() {
+        let names = [
+            "h264_baseline.h264",
+            "h264_constrained_baseline.h264",
+            "h264_main.h264",
+            "h264_high.h264",
+            "h264_tC.h264",
+            "h264_tD.h264",
+            "h264_tN.h264",
+            "h264_tW.h264",
+            "h264_xallI.h264",
+            "h264_xfd.h264",
+        ];
+        for name in names {
+            let dec = SwH264Decoder::new(sample(name)).unwrap();
+            let sps = dec.sps.clone().unwrap();
+            assert_eq!(
+                8 + sps.bit_depth_luma_minus8 as u32,
+                8,
+                "{name}: expected 8-bit luma"
+            );
+            assert!(
+                (0..=1).contains(&sps.chroma_format_idc),
+                "{name}: expected mono/4:2:0"
+            );
+            assert!(
+                !sps.seq_scaling_matrix_present_flag,
+                "{name}: scaling lists out of Tier E scope"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_smoke_baseline() {
+        dump_smoke("h264_baseline.h264");
+    }
+
+    #[test]
+    fn dump_smoke_high() {
+        dump_smoke("h264_high.h264");
+    }
+
+    /// Decode a stream with the Rust path armed (the per-frame pixel oracle in
+    /// `decode_h264_frame` byte-compares every frame against the C core), pin
+    /// every output to its golden, and return the entries: one per frame
+    /// (cropped I420 pixels) and one per slice (the Rust per-MB record stream).
+    fn stream_golden(name: &str) -> Vec<(String, Vec<u8>)> {
+        let data = sample(name);
+        let mut dec = SwH264Decoder::new(data).unwrap();
+        dec.arm_mb_dump();
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut frames = 0usize;
+        while let Some(frame) = dec.decode().unwrap() {
+            if let Some(pd) = &frame.pixel_data {
+                let key = format!("stream::{name}::f{frames}");
+                crate::rust::goldens::assert_golden(&key, &pd.buffer);
+                crate::rust::goldens::record(&key, &pd.buffer);
+                out.push((key, pd.buffer.clone()));
+            }
+            frames += 1;
+        }
+        frames += dec.flush().unwrap().len();
+        assert!(frames > 0, "{name}: no frames decoded");
+        for (si, rec) in dec.take_rust_records().iter().enumerate() {
+            let key = format!("stream::{name}::s{si}");
+            crate::rust::goldens::assert_golden(&key, rec);
+            crate::rust::goldens::record(&key, rec);
+            out.push((key, rec.clone()));
+        }
+        out
+    }
+
+    /// Tier E1e: full-stream pixel oracle over an all-intra stream. Every
+    /// frame here is intra-only, so the Rust path (intra pred + transform +
+    /// deblock) must match the C core byte-for-byte on every frame.
+    #[test]
+    fn pixel_oracle_xalli() {
+        stream_golden("h264_xallI.h264");
+    }
+
+    /// Tier E2: full-stream pixel oracle over a P-slice (CAVLC) stream. Every
+    /// frame is I/P, so inter MC (all P partition types) must match the C core
+    /// byte-for-byte on every frame.
+    #[test]
+    fn pixel_oracle_baseline() {
+        stream_golden("h264_baseline.h264");
+    }
+
+    /// Tier E3: full-stream pixel oracle over a mixed-GOP stream with B
+    /// frames (direct mode, bi-pred). Every frame must match the C core
+    /// byte-for-byte.
+    #[test]
+    fn pixel_oracle_main() {
+        stream_golden("h264_main.h264");
+    }
+
+    /// Tier E4: full-stream pixel oracle + golden pinning for the High profile
+    /// (8x8 transform, B frames).
+    #[test]
+    fn pixel_oracle_high() {
+        stream_golden("h264_high.h264");
+    }
+
+    /// Re-run the stream oracles and return per-frame/per-slice golden entries
+    /// (for `regenerate_goldens`).
+    pub(crate) fn golden_entries() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for name in [
+            "h264_xallI.h264",
+            "h264_baseline.h264",
+            "h264_main.h264",
+            "h264_high.h264",
+        ] {
+            for (k, b) in stream_golden(name) {
+                v.push((k, crate::rust::goldens::sha256_hex(&b)));
+            }
+        }
+        v
     }
 }

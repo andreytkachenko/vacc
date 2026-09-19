@@ -1241,7 +1241,6 @@ dependencies = [
 name = "vacc-sw-decode"
 version = "0.1.1"
 dependencies = [
- "cc",
  "log",
  "thiserror 2.0.20",
  "vacc-core",

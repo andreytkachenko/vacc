@@ -2,10 +2,10 @@
 //!
 //! Control plane uses the common Rust H.264 implementations from
 //! [`vacc_parser`] (NAL/SPS/PPS/slice parsing, DPB, POC, ref lists); the data
-//! plane is a small statically-linked subset of [edge264]'s C slice-decode
-//! routines, driven per-slice through FFI.
+//! plane is the pure-Rust slice-decode core in [`rust`], ported bit-exactly
+//! from edge264's C routines and pinned to golden hashes.
 
 pub mod decoder;
-pub mod ffi;
+pub mod rust;
 
 pub use decoder::SwH264Decoder;
