@@ -479,9 +479,35 @@ const SHUFAB: [i8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2];
 
 /// DEBLOCK_LUMA_SOFT (edge264_deblock.c:95). bS in [0..3].
 /// Returns the updated (p1, p0, q0, q1); p2/q2 unchanged.
+/// SSE-dispatched on x86_64; [`luma_soft_scalar`] is the fallback.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn luma_soft(
+    p2: V8,
+    p1: V8,
+    p0: V8,
+    q0: V8,
+    q1: V8,
+    q2: V8,
+    ialpha: i32,
+    ibeta: i32,
+    itC0: i32,
+) -> (V8, V8, V8, V8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::luma_soft_sse(p2, p1, p0, q0, q1, q2, ialpha, ibeta, itC0);
+            }
+        }
+    }
+    luma_soft_scalar(p2, p1, p0, q0, q1, q2, ialpha, ibeta, itC0)
+}
+
+/// Scalar fallback for [`luma_soft`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn luma_soft_scalar(
     p2: V8,
     mut p1: V8,
     mut p0: V8,
@@ -529,8 +555,31 @@ fn luma_soft(
 /// DEBLOCK_CHROMA_SOFT (edge264_deblock.c:130). alpha/beta packed as
 /// int32 {left_Y,left_Cb,left_Cr,0}; shufab picks Cb (low 8) / Cr (high 8).
 /// Returns updated (p0, q0); p1/q1 unchanged.
+/// SSE-dispatched on x86_64; [`chroma_soft_scalar`] is the fallback.
 #[inline]
 fn chroma_soft(
+    p1: V8,
+    p0: V8,
+    q0: V8,
+    q1: V8,
+    ialpha: i32,
+    ibeta: i32,
+    itC0: i64,
+) -> (V8, V8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::chroma_soft_sse(p1, p0, q0, q1, ialpha, ibeta, itC0);
+            }
+        }
+    }
+    chroma_soft_scalar(p1, p0, q0, q1, ialpha, ibeta, itC0)
+}
+
+/// Scalar fallback for [`chroma_soft`].
+#[inline]
+fn chroma_soft_scalar(
     p1: V8,
     mut p0: V8,
     mut q0: V8,
@@ -563,9 +612,36 @@ fn chroma_soft(
 
 /// DEBLOCK_LUMA_HARD (edge264_deblock.c:213). bS=4. Uses beta-1 (not for beta=0).
 /// Returns updated (p0, p1, p2, q0, q1, q2); p3/q3 unchanged.
+/// SSE-dispatched on x86_64; [`luma_hard_scalar`] is the fallback.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn luma_hard(
+    p3: V8,
+    p2: V8,
+    p1: V8,
+    p0: V8,
+    q0: V8,
+    q1: V8,
+    q2: V8,
+    q3: V8,
+    ialpha: i32,
+    ibeta: i32,
+) -> (V8, V8, V8, V8, V8, V8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::luma_hard_sse(p3, p2, p1, p0, q0, q1, q2, q3, ialpha, ibeta);
+            }
+        }
+    }
+    luma_hard_scalar(p3, p2, p1, p0, q0, q1, q2, q3, ialpha, ibeta)
+}
+
+/// Scalar fallback for [`luma_hard`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn luma_hard_scalar(
     p3: V8,
     mut p2: V8,
     mut p1: V8,
@@ -633,8 +709,30 @@ fn luma_hard(
 
 /// DEBLOCK_CHROMA_HARD (edge264_deblock.c:261). bS=4.
 /// Returns updated (p0, q0); p1/q1 unchanged.
+/// SSE-dispatched on x86_64; [`chroma_hard_scalar`] is the fallback.
 #[inline]
-fn chroma_hard(p1: V8, mut p0: V8, mut q0: V8, q1: V8, ialpha: i32, ibeta: i32) -> (V8, V8) {
+fn chroma_hard(p1: V8, p0: V8, q0: V8, q1: V8, ialpha: i32, ibeta: i32) -> (V8, V8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::chroma_hard_sse(p1, p0, q0, q1, ialpha, ibeta);
+            }
+        }
+    }
+    chroma_hard_scalar(p1, p0, q0, q1, ialpha, ibeta)
+}
+
+/// Scalar fallback for [`chroma_hard`].
+#[inline]
+fn chroma_hard_scalar(
+    p1: V8,
+    mut p0: V8,
+    mut q0: V8,
+    q1: V8,
+    ialpha: i32,
+    ibeta: i32,
+) -> (V8, V8) {
     let abs0 = bor(subsu8(p0, q0), subsu8(q0, p0));
     let abs1 = bor(subsu8(p1, p0), subsu8(p0, p1));
     let abs2 = bor(subsu8(q1, q0), subsu8(q0, q1));
@@ -648,6 +746,314 @@ fn chroma_hard(p1: V8, mut p0: V8, mut q0: V8, q1: V8, ialpha: i32, ibeta: i32) 
     p0 = ifelse_mask(ignore, p0, pp0b);
     q0 = ifelse_mask(ignore, q0, qp0b);
     (p0, q0)
+}
+
+// ============================================================================
+// SSE port of the four filter kernels above (x86_64). Dispatched from
+// luma_soft / chroma_soft / luma_hard / chroma_hard behind an sse4.1 check;
+// the scalar versions remain as fallback. Each op mirrors the scalar V8 op
+// 1:1 (original C macros: edge264_deblock.c:95-276).
+// ============================================================================
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    #[inline]
+    fn to_m(v: V8) -> __m128i {
+        unsafe { _mm_loadu_si128(v.as_ptr() as *const __m128i) }
+    }
+    #[inline]
+    fn from_m(m: __m128i) -> V8 {
+        let mut o = [0i8; 16];
+        unsafe { _mm_storeu_si128(o.as_mut_ptr() as *mut __m128i, m) };
+        o
+    }
+
+    /// ifelse_mask: per byte, mask < 0 ? t : f.
+    #[inline]
+    fn pick(mask: __m128i, t: __m128i, f: __m128i) -> __m128i {
+        unsafe { _mm_blendv_epi8(f, t, mask) }
+    }
+
+    /// expand4: C `ziplo8(ziplo8(x0,x0))` — each of the 4 bytes of `a`
+    /// repeated 4 times: [b0x4, b1x4, b2x4, b3x4].
+    #[inline]
+    fn e4(a: i32) -> __m128i {
+        unsafe {
+            let v = _mm_cvtsi32_si128(a);
+            let u = _mm_unpacklo_epi8(v, v);
+            _mm_unpacklo_epi8(u, u)
+        }
+    }
+
+    /// expand2: the 8 bytes of `a` each duplicated.
+    #[inline]
+    fn e2(a: i64) -> __m128i {
+        unsafe {
+            let v = _mm_cvtsi64_si128(a);
+            _mm_unpacklo_epi8(v, v)
+        }
+    }
+
+    /// DEBLOCK_LUMA_SOFT. See [`super::luma_soft`].
+    #[allow(clippy::too_many_arguments)] // mirrors C `DEBLOCK_LUMA_SOFT` arity
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn luma_soft_sse(
+        p2: V8,
+        p1: V8,
+        p0: V8,
+        q0: V8,
+        q1: V8,
+        q2: V8,
+        ialpha: i32,
+        ibeta: i32,
+        itC0: i32,
+    ) -> (V8, V8, V8, V8) {
+        let p2 = to_m(p2);
+        let p1 = to_m(p1);
+        let p0 = to_m(p0);
+        let q0 = to_m(q0);
+        let q1 = to_m(q1);
+        let q2 = to_m(q2);
+        let zero = _mm_setzero_si128();
+        let pq0 = _mm_subs_epu8(p0, q0);
+        let qp0 = _mm_subs_epu8(q0, p0);
+        let sub0 = _mm_subs_epu8(_mm_adds_epu8(qp0, _mm_set1_epi8(-128)), pq0);
+        let abs0 = _mm_or_si128(pq0, qp0);
+        let abs1 = _mm_or_si128(_mm_subs_epu8(p1, p0), _mm_subs_epu8(p0, p1));
+        let abs2 = _mm_or_si128(_mm_subs_epu8(q1, q0), _mm_subs_epu8(q0, q1));
+        let beta = _mm_set1_epi8(ibeta as i8);
+        let and = _mm_min_epu8(
+            _mm_subs_epu8(_mm_set1_epi8(ialpha as i8), abs0),
+            _mm_subs_epu8(beta, _mm_max_epu8(abs1, abs2)),
+        );
+        let tC0 = e4(itC0);
+        let ignore = _mm_or_si128(_mm_cmpeq_epi8(and, zero), _mm_cmpgt_epi8(zero, tC0));
+        let ftC0 = _mm_andnot_si128(ignore, tC0);
+        let c1 = _mm_set1_epi8(1);
+        let x0 = _mm_avg_epu8(p0, q0);
+        let x1 = _mm_sub_epi8(_mm_avg_epu8(p2, x0), _mm_and_si128(_mm_xor_si128(p2, x0), c1));
+        let x2 = _mm_sub_epi8(_mm_avg_epu8(q2, x0), _mm_and_si128(_mm_xor_si128(q2, x0), c1));
+        let pp1 = _mm_min_epu8(
+            _mm_max_epu8(x1, _mm_subs_epu8(p1, ftC0)),
+            _mm_adds_epu8(p1, ftC0),
+        );
+        let qp1 = _mm_min_epu8(
+            _mm_max_epu8(x2, _mm_subs_epu8(q1, ftC0)),
+            _mm_adds_epu8(q1, ftC0),
+        );
+        let cm1 = _mm_set1_epi8(-1);
+        let bm1 = _mm_add_epi8(beta, cm1);
+        let sub1 = _mm_avg_epu8(p1, _mm_xor_si128(q1, cm1));
+        let apltb = _mm_cmpeq_epi8(
+            _mm_subs_epu8(_mm_subs_epu8(p2, p0), bm1),
+            _mm_subs_epu8(_mm_subs_epu8(p0, p2), bm1),
+        );
+        let aqltb = _mm_cmpeq_epi8(
+            _mm_subs_epu8(_mm_subs_epu8(q2, q0), bm1),
+            _mm_subs_epu8(_mm_subs_epu8(q0, q2), bm1),
+        );
+        let p1o = pick(apltb, pp1, p1);
+        let q1o = pick(aqltb, qp1, q1);
+        let ftC = _mm_andnot_si128(ignore, _mm_sub_epi8(_mm_sub_epi8(ftC0, apltb), aqltb));
+        let x3 = _mm_avg_epu8(sub0, _mm_avg_epu8(sub1, _mm_set1_epi8(127)));
+        let c128 = _mm_set1_epi8(-128);
+        let delta = _mm_min_epu8(_mm_subs_epu8(x3, c128), ftC);
+        let ndelta = _mm_min_epu8(_mm_subs_epu8(c128, x3), ftC);
+        let p0o = _mm_subs_epu8(_mm_adds_epu8(p0, delta), ndelta);
+        let q0o = _mm_subs_epu8(_mm_adds_epu8(q0, ndelta), delta);
+        (from_m(p1o), from_m(p0o), from_m(q0o), from_m(q1o))
+    }
+
+    /// DEBLOCK_CHROMA_SOFT. See [`super::chroma_soft`].
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn chroma_soft_sse(
+        p1: V8,
+        p0: V8,
+        q0: V8,
+        q1: V8,
+        ialpha: i32,
+        ibeta: i32,
+        itC0: i64,
+    ) -> (V8, V8) {
+        let p1 = to_m(p1);
+        let p0 = to_m(p0);
+        let q0 = to_m(q0);
+        let q1 = to_m(q1);
+        let zero = _mm_setzero_si128();
+        let c128 = _mm_set1_epi8(-128);
+        let pq0 = _mm_subs_epu8(p0, q0);
+        let qp0 = _mm_subs_epu8(q0, p0);
+        let sub0 = _mm_subs_epu8(_mm_adds_epu8(qp0, c128), pq0);
+        let abs0 = _mm_or_si128(pq0, qp0);
+        let abs1 = _mm_or_si128(_mm_subs_epu8(p1, p0), _mm_subs_epu8(p0, p1));
+        let abs2 = _mm_or_si128(_mm_subs_epu8(q1, q0), _mm_subs_epu8(q0, q1));
+        // alpha/beta: SHUFAB over 4 copies of the packed int32 — byte 1 to
+        // the low 8 lanes (Cb), byte 2 to the high 8 lanes (Cr).
+        let shufab = unsafe { _mm_loadu_si128(SHUFAB.as_ptr() as *const __m128i) };
+        let alpha = _mm_shuffle_epi8(_mm_cvtsi32_si128(ialpha), shufab);
+        let beta = _mm_shuffle_epi8(_mm_cvtsi32_si128(ibeta), shufab);
+        let and = _mm_min_epu8(
+            _mm_subs_epu8(alpha, abs0),
+            _mm_subs_epu8(beta, _mm_max_epu8(abs1, abs2)),
+        );
+        let ignore = _mm_cmpeq_epi8(and, zero);
+        let cm1 = _mm_set1_epi8(-1);
+        let ftC = _mm_andnot_si128(ignore, _mm_sub_epi8(e2(itC0), cm1));
+        let sub1 = _mm_avg_epu8(p1, _mm_xor_si128(q1, cm1));
+        let x3 = _mm_avg_epu8(sub0, _mm_avg_epu8(sub1, _mm_set1_epi8(127)));
+        let delta = _mm_min_epu8(_mm_subs_epu8(x3, c128), ftC);
+        let ndelta = _mm_min_epu8(_mm_subs_epu8(c128, x3), ftC);
+        let p0o = _mm_subs_epu8(_mm_adds_epu8(p0, delta), ndelta);
+        let q0o = _mm_subs_epu8(_mm_adds_epu8(q0, ndelta), delta);
+        (from_m(p0o), from_m(q0o))
+    }
+
+    /// DEBLOCK_LUMA_HARD. See [`super::luma_hard`].
+    #[allow(clippy::too_many_arguments)] // mirrors C `DEBLOCK_LUMA_HARD` arity
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn luma_hard_sse(
+        p3: V8,
+        p2: V8,
+        p1: V8,
+        p0: V8,
+        q0: V8,
+        q1: V8,
+        q2: V8,
+        q3: V8,
+        ialpha: i32,
+        ibeta: i32,
+    ) -> (V8, V8, V8, V8, V8, V8) {
+        let p3 = to_m(p3);
+        let p2 = to_m(p2);
+        let p1 = to_m(p1);
+        let p0 = to_m(p0);
+        let q0 = to_m(q0);
+        let q1 = to_m(q1);
+        let q2 = to_m(q2);
+        let q3 = to_m(q3);
+        let zero = _mm_setzero_si128();
+        let alpha = _mm_set1_epi8(ialpha as i8);
+        let beta = _mm_set1_epi8(ibeta as i8);
+        let abs0 = _mm_or_si128(_mm_subs_epu8(p0, q0), _mm_subs_epu8(q0, p0));
+        let abs1 = _mm_or_si128(_mm_subs_epu8(p1, p0), _mm_subs_epu8(p0, p1));
+        let abs2 = _mm_or_si128(_mm_subs_epu8(q1, q0), _mm_subs_epu8(q0, q1));
+        let ignore = _mm_cmpeq_epi8(
+            _mm_min_epu8(
+                _mm_subs_epu8(alpha, abs0),
+                _mm_subs_epu8(beta, _mm_max_epu8(abs1, abs2)),
+            ),
+            zero,
+        );
+        let c1 = _mm_set1_epi8(1);
+        // C uses subsu8 (unsigned saturating) here: max(|diff|-(beta-1), 0) == 0
+        // is the "<= beta-1" test; a wrapping sub would go negative and fail it.
+        let condpq = _mm_subs_epu8(abs0, _mm_avg_epu8(_mm_avg_epu8(alpha, c1), zero));
+        let bm1 = _mm_sub_epi8(beta, c1);
+        let condp = _mm_cmpeq_epi8(
+            _mm_or_si128(
+                _mm_subs_epu8(_mm_or_si128(_mm_subs_epu8(p2, p0), _mm_subs_epu8(p0, p2)), bm1),
+                condpq,
+            ),
+            zero,
+        );
+        let condq = _mm_cmpeq_epi8(
+            _mm_or_si128(
+                _mm_subs_epu8(_mm_or_si128(_mm_subs_epu8(q2, q0), _mm_subs_epu8(q0, q2)), bm1),
+                condpq,
+            ),
+            zero,
+        );
+        let fix0 = _mm_and_si128(_mm_xor_si128(p0, q0), c1);
+        let pq0 = _mm_sub_epi8(_mm_avg_epu8(p0, q0), fix0);
+        let and0 = _mm_xor_si128(fix0, c1);
+        let p2q1 = _mm_sub_epi8(_mm_avg_epu8(p2, q1), _mm_and_si128(_mm_xor_si128(p2, q1), c1));
+        let q2p1 = _mm_sub_epi8(_mm_avg_epu8(q2, p1), _mm_and_si128(_mm_xor_si128(q2, p1), c1));
+        let p21q1 =
+            _mm_sub_epi8(_mm_avg_epu8(p2q1, p1), _mm_and_si128(_mm_xor_si128(p2q1, p1), and0));
+        let q21p1 =
+            _mm_sub_epi8(_mm_avg_epu8(q2p1, q1), _mm_and_si128(_mm_xor_si128(q2p1, q1), and0));
+        let pp0a = _mm_avg_epu8(p21q1, pq0);
+        let qp0a = _mm_avg_epu8(q21p1, pq0);
+        let pp0b = _mm_avg_epu8(
+            p1,
+            _mm_sub_epi8(_mm_avg_epu8(p0, q1), _mm_and_si128(_mm_xor_si128(p0, q1), c1)),
+        );
+        let qp0b = _mm_avg_epu8(
+            q1,
+            _mm_sub_epi8(_mm_avg_epu8(q0, p1), _mm_and_si128(_mm_xor_si128(q0, p1), c1)),
+        );
+        let p0o = pick(ignore, p0, pick(condp, pp0a, pp0b));
+        let q0o = pick(ignore, q0, pick(condq, qp0a, qp0b));
+        let fcondp = _mm_andnot_si128(ignore, condp);
+        let fcondq = _mm_andnot_si128(ignore, condq);
+        let p21 = _mm_sub_epi8(_mm_avg_epu8(p2, p1), _mm_and_si128(_mm_xor_si128(p2, p1), and0));
+        let q21 = _mm_sub_epi8(_mm_avg_epu8(q2, q1), _mm_and_si128(_mm_xor_si128(q2, q1), and0));
+        let pp1 = _mm_avg_epu8(p21, pq0);
+        let qp1 = _mm_avg_epu8(q21, pq0);
+        let p1o = pick(fcondp, pp1, p1);
+        let q1o = pick(fcondq, qp1, q1);
+        let fix1 = _mm_and_si128(_mm_xor_si128(p21, pq0), c1);
+        let fix2 = _mm_and_si128(_mm_xor_si128(q21, pq0), c1);
+        let p210q0 = _mm_sub_epi8(pp1, fix1);
+        let q210p0 = _mm_sub_epi8(qp1, fix2);
+        let p3p2 = _mm_sub_epi8(
+            _mm_avg_epu8(p3, p2),
+            _mm_and_si128(_mm_xor_si128(p3, p2), _mm_xor_si128(fix1, c1)),
+        );
+        let q3q2 = _mm_sub_epi8(
+            _mm_avg_epu8(q3, q2),
+            _mm_and_si128(_mm_xor_si128(q3, q2), _mm_xor_si128(fix2, c1)),
+        );
+        let pp2 = _mm_avg_epu8(p3p2, p210q0);
+        let qp2 = _mm_avg_epu8(q3q2, q210p0);
+        let p2o = pick(fcondp, pp2, p2);
+        let q2o = pick(fcondq, qp2, q2);
+        (from_m(p0o), from_m(p1o), from_m(p2o), from_m(q0o), from_m(q1o), from_m(q2o))
+    }
+
+    /// DEBLOCK_CHROMA_HARD. See [`super::chroma_hard`].
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn chroma_hard_sse(
+        p1: V8,
+        p0: V8,
+        q0: V8,
+        q1: V8,
+        ialpha: i32,
+        ibeta: i32,
+    ) -> (V8, V8) {
+        let p1 = to_m(p1);
+        let p0 = to_m(p0);
+        let q0 = to_m(q0);
+        let q1 = to_m(q1);
+        let zero = _mm_setzero_si128();
+        let abs0 = _mm_or_si128(_mm_subs_epu8(p0, q0), _mm_subs_epu8(q0, p0));
+        let abs1 = _mm_or_si128(_mm_subs_epu8(p1, p0), _mm_subs_epu8(p0, p1));
+        let abs2 = _mm_or_si128(_mm_subs_epu8(q1, q0), _mm_subs_epu8(q0, q1));
+        // alpha/beta: SHUFAB over 4 copies of the packed int32 — byte 1 to
+        // the low 8 lanes (Cb), byte 2 to the high 8 lanes (Cr).
+        let shufab = unsafe { _mm_loadu_si128(SHUFAB.as_ptr() as *const __m128i) };
+        let alpha = _mm_shuffle_epi8(_mm_cvtsi32_si128(ialpha), shufab);
+        let beta = _mm_shuffle_epi8(_mm_cvtsi32_si128(ibeta), shufab);
+        let and = _mm_min_epu8(
+            _mm_subs_epu8(alpha, abs0),
+            _mm_subs_epu8(beta, _mm_max_epu8(abs1, abs2)),
+        );
+        let ignore = _mm_cmpeq_epi8(and, zero);
+        let c1 = _mm_set1_epi8(1);
+        let pp0b = _mm_avg_epu8(
+            p1,
+            _mm_sub_epi8(_mm_avg_epu8(p0, q1), _mm_and_si128(_mm_xor_si128(p0, q1), c1)),
+        );
+        let qp0b = _mm_avg_epu8(
+            q1,
+            _mm_sub_epi8(_mm_avg_epu8(q0, p1), _mm_and_si128(_mm_xor_si128(q0, p1), c1)),
+        );
+        let p0o = pick(ignore, p0, pp0b);
+        let q0o = pick(ignore, q0, qp0b);
+        (from_m(p0o), from_m(q0o))
+    }
 }
 
 // ============================================================================
@@ -2123,4 +2529,61 @@ mod prim_tests {
         assert_eq!(y, [7u8; 64 * 48]);
         assert_eq!(c, [9u8; 32 * 48]);
     }
-}
+
+        /// SSE filter kernels must match the scalar fallback bit-for-bit on random
+        /// inputs (fast targeted check; `inter_deblock_golden` covers the same
+        /// through the full deblock path).
+        #[test]
+        fn sse_vs_scalar_filters() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !std::arch::is_x86_feature_detected!("sse4.1") {
+                    return;
+                }
+                let mut rng = Lcg(0xd3b1_0cc5_e55e);
+                fn rv8(rng: &mut Lcg) -> V8 {
+                    let mut o = [0i8; 16];
+                    for x in o.iter_mut() {
+                        *x = rng.byte() as i8;
+                    }
+                    o
+                }
+                for _ in 0..20_000 {
+                    let (p3, p2, p1, p0, q0, q1, q2, q3) = (
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                        rv8(&mut rng),
+                    );
+                    let ia = rng.next() as i32;
+                    let ib = rng.next() as i32;
+                    let itc = (rng.next() % 40) as i32 - 5;
+                    assert_eq!(
+                        luma_soft_scalar(p2, p1, p0, q0, q1, q2, ia, ib, itc),
+                        unsafe { sse::luma_soft_sse(p2, p1, p0, q0, q1, q2, ia, ib, itc) },
+                        "luma_soft"
+                    );
+                    assert_eq!(
+                        luma_hard_scalar(p3, p2, p1, p0, q0, q1, q2, q3, ia, ib),
+                        unsafe { sse::luma_hard_sse(p3, p2, p1, p0, q0, q1, q2, q3, ia, ib) },
+                        "luma_hard"
+                    );
+                    let itc64 = rng.next() as i64;
+                    assert_eq!(
+                        chroma_soft_scalar(p1, p0, q0, q1, ia, ib, itc64),
+                        unsafe { sse::chroma_soft_sse(p1, p0, q0, q1, ia, ib, itc64) },
+                        "chroma_soft"
+                    );
+                    assert_eq!(
+                        chroma_hard_scalar(p1, p0, q0, q1, ia, ib),
+                        unsafe { sse::chroma_hard_sse(p1, p0, q0, q1, ia, ib) },
+                        "chroma_hard"
+                    );
+                }
+            }
+        }
+    }
