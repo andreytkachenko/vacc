@@ -302,9 +302,11 @@ pub struct SliceContext<'a> {
     /// `PIXEL_MARGIN`) of each DPB slot, indexed by `mb->refPic`. Null for
     /// empty slots. All buffers share the same stride/plane layout.
     pub ref_plane_bases: Vec<*const u8>,
-    /// Inter MC neighborhood scratch (replaces per-block heap Vecs): max luma
-    /// neighborhood (16+5)*(16+5) = 441 bytes, max chroma 9*2*9 = 162 bytes.
-    pub mc_y: [u8; 441],
+    /// Luma MC neighborhood scratch for non-interior (edge) blocks: 21 rows x
+    /// 32 fixed stride = 672 bytes (C `edge_buf` semantics, `sstride_Y = 32`).
+    /// The SSE kernel loads up to 16 bytes per row starting at block-relative
+    /// col +16, so each of the `hu + 5` rows holds 32 fully-clamped samples.
+    pub mc_y: [u8; 672],
     pub mc_c: [u8; 162],
     /// Reusable deblock window buffers (MB origin at row 48 col 32 / chroma
     /// buffer row 48 col 8): avoids per-MB zeroing and Vec traffic. The
@@ -732,14 +734,16 @@ impl SliceContext<'_> {
                 && y_int_y >= 2
                 && y_int_y + hu as i32 + 2 < height_y;
             if !interior {
+                // C edge_buf_l fill: 32 fully-clamped samples per row (cols
+                // x-2..x+29), fixed stride 32, rows y-2..y+h+2.
                 for r in 0..hu + 5 {
                     let ry = (y_int_y - 2 + r as i32).clamp(0, height_y - 1);
                     copy_clamped_row(
-                        unsafe { std::slice::from_raw_parts_mut(src_y.add(r * (wu + 5)), wu + 5) },
+                        unsafe { std::slice::from_raw_parts_mut(src_y.add(r * 32), 32) },
                         unsafe { ref_base.add((ry * stride_y as i32) as usize) },
                         x_int_y - 2,
                         width_y,
-                        wu + 5,
+                        32,
                     );
                 }
             }
@@ -753,15 +757,17 @@ impl SliceContext<'_> {
                     )
                 }
             } else {
-                unsafe { std::slice::from_raw_parts(src_y, (hu + 5) * (wu + 5)) }
+                unsafe { std::slice::from_raw_parts(src_y, (hu + 5) * 32) }
             };
             inter::inter_luma(
                 src_luma,
                 unsafe { std::slice::from_raw_parts_mut(base.add(off_y), len_y) },
                 wu,
                 hu,
-                ((y & 3) as u32) * 4 + (x & 3) as u32,
-                if interior { stride_y } else { wu + 5 },
+                // C mode encoding: width base (w<<1 & 48) + yFrac*4 + xFrac —
+                // the SSE kernel switches on the full 0..47 mode space.
+                (((wu as u32) << 1) & 48) + ((y & 3) as u32) * 4 + (x & 3) as u32,
+                if interior { stride_y } else { 32 },
                 stride_y,
                 &wod,
             );

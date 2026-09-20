@@ -48,6 +48,38 @@ pub fn inter_luma(
     dstride: usize,
     wod: &[i16; 8],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                // `src` is the neighborhood (block top-left minus 2 rows/cols);
+                // the C kernel's `src2` is the block top-left itself.
+                return sse::inter_luma_sse(
+                    src.as_ptr().add(2 * sstride + 2),
+                    dst.as_mut_ptr(),
+                    h,
+                    mode,
+                    sstride,
+                    dstride,
+                    wod,
+                );
+            }
+        }
+    }
+    inter_luma_scalar(src, dst, w, h, mode, sstride, dstride, wod);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inter_luma_scalar(
+    src: &[u8],
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    mode: u32,
+    sstride: usize,
+    dstride: usize,
+    wod: &[i16; 8],
+) {
     let x = (mode & 3) as isize;
     let y = ((mode >> 2) & 3) as isize;
     // Block-relative sample; r in -2..h+2, c in -2..w+2.
@@ -134,6 +166,95 @@ pub(super) fn sra_machine(v: i32, k: u32) -> i32 {
     }
 }
 
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    fn pack_w(w0: i32, w1: i32) -> i16 {
+        ((w1 << 8) | (w0 & 255)) as i16
+    }
+
+    /// Bit-exact check of the luma MC against the real C `decode_inter_luma`
+    /// (edge264_inter.c) with a deterministic LCG neighborhood. The C source
+    /// was removed in the E4 cutover but lives on in git history:
+    ///   git archive 9cdae1f^ crates/vacc-sw-decode/c | tar -x -C /tmp/ziptest3
+    /// Regenerate the oracle file with:
+    ///   gcc -O2 -march=native -std=gnu11 -flax-vector-conversions \
+    ///       -I <baseline>/c/src harness.c -o harness && ./harness > oracle_luma.txt
+    #[test]
+    #[ignore = "requires /tmp/ziptest3/oracle_luma.txt (see docs; C tree in git history)"]
+    fn oracle_luma() {
+        let text = match std::fs::read_to_string("/tmp/ziptest3/oracle_luma.txt") {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "oracle_luma: skipping ({e}); restore the C tree from git \
+history (9cdae1f^) and regenerate /tmp/ziptest3/oracle_luma.txt"
+                );
+                return;
+            }
+        };
+        let mut lines = text.lines();
+        let mut rng: u32 = 0x12345678;
+        let rnd = |st: &mut u32| -> u8 {
+            *st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            (*st >> 24) as u8
+        };
+
+        let combos = [(4, 4), (4, 8), (8, 4), (8, 8), (8, 16), (16, 8), (16, 16)];
+        let wods: [[i16; 8]; 3] = [
+            [256, 0, 0, 0, 256, 256, 0, 0],
+            [257, 1, 1, 1, 257, 257, 1, 1],
+            [pack_w(64, 120), 33, 6, 6, pack_w(-30, 90), pack_w(20, -50), 45, 99],
+        ];
+
+        for (zi, wod) in wods.iter().enumerate() {
+            for &(w, h) in &combos {
+                let base = if w == 4 { 0 } else if w == 8 { 16 } else { 32 };
+                for xy in 0..16 {
+                    let mut nb = [0u8; 64 * 32];
+                    let mut dstb = [0u8; 64 * 32];
+                    for b in nb.iter_mut() {
+                        *b = rnd(&mut rng);
+                    }
+                    for b in dstb.iter_mut() {
+                        *b = rnd(&mut rng);
+                    }
+
+                    let header = lines.next().unwrap();
+                    assert_eq!(header, format!("M{} W{} H{} Z{}", base + xy, w, h, zi));
+                    let mut expected = Vec::with_capacity(w * h);
+                    for _ in 0..h {
+                        let line = lines.next().unwrap();
+                        for i in (0..line.len()).step_by(2) {
+                            expected.push(u8::from_str_radix(&line[i..i + 2], 16).unwrap());
+                        }
+                    }
+
+                    // Rust view starts at (yInt-2, xInt-2) = nb[4*32+4]; C's
+                    // src2 is the block top-left at nb[6*32+6].
+                    let sstride = 32usize;
+                    let src = &nb[4 * sstride + 4..(4 * sstride + 4) + (h + 4) * sstride + w + 5];
+                    let dst = &mut dstb[6 * sstride + 6..(6 * sstride + 6) + (h - 1) * sstride + w];
+                    inter_luma(src, dst, w, h, (base + xy) as u32, sstride, sstride, wod);
+                    for r in 0..h {
+                        assert_eq!(
+                            &dst[r * sstride..r * sstride + w],
+                            &expected[r * w..(r + 1) * w],
+                            "mismatch C mode {} w={} h={} z={} row {}",
+                            base + xy,
+                            w,
+                            h,
+                            zi,
+                            r
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Combined Cb+Cr inter chroma MC. `src` holds (h+2) reference rows x (cw+1)
 /// cols at `sstride`: row 2k = Cb ref row k, row 2k+1 = Cr ref row k (the
 /// kernel reads up to row h+1). `dst` holds the initial h rows x cw cols at
@@ -189,4 +310,1080 @@ pub fn inter_chroma(
             }
         }
     }
+}
+
+/// SSE/SSSE3/SSE4.1 port of C `decode_inter_luma` (edge264_inter.c), bit-exact.
+/// Requires SSE4.1 (implies SSE2/SSE3/SSSE3). Dispatched from [`inter_luma`]
+/// when the CPU supports it; the scalar core is the fallback.
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use core::arch::x86_64::*;
+
+    // ---- loads (all unaligned; dst reads are exactly the valid block) ----
+    #[inline(always)] fn loadu128(p: *const u8) -> __m128i {
+        unsafe { _mm_loadu_si128(p as *const _) }
+    }
+    #[inline(always)] fn loadu64(p: *const u8) -> __m128i {
+        unsafe { _mm_loadl_epi64(p as *const _) }
+    }
+    #[inline(always)] fn loadu32(p: *const u8) -> __m128i {
+        unsafe {
+            // C: (i32x4){*(int32_t *)(p)} — value in lane 0, rest zero.
+            _mm_setr_epi32((p as *const u32).read_unaligned() as i32, 0, 0, 0)
+        }
+    }
+    #[inline(always)] fn loadu32x4(
+        p0: *const u8,
+        p1: *const u8,
+        p2: *const u8,
+        p3: *const u8,
+    ) -> __m128i {
+        unsafe {
+            _mm_setr_epi32(
+                (p0 as *const u32).read_unaligned() as i32,
+                (p1 as *const u32).read_unaligned() as i32,
+                (p2 as *const u32).read_unaligned() as i32,
+                (p3 as *const u32).read_unaligned() as i32,
+            )
+        }
+    }
+    #[inline(always)] fn loadu64x2(p0: *const u8, p1: *const u8) -> __m128i {
+        unsafe {
+            _mm_set_epi64x(
+                (p1 as *const i64).read_unaligned(),
+                (p0 as *const i64).read_unaligned(),
+            )
+        }
+    }
+
+    // ---- byte moves / shuffles (semantics verified vs C on this machine) ----
+    // C shrd128(l, h, i) = _mm_alignr_epi8(h, l, i): 16 bytes from offset i of
+    // [l | h] — first arg is the LOW half. Runtime shift via pshufb (robust;
+    // matches alignr for i in 0..16).
+    #[inline(always)] fn shrd128(l: __m128i, h: __m128i, i: i32) -> __m128i {
+        unsafe {
+            let base = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            let ml = _mm_add_epi8(base, _mm_set1_epi8(i as i8)); // i + j
+            let mh = _mm_sub_epi8(ml, _mm_set1_epi8(16)); // i + j - 16
+            let sel_l = _mm_cmplt_epi8(ml, _mm_set1_epi8(16)); // 0xFF where i+j < 16
+            let from_l = _mm_shuffle_epi8(l, ml);
+            let from_h = _mm_shuffle_epi8(h, mh);
+            _mm_blendv_epi8(from_h, from_l, sel_l)
+        }
+    }
+    #[inline(always)] fn shr128<const N: i32>(a: __m128i) -> __m128i {
+        unsafe { _mm_srli_si128::<N>(a) }
+    }
+    #[inline(always)] fn ziplo8(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi8(a, b) }
+    }
+    #[inline(always)] fn ziphi8(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpackhi_epi8(a, b) }
+    }
+    #[inline(always)] fn ziplo16(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi16(a, b) }
+    }
+    #[inline(always)] fn ziphi16(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpackhi_epi16(a, b) }
+    }
+    #[inline(always)] fn ziplo32(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi32(a, b) }
+    }
+    #[inline(always)] fn ziplo64(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi64(a, b) }
+    }
+    #[inline(always)] fn ziphi64(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpackhi_epi64(a, b) }
+    }
+    // == C shufps(a,b,0x91): [a[4..8], a[8..12], b[4..8], b[8..12]] (probe-verified).
+    #[inline(always)] fn zipmd64(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            _mm_setr_epi32(
+                _mm_cvtsi128_si32(_mm_srli_si128::<4>(a)),
+                _mm_cvtsi128_si32(_mm_srli_si128::<8>(a)),
+                _mm_cvtsi128_si32(_mm_srli_si128::<4>(b)),
+                _mm_cvtsi128_si32(_mm_srli_si128::<8>(b)),
+            )
+        }
+    }
+    // == C shufps(a,b,0x88): [a[0..4], a[8..12], b[0..4], b[8..12]] (probe-verified).
+    #[inline(always)] fn unziplo32(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            _mm_setr_epi32(
+                _mm_cvtsi128_si32(a),
+                _mm_cvtsi128_si32(_mm_srli_si128::<8>(a)),
+                _mm_cvtsi128_si32(b),
+                _mm_cvtsi128_si32(_mm_srli_si128::<8>(b)),
+            )
+        }
+    }
+
+    // ---- 6-tap filter constants (i8x16) ----
+    const MUL15: __m128i = unsafe {
+        core::mem::transmute([1i8, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5])
+    };
+    const MUL20: __m128i = unsafe { core::mem::transmute([20i8; 16]) };
+    const MUL51: __m128i = unsafe {
+        core::mem::transmute([-5i8, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1, -5, 1])
+    };
+
+    #[inline(always)] fn maddubs(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_maddubs_epi16(a, b) }
+    }
+    #[inline(always)] fn add16(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_add_epi16(a, b) }
+    }
+
+    #[inline(always)] fn sixtap_vlo(
+        a: __m128i,
+        b: __m128i,
+        c: __m128i,
+        d: __m128i,
+        e: __m128i,
+        f: __m128i,
+    ) -> __m128i {
+        let r = maddubs(ziplo8(a, b), MUL15);
+        let r = add16(r, maddubs(ziplo8(c, d), MUL20));
+        add16(r, maddubs(ziplo8(e, f), MUL51))
+    }
+    #[inline(always)] fn sixtap_vhi(
+        a: __m128i,
+        b: __m128i,
+        c: __m128i,
+        d: __m128i,
+        e: __m128i,
+        f: __m128i,
+    ) -> __m128i {
+        let r = maddubs(ziphi8(a, b), MUL15);
+        let r = add16(r, maddubs(ziphi8(c, d), MUL20));
+        add16(r, maddubs(ziphi8(e, f), MUL51))
+    }
+    #[inline(always)] fn sixtap_h4(l0: __m128i, l1: __m128i) -> __m128i {
+        let a = ziplo8(l0, shr128::<1>(l0));
+        let b = ziplo8(l1, shr128::<1>(l1));
+        let r = maddubs(ziplo64(a, b), MUL15);
+        let r = add16(r, maddubs(zipmd64(a, b), MUL20));
+        add16(r, maddubs(ziphi64(a, b), MUL51))
+    }
+    #[inline(always)] fn sixtap_h8(a: __m128i) -> __m128i {
+        let a1 = shr128::<1>(a);
+        let ab = ziplo8(a, a1);
+        let ij = ziphi8(a, a1);
+        let r = maddubs(ab, MUL15);
+        let r = add16(r, maddubs(shrd128(ab, ij, 4), MUL20));
+        add16(r, maddubs(shrd128(ab, ij, 8), MUL51))
+    }
+    // C sixtapHV: ((((a+f)-(b+e))>>2 + ((c+d)-(b+e)))>>2) + (c+d), i16 wrapping.
+    #[inline(always)] fn sixtap_hv(
+        a: __m128i,
+        b: __m128i,
+        c: __m128i,
+        d: __m128i,
+        e: __m128i,
+        f: __m128i,
+    ) -> __m128i {
+        unsafe {
+            let af = _mm_add_epi16(a, f);
+            let be = _mm_add_epi16(b, e);
+            let cd = _mm_add_epi16(c, d);
+            let t1 = _mm_srai_epi16::<2>(_mm_sub_epi16(af, be));
+            let t2 = _mm_srai_epi16::<2>(_mm_add_epi16(t1, _mm_sub_epi16(cd, be)));
+            _mm_add_epi16(t2, cd)
+        }
+    }
+    // C SIXTAPH16 macro: two 16-wide horizontal taps from l0 + next-row lG.
+    #[inline(always)] fn sixtap_h16(l0: __m128i, lg: __m128i) -> (__m128i, __m128i) {
+        let r0 = maddubs(l0, MUL15);
+        let r0 = add16(r0, maddubs(shrd128(l0, lg, 2), MUL20));
+        let r0 = add16(r0, maddubs(shrd128(l0, lg, 4), MUL51));
+        let r1 = maddubs(shrd128(l0, lg, 1), MUL15);
+        let r1 = add16(r1, maddubs(shrd128(l0, lg, 3), MUL20));
+        let r1 = add16(r1, maddubs(shrd128(l0, lg, 5), MUL51));
+        (ziplo16(r0, r1), ziphi16(r0, r1))
+    }
+
+    // packus16((a+(1<<(i-1)))>>i, (b+(1<<(i-1)))>>i); i is 5 or 6.
+    // MUST use the immediate form (_mm_srai_epi16): the vector-count form
+    // (_mm_sra_epi16) is broken on this CPU (nonzero counts yield 0), and
+    // GCC lowers C's constant `>> i` to the immediate form as well.
+    #[inline(always)] fn shrrpus16(a: __m128i, b: __m128i, i: i32) -> __m128i {
+        unsafe {
+            let (sa, sb) = if i == 5 {
+                (
+                    _mm_srai_epi16::<5>(_mm_add_epi16(a, _mm_set1_epi16(16))),
+                    _mm_srai_epi16::<5>(_mm_add_epi16(b, _mm_set1_epi16(16))),
+                )
+            } else {
+                (
+                    _mm_srai_epi16::<6>(_mm_add_epi16(a, _mm_set1_epi16(32))),
+                    _mm_srai_epi16::<6>(_mm_add_epi16(b, _mm_set1_epi16(32))),
+                )
+            };
+            _mm_packus_epi16(sa, sb)
+        }
+    }
+
+    #[inline(always)] fn ifelse_mask(v: __m128i, t: __m128i, f: __m128i) -> __m128i {
+        unsafe { _mm_blendv_epi8(f, t, v) }
+    }
+    #[inline(always)] fn shuffle(a: __m128i, m: __m128i) -> __m128i {
+        unsafe { _mm_shuffle_epi8(a, m) }
+    }
+    // 32-byte gather over [a | b]: where m<16 take a[m], else b[m-16] — matches
+    // C shuffle2 = ifelse_mask(16 > m, pshufb(a,m), pshufb(b,m)) (on this machine
+    // pshufb wraps, so for m<16 pshufb(b, m-16) == b[m] and for m>=16 pshufb(a,m)
+    // == a[m-16]; the select picks the non-wrapping side).
+    #[inline(always)] fn shuffle2(a: __m128i, b: __m128i, m: __m128i) -> __m128i {
+        unsafe {
+            let sa = _mm_shuffle_epi8(a, m);
+            let sb = _mm_shuffle_epi8(b, _mm_sub_epi8(m, _mm_set1_epi8(16)));
+            _mm_blendv_epi8(sb, sa, _mm_cmplt_epi8(m, _mm_set1_epi8(16)))
+        }
+    }
+    #[inline(always)] fn avgu8(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_avg_epu8(a, b) }
+    }
+
+    // C maddshrL(q,p,w,o,wd): weighted-prediction weight/offset/shift. `wd`'s
+    // low byte (wod[2]) is the uniform shift count for every lane.
+    #[inline(always)] fn maddshr_l(
+        q: __m128i,
+        p: __m128i,
+        w: __m128i,
+        o: __m128i,
+        wd: __m128i,
+    ) -> __m128i {
+        unsafe {
+            let x0 = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziplo8(q, p), w), o), wd);
+            let x1 = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziphi8(q, p), w), o), wd);
+            _mm_packus_epi16(x0, x1)
+        }
+    }
+
+    // ---- stride helpers (n may be negative) ----
+    #[inline(always)] fn sadd(p: *const u8, n: i32, sstride: usize) -> *const u8 {
+        unsafe { p.offset((n as isize) * (sstride as isize)) }
+    }
+    #[inline(always)] fn daddr(p: *mut u8, n: i32, dstride: usize) -> *mut u8 {
+        unsafe { p.offset((n as isize) * (dstride as isize)) }
+    }
+
+    // ---- output stores ----
+    // 4 rows x 4 bytes (one __m128i of maddshr_l output).
+    #[inline(always)] fn store4(d: *mut u8, dstride: usize, r: __m128i) {
+        unsafe {
+            (d as *mut i32).write_unaligned(_mm_cvtsi128_si32(r));
+            (d.add(dstride) as *mut i32).write_unaligned(_mm_cvtsi128_si32(_mm_srli_si128::<4>(r)));
+            (d.add(dstride * 2) as *mut i32).write_unaligned(_mm_cvtsi128_si32(_mm_srli_si128::<8>(r)));
+            (d.add(dstride * 3) as *mut i32).write_unaligned(_mm_cvtsi128_si32(_mm_srli_si128::<12>(r)));
+        }
+    }
+    // 2 rows x 8 bytes.
+    #[inline(always)] fn store2x64(d: *mut u8, dstride: usize, r: __m128i) {
+        unsafe {
+            (d as *mut i64).write_unaligned(_mm_cvtsi128_si64(r));
+            (d.add(dstride) as *mut i64).write_unaligned(_mm_cvtsi128_si64(_mm_srli_si128::<8>(r)));
+        }
+    }
+    // 1 row x 16 bytes.
+    #[inline(always)] fn store16(d: *mut u8, r: __m128i) {
+        unsafe { _mm_storeu_si128(d as *mut __m128i, r); }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn inter_luma_sse(
+        src2: *const u8,
+        dst: *mut u8,
+        h: usize,
+        mode: u32,
+        sstride: usize,
+        dstride: usize,
+        wod: &[i16; 8],
+    ) {
+        let wod_v = unsafe { _mm_loadu_si128(wod.as_ptr() as *const __m128i) };
+        // broadcast16(wod,0): all i16 lanes = wod[0]; broadcast16(wod,1) = wod[1].
+        // Register-only intrinsics are safe here: this fn carries
+        // #[target_feature] and is dispatched behind an sse4.1 CPU check.
+        let w0 = _mm_shuffle_epi32::<0>(_mm_shufflelo_epi16::<0>(wod_v));
+        let wd = _mm_set_epi64x(wod[6] as i64, wod[2] as i64);
+        let o = _mm_shuffle_epi32::<0>(_mm_shufflelo_epi16::<5>(wod_v));
+        let m0 = _mm_set1_epi8((-(0xd888 >> (mode & 15) & 1)) as i8);
+        let m1 = _mm_set1_epi8((-(0xa504 >> (mode & 15) & 1)) as i8);
+        let shufx_base = _mm_setr_epi8(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
+        let shufx = _mm_sub_epi8(shufx_base, m0);
+        let src0 = src2.wrapping_sub(2);
+
+        match mode {
+            // ================= 4xH (mode 0..15) =================
+            0 => {
+                let mut s = src2;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    let p = loadu32x4(
+                        sadd(s, 0, sstride),
+                        sadd(s, 1, sstride),
+                        sadd(s, 2, sstride),
+                        sadd(s, 3, sstride),
+                    );
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(d, dstride, maddshr_l(q, p, w0, o, wd));
+                    d = daddr(d, 4, dstride);
+                    s = sadd(s, 4, sstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            1..=3 => {
+                let mut s = src0;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    let l2 = loadu128(sadd(s, 0, sstride));
+                    let l3 = loadu128(sadd(s, 1, sstride));
+                    let l4 = loadu128(sadd(s, 2, sstride));
+                    let l5 = loadu128(sadd(s, 3, sstride));
+                    let h01 = shrrpus16(sixtap_h4(l2, l3), sixtap_h4(l4, l5), 5);
+                    let s0 = shuffle(ziplo64(l2, l3), shufx);
+                    let s1 = shuffle(ziplo64(l4, l5), shufx);
+                    let sv = unziplo32(s0, s1);
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(
+                        d,
+                        dstride,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, h01, sv), h01), w0, o, wd),
+                    );
+                    d = daddr(d, 4, dstride);
+                    s = sadd(s, 4, sstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            4 | 8 | 12 => {
+                let mut s = src2;
+                let mut m02 = loadu32x4(
+                    sadd(s, -2, sstride),
+                    sadd(s, -1, sstride),
+                    sadd(s, 0, sstride),
+                    sadd(s, 1, sstride),
+                );
+                let mut m12 = shrd128(m02, loadu32(sadd(s, 2, sstride)), 4);
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 4, sstride);
+                    let m52 = loadu32x4(
+                        sadd(s, -1, sstride),
+                        sadd(s, 0, sstride),
+                        sadd(s, 1, sstride),
+                        sadd(s, 2, sstride),
+                    );
+                    let m22 = shrd128(m12, m52, 4);
+                    let m32 = shrd128(m12, m52, 8);
+                    let m42 = shrd128(m12, m52, 12);
+                    let v0 = sixtap_vlo(m02, m12, m22, m32, m42, m52);
+                    let v1 = sixtap_vhi(m02, m12, m22, m32, m42, m52);
+                    let v01 = shrrpus16(v0, v1, 5);
+                    let sv = ifelse_mask(m1, v01, ifelse_mask(m0, m32, m22));
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(d, dstride, maddshr_l(q, avgu8(sv, v01), w0, o, wd));
+                    m02 = m42;
+                    m12 = m52;
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            5 | 7 | 13 | 15 => {
+                let mut s = src0;
+                let mut l0 = loadu128(sadd(s, -2, sstride));
+                let mut l1 = loadu128(sadd(s, -1, sstride));
+                let mut l2 = loadu128(sadd(s, 0, sstride));
+                let mut l3 = loadu128(sadd(s, 1, sstride));
+                let mut l4 = loadu128(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 4, sstride);
+                    let l5 = loadu128(sadd(s, -1, sstride));
+                    let l6 = loadu128(sadd(s, 0, sstride));
+                    let l7 = loadu128(sadd(s, 1, sstride));
+                    let l8 = loadu128(sadd(s, 2, sstride));
+                    let l02 = shuffle(l0, shufx);
+                    let l12 = shuffle(l1, shufx);
+                    let l22 = shuffle(l2, shufx);
+                    let l32 = shuffle(l3, shufx);
+                    let l42 = shuffle(l4, shufx);
+                    let l52 = shuffle(l5, shufx);
+                    let l62 = shuffle(l6, shufx);
+                    let l72 = shuffle(l7, shufx);
+                    let l82 = shuffle(l8, shufx);
+                    let m02 = ziplo32(l02, l12);
+                    let m12 = ziplo32(l12, l22);
+                    let m22 = ziplo32(l22, l32);
+                    let m32 = ziplo32(l32, l42);
+                    let m42 = ziplo32(l42, l52);
+                    let m52 = ziplo32(l52, l62);
+                    let m62 = ziplo32(l62, l72);
+                    let m72 = ziplo32(l72, l82);
+                    let v0 = sixtap_vlo(m02, m12, m22, m32, m42, m52);
+                    let v1 = sixtap_vlo(m22, m32, m42, m52, m62, m72);
+                    let v01 = shrrpus16(v0, v1, 5);
+                    let h0 = sixtap_h4(ifelse_mask(m1, l3, l2), ifelse_mask(m1, l4, l3));
+                    let h1 = sixtap_h4(ifelse_mask(m1, l5, l4), ifelse_mask(m1, l6, l5));
+                    let sv = avgu8(v01, shrrpus16(h0, h1, 5));
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(d, dstride, maddshr_l(q, sv, w0, o, wd));
+                    l0 = l4;
+                    l1 = l5;
+                    l2 = l6;
+                    l3 = l7;
+                    l4 = l8;
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            9 | 11 => {
+                let mut s = src0;
+                let mut l0 = loadu128(sadd(s, -2, sstride));
+                let mut l1 = loadu128(sadd(s, -1, sstride));
+                let mut l2 = loadu128(sadd(s, 0, sstride));
+                let mut l3 = loadu128(sadd(s, 1, sstride));
+                let mut l4 = loadu128(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 4, sstride);
+                    let l5 = loadu128(sadd(s, -1, sstride));
+                    let l6 = loadu128(sadd(s, 0, sstride));
+                    let l7 = loadu128(sadd(s, 1, sstride));
+                    let l8 = loadu128(sadd(s, 2, sstride));
+                    let r0 = ziplo16(ziphi8(l0, l1), ziphi8(l2, l3));
+                    let r1 = ziplo16(ziphi8(l4, l5), ziphi8(l6, l7));
+                    let r2 = _mm_set_epi64x(
+                        _mm_cvtsi128_si64(_mm_srli_si128::<8>(l8)),
+                        _mm_cvtsi128_si64(ziplo32(r0, r1)),
+                    );
+                    let v08 = sixtap_h8(r2);
+                    let v00 = sixtap_vlo(l0, l1, l2, l3, l4, l5);
+                    let v10 = sixtap_vlo(l1, l2, l3, l4, l5, l6);
+                    let v20 = sixtap_vlo(l2, l3, l4, l5, l6, l7);
+                    let v30 = sixtap_vlo(l3, l4, l5, l6, l7, l8);
+                    let v01 = shrd128(v00, v08, 2);
+                    let v11 = shrd128(v10, shr128::<2>(v08), 2);
+                    let v21 = shrd128(v20, shr128::<4>(v08), 2);
+                    let v31 = shrd128(v30, shr128::<6>(v08), 2);
+                    let m00 = ziplo64(v00, v10);
+                    let m01 = ziplo64(v01, v11);
+                    let m02 = zipmd64(v00, v10);
+                    let m03 = zipmd64(v01, v11);
+                    let m04 = ziphi64(v00, v10);
+                    let m05 = ziphi64(v01, v11);
+                    let m20 = ziplo64(v20, v30);
+                    let m21 = ziplo64(v21, v31);
+                    let m22 = zipmd64(v20, v30);
+                    let m23 = zipmd64(v21, v31);
+                    let m24 = ziphi64(v20, v30);
+                    let m25 = ziphi64(v21, v31);
+                    let vh0 = sixtap_hv(m00, m01, m02, m03, m04, m05);
+                    let vh1 = sixtap_hv(m20, m21, m22, m23, m24, m25);
+                    let vh = shrrpus16(vh0, vh1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, m03, m02),
+                        ifelse_mask(m0, m23, m22),
+                        5,
+                    );
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(d, dstride, maddshr_l(q, avgu8(sv, vh), w0, o, wd));
+                    l0 = l4;
+                    l1 = l5;
+                    l2 = l6;
+                    l3 = l7;
+                    l4 = l8;
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            6 | 10 | 14 => {
+                let mut s = src0;
+                let l0 = loadu128(sadd(s, -2, sstride));
+                let l1 = loadu128(sadd(s, -1, sstride));
+                let l2 = loadu128(sadd(s, 0, sstride));
+                let l3 = loadu128(sadd(s, 1, sstride));
+                let l4 = loadu128(sadd(s, 2, sstride));
+                let mut h0 = sixtap_h4(l0, l1);
+                let mut h2 = sixtap_h4(l2, l3);
+                let mut h3 = sixtap_h4(l3, l4);
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 4, sstride);
+                    let l5 = loadu128(sadd(s, -1, sstride));
+                    let l6 = loadu128(sadd(s, 0, sstride));
+                    let l7 = loadu128(sadd(s, 1, sstride));
+                    let l8 = loadu128(sadd(s, 2, sstride));
+                    let h5 = sixtap_h4(l5, l6);
+                    let h7 = sixtap_h4(l7, l8);
+                    let h1 = shrd128(h0, h2, 8);
+                    let h4 = shrd128(h3, h5, 8);
+                    let h6 = shrd128(h5, h7, 8);
+                    let hv0 = sixtap_hv(h0, h1, h2, h3, h4, h5);
+                    let hv1 = sixtap_hv(h2, h3, h4, h5, h6, h7);
+                    let hv = shrrpus16(hv0, hv1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, h3, h2),
+                        ifelse_mask(m0, h5, h4),
+                        5,
+                    );
+                    let q = loadu32x4(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    store4(
+                        d,
+                        dstride,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, hv, sv), hv), w0, o, wd),
+                    );
+                    h0 = h4;
+                    h2 = h6;
+                    h3 = h7;
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // ================= 8xH (mode 16..31) =================
+            16 => {
+                let mut s = src2;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    let p0 = loadu64x2(sadd(s, 0, sstride), sadd(s, 1, sstride));
+                    let p1 = loadu64x2(sadd(s, 2, sstride), sadd(s, 3, sstride));
+                    let q0 = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    let q1 = loadu64x2(
+                        daddr(d, 2, dstride) as *const u8,
+                        daddr(d, 3, dstride) as *const u8,
+                    );
+                    let r0 = maddshr_l(q0, p0, w0, o, wd);
+                    let r1 = maddshr_l(q1, p1, w0, o, wd);
+                    store2x64(d, dstride, r0);
+                    store2x64(daddr(d, 2, dstride), dstride, r1);
+                    s = sadd(s, 4, sstride);
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            17..=19 => {
+                let mut s = src0;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    let l0 = loadu128(sadd(s, 0, sstride));
+                    let l1 = loadu128(sadd(s, 1, sstride));
+                    let h01 = shrrpus16(sixtap_h8(l0), sixtap_h8(l1), 5);
+                    let sv = ziplo64(shuffle(l0, shufx), shuffle(l1, shufx));
+                    let q = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    store2x64(
+                        d,
+                        dstride,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, h01, sv), h01), w0, o, wd),
+                    );
+                    s = sadd(s, 2, sstride);
+                    d = daddr(d, 2, dstride);
+                    rem -= 2;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            20 | 24 | 28 => {
+                let mut s = src2;
+                let mut l0 = loadu64(sadd(s, -2, sstride));
+                let mut l1 = loadu64(sadd(s, -1, sstride));
+                let mut l2 = loadu64(sadd(s, 0, sstride));
+                let mut l3 = loadu64(sadd(s, 1, sstride));
+                let mut l4 = loadu64(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 2, sstride);
+                    let l5 = loadu64(sadd(s, 1, sstride));
+                    let l6 = loadu64(sadd(s, 2, sstride));
+                    let v0 = sixtap_vlo(l0, l1, l2, l3, l4, l5);
+                    let v1 = sixtap_vlo(l1, l2, l3, l4, l5, l6);
+                    let v01 = shrrpus16(v0, v1, 5);
+                    let sv = ifelse_mask(m0, ziplo64(l3, l4), ziplo64(l2, l3));
+                    let q = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    store2x64(
+                        d,
+                        dstride,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, v01, sv), v01), w0, o, wd),
+                    );
+                    l0 = l2;
+                    l1 = l3;
+                    l2 = l4;
+                    l3 = l5;
+                    l4 = l6;
+                    d = daddr(d, 2, dstride);
+                    rem -= 2;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            21 | 23 | 29 | 31 => {
+                let mut s = src0;
+                let mut l02 = shuffle(loadu128(sadd(s, -2, sstride)), shufx);
+                let mut l12 = shuffle(loadu128(sadd(s, -1, sstride)), shufx);
+                let mut l2 = loadu128(sadd(s, 0, sstride));
+                let mut l3 = loadu128(sadd(s, 1, sstride));
+                let mut l4 = loadu128(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 2, sstride);
+                    let l5 = loadu128(sadd(s, 1, sstride));
+                    let l6 = loadu128(sadd(s, 2, sstride));
+                    let l22 = shuffle(l2, shufx);
+                    let l32 = shuffle(l3, shufx);
+                    let l42 = shuffle(l4, shufx);
+                    let l52 = shuffle(l5, shufx);
+                    let l62 = shuffle(l6, shufx);
+                    let v0 = sixtap_vlo(l02, l12, l22, l32, l42, l52);
+                    let v1 = sixtap_vlo(l12, l22, l32, l42, l52, l62);
+                    let v01 = shrrpus16(v0, v1, 5);
+                    let h0 = sixtap_h8(ifelse_mask(m1, l3, l2));
+                    let h1 = sixtap_h8(ifelse_mask(m1, l4, l3));
+                    let sv = avgu8(v01, shrrpus16(h0, h1, 5));
+                    let q = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    store2x64(d, dstride, maddshr_l(q, sv, w0, o, wd));
+                    l02 = l22;
+                    l12 = l32;
+                    l2 = l4;
+                    l3 = l5;
+                    l4 = l6;
+                    d = daddr(d, 2, dstride);
+                    rem -= 2;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            25 | 27 => {
+                let mut s = src0;
+                let mut l0 = loadu128(sadd(s, -2, sstride));
+                let mut l1 = loadu128(sadd(s, -1, sstride));
+                let mut l2 = loadu128(sadd(s, 0, sstride));
+                let mut l3 = loadu128(sadd(s, 1, sstride));
+                let mut l4 = loadu128(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 2, sstride);
+                    let l5 = loadu128(sadd(s, 1, sstride));
+                    let l6 = loadu128(sadd(s, 2, sstride));
+                    let x00 = sixtap_vlo(l0, l1, l2, l3, l4, l5);
+                    let x10 = sixtap_vlo(l1, l2, l3, l4, l5, l6);
+                    let x08 = sixtap_vhi(l0, l1, l2, l3, l4, l5);
+                    let x18 = sixtap_vhi(l1, l2, l3, l4, l5, l6);
+                    let x01 = shrd128(x00, x08, 2);
+                    let x11 = shrd128(x10, x18, 2);
+                    let x02 = shrd128(x00, x08, 4);
+                    let x12 = shrd128(x10, x18, 4);
+                    let x03 = shrd128(x00, x08, 6);
+                    let x13 = shrd128(x10, x18, 6);
+                    let x04 = shrd128(x00, x08, 8);
+                    let x14 = shrd128(x10, x18, 8);
+                    let x05 = shrd128(x00, x08, 10);
+                    let x15 = shrd128(x10, x18, 10);
+                    let vh0 = sixtap_hv(x00, x01, x02, x03, x04, x05);
+                    let vh1 = sixtap_hv(x10, x11, x12, x13, x14, x15);
+                    let vh = shrrpus16(vh0, vh1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, x03, x02),
+                        ifelse_mask(m0, x13, x12),
+                        5,
+                    );
+                    let q = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    store2x64(d, dstride, maddshr_l(q, avgu8(vh, sv), w0, o, wd));
+                    l0 = l2;
+                    l1 = l3;
+                    l2 = l4;
+                    l3 = l5;
+                    l4 = l6;
+                    d = daddr(d, 2, dstride);
+                    rem -= 2;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            22 | 26 | 30 => {
+                let mut s = src0;
+                let mut v0 = sixtap_h8(loadu128(sadd(s, -2, sstride)));
+                let mut v1 = sixtap_h8(loadu128(sadd(s, -1, sstride)));
+                let mut v2 = sixtap_h8(loadu128(sadd(s, 0, sstride)));
+                let mut v3 = sixtap_h8(loadu128(sadd(s, 1, sstride)));
+                let mut v4 = sixtap_h8(loadu128(sadd(s, 2, sstride)));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 2, sstride);
+                    let v5 = sixtap_h8(loadu128(sadd(s, 1, sstride)));
+                    let v6 = sixtap_h8(loadu128(sadd(s, 2, sstride)));
+                    let hv0 = sixtap_hv(v0, v1, v2, v3, v4, v5);
+                    let hv1 = sixtap_hv(v1, v2, v3, v4, v5, v6);
+                    let hv = shrrpus16(hv0, hv1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, v3, v2),
+                        ifelse_mask(m0, v4, v3),
+                        5,
+                    );
+                    let q = loadu64x2(
+                        daddr(d, 0, dstride) as *const u8,
+                        daddr(d, 1, dstride) as *const u8,
+                    );
+                    store2x64(
+                        d,
+                        dstride,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, hv, sv), hv), w0, o, wd),
+                    );
+                    v0 = v2;
+                    v1 = v3;
+                    v2 = v4;
+                    v3 = v5;
+                    v4 = v6;
+                    d = daddr(d, 2, dstride);
+                    rem -= 2;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // ================= 16xH (mode 32..47) =================
+            32 => {
+                let mut s = src2;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    for k in 0..4 {
+                        let q = loadu128(daddr(d, k, dstride));
+                        let p = loadu128(sadd(s, k, sstride));
+                        store16(daddr(d, k, dstride), maddshr_l(q, p, w0, o, wd));
+                    }
+                    s = sadd(s, 4, sstride);
+                    d = daddr(d, 4, dstride);
+                    rem -= 4;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            33..=35 => {
+                let mut s = src0;
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    let l0 = loadu128(s);
+                    let lg = loadu64(unsafe { s.add(16) });
+                    let (h0, h8) = sixtap_h16(l0, lg);
+                    let h01 = shrrpus16(h0, h8, 5);
+                    let sv = ifelse_mask(m1, h01, shuffle2(l0, lg, shufx));
+                    let q = loadu128(d);
+                    store16(d, maddshr_l(q, avgu8(sv, h01), w0, o, wd));
+                    s = sadd(s, 1, sstride);
+                    d = daddr(d, 1, dstride);
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            36 | 40 | 44 => {
+                let mut s = src2;
+                let mut l0 = loadu128(sadd(s, -2, sstride));
+                let mut l1 = loadu128(sadd(s, -1, sstride));
+                let mut l2 = loadu128(sadd(s, 0, sstride));
+                let mut l3 = loadu128(sadd(s, 1, sstride));
+                let mut l4 = loadu128(sadd(s, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 1, sstride);
+                    let l5 = loadu128(sadd(s, 2, sstride));
+                    let v0 = sixtap_vlo(l0, l1, l2, l3, l4, l5);
+                    let v8 = sixtap_vhi(l0, l1, l2, l3, l4, l5);
+                    let v01 = shrrpus16(v0, v8, 5);
+                    let sv = ifelse_mask(m1, v01, ifelse_mask(m0, l3, l2));
+                    let q = loadu128(d);
+                    store16(d, maddshr_l(q, avgu8(sv, v01), w0, o, wd));
+                    l0 = l1;
+                    l1 = l2;
+                    l2 = l3;
+                    l3 = l4;
+                    l4 = l5;
+                    d = daddr(d, 1, dstride);
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            37 | 39 | 45 | 47 => {
+                let mut s = src0;
+                let mut sg = unsafe { src0.add(16) };
+                let mut l02 = shuffle2(
+                    loadu128(sadd(s, -2, sstride)),
+                    loadu64(sadd(sg, -2, sstride)),
+                    shufx,
+                );
+                let mut l12 = shuffle2(
+                    loadu128(sadd(s, -1, sstride)),
+                    loadu64(sadd(sg, -1, sstride)),
+                    shufx,
+                );
+                let mut l20 = loadu128(sadd(s, 0, sstride));
+                let mut l2g = loadu64(sadd(sg, 0, sstride));
+                let mut l30 = loadu128(sadd(s, 1, sstride));
+                let mut l3g = loadu64(sadd(sg, 1, sstride));
+                let mut l40 = loadu128(sadd(s, 2, sstride));
+                let mut l4g = loadu64(sadd(sg, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 1, sstride);
+                    sg = sadd(sg, 1, sstride);
+                    let l50 = loadu128(sadd(s, 2, sstride));
+                    let l5g = loadu64(sadd(sg, 2, sstride));
+                    let l22 = shuffle2(l20, l2g, shufx);
+                    let l32 = shuffle2(l30, l3g, shufx);
+                    let l42 = shuffle2(l40, l4g, shufx);
+                    let l52 = shuffle2(l50, l5g, shufx);
+                    let v0 = sixtap_vlo(l02, l12, l22, l32, l42, l52);
+                    let v1 = sixtap_vhi(l02, l12, l22, l32, l42, l52);
+                    let v01 = shrrpus16(v0, v1, 5);
+                    let s0 = ifelse_mask(m1, l30, l20);
+                    let s1 = ifelse_mask(m1, l3g, l2g);
+                    let (h0, h1) = sixtap_h16(s0, s1);
+                    let h01 = shrrpus16(h0, h1, 5);
+                    let q = loadu128(d);
+                    store16(d, maddshr_l(q, avgu8(v01, h01), w0, o, wd));
+                    l02 = l12;
+                    l12 = l22;
+                    let n_l20 = l30;
+                    let n_l2g = l3g;
+                    let n_l30 = l40;
+                    let n_l3g = l4g;
+                    let n_l40 = l50;
+                    let n_l4g = l5g;
+                    l20 = n_l20;
+                    l2g = n_l2g;
+                    l30 = n_l30;
+                    l3g = n_l3g;
+                    l40 = n_l40;
+                    l4g = n_l4g;
+                    d = daddr(d, 1, dstride);
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            41 | 43 => {
+                let mut s = src0;
+                let mut sg = unsafe { src0.add(16) };
+                let mut l00 = loadu128(sadd(s, -2, sstride));
+                let mut l0g = loadu64(sadd(sg, -2, sstride));
+                let mut l10 = loadu128(sadd(s, -1, sstride));
+                let mut l1g = loadu64(sadd(sg, -1, sstride));
+                let mut l20 = loadu128(sadd(s, 0, sstride));
+                let mut l2g = loadu64(sadd(sg, 0, sstride));
+                let mut l30 = loadu128(sadd(s, 1, sstride));
+                let mut l3g = loadu64(sadd(sg, 1, sstride));
+                let mut l40 = loadu128(sadd(s, 2, sstride));
+                let mut l4g = loadu64(sadd(sg, 2, sstride));
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 1, sstride);
+                    sg = sadd(sg, 1, sstride);
+                    let l50 = loadu128(sadd(s, 2, sstride));
+                    let l5g = loadu64(sadd(sg, 2, sstride));
+                    let v0 = sixtap_vlo(l00, l10, l20, l30, l40, l50);
+                    let v8 = sixtap_vhi(l00, l10, l20, l30, l40, l50);
+                    let vg = sixtap_vlo(l0g, l1g, l2g, l3g, l4g, l5g);
+                    let v1 = shrd128(v0, v8, 2);
+                    let v2 = shrd128(v0, v8, 4);
+                    let v3 = shrd128(v0, v8, 6);
+                    let v4 = shrd128(v0, v8, 8);
+                    let v5 = shrd128(v0, v8, 10);
+                    let vh0 = sixtap_hv(v0, v1, v2, v3, v4, v5);
+                    let v9 = shrd128(v8, vg, 2);
+                    let va = shrd128(v8, vg, 4);
+                    let vb = shrd128(v8, vg, 6);
+                    let vc = shrd128(v8, vg, 8);
+                    let vd = shrd128(v8, vg, 10);
+                    let vh1 = sixtap_hv(v8, v9, va, vb, vc, vd);
+                    let vh = shrrpus16(vh0, vh1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, v3, v2),
+                        ifelse_mask(m0, vb, va),
+                        5,
+                    );
+                    let q = loadu128(d);
+                    store16(d, maddshr_l(q, avgu8(sv, vh), w0, o, wd));
+                    l00 = l10;
+                    l10 = l20;
+                    l20 = l30;
+                    l30 = l40;
+                    l40 = l50;
+                    let n_l0g = l1g;
+                    let n_l1g = l2g;
+                    let n_l2g = l3g;
+                    let n_l3g = l4g;
+                    let n_l4g = l5g;
+                    l0g = n_l0g;
+                    l1g = n_l1g;
+                    l2g = n_l2g;
+                    l3g = n_l3g;
+                    l4g = n_l4g;
+                    d = daddr(d, 1, dstride);
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            38 | 42 | 46 => {
+                let mut s = src0;
+                let mut sg = unsafe { src0.add(16) };
+                let l00 = loadu128(sadd(s, -2, sstride));
+                let l0g = loadu64(sadd(sg, -2, sstride));
+                let (mut h00, mut h01) = sixtap_h16(l00, l0g);
+                let l10 = loadu128(sadd(s, -1, sstride));
+                let l1g = loadu64(sadd(sg, -1, sstride));
+                let (mut h10, mut h11) = sixtap_h16(l10, l1g);
+                let l20 = loadu128(sadd(s, 0, sstride));
+                let l2g = loadu64(sadd(sg, 0, sstride));
+                let (mut h20, mut h21) = sixtap_h16(l20, l2g);
+                let l30 = loadu128(sadd(s, 1, sstride));
+                let l3g = loadu64(sadd(sg, 1, sstride));
+                let (mut h30, mut h31) = sixtap_h16(l30, l3g);
+                let l40 = loadu128(sadd(s, 2, sstride));
+                let l4g = loadu64(sadd(sg, 2, sstride));
+                let (mut h40, mut h41) = sixtap_h16(l40, l4g);
+                let mut d = dst;
+                let mut rem = h;
+                loop {
+                    s = sadd(s, 1, sstride);
+                    sg = sadd(sg, 1, sstride);
+                    let l50 = loadu128(sadd(s, 2, sstride));
+                    let l5g = loadu64(sadd(sg, 2, sstride));
+                    let (h50, h51) = sixtap_h16(l50, l5g);
+                    let hv0 = sixtap_hv(h00, h10, h20, h30, h40, h50);
+                    let hv1 = sixtap_hv(h01, h11, h21, h31, h41, h51);
+                    let hv = shrrpus16(hv0, hv1, 6);
+                    let sv = shrrpus16(
+                        ifelse_mask(m0, h30, h20),
+                        ifelse_mask(m0, h31, h21),
+                        5,
+                    );
+                    let q = loadu128(d);
+                    store16(
+                        d,
+                        maddshr_l(q, avgu8(ifelse_mask(m1, hv, sv), hv), w0, o, wd),
+                    );
+                    let n_h00 = h10;
+                    let n_h01 = h11;
+                    let n_h10 = h20;
+                    let n_h11 = h21;
+                    let n_h20 = h30;
+                    let n_h21 = h31;
+                    let n_h30 = h40;
+                    let n_h31 = h41;
+                    let n_h40 = h50;
+                    let n_h41 = h51;
+                    h00 = n_h00;
+                    h01 = n_h01;
+                    h10 = n_h10;
+                    h11 = n_h11;
+                    h20 = n_h20;
+                    h21 = n_h21;
+                    h30 = n_h30;
+                    h31 = n_h31;
+                    h40 = n_h40;
+                    h41 = n_h41;
+                    d = daddr(d, 1, dstride);
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+            }
+            _ => unreachable!("bad inter mode {mode}"),
+        }
+    }
+
 }

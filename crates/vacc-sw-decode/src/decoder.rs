@@ -855,7 +855,7 @@ impl SwH264Decoder {
             coded_h: self.coded_h,
             samples_mb: [std::ptr::null_mut(); 3],
             ref_plane_bases,
-            mc_y: [0u8; 441],
+            mc_y: [0u8; 672],
             mc_c: [0u8; 162],
             dblk_y: [0u8; crate::rust::deblock::DEBLOCK_LY_SIZE],
             dblk_c: [0u8; crate::rust::deblock::DEBLOCK_LC_SIZE],
