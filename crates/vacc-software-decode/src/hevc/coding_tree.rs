@@ -10,6 +10,7 @@ use std::sync::{Condvar, Mutex};
 use crate::hevc::cabac::{CabacContext, CabacEngine};
 use crate::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
 use crate::hevc::bitreader::{BitstreamReader, coded_to_rbsp_offset};
+use crate::hevc::interpolation::FIR_SCRATCH_MAX;
 use crate::hevc::inter_prediction::{
     decode_prediction_unit_inter, get_pu_motion, perform_inter_prediction, DpbView,
 };
@@ -1565,13 +1566,10 @@ fn write_mc_block(pic: &mut Picture, c: usize, x0: i32, y0: i32, w: i32, h: i32,
     }
 }
 
-/// Max 2D FIR intermediate: luma 64 wide x (64+7) rows.
-const FIR_TMP_MAX: usize = 64 * 71;
-
 fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, n_pb_h: i32, mi: &PuMotionInfo) {
     let sps = ctx.sps;
-    if ctx.fir_tmp.len() < FIR_TMP_MAX {
-        ctx.fir_tmp.resize(FIR_TMP_MAX, 0);
+    if ctx.fir_tmp.len() < FIR_SCRATCH_MAX {
+        ctx.fir_tmp.resize(FIR_SCRATCH_MAX, 0);
     }
     // Luma
     {
@@ -1588,7 +1586,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         let l0 = &mut ctx.mc_l0[..n];
         let l1 = &mut ctx.mc_l1[..n];
         let out = &mut ctx.mc_out[..n];
-        let ft = &mut ctx.fir_tmp[..FIR_TMP_MAX];
+        let ft = &mut ctx.fir_tmp[..FIR_SCRATCH_MAX];
         perform_inter_prediction(
             sps,
             ctx.pps,
@@ -1628,7 +1626,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         if ctx.mc_out.len() < c_n {
             ctx.mc_out.resize(c_n, 0);
         }
-        let ft = &mut ctx.fir_tmp[..FIR_TMP_MAX];
+        let ft = &mut ctx.fir_tmp[..FIR_SCRATCH_MAX];
         for c in 1..=2 {
             let l0 = &mut ctx.mc_l0[..c_n];
             let l1 = &mut ctx.mc_l1[..c_n];

@@ -1049,7 +1049,7 @@ pub fn perform_inter_prediction(
     pred_l0: &mut [i16],
     pred_l1: &mut [i16],
     pred_samples: &mut [i16],
-    // 2D FIR intermediate (>= 64*71 samples).
+    // MC scratch (>= interpolation::FIR_SCRATCH_MAX samples).
     fir_tmp: &mut [i16],
 ) {
     let bit_depth = if c_idx == 0 { sps.bit_depth_y } else { sps.bit_depth_c };
