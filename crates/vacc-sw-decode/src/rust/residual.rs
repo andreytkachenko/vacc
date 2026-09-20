@@ -269,6 +269,29 @@ pub unsafe fn add_idct4x4(
     pix: *mut u8,
     stride: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::add_idct4x4_sse(c, qp, ws, dcidx, pix, stride);
+            }
+        }
+    }
+    unsafe {
+        add_idct4x4_scalar(c, qp, ws, dcidx, pix, stride)
+    }
+}
+
+/// Scalar fallback for [`add_idct4x4`].
+#[inline]
+pub(crate) unsafe fn add_idct4x4_scalar(
+    c: &mut [i32; 64],
+    qp: u8,
+    ws: &[i8; 16],
+    dcidx: i32,
+    pix: *mut u8,
+    stride: usize,
+) {
     let qpu = qp as u32;
     let sh = qpu / 6;
     let na = NORM_ADJUST_4X4[(qpu % 6) as usize];
@@ -306,12 +329,28 @@ pub unsafe fn add_idct4x4(
 
 /// C `add_dc4x4` (edge264_residual.c:174): broadcast the DC residual over a
 /// 4x4 block at the start of `pix` (rows at r*stride). Does NOT touch c
-/// (unlike add_idct4x4).
+/// (unlike add_idct4x4). `dcidx` must be in 0..=7 (indexes `c[16 + dcidx]`).
 ///
 /// # Safety
 /// `pix` must point at a block origin with rows 0..3 addressable, as with the
 /// C kernel's raw pointer use.
 pub unsafe fn add_dc4x4(c: &[i32; 64], dcidx: i32, pix: *mut u8, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::add_dc4x4_sse(c, dcidx, pix, stride);
+            }
+        }
+    }
+    unsafe {
+        add_dc4x4_scalar(c, dcidx, pix, stride)
+    }
+}
+
+/// Scalar fallback for [`add_dc4x4`].
+#[inline]
+pub(crate) unsafe fn add_dc4x4_scalar(c: &[i32; 64], dcidx: i32, pix: *mut u8, stride: usize) {
     // C `set16((c + 32) >> 6)`: i32 shift, then truncated (not saturated) to i16.
     let r = ((c[16 + dcidx as usize]).wrapping_add(32) >> 6) as i16;
     for i in 0..4 {
@@ -331,6 +370,28 @@ pub unsafe fn add_dc4x4(c: &[i32; 64], dcidx: i32, pix: *mut u8, stride: usize) 
 /// `pix` must point at a block origin with `8*stride` bytes addressable, as
 /// with the C kernel's raw pointer use.
 pub unsafe fn add_idct8x8(c: &mut [i32; 64], qp: u8, ws: &[i8; 64], pix: *mut u8, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::add_idct8x8_sse(c, qp, ws, pix, stride);
+            }
+        }
+    }
+    unsafe {
+        add_idct8x8_scalar(c, qp, ws, pix, stride)
+    }
+}
+
+/// Scalar fallback for [`add_idct8x8`].
+#[inline]
+pub(crate) unsafe fn add_idct8x8_scalar(
+    c: &mut [i32; 64],
+    qp: u8,
+    ws: &[i8; 64],
+    pix: *mut u8,
+    stride: usize,
+) {
     let qpu = qp as u32;
     let div = qpu / 6;
     let m = (qpu % 6) as usize;
@@ -619,6 +680,537 @@ impl Residual {
                 pix.as_mut_ptr(),
                 stride,
             )
+        }
+    }
+}
+
+// --- SSE4.1 ports (x86_64) — bit-exact with the scalar kernels above; C
+// reference edge264_residual.c. Unlike C's `scale32` madd shortcut, the
+// dequant keeps the full i32 coefficient (goldens pin wrapping_mul; fuzz
+// drives i32::MAX). ---
+
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    /// Keep i16 lanes 0..3 (bytes 0..7), zero the rest.
+    #[inline]
+    fn lo4_mask() -> __m128i {
+        unsafe { _mm_setr_epi32(-1, -1, 0, 0) }
+    }
+
+    /// Zero-extend the low 4 bytes -> i16x8 [b0,b1,b2,b3,0,0,0,0].
+    #[inline]
+    fn ext4(v: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi8(v, _mm_setzero_si128()) }
+    }
+
+    /// C `mullou8`: unsigned byte products of the low halves -> i16x8 lanes
+    /// 0..7 (high 4 lanes zero). Raw `_mm_mullo_epi16` on the byte vectors
+    /// would multiply 16-bit pairs instead — NOT equivalent.
+    #[inline]
+    fn byte_mul_lo(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            let z = _mm_setzero_si128();
+            _mm_mullo_epi16(_mm_unpacklo_epi8(a, z), _mm_unpacklo_epi8(b, z))
+        }
+    }
+
+    /// C `mulhiu8`: unsigned byte products of the high halves -> i16x8 lanes
+    /// 0..7 (high 4 lanes zero).
+    #[inline]
+    fn byte_mul_hi(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            let z = _mm_setzero_si128();
+            _mm_mullo_epi16(_mm_unpackhi_epi8(a, z), _mm_unpackhi_epi8(b, z))
+        }
+    }
+
+    /// Zero-extend the low 8 bytes -> i16x8.
+    #[inline]
+    fn ext8(v: __m128i) -> __m128i {
+        unsafe {
+            let z = _mm_setzero_si128();
+            _mm_or_si128(_mm_unpacklo_epi8(v, z), _mm_slli_si128(_mm_unpackhi_epi8(v, z), 8))
+        }
+    }
+
+    /// Exact low 32 bits of `a * b` per i32 lane (a: i32x4; b: i16x8 — lanes
+    /// 0..3 hold the four weights). Full-width multiply, exact for all a and
+    /// any i16 b: with a = u + hi*2^16 (u unsigned low 16), PMULLW/PMULHW
+    /// read u as signed (u - 65536k); the k*b lost in bits 16..31 is added
+    /// back via `kb`. The weights are spread to even i16 lanes because each
+    /// i32 lane of a contributes only its low i16 half to the products.
+    #[inline]
+    fn mul32_16(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            let zero = _mm_setzero_si128();
+            let b = _mm_unpacklo_epi16(b, zero);
+            let u = _mm_and_si128(a, _mm_set1_epi32(0x0000FFFF));
+            let hi = _mm_srai_epi32(a, 16);
+            let x0 = _mm_mullo_epi16(u, b);
+            let x1 = _mm_mulhi_epi16(u, b);
+            let y0 = _mm_mullo_epi16(hi, b);
+            let kb = _mm_mullo_epi16(_mm_cmpgt_epi16(zero, u), _mm_sub_epi16(zero, b));
+            _mm_or_si128(x0, _mm_slli_epi32(_mm_add_epi16(_mm_add_epi16(x1, y0), kb), 16))
+        }
+    }
+
+    /// Saturating i32x4 -> i16x4 in the low 4 i16 lanes (high 8 bytes zero).
+    #[inline]
+    fn narrow_sat16_lo(x: __m128i) -> __m128i {
+        unsafe {
+            let clamped = _mm_max_epi32(
+                _mm_min_epi32(x, _mm_set1_epi32(32767)),
+                _mm_set1_epi32(-32768),
+            );
+            let gather = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+            _mm_shuffle_epi8(_mm_and_si128(clamped, _mm_set1_epi32(0x0000FFFF)), gather)
+        }
+    }
+
+    /// `v << n`, n masked to i32 width (matches scalar wrapping_shl).
+    #[inline]
+    fn sll32(v: __m128i, n: u32) -> __m128i {
+        unsafe {
+            let n = n & 31;
+            let v = match n & 15 {
+                0 => v,
+                1 => _mm_slli_epi32(v, 1),
+                2 => _mm_slli_epi32(v, 2),
+                3 => _mm_slli_epi32(v, 3),
+                4 => _mm_slli_epi32(v, 4),
+                5 => _mm_slli_epi32(v, 5),
+                6 => _mm_slli_epi32(v, 6),
+                7 => _mm_slli_epi32(v, 7),
+                8 => _mm_slli_epi32(v, 8),
+                9 => _mm_slli_epi32(v, 9),
+                10 => _mm_slli_epi32(v, 10),
+                11 => _mm_slli_epi32(v, 11),
+                12 => _mm_slli_epi32(v, 12),
+                13 => _mm_slli_epi32(v, 13),
+                14 => _mm_slli_epi32(v, 14),
+                _ => _mm_slli_epi32(v, 15),
+            };
+            if n >= 16 {
+                _mm_slli_epi32(v, 16)
+            } else {
+                v
+            }
+        }
+    }
+
+    /// `v >> n` (arithmetic), n masked to i32 width.
+    #[inline]
+    fn sra32(v: __m128i, n: u32) -> __m128i {
+        unsafe {
+            let n = n & 31;
+            let v = match n & 15 {
+                0 => v,
+                1 => _mm_srai_epi32(v, 1),
+                2 => _mm_srai_epi32(v, 2),
+                3 => _mm_srai_epi32(v, 3),
+                4 => _mm_srai_epi32(v, 4),
+                5 => _mm_srai_epi32(v, 5),
+                6 => _mm_srai_epi32(v, 6),
+                7 => _mm_srai_epi32(v, 7),
+                8 => _mm_srai_epi32(v, 8),
+                9 => _mm_srai_epi32(v, 9),
+                10 => _mm_srai_epi32(v, 10),
+                11 => _mm_srai_epi32(v, 11),
+                12 => _mm_srai_epi32(v, 12),
+                13 => _mm_srai_epi32(v, 13),
+                14 => _mm_srai_epi32(v, 14),
+                _ => _mm_srai_epi32(v, 15),
+            };
+            if n >= 16 {
+                _mm_srai_epi32(v, 16)
+            } else {
+                v
+            }
+        }
+    }
+
+    /// `v << n` (i16 lanes), n masked to i16 width.
+    #[inline]
+    fn sll16(v: __m128i, n: u32) -> __m128i {
+        unsafe {
+            match n & 15 {
+                0 => v,
+                1 => _mm_slli_epi16(v, 1),
+                2 => _mm_slli_epi16(v, 2),
+                3 => _mm_slli_epi16(v, 3),
+                4 => _mm_slli_epi16(v, 4),
+                5 => _mm_slli_epi16(v, 5),
+                6 => _mm_slli_epi16(v, 6),
+                7 => _mm_slli_epi16(v, 7),
+                8 => _mm_slli_epi16(v, 8),
+                9 => _mm_slli_epi16(v, 9),
+                10 => _mm_slli_epi16(v, 10),
+                11 => _mm_slli_epi16(v, 11),
+                12 => _mm_slli_epi16(v, 12),
+                13 => _mm_slli_epi16(v, 13),
+                14 => _mm_slli_epi16(v, 14),
+                _ => _mm_slli_epi16(v, 15),
+            }
+        }
+    }
+
+    /// 4x4 IDCT pass (C e0..e3/f0..f3), wrapping i32.
+    #[inline]
+    fn pass4x(
+        d0: __m128i,
+        d1: __m128i,
+        d2: __m128i,
+        d3: __m128i,
+    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        unsafe {
+            let e0 = _mm_add_epi32(d0, d2);
+        let e1 = _mm_sub_epi32(d0, d2);
+        let e2 = _mm_sub_epi32(_mm_srai_epi32(d1, 1), d3);
+        let e3 = _mm_add_epi32(_mm_srai_epi32(d3, 1), d1);
+        (
+            _mm_add_epi32(e0, e3),
+            _mm_add_epi32(e1, e2),
+            _mm_sub_epi32(e1, e2),
+            _mm_sub_epi32(e0, e3),
+        )
+        }
+    }
+
+    /// 8x8 IDCT pass (C e0..e7/f0..f7/d0'..d7'), wrapping i16.
+    #[inline]
+    fn pass8x(d: [__m128i; 8]) -> [__m128i; 8] {
+        unsafe {
+            let (d0, d1, d2, d3, d4, d5, d6, d7) = (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+        let e0 = _mm_add_epi16(d0, d4);
+        let e1 = _mm_sub_epi16(_mm_sub_epi16(d5, d3), _mm_add_epi16(_mm_srai_epi16(d7, 1), d7));
+        let e2 = _mm_sub_epi16(d0, d4);
+        let e3 = _mm_sub_epi16(_mm_add_epi16(d1, d7), _mm_add_epi16(_mm_srai_epi16(d3, 1), d3));
+        let e4 = _mm_sub_epi16(_mm_srai_epi16(d2, 1), d6);
+        let e5 = _mm_add_epi16(_mm_sub_epi16(d7, d1), _mm_add_epi16(_mm_srai_epi16(d5, 1), d5));
+        let e6 = _mm_add_epi16(_mm_srai_epi16(d6, 1), d2);
+        let e7 = _mm_add_epi16(_mm_add_epi16(d3, d5), _mm_add_epi16(_mm_srai_epi16(d1, 1), d1));
+        let f0 = _mm_add_epi16(e0, e6);
+        let f1 = _mm_add_epi16(_mm_srai_epi16(e7, 2), e1);
+        let f2 = _mm_add_epi16(e2, e4);
+        let f3 = _mm_add_epi16(_mm_srai_epi16(e5, 2), e3);
+        let f4 = _mm_sub_epi16(e2, e4);
+        let f5 = _mm_sub_epi16(_mm_srai_epi16(e3, 2), e5);
+        let f6 = _mm_sub_epi16(e0, e6);
+        let f7 = _mm_sub_epi16(e7, _mm_srai_epi16(e1, 2));
+        [
+            _mm_add_epi16(f0, f7),
+            _mm_add_epi16(f2, f5),
+            _mm_add_epi16(f4, f3),
+            _mm_add_epi16(f6, f1),
+            _mm_sub_epi16(f6, f1),
+            _mm_sub_epi16(f4, f3),
+            _mm_sub_epi16(f2, f5),
+            _mm_sub_epi16(f0, f7),
+        ]
+        }
+    }
+
+    /// 8x8 i16 transpose: t[i] = column i of `f` (C x0..xF zip cascade).
+    #[inline]
+    fn transpose8(f: [__m128i; 8]) -> [__m128i; 8] {
+        unsafe {
+            let a0 = _mm_unpacklo_epi16(f[0], f[1]);
+        let a1 = _mm_unpackhi_epi16(f[0], f[1]);
+        let b0 = _mm_unpacklo_epi16(f[2], f[3]);
+        let b1 = _mm_unpackhi_epi16(f[2], f[3]);
+        let c0 = _mm_unpacklo_epi16(f[4], f[5]);
+        let c1 = _mm_unpackhi_epi16(f[4], f[5]);
+        let e0 = _mm_unpacklo_epi16(f[6], f[7]);
+        let e1 = _mm_unpackhi_epi16(f[6], f[7]);
+        let p0 = _mm_unpacklo_epi32(a0, b0);
+        let p1 = _mm_unpackhi_epi32(a0, b0);
+        let p2 = _mm_unpacklo_epi32(a1, b1);
+        let p3 = _mm_unpackhi_epi32(a1, b1);
+        let p4 = _mm_unpacklo_epi32(c0, e0);
+        let p5 = _mm_unpackhi_epi32(c0, e0);
+        let p6 = _mm_unpacklo_epi32(c1, e1);
+        let p7 = _mm_unpackhi_epi32(c1, e1);
+        [
+            _mm_unpacklo_epi64(p0, p4),
+            _mm_unpackhi_epi64(p0, p4),
+            _mm_unpacklo_epi64(p1, p5),
+            _mm_unpackhi_epi64(p1, p5),
+            _mm_unpacklo_epi64(p2, p6),
+            _mm_unpackhi_epi64(p2, p6),
+            _mm_unpacklo_epi64(p3, p7),
+            _mm_unpackhi_epi64(p3, p7),
+        ]
+        }
+    }
+
+    /// Dequantize one 4x4 row: ((c * ls) << sh + 8) >> 4, wrapping i32.
+    #[inline]
+    fn deq4x(c: __m128i, w: __m128i, sh: u32) -> __m128i {
+        unsafe { sra32(_mm_add_epi32(sll32(mul32_16(c, w), sh), _mm_set1_epi32(8)), 4) }
+    }
+
+    /// Add sat16(h >> 6) to four 4-byte pixel rows (C final store).
+    #[inline]
+    fn add4_pix(pix: *mut u8, stride: usize, h0: __m128i, h1: __m128i, h2: __m128i, h3: __m128i) {
+        let hs = unsafe {
+            [
+                narrow_sat16_lo(_mm_srai_epi32(h0, 6)),
+                narrow_sat16_lo(_mm_srai_epi32(h1, 6)),
+                narrow_sat16_lo(_mm_srai_epi32(h2, 6)),
+                narrow_sat16_lo(_mm_srai_epi32(h3, 6)),
+            ]
+        };
+        for (i, r) in hs.iter().enumerate() {
+            unsafe {
+                let pv = std::ptr::read_unaligned(pix.add(i * stride) as *const u32);
+                let sum = _mm_add_epi16(ext4(_mm_cvtsi32_si128(pv as i32)), *r);
+                let out = _mm_packus_epi16(sum, sum);
+                std::ptr::write_unaligned(pix.add(i * stride) as *mut u32, _mm_cvtsi128_si32(out) as u32);
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn add_idct4x4_sse(
+        c: &mut [i32; 64],
+        qp: u8,
+        ws: &[i8; 16],
+        dcidx: i32,
+        pix: *mut u8,
+        stride: usize,
+    ) {
+        let qpu = qp as u32;
+        let sh = qpu / 6;
+        let na = unsafe {
+            _mm_loadu_si128(NORM_ADJUST_4X4[(qpu % 6) as usize].as_ptr() as *const __m128i)
+        };
+        let wsv = unsafe { _mm_loadu_si128(ws.as_ptr() as *const __m128i) };
+        // LS = unsigned byte products (C mullou8/mulhiu8).
+        let ls_lo = byte_mul_lo(wsv, na);
+        let ls_hi = byte_mul_hi(wsv, na);
+        let lo4 = lo4_mask();
+        let w0 = _mm_and_si128(ls_lo, lo4);
+        let w1 = _mm_srli_si128(ls_lo, 8);
+        let w2 = _mm_and_si128(ls_hi, lo4);
+        let w3 = _mm_srli_si128(ls_hi, 8);
+        let base = c.as_ptr();
+        let mut d0 = deq4x(unsafe { _mm_loadu_si128(base as *const __m128i) }, w0, sh);
+        let d1 = deq4x(unsafe { _mm_loadu_si128(base.add(4) as *const __m128i) }, w1, sh);
+        let d2 = deq4x(unsafe { _mm_loadu_si128(base.add(8) as *const __m128i) }, w2, sh);
+        let d3 = deq4x(unsafe { _mm_loadu_si128(base.add(12) as *const __m128i) }, w3, sh);
+        if dcidx >= 0 {
+            // C: d0[0] = c[16 + DCidx] (raw coefficient, no dequant).
+            d0 = _mm_insert_epi32(d0, c[16 + dcidx as usize], 0);
+        }
+        c[..16].fill(0);
+        // pass1 -> transpose (+32 on the first row) -> pass2.
+        let (f0, f1, f2, f3) = pass4x(d0, d1, d2, d3);
+        let x0 = _mm_unpacklo_epi32(f0, f1);
+        let x1 = _mm_unpackhi_epi32(f0, f1);
+        let x2 = _mm_unpacklo_epi32(f2, f3);
+        let x3 = _mm_unpackhi_epi32(f2, f3);
+        let t0 = _mm_add_epi32(_mm_unpacklo_epi64(x0, x2), _mm_set1_epi32(32));
+        let t1 = _mm_unpackhi_epi64(x0, x2);
+        let t2 = _mm_unpacklo_epi64(x1, x3);
+        let t3 = _mm_unpackhi_epi64(x1, x3);
+        let (h0, h1, h2, h3) = pass4x(t0, t1, t2, t3);
+        add4_pix(pix, stride, h0, h1, h2, h3);
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn add_dc4x4_sse(c: &[i32; 64], dcidx: i32, pix: *mut u8, stride: usize) {
+        // C `set16((c + 32) >> 6)`: i32 shift, truncated (not saturated) to i16.
+        let r = _mm_set1_epi16(((c[16 + dcidx as usize]).wrapping_add(32) >> 6) as i16);
+        for i in 0..4 {
+            unsafe {
+                let pv = std::ptr::read_unaligned(pix.add(i * stride) as *const u32);
+                let sum = _mm_add_epi16(ext4(_mm_cvtsi32_si128(pv as i32)), r);
+                let out = _mm_packus_epi16(sum, sum);
+                std::ptr::write_unaligned(pix.add(i * stride) as *mut u32, _mm_cvtsi128_si32(out) as u32);
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn add_idct8x8_sse(
+        c: &mut [i32; 64],
+        qp: u8,
+        ws: &[i8; 64],
+        pix: *mut u8,
+        stride: usize,
+    ) {
+        let qpu = qp as u32;
+        let div = qpu / 6;
+        let m = (qpu % 6) as usize;
+        let na0 = unsafe { _mm_loadu_si128(NORM_ADJUST_8X8[m * 2].as_ptr() as *const __m128i) };
+        let na1 =
+            unsafe { _mm_loadu_si128(NORM_ADJUST_8X8[m * 2 + 1].as_ptr() as *const __m128i) };
+        let wbase = ws.as_ptr() as *const __m128i;
+        let (w0, w1, w2, w3) = (
+            unsafe { _mm_loadu_si128(wbase) },
+            unsafe { _mm_loadu_si128(wbase.add(1)) },
+            unsafe { _mm_loadu_si128(wbase.add(2)) },
+            unsafe { _mm_loadu_si128(wbase.add(3)) },
+        );
+        // LSb = unsigned byte products (C mullou8/mulhiu8), i16 lanes 0..7.
+        let ls = [
+            byte_mul_lo(w0, na0),
+            byte_mul_hi(w0, na0),
+            byte_mul_lo(w1, na1),
+            byte_mul_hi(w1, na1),
+            byte_mul_lo(w2, na0),
+            byte_mul_hi(w2, na0),
+            byte_mul_lo(w3, na1),
+            byte_mul_hi(w3, na1),
+        ];
+        let cbase = c.as_ptr();
+        let cv = |k: usize| unsafe { _mm_loadu_si128(cbase.add(4 * k) as *const __m128i) };
+        let lo4 = lo4_mask();
+        let d = if div < 6 {
+            let off = _mm_set1_epi32(1i32 << (5 - div));
+            let sh = 6 - div;
+            std::array::from_fn(|b| {
+                let wlo = _mm_and_si128(ls[b], lo4);
+                let whi = _mm_srli_si128(ls[b], 8);
+                let lo = narrow_sat16_lo(sra32(_mm_add_epi32(mul32_16(cv(2 * b), wlo), off), sh));
+                let hi = narrow_sat16_lo(sra32(
+                    _mm_add_epi32(mul32_16(cv(2 * b + 1), whi), off),
+                    sh,
+                ));
+                _mm_or_si128(lo, _mm_slli_si128(hi, 8))
+            })
+        } else {
+            let sh = div - 6;
+            std::array::from_fn(|b| {
+                let sat_lo = narrow_sat16_lo(cv(2 * b));
+                let sat_hi = narrow_sat16_lo(cv(2 * b + 1));
+                _mm_mullo_epi16(_mm_or_si128(sat_lo, _mm_slli_si128(sat_hi, 8)), sll16(ls[b], sh))
+            })
+        };
+        c.fill(0);
+        // pass1 -> transpose (+32 on the first row) -> pass2.
+        let mut t = transpose8(pass8x(d));
+        t[0] = _mm_add_epi16(t[0], _mm_set1_epi16(32));
+        let d = pass8x(t);
+        // row i += d[i] >> 6 (arithmetic), clamped.
+        for (i, row) in d.iter().enumerate() {
+            unsafe {
+                let pv = std::ptr::read_unaligned(pix.add(i * stride) as *const u64);
+                let sum = _mm_add_epi16(ext8(_mm_cvtsi64_si128(pv as i64)), _mm_srai_epi16(*row, 6));
+                let out = _mm_packus_epi16(sum, sum);
+                std::ptr::write_unaligned(pix.add(i * stride) as *mut u64, _mm_cvtsi128_si64(out) as u64);
+            }
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SplitMix64-style LCG (same family as the deblock params test).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n
+        }
+    }
+
+    /// SSE (via the dispatchers) vs scalar fallback for the three IDCT/DC
+    /// kernels: random + extreme coefficients (i32::MAX/MIN/full range), full
+    /// QP range (exercises wrapping-shift masking beyond qp 51), dcidx -1..7.
+    #[test]
+    fn sse_vs_scalar_idct() {
+        let mut rng = Lcg(0x01dc_755e);
+        for _ in 0..20_000 {
+            let mk_c = |rng: &mut Lcg| -> [i32; 64] {
+                core::array::from_fn(|_| match rng.below(16) {
+                    0 => i32::MAX,
+                    1 => i32::MIN,
+                    2 => rng.next() as i32, // full range
+                    _ => (rng.below(4096) as i32) - 2048,
+                })
+            };
+            let ws4: [i8; 16] = core::array::from_fn(|_| rng.next() as i8);
+            let ws8: [i8; 64] = core::array::from_fn(|_| rng.next() as i8);
+            // Mostly spec range (qp <= 51), occasionally beyond.
+            let qp = if rng.below(32) == 0 {
+                rng.next() as u8
+            } else {
+                rng.below(52) as u8
+            };
+            let dcidx = if rng.below(4) == 0 { -1 } else { rng.below(8) as i32 };
+
+            // add_idct4x4 (zeroes c[0..16]).
+            let stride4 = 4 + (rng.below(4) as usize) * 4;
+            let mut pix = [0u8; 4 * 20];
+            for v in pix.iter_mut() {
+                *v = rng.next() as u8;
+            }
+            let c0 = mk_c(&mut rng);
+            let (mut c_a, mut c_b) = (c0, c0);
+            let (mut pa, mut pb) = (pix, pix);
+            unsafe {
+                add_idct4x4(&mut c_a, qp, &ws4, dcidx, pa.as_mut_ptr(), stride4);
+                add_idct4x4_scalar(&mut c_b, qp, &ws4, dcidx, pb.as_mut_ptr(), stride4);
+            }
+            assert_eq!(c_a, c_b, "idct4x4: c post-state (qp={qp})");
+            for i in 0..4 {
+                assert_eq!(
+                    &pa[i * stride4..i * stride4 + 4],
+                    &pb[i * stride4..i * stride4 + 4],
+                    "idct4x4: row {i} (qp={qp}, dcidx={dcidx})"
+                );
+            }
+
+            // add_dc4x4 (read-only on c). dcidx must be in range (a DC-only
+            // 4x4 block always carries its DC coeff); -1 is invalid here.
+            let dc = rng.below(8) as i32;
+            let (mut pa, mut pb) = (pix, pix);
+            unsafe {
+                add_dc4x4(&c_a, dc, pa.as_mut_ptr(), stride4);
+                add_dc4x4_scalar(&c_a, dc, pb.as_mut_ptr(), stride4);
+            }
+            for i in 0..4 {
+                assert_eq!(
+                    &pa[i * stride4..i * stride4 + 4],
+                    &pb[i * stride4..i * stride4 + 4],
+                    "dc4x4: row {i} (qp={qp}, dcidx={dc})"
+                );
+            }
+
+            // add_idct8x8 (zeroes all of c).
+            let stride8 = 8 + (rng.below(4) as usize) * 8;
+            let mut pix8 = [0u8; 8 * 40];
+            for v in pix8.iter_mut() {
+                *v = rng.next() as u8;
+            }
+            let c0 = mk_c(&mut rng);
+            let (mut c_a, mut c_b) = (c0, c0);
+            let (mut pa, mut pb) = (pix8, pix8);
+            unsafe {
+                add_idct8x8(&mut c_a, qp, &ws8, pa.as_mut_ptr(), stride8);
+                add_idct8x8_scalar(&mut c_b, qp, &ws8, pb.as_mut_ptr(), stride8);
+            }
+            assert_eq!(c_a, c_b, "idct8x8: c post-state (qp={qp})");
+            for i in 0..8 {
+                assert_eq!(
+                    &pa[i * stride8..i * stride8 + 8],
+                    &pb[i * stride8..i * stride8 + 8],
+                    "idct8x8: row {i} (qp={qp})"
+                );
+            }
         }
     }
 }
