@@ -353,6 +353,7 @@ fn decode_rust(
                 mc_l0: Vec::new(),
                 mc_l1: Vec::new(),
                 mc_out: Vec::new(),
+                fir_tmp: Vec::new(),
             };
             let (ok, bp) = decode_slice_segment_data(&mut ctx, &epb, sh_coded);
             // `bp` is the segment's true end position (serial: this reader;

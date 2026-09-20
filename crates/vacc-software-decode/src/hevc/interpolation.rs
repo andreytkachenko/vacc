@@ -72,6 +72,8 @@ pub fn interpolate_luma(
     n_pb_h: usize,
     bit_depth: i32,
     pred: &mut [i16],
+    // 2D FIR intermediate; must hold at least 64*71 samples.
+    fir_tmp: &mut [i16],
 ) {
     // §8.5.3.3.3: shift1 = Min(4, BitDepthY - 8), shift2 = 6, shift3 = Max(2, 14 - BitDepthY)
     let shift1 = 4.min(bit_depth - 8);
@@ -92,18 +94,18 @@ pub fn interpolate_luma(
             // Interior bounds were checked above; SSE2 is x86_64 baseline.
             sse2::luma_interior(
                 plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2,
-                shift3, pred,
+                shift3, pred, fir_tmp,
             );
         } else {
             luma_interior_scalar(
                 plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2,
-                shift3, pred,
+                shift3, pred, fir_tmp,
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
         luma_interior_scalar(
             plane, stride, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3,
-            pred,
+            pred, fir_tmp,
         );
     } else {
         // Safe clamped access — used for edge PUs
@@ -114,6 +116,7 @@ pub fn interpolate_luma(
         };
         luma_interp_core(
             ref_fn, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3, pred,
+            fir_tmp,
         );
     }
 }
@@ -132,6 +135,7 @@ fn luma_interp_core<R: Fn(i32, i32) -> i32>(
     shift2: i32,
     shift3: i32,
     pred: &mut [i16],
+    tmp: &mut [i16],
 ) {
     if x_frac == 0 && y_frac == 0 {
         for y in 0..n_pb_h {
@@ -164,7 +168,9 @@ fn luma_interp_core<R: Fn(i32, i32) -> i32>(
     } else {
         let tmp_h = n_pb_h + 7;
         debug_assert!(n_pb_w <= 64 && tmp_h <= 71);
-        let mut tmp = [0i16; 64 * 71];
+        // Pass 1 below writes every row/col pass 2 reads, so the buffer needs
+        // no initialization.
+        let tmp = &mut tmp[..n_pb_w * tmp_h];
         let f_h = LUMA_FILTER[x_frac as usize];
         for y in 0..tmp_h {
             for x in 0..n_pb_w {
@@ -205,10 +211,12 @@ fn luma_interior_scalar(
     shift2: i32,
     shift3: i32,
     pred: &mut [i16],
+    fir_tmp: &mut [i16],
 ) {
     let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
     luma_interp_core(
         ref_fn, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, shift1, shift2, shift3, pred,
+        fir_tmp,
     );
 }
 
@@ -230,6 +238,8 @@ pub fn interpolate_chroma(
     n_pb_hc: usize,
     bit_depth: i32,
     pred: &mut [i16],
+    // 2D FIR intermediate; must hold at least 32*35 samples.
+    fir_tmp: &mut [i16],
 ) {
     let shift1 = 4.min(bit_depth - 8);
     let shift2 = 6;
@@ -249,18 +259,18 @@ pub fn interpolate_chroma(
             // Interior bounds were checked above; SSE2 is x86_64 baseline.
             sse2::chroma_interior(
                 plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
-                shift3, pred,
+                shift3, pred, fir_tmp,
             );
         } else {
             chroma_interior_scalar(
                 plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
-                shift3, pred,
+                shift3, pred, fir_tmp,
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
         chroma_interior_scalar(
             plane, stride, x_int, y_int, x_frac, y_frac, n_pb_wc, n_pb_hc, shift1, shift2,
-            shift3, pred,
+            shift3, pred, fir_tmp,
         );
     } else {
         let ref_fn = |x: i32, y: i32| {
@@ -280,6 +290,7 @@ pub fn interpolate_chroma(
             shift2,
             shift3,
             pred,
+            fir_tmp,
         );
     }
 }
@@ -298,6 +309,7 @@ fn chroma_interp_core<R: Fn(i32, i32) -> i32>(
     shift2: i32,
     shift3: i32,
     pred: &mut [i16],
+    tmp: &mut [i16],
 ) {
     if x_frac == 0 && y_frac == 0 {
         for y in 0..n_pb_hc {
@@ -330,7 +342,8 @@ fn chroma_interp_core<R: Fn(i32, i32) -> i32>(
     } else {
         let tmp_h = n_pb_hc + 3;
         debug_assert!(n_pb_wc <= 32 && tmp_h <= 35);
-        let mut tmp = [0i16; 32 * 35];
+        // Pass 1 below writes every row/col pass 2 reads — no init needed.
+        let tmp = &mut tmp[..n_pb_wc * tmp_h];
         let f_h = CHROMA_FILTER[x_frac as usize];
         for y in 0..tmp_h {
             for x in 0..n_pb_wc {
@@ -371,6 +384,7 @@ fn chroma_interior_scalar(
     shift2: i32,
     shift3: i32,
     pred: &mut [i16],
+    fir_tmp: &mut [i16],
 ) {
     let ref_fn = |x: i32, y: i32| plane[(y * stride + x) as usize] as i32;
     chroma_interp_core(
@@ -385,6 +399,7 @@ fn chroma_interior_scalar(
         shift2,
         shift3,
         pred,
+        fir_tmp,
     );
 }
 
@@ -720,6 +735,7 @@ mod sse2 {
         shift2: i32,
         shift3: i32,
         pred: &mut [i16],
+        fir_tmp: &mut [i16],
     ) {
         debug_assert_eq!(n_pb_w % 4, 0);
         if x_frac == 0 && y_frac == 0 {
@@ -775,7 +791,8 @@ mod sse2 {
         } else {
             let tmp_h = n_pb_h + 7;
             debug_assert!(n_pb_w <= 64 && tmp_h <= 71);
-            let mut tmp = [0i16; 64 * 71];
+            // Pass 1 writes every row/col pass 2 reads — no init needed.
+            let tmp = &mut fir_tmp[..n_pb_w * tmp_h];
             let f_h = LUMA_FILTER[x_frac as usize];
             for y in 0..tmp_h {
                 let off = ((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize;
@@ -878,6 +895,7 @@ mod sse2 {
         shift2: i32,
         shift3: i32,
         pred: &mut [i16],
+        fir_tmp: &mut [i16],
     ) {
         debug_assert_eq!(n_pb_wc % 4, 0);
         if x_frac == 0 && y_frac == 0 {
@@ -937,7 +955,8 @@ mod sse2 {
         } else {
             let tmp_h = n_pb_hc + 3;
             debug_assert!(n_pb_wc <= 32 && tmp_h <= 35);
-            let mut tmp = [0i16; 32 * 35];
+            // Pass 1 writes every row/col pass 2 reads — no init needed.
+            let tmp = &mut fir_tmp[..n_pb_wc * tmp_h];
             let f_h = CHROMA_FILTER[x_frac as usize];
             for y in 0..tmp_h {
                 let off = ((y_int + y as i32 - 1) * stride + (x_int - 1)) as usize;
@@ -1023,9 +1042,10 @@ mod tests {
                     let n_samples = n_pb_w * n_pb_h;
                     let mut pred_rs = vec![0i16; n_samples];
 
+                    let mut fir = [0i16; 64 * 71];
                     interpolate_luma(
                         &plane, pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
-                        n_pb_w, n_pb_h, bit_depth, &mut pred_rs,
+                        n_pb_w, n_pb_h, bit_depth, &mut pred_rs, &mut fir[..],
                     );
                     for v in &pred_rs {
                         goldens::push_i16(&mut buf, *v);
@@ -1062,9 +1082,10 @@ mod tests {
                     let n_samples = n_pb_wc * n_pb_hc;
                     let mut pred_rs = vec![0i16; n_samples];
 
+                    let mut fir = [0i16; 32 * 35];
                     interpolate_chroma(
                         &plane, 1, pic_w, pic_h, stride, x_int, y_int, x_frac, y_frac,
-                        n_pb_wc, n_pb_hc, bit_depth, &mut pred_rs,
+                        n_pb_wc, n_pb_hc, bit_depth, &mut pred_rs, &mut fir[..],
                     );
                     for v in &pred_rs {
                         goldens::push_i16(&mut buf, *v);

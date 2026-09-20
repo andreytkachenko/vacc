@@ -1049,6 +1049,8 @@ pub fn perform_inter_prediction(
     pred_l0: &mut [i16],
     pred_l1: &mut [i16],
     pred_samples: &mut [i16],
+    // 2D FIR intermediate (>= 64*71 samples).
+    fir_tmp: &mut [i16],
 ) {
     let bit_depth = if c_idx == 0 { sps.bit_depth_y } else { sps.bit_depth_c };
 
@@ -1085,6 +1087,7 @@ pub fn perform_inter_prediction(
                         comp_h as usize,
                         bit_depth,
                         pred_l0,
+                        fir_tmp,
                     );
                 } else {
                     // §8.5.3.3.2: chroma MV derivation from luma MV. For 4:2:0
@@ -1110,6 +1113,7 @@ pub fn perform_inter_prediction(
                         comp_h as usize,
                         bit_depth,
                         pred_l0,
+                        fir_tmp,
                     );
                 }
             }
@@ -1144,6 +1148,7 @@ pub fn perform_inter_prediction(
                         comp_h as usize,
                         bit_depth,
                         pred_l1,
+                        fir_tmp,
                     );
                 } else {
                     let x_pb_c = x_pb / sub_w;
@@ -1167,6 +1172,7 @@ pub fn perform_inter_prediction(
                         comp_h as usize,
                         bit_depth,
                         pred_l1,
+                        fir_tmp,
                     );
                 }
             }

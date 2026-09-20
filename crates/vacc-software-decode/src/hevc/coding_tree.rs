@@ -162,6 +162,9 @@ pub struct DecodingContext<'bs, 'a> {
     /// Final MC output for the current component (written by weighted
     /// prediction, consumed by `write_mc_block`).
     pub mc_out: Vec<i16>,
+    /// 2D FIR intermediate (max 64*71 luma / 32*35 chroma). Grow-only: pass 1
+    /// writes every element pass 2 reads, so no zero-init is needed.
+    pub fir_tmp: Vec<i16>,
 }
 
 impl<'bs, 'a> DecodingContext<'bs, 'a> {
@@ -257,6 +260,7 @@ impl<'bs, 'a> DecodingContext<'bs, 'a> {
             mc_l0: Vec::new(),
             mc_l1: Vec::new(),
             mc_out: Vec::new(),
+            fir_tmp: Vec::new(),
         }
     }
 }
@@ -1561,8 +1565,14 @@ fn write_mc_block(pic: &mut Picture, c: usize, x0: i32, y0: i32, w: i32, h: i32,
     }
 }
 
+/// Max 2D FIR intermediate: luma 64 wide x (64+7) rows.
+const FIR_TMP_MAX: usize = 64 * 71;
+
 fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, n_pb_h: i32, mi: &PuMotionInfo) {
     let sps = ctx.sps;
+    if ctx.fir_tmp.len() < FIR_TMP_MAX {
+        ctx.fir_tmp.resize(FIR_TMP_MAX, 0);
+    }
     // Luma
     {
         let n = (n_pb_w * n_pb_h) as usize;
@@ -1578,6 +1588,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         let l0 = &mut ctx.mc_l0[..n];
         let l1 = &mut ctx.mc_l1[..n];
         let out = &mut ctx.mc_out[..n];
+        let ft = &mut ctx.fir_tmp[..FIR_TMP_MAX];
         perform_inter_prediction(
             sps,
             ctx.pps,
@@ -1597,6 +1608,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
             l0,
             l1,
             out,
+            ft,
         );
         write_mc_block(ctx.pic, 0, x_pb, y_pb, n_pb_w, n_pb_h, out);
     }
@@ -1616,6 +1628,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         if ctx.mc_out.len() < c_n {
             ctx.mc_out.resize(c_n, 0);
         }
+        let ft = &mut ctx.fir_tmp[..FIR_TMP_MAX];
         for c in 1..=2 {
             let l0 = &mut ctx.mc_l0[..c_n];
             let l1 = &mut ctx.mc_l1[..c_n];
@@ -1639,6 +1652,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
                 l0,
                 l1,
                 out,
+                ft,
             );
             write_mc_block(ctx.pic, c as usize, x_c, y_c, c_w, c_h, out);
         }

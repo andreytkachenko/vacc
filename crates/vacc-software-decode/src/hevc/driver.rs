@@ -293,6 +293,7 @@ pub fn decode_picture(
                 mc_l0: Vec::new(),
                 mc_l1: Vec::new(),
                 mc_out: Vec::new(),
+                fir_tmp: Vec::new(),
             };
             let (ok, _) = decode_slice_segment_data(&mut ctx, &epb, sh_coded);
             (ok, (ctx.wpp_saved_contexts, ctx.wpp_contexts_available))
