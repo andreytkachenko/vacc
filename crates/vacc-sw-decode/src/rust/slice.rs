@@ -307,7 +307,11 @@ pub struct SliceContext<'a> {
     /// The SSE kernel loads up to 16 bytes per row starting at block-relative
     /// col +16, so each of the `hu + 5` rows holds 32 fully-clamped samples.
     pub mc_y: [u8; 672],
-    pub mc_c: [u8; 162],
+    /// Chroma MC neighborhood scratch for non-interior (edge) blocks:
+    /// (hu+2) interleaved Cb/Cr rows x 9 clamped cols at fixed stride 16 =
+    /// 320 bytes (C `edge_buf` chroma semantics, `sstride_C = 16`). The SSE
+    /// kernel loads up to 16 bytes per row; only the first cw+1 cols are used.
+    pub mc_c: [u8; 320],
     /// Reusable deblock window buffers (MB origin at row 48 col 32 / chroma
     /// buffer row 48 col 8): avoids per-MB zeroing and Vec traffic. The
     /// kernel never reads outside the filled 20x20 luma / 20x10 chroma window.
@@ -663,38 +667,58 @@ impl SliceContext<'_> {
                 }
             }
         } else {
-            // Half chroma pel: gather the clamped neighborhood (C edge_buf_c
-            // semantics), then run the bilinear.
-            for k in 0..hu / 2 + 1 {
-                let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
-                let roff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
-                copy_clamped_row(
-                    unsafe {
-                        std::slice::from_raw_parts_mut(src_c.add((2 * k) * (cw + 1)), cw + 1)
-                    },
-                    unsafe { ref_base.add(roff) },
-                    x_int_c,
-                    width_y / 2,
-                    cw + 1,
-                );
-                copy_clamped_row(
-                    unsafe {
-                        std::slice::from_raw_parts_mut(src_c.add((2 * k + 1) * (cw + 1)), cw + 1)
-                    },
-                    unsafe { ref_base.add(roff + stride_c / 2) },
-                    x_int_c,
-                    width_y / 2,
-                    cw + 1,
-                );
+            // Half chroma pel. C makes one edge decision for both planes from
+            // the luma coords (xWide = x&7 != 0, unsigned so negative coords
+            // take the edge path too): interior reads the ref neighborhood
+            // directly; edge gathers the clamped neighborhood into scratch
+            // (C edge_buf_c: 9 clamped cols per row, fixed stride 16).
+            let interior_c = x_int_y >= 2
+                && x_int_y + wu as i32 + 2 < width_y
+                && y_int_y >= 2
+                && y_int_y + hu as i32 + 2 < height_y;
+            if !interior_c {
+                for k in 0..hu / 2 + 1 {
+                    let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
+                    let roff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
+                    copy_clamped_row(
+                        unsafe { std::slice::from_raw_parts_mut(src_c.add(2 * k * 16), 9) },
+                        unsafe { ref_base.add(roff) },
+                        x_int_c,
+                        width_y / 2,
+                        9,
+                    );
+                    copy_clamped_row(
+                        unsafe { std::slice::from_raw_parts_mut(src_c.add((2 * k + 1) * 16), 9) },
+                        unsafe { ref_base.add(roff + stride_c / 2) },
+                        x_int_c,
+                        width_y / 2,
+                        9,
+                    );
+                }
             }
+            let src_chroma = if interior_c {
+                // Rows yInt_C..yInt_C+h/2 (interleaved Cb/Cr), cols
+                // xInt_C..xInt_C+8 at the real stride — inside the ref plane
+                // by `interior_c` (unused overread bytes may cross into the
+                // next row, exactly like C).
+                unsafe {
+                    std::slice::from_raw_parts(
+                        ref_base.add((y_int_c * stride_c as i32 + x_int_c) as usize
+                            + self.plane_size_y as usize),
+                        (hu + 1) * stride_c / 2 + 16,
+                    )
+                }
+            } else {
+                unsafe { std::slice::from_raw_parts(src_c, (hu + 2) * 16) }
+            };
             inter::inter_chroma(
-                unsafe { std::slice::from_raw_parts(src_c, (hu / 2 + 1) * 2 * (cw + 1)) },
+                src_chroma,
                 unsafe { std::slice::from_raw_parts_mut(base.add(off_c), len_c) },
                 wu,
                 hu,
                 (x & 7) as u32,
                 (y & 7) as u32,
-                cw + 1,
+                if interior_c { stride_c / 2 } else { 16 },
                 stride_c / 2,
                 &wod,
             );

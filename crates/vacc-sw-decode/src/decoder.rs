@@ -856,7 +856,7 @@ impl SwH264Decoder {
             samples_mb: [std::ptr::null_mut(); 3],
             ref_plane_bases,
             mc_y: [0u8; 672],
-            mc_c: [0u8; 162],
+            mc_c: [0u8; 320],
             dblk_y: [0u8; crate::rust::deblock::DEBLOCK_LY_SIZE],
             dblk_c: [0u8; crate::rust::deblock::DEBLOCK_LC_SIZE],
             ws4: if sps.seq_scaling_matrix_present_flag {

@@ -255,14 +255,48 @@ history (9cdae1f^) and regenerate /tmp/ziptest3/oracle_luma.txt"
     }
 }
 
-/// Combined Cb+Cr inter chroma MC. `src` holds (h+2) reference rows x (cw+1)
-/// cols at `sstride`: row 2k = Cb ref row k, row 2k+1 = Cr ref row k (the
-/// kernel reads up to row h+1). `dst` holds the initial h rows x cw cols at
-/// `dstride` (row 2k = Cb output row k, row 2k+1 = Cr output row k) and
+/// Combined Cb+Cr inter chroma MC. `src` holds (h+2) reference rows at
+/// `sstride`: row 2k = Cb ref row k, row 2k+1 = Cr ref row k (the kernel
+/// reads up to row h+1; the widest load is 16 bytes per row, of which only
+/// the first cw+1 cols are used). `dst` holds the initial h rows x cw cols
+/// at `dstride` (row 2k = Cb output row k, row 2k+1 = Cr output row k) and
 /// receives the result in place. `xFrac`/`yFrac` are the sub-chroma-pel
 /// positions (0..7; chroma quarter-pel = luma eighth-pel).
 #[allow(clippy::too_many_arguments)]
 pub fn inter_chroma(
+    src: &[u8],
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    x_frac: u32,
+    y_frac: u32,
+    sstride: usize,
+    dstride: usize,
+    wod: &[i16; 8],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::inter_chroma_sse(
+                    src.as_ptr(),
+                    dst.as_mut_ptr(),
+                    w,
+                    h,
+                    x_frac,
+                    y_frac,
+                    sstride,
+                    dstride,
+                    wod,
+                );
+            }
+        }
+    }
+    inter_chroma_scalar(src, dst, w, h, x_frac, y_frac, sstride, dstride, wod);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inter_chroma_scalar(
     src: &[u8],
     dst: &mut [u8],
     w: usize,
@@ -388,6 +422,9 @@ mod sse {
     }
     #[inline(always)] fn ziplo32(a: __m128i, b: __m128i) -> __m128i {
         unsafe { _mm_unpacklo_epi32(a, b) }
+    }
+    #[inline(always)] fn ziphi32(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_unpackhi_epi32(a, b) }
     }
     #[inline(always)] fn ziplo64(a: __m128i, b: __m128i) -> __m128i {
         unsafe { _mm_unpacklo_epi64(a, b) }
@@ -588,6 +625,203 @@ mod sse {
     // 1 row x 16 bytes.
     #[inline(always)] fn store16(d: *mut u8, r: __m128i) {
         unsafe { _mm_storeu_si128(d as *mut __m128i, r); }
+    }
+
+    // ---- C decode_inter_chroma (edge264_inter.c L977) helpers ----
+    // C shrrpu16(a, b, 6) = packus(avg_epu16(a>>5, 0), avg_epu16(b>>5, 0)):
+    // round(x/64) per non-negative lane.
+    #[inline(always)] fn shrrp16(a: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            let zero = _mm_setzero_si128();
+            _mm_packus_epi16(
+                _mm_avg_epu16(_mm_srli_epi16(a, 5), zero),
+                _mm_avg_epu16(_mm_srli_epi16(b, 5), zero),
+            )
+        }
+    }
+    // C maddABCD(ab, cd, shuf, AB, CD) = pmaddubsw(pshufb(ab, shuf), AB)
+    // + pmaddubsw(pshufb(cd, shuf), CD): x[i] = sab[2i]*A + sab[2i+1]*B
+    // + scd[2i]*C + scd[2i+1]*D (2D bilinear weights, sum 64).
+    #[inline(always)] fn madd_abcd(
+        ab: __m128i,
+        cd: __m128i,
+        shuf: __m128i,
+        ab_w: __m128i,
+        cd_w: __m128i,
+    ) -> __m128i {
+        add16(maddubs(shuffle(ab, shuf), ab_w), maddubs(shuffle(cd, shuf), cd_w))
+    }
+    // C loada64x2(p0, p1): two 8-byte dst reads (w==16 chroma q).
+    #[inline(always)] fn loadq64x2(p0: *const u8, p1: *const u8) -> __m128i {
+        unsafe {
+            _mm_set_epi64x(
+                (p1 as *const i64).read_unaligned(),
+                (p0 as *const i64).read_unaligned(),
+            )
+        }
+    }
+    // C w==4 dst read: i16x8 q = {*(int16_t *)DADDR(dst, 0..3)} — the four rows
+    // are packed DENSELY into the low 8 bytes (i16 lanes 0..3); maddshrC4 only
+    // consumes ziplo8 (low 8 bytes), so the high lanes may be zero.
+    #[inline(always)] fn load4x16(d: *const u8, dstride: usize) -> __m128i {
+        unsafe {
+            _mm_setr_epi16(
+                (d as *const i16).read_unaligned(),
+                (d.add(dstride) as *const i16).read_unaligned(),
+                (d.add(dstride * 2) as *const i16).read_unaligned(),
+                (d.add(dstride * 3) as *const i16).read_unaligned(),
+                0,
+                0,
+                0,
+                0,
+            )
+        }
+    }
+    // C w==4 dst write: *(int16_t *)DADDR(dst, i) = v[i] — two pixels per
+    // row (v's i16 lanes hold pixel pairs from packus(a, a)).
+    #[inline(always)] fn store4x16(d: *mut u8, dstride: usize, r: __m128i) {
+        unsafe {
+            (d as *mut i16).write_unaligned(_mm_extract_epi16(r, 0) as i16);
+            (d.add(dstride) as *mut i16).write_unaligned(_mm_extract_epi16(r, 1) as i16);
+            (d.add(dstride * 2) as *mut i16).write_unaligned(_mm_extract_epi16(r, 2) as i16);
+            (d.add(dstride * 3) as *mut i16).write_unaligned(_mm_extract_epi16(r, 3) as i16);
+        }
+    }
+
+    /// SSE port of C `decode_inter_chroma` (edge264_inter.c L977), bit-exact.
+    /// `src`/`dst` rows are interleaved Cb/Cr (row 2k = Cb k, row 2k+1 = Cr
+    /// k). The w/h are luma block dimensions; chroma is w/2 x h/2 per plane.
+    #[allow(clippy::too_many_arguments)] // mirrors C `decode_inter_chroma` arity
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn inter_chroma_sse(
+        src: *const u8,
+        dst: *mut u8,
+        w: usize,
+        h: usize,
+        x_frac: u32,
+        y_frac: u32,
+        sstride: usize,
+        dstride: usize,
+        wod: &[i16; 8],
+    ) {
+        let xf = (x_frac & 7) as i32;
+        let yf = (y_frac & 7) as i32;
+        // C packs the 2D bilinear weights into one dword (ABCD): A=(8-xF)
+        // (8-yF), B=xF(8-yF), C=(8-xF)yF, D=xF*yF — all <= 64, sum 64.
+        let a = ((8 - xf) * (8 - yf)) as i8;
+        let b = (xf * (8 - yf)) as i8;
+        let c = ((8 - xf) * yf) as i8;
+        let d = (xf * yf) as i8;
+        let ab_w = _mm_setr_epi8(a, b, a, b, a, b, a, b, a, b, a, b, a, b, a, b);
+        let cd_w = _mm_setr_epi8(c, d, c, d, c, d, c, d, c, d, c, d, c, d, c, d);
+        // C wo8 = ziphi16(wod, wod): {wCb, wCr, oCb, oCr} i16 lanes doubled.
+        let wo8 = _mm_setr_epi8(
+            (wod[4] & 0xFF) as i8,
+            (wod[4] >> 8) as i8,
+            (wod[4] & 0xFF) as i8,
+            (wod[4] >> 8) as i8,
+            (wod[5] & 0xFF) as i8,
+            (wod[5] >> 8) as i8,
+            (wod[5] & 0xFF) as i8,
+            (wod[5] >> 8) as i8,
+            (wod[6] & 0xFF) as i8,
+            (wod[6] >> 8) as i8,
+            (wod[6] & 0xFF) as i8,
+            (wod[6] >> 8) as i8,
+            (wod[7] & 0xFF) as i8,
+            (wod[7] >> 8) as i8,
+            (wod[7] & 0xFF) as i8,
+            (wod[7] >> 8) as i8,
+        );
+        // C wd = (u64x2)wod >> 48: per-lane u64 shift -> {wod[3], wod[7]}.
+        // This machine's PSRAW shifts every lane by the low i64 count
+        // (= wod[3], the chroma log2 weight denom), matching C exactly.
+        let wd = _mm_set_epi64x(wod[7] as i64, wod[3] as i64);
+
+        if w == 16 {
+            // chroma 8 wide; h even.
+            let shuf = _mm_setr_epi8(0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8);
+            let wcb = _mm_shuffle_epi32::<0x00>(wo8);
+            let wcr = _mm_shuffle_epi32::<0x55>(wo8);
+            let ocb = _mm_shuffle_epi32::<0xAA>(wo8);
+            let ocr = _mm_shuffle_epi32::<0xFF>(wo8);
+            let mut l0 = loadu128(src);
+            let mut l1 = loadu128(sadd(src, 1, sstride));
+            let mut d = dst;
+            let mut s2 = sadd(src, 2, sstride);
+            let mut rem = h;
+            while rem > 0 {
+                let l2 = loadu128(s2);
+                let l3 = loadu128(sadd(s2, 1, sstride));
+                let x0 = madd_abcd(l0, l2, shuf, ab_w, cd_w);
+                let x1 = madd_abcd(l1, l3, shuf, ab_w, cd_w);
+                let p = shrrp16(x0, x1);
+                // q = [8 Cb dst bytes | 8 Cr dst bytes]
+                let q = loadq64x2(d, daddr(d, 1, dstride));
+                // C maddshrC16: per-half pmaddubsw + offset + PSRAW(wd).
+                let xc = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziplo8(q, p), wcb), ocb), wd);
+                let xr = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziphi8(q, p), wcr), ocr), wd);
+                store2x64(d, dstride, _mm_packus_epi16(xc, xr));
+                l0 = l2;
+                l1 = l3;
+                s2 = sadd(s2, 2, sstride);
+                d = daddr(d, 2, dstride);
+                rem -= 2;
+            }
+        } else if w == 8 {
+            // chroma 4 wide; h a multiple of 4.
+            let shuf = _mm_setr_epi8(0, 1, 1, 2, 2, 3, 3, 4, 8, 9, 9, 10, 10, 11, 11, 12);
+            let w0 = ziplo32(wo8, wo8);
+            let o = ziphi32(wo8, wo8);
+            let mut l0 = loadu64x2(src, sadd(src, 1, sstride));
+            let mut d = dst;
+            let mut s2 = sadd(src, 2, sstride);
+            let mut rem = h;
+            while rem > 0 {
+                let l1 = loadu64x2(s2, sadd(s2, 1, sstride));
+                let l2 = loadu64x2(sadd(s2, 2, sstride), sadd(s2, 3, sstride));
+                let x0 = madd_abcd(l0, l1, shuf, ab_w, cd_w);
+                let x1 = madd_abcd(l1, l2, shuf, ab_w, cd_w);
+                let p = shrrp16(x0, x1);
+                // q = 4 rows x 4 dst bytes (Cb k, Cr k, Cb k+1, Cr k+1)
+                let q = loadu32x4(d, daddr(d, 1, dstride), daddr(d, 2, dstride), daddr(d, 3, dstride));
+                // C maddshrC8 (= maddshrL): shared w0/o for both halves.
+                let xl = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziplo8(q, p), w0), o), wd);
+                let xh = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziphi8(q, p), w0), o), wd);
+                store4(d, dstride, _mm_packus_epi16(xl, xh));
+                l0 = l2;
+                s2 = sadd(s2, 4, sstride);
+                d = daddr(d, 4, dstride);
+                rem -= 4;
+            }
+        } else {
+            // w == 4: chroma 2 wide; h a multiple of 4.
+            let shuf = _mm_setr_epi8(0, 1, 1, 2, 4, 5, 5, 6, 8, 9, 9, 10, 12, 13, 13, 14);
+            let w0 = _mm_shuffle_epi32::<0x44>(wo8); // C broadcast64(wo8, 0)
+            let o = ziphi64(wo8, wo8);
+            let mut l0 = ziplo32(loadu32(src), loadu32(sadd(src, 1, sstride)));
+            let mut d = dst;
+            let mut s2 = sadd(src, 2, sstride);
+            let mut rem = h;
+            while rem > 0 {
+                let l1 = loadu32x4(
+                    s2,
+                    sadd(s2, 1, sstride),
+                    sadd(s2, 2, sstride),
+                    sadd(s2, 3, sstride),
+                );
+                let x0 = madd_abcd(ziplo64(l0, l1), l1, shuf, ab_w, cd_w);
+                let p = shrrp16(x0, _mm_setzero_si128());
+                let q = load4x16(d, dstride);
+                // C maddshrC4: packus(a, a) — the i16 lanes hold pixel pairs.
+                let a = _mm_sra_epi16(_mm_adds_epi16(maddubs(ziplo8(q, p), w0), o), wd);
+                store4x16(d, dstride, _mm_packus_epi16(a, a));
+                l0 = shr128::<8>(l1);
+                s2 = sadd(s2, 4, sstride);
+                d = daddr(d, 4, dstride);
+                rem -= 4;
+            }
+        }
     }
 
     #[target_feature(enable = "sse4.1")]
@@ -1386,4 +1620,86 @@ mod sse {
         }
     }
 
+}
+#[cfg(test)]
+mod chroma_sse_diff_tests {
+    use super::*;
+
+    fn pack_w(w0: i32, w1: i32) -> i16 {
+        ((w1 << 8) | (w0 & 255)) as i16
+    }
+
+    #[test]
+    fn sse_chroma_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let wods: [[i16; 8]; 4] = [
+            WOD_NO_WEIGHT,
+            [257, 1, 1, 1, 257, 257, 1, 1],
+            [pack_w(0, 300), 0, 0, 2, pack_w(1, 300), pack_w(2, 260), 128, -200],
+            [pack_w(100, 120), 77, 3, 4, pack_w(-5, 90), pack_w(20, -50), 200, -250],
+        ];
+        for (zi, wod) in wods.iter().enumerate() {
+            for &(w, h) in &[
+                (16usize, 16usize),
+                (16, 8),
+                (8, 16),
+                (8, 8),
+                (8, 4),
+                (4, 8),
+                (4, 4),
+            ] {
+                for xf in 0..8u32 {
+                    for yf in 0..8u32 {
+                        let cw = w / 2;
+                        for &sstride in &[4usize, 5, 6, 8, 9, 12, 16] {
+                            // dst stride must be >= chroma width (real H.264 always
+                            // satisfies this); overlapping rows would diverge between
+                            // the chunked SSE read-before-write and sequential scalar.
+                            let dstride = sstride.max(cw);
+                            let mut seed = ((w as u64) << 40)
+                                | ((h as u64) << 32)
+                                | ((xf as u64) << 24)
+                                | ((yf as u64) << 16)
+                                | ((sstride as u64) << 8)
+                                | (zi as u64);
+                            let mut next = || {
+                                seed = seed
+                                    .wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                                (seed >> 33) as u8
+                            };
+                            let mut src = vec![0u8; (h + 2) * sstride + 16];
+                            for b in src.iter_mut() {
+                                *b = next();
+                            }
+                            let mut dst0 = vec![0u8; (h - 1) * dstride + cw];
+                            for b in dst0.iter_mut() {
+                                *b = next();
+                            }
+                            let mut dst_ref = dst0.clone();
+                            let mut dst_sse = dst0.clone();
+                            inter_chroma_scalar(
+                                &src,
+                                &mut dst_ref,
+                                w,
+                                h,
+                                xf,
+                                yf,
+                                sstride,
+                                dstride,
+                                wod,
+                            );
+                            inter_chroma(&src, &mut dst_sse, w, h, xf, yf, sstride, dstride, wod);
+                            assert_eq!(
+                                dst_sse, dst_ref,
+                                "w={w} h={h} xf={xf} yf={yf} ss={sstride} z={zi}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
