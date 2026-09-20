@@ -1054,6 +1054,361 @@ mod sse {
         let q0o = pick(ignore, q0, qp0b);
         (from_m(p0o), from_m(q0o))
     }
+
+    // ------------------------------------------------------------------
+    // Deblock parameter computation (deblock_mb, edge264_deblock.c:927).
+    // ------------------------------------------------------------------
+
+    /// Load a 16-byte pshufb mask constant.
+    #[inline]
+    fn mask(m: &[i8; 16]) -> __m128i {
+        unsafe { _mm_loadu_si128(m.as_ptr() as *const __m128i) }
+    }
+
+    /// Load mb.mvs[8*i..8*i+8] as i16x8.
+    #[inline]
+    fn mvsv_m(mb: &Mb, i: usize) -> __m128i {
+        unsafe { _mm_loadu_si128(mb.mvs[8 * i..].as_ptr() as *const __m128i) }
+    }
+
+    /// C `unziplo32` (edge264_internal.h:765), i32-lane level: [x0, x2, y0, y2].
+    #[inline]
+    fn uzp1_32(x: __m128i, y: __m128i) -> __m128i {
+        unsafe { _mm_unpacklo_epi64(_mm_shuffle_epi32(x, 0x88), _mm_shuffle_epi32(y, 0x88)) }
+    }
+
+    /// C `unziphi32` (edge264_internal.h:766), i32-lane level: [x1, x3, y1, y3].
+    #[inline]
+    fn uzp2_32(x: __m128i, y: __m128i) -> __m128i {
+        unsafe { _mm_unpackhi_epi64(_mm_shuffle_epi32(x, 0xDD), _mm_shuffle_epi32(y, 0xDD)) }
+    }
+
+    /// C `trnlo32` (edge264_internal.h:763), i32-lane level: [x0, y0, x2, y2].
+    #[inline]
+    fn trnlo_32(x: __m128i, y: __m128i) -> __m128i {
+        unsafe { _mm_shuffle_epi32(uzp1_32(x, y), 0xD8) }
+    }
+
+    /// C `abs8` (edge264_internal.h:835): _mm_min_epu8(-a, a).
+    #[inline]
+    fn abs8_m(a: __m128i) -> __m128i {
+        unsafe { _mm_min_epu8(_mm_sub_epi8(_mm_setzero_si128(), a), a) }
+    }
+
+    /// C `packabd16`: abs8(packs16(subs16(a, b), subs16(c, d))).
+    #[inline]
+    fn packabd16_m(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m128i {
+        unsafe { abs8_m(_mm_packs_epi16(_mm_subs_epi16(a, b), _mm_subs_epi16(c, d))) }
+    }
+
+    /// C `shuffle3` (edge264_internal.h:828): gather from a 48-byte table.
+    /// pshufb masks indices to 4 bits (unless bit 7 is set), so p[1] covers
+    /// 16..31 and p[2] covers 32..47; blend by range like the C ifelse_mask.
+    #[inline]
+    fn shuffle3_m(table: &[u8; 48], m: __m128i) -> __m128i {
+        let p0 = unsafe { _mm_loadu_si128(table.as_ptr() as *const __m128i) };
+        let p1 = unsafe { _mm_loadu_si128(table[16..].as_ptr() as *const __m128i) };
+        let p2 = unsafe { _mm_loadu_si128(table[32..].as_ptr() as *const __m128i) };
+        let s0 = unsafe { _mm_shuffle_epi8(p0, m) };
+        let s1 = unsafe { _mm_shuffle_epi8(p1, m) };
+        let s2 = unsafe { _mm_shuffle_epi8(p2, m) };
+        let lt16 = unsafe { _mm_cmpgt_epi8(_mm_set1_epi8(16), m) };
+        let lt32 = unsafe { _mm_cmpgt_epi8(_mm_set1_epi8(32), m) };
+        pick(lt16, s0, pick(lt32, s1, s2))
+    }
+
+    /// SSE port of [`super::deblock_params_scalar`], mirroring it 1:1 (C
+    /// reference: deblock_mb, edge264_deblock.c:927).
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn deblock_params_sse(
+        mbs: &[Mb; 3],
+        entropy: i32,
+        offA: i32,
+        offB: i32,
+    ) -> ([u8; 16], [u8; 16], [i32; 16]) {
+        let mb = &mbs[2];
+        let mbA = if mb.fe & 1 != 0 { &mbs[1] } else { mb };
+        let mbB = if mb.fe & 2 != 0 { &mbs[0] } else { mb };
+
+        // --- alpha / beta (QP averaging: mid/mid/A/B per plane) ---
+        let av = |a: i32, b: i32| ((a + b + 1) >> 1) as i8;
+        let qPav = _mm_setr_epi8(
+            mb.qy as i8,
+            mb.qcb as i8,
+            mb.qcr as i8,
+            0,
+            mb.qy as i8,
+            mb.qcb as i8,
+            mb.qcr as i8,
+            0,
+            av(mb.qy, mbA.qy),
+            av(mb.qcb, mbA.qcb),
+            av(mb.qcr, mbA.qcr),
+            0,
+            av(mb.qy, mbB.qy),
+            av(mb.qcb, mbB.qcb),
+            av(mb.qcr, mbB.qcr),
+            0,
+        );
+        let zero = _mm_setzero_si128();
+        let indexA = _mm_min_epu8(
+            _mm_max_epi8(_mm_add_epi8(qPav, _mm_set1_epi8(offA as i8)), zero),
+            _mm_set1_epi8(51),
+        );
+        let indexB = _mm_min_epu8(
+            _mm_max_epi8(_mm_add_epi8(qPav, _mm_set1_epi8(offB as i8)), zero),
+            _mm_set1_epi8(51),
+        );
+        let Am4 = _mm_subs_epu8(indexA, _mm_set1_epi8(4));
+        let alpha_v = shuffle3_m(&IDX2ALPHA, Am4);
+        let beta_v = shuffle3_m(&IDX2BETA, _mm_subs_epu8(indexB, _mm_set1_epi8(4)));
+
+        // --- tC0 (bS-dependent) ---
+        let mut tC0_v = [zero; 4];
+        if mb.inter == 0 {
+            // intra: tC0 from idx2tC0[2]
+            let tC03 = shuffle3_m(&IDX2TC0_2, Am4);
+            let b0 = _mm_shuffle_epi8(tC03, zero); // broadcast8(tC03, 0)
+            tC0_v[0] = b0;
+            tC0_v[1] = b0;
+            let t2 = _mm_shuffle_epi8(tC03, mask(&SHUF_INTRA));
+            tC0_v[2] = t2;
+            tC0_v[3] = t2;
+        } else {
+            let tC01 = shuffle3_m(&IDX2TC0_0, Am4);
+            let tC02 = shuffle3_m(&IDX2TC0_1, Am4);
+            let c3 = _mm_set1_epi8(3);
+            let (bS0aceg, bS0bdfh) = if (ri32(mb, 1) & ri32(mbA, 1) & ri32(mbB, 1)) == -1 {
+                // P macroblocks
+                let mvsv0 = uzp2_32(mvsv_m(mbA, 1), mvsv_m(mbA, 3));
+                let mvsv1 = uzp1_32(mvsv_m(mb, 0), mvsv_m(mb, 2));
+                let mvsv2 = uzp2_32(mvsv_m(mb, 0), mvsv_m(mb, 2));
+                let mvsv3 = uzp1_32(mvsv_m(mb, 1), mvsv_m(mb, 3));
+                let mvsv4 = uzp2_32(mvsv_m(mb, 1), mvsv_m(mb, 3));
+                let mvsh0 = _mm_unpackhi_epi64(mvsv_m(mbB, 2), mvsv_m(mbB, 3));
+                let mvsh1 = _mm_unpacklo_epi64(mvsv_m(mb, 0), mvsv_m(mb, 1));
+                let mvsh2 = _mm_unpackhi_epi64(mvsv_m(mb, 0), mvsv_m(mb, 1));
+                let mvsh3 = _mm_unpacklo_epi64(mvsv_m(mb, 2), mvsv_m(mb, 3));
+                let mvsh4 = _mm_unpackhi_epi64(mvsv_m(mb, 2), mvsv_m(mb, 3));
+                let mvsac = packabd16_m(mvsv0, mvsv1, mvsv2, mvsv3);
+                let mvsbd = packabd16_m(mvsv1, mvsv2, mvsv3, mvsv4);
+                let mvseg = packabd16_m(mvsh0, mvsh1, mvsh2, mvsh3);
+                let mvsfh = packabd16_m(mvsh1, mvsh2, mvsh3, mvsh4);
+                let mvsaceg =
+                    _mm_packs_epi16(_mm_subs_epu8(mvsac, c3), _mm_subs_epu8(mvseg, c3));
+                let mvsbdfh =
+                    _mm_packs_epi16(_mm_subs_epu8(mvsbd, c3), _mm_subs_epu8(mvsfh, c3));
+                let refs = _mm_shuffle_epi8(
+                    _mm_setr_epi32(rp32(mb, 0), 0, rp32(mbA, 0), rp32(mbB, 0)),
+                    mask(&SHUFVHAB),
+                );
+                let neq = _mm_xor_si128(refs, _mm_srli_si128(refs, 8));
+                let refsaceg = _mm_unpacklo_epi8(neq, neq);
+                let bS0aceg = _mm_cmpeq_epi8(_mm_or_si128(refsaceg, mvsaceg), zero);
+                let bS0bdfh = _mm_cmpeq_epi8(mvsbdfh, zero);
+                (bS0aceg, bS0bdfh)
+            } else if mb.inter_eqs_s == 0x1b5fbbff {
+                // 16x16 B macroblock
+                let mvA1 = mvsv_m(mbA, 1);
+                let mvA3 = mvsv_m(mbA, 3);
+                let mvA5 = mvsv_m(mbA, 5);
+                let mvA7 = mvsv_m(mbA, 7);
+                let mv0 = mvsv_m(mb, 0);
+                let mv1 = mvsv_m(mb, 1);
+                let mv2 = mvsv_m(mb, 2);
+                let mv4 = mvsv_m(mb, 4);
+                let mv5 = mvsv_m(mb, 5);
+                let mv6 = mvsv_m(mb, 6);
+                let mvB2 = mvsv_m(mbB, 2);
+                let mvB3 = mvsv_m(mbB, 3);
+                let mvB6 = mvsv_m(mbB, 6);
+                let mvB7 = mvsv_m(mbB, 7);
+                let mvsv0l0 = uzp2_32(mvA1, mvA3);
+                let mvsv1l0 = uzp1_32(mv0, mv2);
+                let mvsv0l1 = uzp2_32(mvA5, mvA7);
+                let mvsv1l1 = uzp1_32(mv4, mv6);
+                let mvsh0l0 = _mm_unpackhi_epi64(mvB2, mvB3);
+                let mvsh1l0 = _mm_unpacklo_epi64(mv0, mv1);
+                let mvsh0l1 = _mm_unpackhi_epi64(mvB6, mvB7);
+                let mvsh1l1 = _mm_unpacklo_epi64(mv4, mv5);
+                let mvsael00 = packabd16_m(mvsv0l0, mvsv1l0, mvsh0l0, mvsh1l0);
+                let mvsael01 = packabd16_m(mvsv0l0, mvsv1l1, mvsh0l0, mvsh1l1);
+                let mvsael10 = packabd16_m(mvsv0l1, mvsv1l0, mvsh0l1, mvsh1l0);
+                let mvsael11 = packabd16_m(mvsv0l1, mvsv1l1, mvsh0l1, mvsh1l1);
+                let mvsaep = _mm_subs_epu8(_mm_max_epu8(mvsael00, mvsael11), c3);
+                let mvsaec = _mm_subs_epu8(_mm_max_epu8(mvsael01, mvsael10), c3);
+                let pp = _mm_packs_epi16(mvsaep, zero);
+                let mvsacegp = _mm_unpacklo_epi32(pp, zero);
+                let pc = _mm_packs_epi16(mvsaec, zero);
+                let mvsacegc = _mm_unpacklo_epi32(pc, zero);
+                let refPic = _mm_set_epi64x(0, rpl(mb)); // [rpl(mb), 0]
+                let refPicAB = _mm_set_epi64x(rpl(mbB), rpl(mbA)); // [rpl(mbA), rpl(mbB)]
+                let refs0 = _mm_shuffle_epi8(uzp1_32(refPic, refPicAB), mask(&SHUFVHAB));
+                let refs1 = _mm_shuffle_epi8(uzp2_32(refPic, refPicAB), mask(&SHUFVHAB));
+                let neq0 = _mm_xor_si128(refs0, _mm_alignr_epi8(refs0, refs1, 8));
+                let neq1 = _mm_xor_si128(refs1, _mm_alignr_epi8(refs1, refs0, 8));
+                let refsaceg = _mm_or_si128(neq0, neq1);
+                let refsacegc = _mm_unpacklo_epi8(refsaceg, refsaceg);
+                let refsacegp = _mm_unpackhi_epi8(refsaceg, refsaceg);
+                let neq3 = _mm_or_si128(
+                    _mm_min_epu8(refsacegp, refsacegc),
+                    _mm_min_epu8(mvsacegp, mvsacegc),
+                );
+                let neq4 = _mm_or_si128(
+                    _mm_min_epu8(refsacegp, mvsacegc),
+                    _mm_min_epu8(mvsacegp, refsacegc),
+                );
+                let bS0aceg = _mm_cmpeq_epi8(_mm_or_si128(neq3, neq4), zero);
+                (bS0aceg, _mm_set1_epi8(-1))
+            } else {
+                // other B macroblocks
+                let mvA1 = mvsv_m(mbA, 1);
+                let mvA3 = mvsv_m(mbA, 3);
+                let mvA5 = mvsv_m(mbA, 5);
+                let mvA7 = mvsv_m(mbA, 7);
+                let mv0 = mvsv_m(mb, 0);
+                let mv1 = mvsv_m(mb, 1);
+                let mv2 = mvsv_m(mb, 2);
+                let mv3 = mvsv_m(mb, 3);
+                let mv4 = mvsv_m(mb, 4);
+                let mv5 = mvsv_m(mb, 5);
+                let mv6 = mvsv_m(mb, 6);
+                let mv7 = mvsv_m(mb, 7);
+                let mvB2 = mvsv_m(mbB, 2);
+                let mvB3 = mvsv_m(mbB, 3);
+                let mvB6 = mvsv_m(mbB, 6);
+                let mvB7 = mvsv_m(mbB, 7);
+                let mvsv0l0 = uzp2_32(mvA1, mvA3);
+                let mvsv1l0 = uzp1_32(mv0, mv2);
+                let mvsv2l0 = uzp2_32(mv0, mv2);
+                let mvsv3l0 = uzp1_32(mv1, mv3);
+                let mvsv4l0 = uzp2_32(mv1, mv3);
+                let mvsv0l1 = uzp2_32(mvA5, mvA7);
+                let mvsv1l1 = uzp1_32(mv4, mv6);
+                let mvsv2l1 = uzp2_32(mv4, mv6);
+                let mvsv3l1 = uzp1_32(mv5, mv7);
+                let mvsv4l1 = uzp2_32(mv5, mv7);
+                let mvsacl00 = packabd16_m(mvsv0l0, mvsv1l0, mvsv2l0, mvsv3l0);
+                let mvsbdl00 = packabd16_m(mvsv1l0, mvsv2l0, mvsv3l0, mvsv4l0);
+                let mvsacl01 = packabd16_m(mvsv0l0, mvsv1l1, mvsv2l0, mvsv3l1);
+                let mvsbdl01 = packabd16_m(mvsv1l0, mvsv2l1, mvsv3l0, mvsv4l1);
+                let mvsacl10 = packabd16_m(mvsv0l1, mvsv1l0, mvsv2l1, mvsv3l0);
+                let mvsbdl10 = packabd16_m(mvsv1l1, mvsv2l0, mvsv3l1, mvsv4l0);
+                let mvsacl11 = packabd16_m(mvsv0l1, mvsv1l1, mvsv2l1, mvsv3l1);
+                let mvsbdl11 = packabd16_m(mvsv1l1, mvsv2l1, mvsv3l1, mvsv4l1);
+                let mvsacp = _mm_subs_epu8(_mm_max_epu8(mvsacl00, mvsacl11), c3);
+                let mvsbdp = _mm_subs_epu8(_mm_max_epu8(mvsbdl00, mvsbdl11), c3);
+                let mvsacc = _mm_subs_epu8(_mm_max_epu8(mvsacl01, mvsacl10), c3);
+                let mvsbdc = _mm_subs_epu8(_mm_max_epu8(mvsbdl01, mvsbdl10), c3);
+                let mvsh0l0 = _mm_unpackhi_epi64(mvB2, mvB3);
+                let mvsh1l0 = _mm_unpacklo_epi64(mv0, mv1);
+                let mvsh2l0 = _mm_unpackhi_epi64(mv0, mv1);
+                let mvsh3l0 = _mm_unpacklo_epi64(mv2, mv3);
+                let mvsh4l0 = _mm_unpackhi_epi64(mv2, mv3);
+                let mvsh0l1 = _mm_unpackhi_epi64(mvB6, mvB7);
+                let mvsh1l1 = _mm_unpacklo_epi64(mv4, mv5);
+                let mvsh2l1 = _mm_unpackhi_epi64(mv4, mv5);
+                let mvsh3l1 = _mm_unpacklo_epi64(mv6, mv7);
+                let mvsh4l1 = _mm_unpackhi_epi64(mv6, mv7);
+                let mvsegl00 = packabd16_m(mvsh0l0, mvsh1l0, mvsh2l0, mvsh3l0);
+                let mvsfhl00 = packabd16_m(mvsh1l0, mvsh2l0, mvsh3l0, mvsh4l0);
+                let mvsegl01 = packabd16_m(mvsh0l0, mvsh1l1, mvsh2l0, mvsh3l1);
+                let mvsfhl01 = packabd16_m(mvsh1l0, mvsh2l1, mvsh3l0, mvsh4l1);
+                let mvsegl10 = packabd16_m(mvsh0l1, mvsh1l0, mvsh2l1, mvsh3l0);
+                let mvsfhl10 = packabd16_m(mvsh1l1, mvsh2l0, mvsh3l1, mvsh4l0);
+                let mvsegl11 = packabd16_m(mvsh0l1, mvsh1l1, mvsh2l1, mvsh3l1);
+                let mvsfhl11 = packabd16_m(mvsh1l1, mvsh2l1, mvsh3l1, mvsh4l1);
+                let mvsegp = _mm_subs_epu8(_mm_max_epu8(mvsegl00, mvsegl11), c3);
+                let mvsfhp = _mm_subs_epu8(_mm_max_epu8(mvsfhl00, mvsfhl11), c3);
+                let mvsegc = _mm_subs_epu8(_mm_max_epu8(mvsegl01, mvsegl10), c3);
+                let mvsfhc = _mm_subs_epu8(_mm_max_epu8(mvsfhl01, mvsfhl10), c3);
+                let mvsacegp = _mm_packs_epi16(mvsacp, mvsegp);
+                let mvsbdfhp = _mm_packs_epi16(mvsbdp, mvsfhp);
+                let mvsacegc = _mm_packs_epi16(mvsacc, mvsegc);
+                let mvsbdfhc = _mm_packs_epi16(mvsbdc, mvsfhc);
+                let refPic = _mm_set_epi64x(0, rpl(mb)); // [rpl(mb), 0]
+                let refPicAB = _mm_set_epi64x(rpl(mbB), rpl(mbA)); // [rpl(mbA), rpl(mbB)]
+                let refs0 = _mm_shuffle_epi8(uzp1_32(refPic, refPicAB), mask(&SHUFVHAB));
+                let refs1 = _mm_shuffle_epi8(uzp2_32(refPic, refPicAB), mask(&SHUFVHAB));
+                let neq0 = _mm_xor_si128(refs0, _mm_alignr_epi8(refs0, refs1, 8));
+                let neq1 = _mm_xor_si128(refs1, _mm_alignr_epi8(refs1, refs0, 8));
+                let neq2 = _mm_xor_si128(refs0, refs1);
+                let refsaceg = _mm_or_si128(neq0, neq1);
+                let refsacegc = _mm_unpacklo_epi8(refsaceg, refsaceg);
+                let refsacegp = _mm_unpackhi_epi8(refsaceg, refsaceg);
+                let refsbdfhc = _mm_unpacklo_epi8(neq2, neq2);
+                let neq3 = _mm_or_si128(
+                    _mm_min_epu8(refsacegp, refsacegc),
+                    _mm_min_epu8(mvsacegp, mvsacegc),
+                );
+                let neq4 = _mm_or_si128(
+                    _mm_min_epu8(refsacegp, mvsacegc),
+                    _mm_min_epu8(mvsacegp, refsacegc),
+                );
+                (
+                    _mm_cmpeq_epi8(_mm_or_si128(neq3, neq4), zero),
+                    _mm_cmpeq_epi8(
+                        _mm_min_epu8(mvsbdfhp, _mm_or_si128(refsbdfhc, mvsbdfhc)),
+                        zero,
+                    ),
+                )
+            };
+
+            // 8x8 blocks with CAVLC: broadcast transform tokens beforehand.
+            let mut nC = to_m(mb.nC_v0());
+            if entropy == 0 && mb.ts8x8 != 0 {
+                nC = _mm_sub_epi8(_mm_cmpeq_epi32(nC, zero), _mm_set1_epi8(-1));
+            }
+
+            // bS=2 masks from coded-block flags
+            let nnzv = _mm_shuffle_epi8(nC, mask(&SHUFV));
+            let nnzl = _mm_shuffle_epi8(to_m(mbA.nC_v0()), mask(&SHUFV));
+            let nnzh = _mm_shuffle_epi8(nC, mask(&SHUFH));
+            let nnzt = _mm_shuffle_epi8(to_m(mbB.nC_v0()), mask(&SHUFH));
+            let bS2abcd =
+                _mm_cmpgt_epi8(_mm_or_si128(nnzv, _mm_alignr_epi8(nnzv, nnzl, 12)), zero);
+            let bS2efgh =
+                _mm_cmpgt_epi8(_mm_or_si128(nnzh, _mm_alignr_epi8(nnzh, nnzt, 12)), zero);
+            let bS2aacc = trnlo_32(bS2abcd, bS2abcd);
+            let bS2eegg = trnlo_32(bS2efgh, bS2efgh);
+
+            // shuffle, blend and store tC0
+            let bS0abcd = _mm_unpacklo_epi32(bS0aceg, bS0bdfh);
+            let bS0efgh = _mm_unpackhi_epi32(bS0aceg, bS0bdfh);
+            let bS0aacc = _mm_unpacklo_epi32(bS0aceg, bS0aceg);
+            let bS0eegg = _mm_unpackhi_epi32(bS0aceg, bS0aceg);
+            tC0_v[0] = pick(
+                bS2abcd,
+                _mm_shuffle_epi8(tC02, mask(&SHUF0)),
+                _mm_or_si128(bS0abcd, _mm_shuffle_epi8(tC01, mask(&SHUF0))),
+            );
+            tC0_v[1] = pick(
+                bS2efgh,
+                _mm_shuffle_epi8(tC02, mask(&SHUF1)),
+                _mm_or_si128(bS0efgh, _mm_shuffle_epi8(tC01, mask(&SHUF1))),
+            );
+            tC0_v[2] = pick(
+                bS2aacc,
+                _mm_shuffle_epi8(tC02, mask(&SHUF2)),
+                _mm_or_si128(bS0aacc, _mm_shuffle_epi8(tC01, mask(&SHUF2))),
+            );
+            tC0_v[3] = pick(
+                bS2eegg,
+                _mm_shuffle_epi8(tC02, mask(&SHUF3)),
+                _mm_or_si128(bS0eegg, _mm_shuffle_epi8(tC01, mask(&SHUF3))),
+            );
+        }
+
+        let mut alpha = [0u8; 16];
+        unsafe { _mm_storeu_si128(alpha.as_mut_ptr() as *mut __m128i, alpha_v) };
+        let mut beta = [0u8; 16];
+        unsafe { _mm_storeu_si128(beta.as_mut_ptr() as *mut __m128i, beta_v) };
+        let mut tC0_s = [0i32; 16];
+        for i in 0..4 {
+            unsafe { _mm_storeu_si128(tC0_s[4 * i..].as_mut_ptr() as *mut __m128i, tC0_v[i]) };
+        }
+        (alpha, beta, tC0_s)
+    }
 }
 
 // ============================================================================
@@ -1270,7 +1625,27 @@ fn zero_v16() -> V16 {
 }
 
 /// Compute alpha[16], beta[16] and tC0_s[16] (deblock_mb, edge264_deblock.c:927).
+/// SSE-dispatched on x86_64; [`deblock_params_scalar`] is the fallback.
 pub(crate) fn deblock_params(
+    mbs: &[Mb; 3],
+    entropy: i32,
+    offA: i32,
+    offB: i32,
+) -> ([u8; 16], [u8; 16], [i32; 16]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            unsafe {
+                return sse::deblock_params_sse(mbs, entropy, offA, offB);
+            }
+        }
+    }
+    deblock_params_scalar(mbs, entropy, offA, offB)
+}
+
+/// Scalar fallback for [`deblock_params`].
+#[inline]
+pub(crate) fn deblock_params_scalar(
     mbs: &[Mb; 3],
     entropy: i32,
     offA: i32,
@@ -2586,4 +2961,68 @@ mod prim_tests {
                 }
             }
         }
+
+    /// SSE parameter computation must match the scalar fallback bit-for-bit on
+    /// random MB states (intra / P / 16x16-B / other-B; CAVLC+8x8 transform).
+    #[test]
+    fn sse_vs_scalar_params() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("sse4.1") {
+                return;
+            }
+            let mut rng = Lcg(0xd3b1_0cc5_f7aa);
+            for _ in 0..20_000 {
+                let kind = (rng.next() % 4) as u32; // 0=intra, 1=P, 2=B-16x16, 3=B-other
+                let mut mb_state = [0u8; 606];
+                for slot in 0..3usize {
+                    let b = slot * 202;
+                    mb_state[b] = rng.byte(); // QP_y
+                    mb_state[b + 1] = rng.byte(); // QP_cb
+                    mb_state[b + 2] = rng.byte(); // QP_cr
+                    mb_state[b + 3] = if kind == 0 { 0 } else { 1 }; // inter
+                    mb_state[b + 4] = 7; // filter_edges (all bits)
+                    let eq = if kind == 2 {
+                        0x1b5f_bbff
+                    } else {
+                        rng.next() as u32
+                    };
+                    mb_state[b + 5..b + 9].copy_from_slice(&eq.to_le_bytes());
+                    mb_state[b + 9] = rng.byte(); // ts8x8
+                    for k in 0..48 {
+                        mb_state[b + 10 + k] = rng.byte();
+                    }
+                    for k in 0..8 {
+                        // P kind forces refIdx L1 to -1 so the P branch is taken;
+                        // B kinds force refIdx[4]=0 so it is not.
+                        mb_state[b + 58 + k] = match (kind, k) {
+                            (1, 4..8) => (-1i8) as u8,
+                            (2 | 3, 4) => 0,
+                            _ => rng.byte(),
+                        };
+                    }
+                    for k in 0..8 {
+                        mb_state[b + 66 + k] = rng.byte();
+                    }
+                    for k in 0..64 {
+                        let mv = i16::from_ne_bytes([rng.byte(), rng.byte()]);
+                        mb_state[b + 74 + 2 * k..b + 74 + 2 * k + 2]
+                            .copy_from_slice(&mv.to_le_bytes());
+                    }
+                }
+                let mbs = [
+                    parse_mb(&mb_state[0..202]),
+                    parse_mb(&mb_state[202..404]),
+                    parse_mb(&mb_state[404..606]),
+                ];
+                let entropy = (rng.next() & 1) as i32;
+                let off_a = rng.byte() as i32 - 128;
+                let off_b = rng.byte() as i32 - 128;
+                assert_eq!(
+                    deblock_params_scalar(&mbs, entropy, off_a, off_b),
+                    unsafe { sse::deblock_params_sse(&mbs, entropy, off_a, off_b) }
+                );
+            }
+        }
+    }
     }
