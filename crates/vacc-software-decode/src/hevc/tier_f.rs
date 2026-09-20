@@ -366,9 +366,22 @@ mod tests {
         check_stream_goldens("msp");
     }
 
+    /// WPP (entropy_coding_sync) streams — pin the rayon parallel path, which
+    /// is not exercised by the other samples. Verified byte-exact against
+    /// ffmpeg (libx265 `entropy-coding-sync=1`) before pinning.
+    #[test]
+    fn tier_f_wpp() {
+        check_stream_goldens("wpp");
+    }
+
+    #[test]
+    fn tier_f_wpp10() {
+        check_stream_goldens("wpp10");
+    }
+
     pub(crate) fn golden_entries() -> Vec<(String, String)> {
         let mut v = Vec::new();
-        for name in ["main", "main10", "cra", "msp"] {
+        for name in ["main", "main10", "cra", "msp", "wpp", "wpp10"] {
             if let Some(entries) = run_stream(name) {
                 v.extend(entries);
             }

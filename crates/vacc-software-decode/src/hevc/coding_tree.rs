@@ -205,61 +205,45 @@ impl<'bs, 'a> DecodingContext<'bs, 'a> {
         }
     }
 
-    /// Build the per-row context for WPP from shared raw-pointer state.
-    /// SAFETY: see [`WppShared`] — the WPP diagonal dependency guarantees
-    /// that grid cells are only read after the writing row completed them.
-    unsafe fn from_wpp(g: &WppShared<'a>, cabac: &'bs mut CabacEngine<'bs>) -> Self {
-        let (cu_ptr, cu_len) = g.cu_info;
-        let (iy_ptr, iy_len) = g.intra_pred_mode_y;
-        let (ic_ptr, ic_len) = g.intra_pred_mode_c;
-        let (mi_ptr, mi_len) = g.motion_info;
-        let (sf_ptr, sf_len) = g.sao_params;
-        let (cbf_ptr, cbf_len) = g.cbf_luma_grid;
-        let (tu_ptr, tu_len) = g.log2_tu_size_grid;
-        let (ev_ptr, ev_len) = g.edge_flags_v;
-        let (eh_ptr, eh_len) = g.edge_flags_h;
-        unsafe {
-            DecodingContext {
-                sps: g.sps,
-                pps: g.pps,
-                sh: g.sh,
-                pic: &mut *g.pic,
-                dpb: g.dpb,
-                cabac,
-                sps_scaling_list_enabled: g.sps_scaling_list_enabled,
-                sps_scaling_list: g.sps_scaling_list,
-                pps_scaling_list_present: g.pps_scaling_list_present,
-                pps_scaling_list: g.pps_scaling_list,
-                cu_info: std::slice::from_raw_parts_mut(cu_ptr, cu_len),
-                cu_info_stride: g.cu_info_stride,
-                intra_pred_mode_y: std::slice::from_raw_parts_mut(iy_ptr, iy_len),
-                intra_pred_mode_c: std::slice::from_raw_parts_mut(ic_ptr, ic_len),
-                intra_pred_mode_stride: g.intra_pred_mode_stride,
-                motion_info: std::slice::from_raw_parts_mut(mi_ptr, mi_len),
-                motion_info_stride: g.motion_info_stride,
-                cbf_luma_grid: std::slice::from_raw_parts_mut(cbf_ptr, cbf_len),
-                log2_tu_size_grid: std::slice::from_raw_parts_mut(tu_ptr, tu_len),
-                edge_flags_v: std::slice::from_raw_parts_mut(ev_ptr, ev_len),
-                edge_flags_h: std::slice::from_raw_parts_mut(eh_ptr, eh_len),
-                filter_grid_stride: g.filter_grid_stride,
-                sao_params: std::slice::from_raw_parts_mut(sf_ptr, sf_len),
-                sao_params_stride: g.sao_params_stride,
-                slice_idx: if g.slice_idx.is_null() {
-                    None
-                } else {
-                    Some(std::slice::from_raw_parts_mut(g.slice_idx, g.slice_idx_len))
-                },
-                current_slice_idx: g.current_slice_idx,
-                qp_y_prev: 0,
-                qp_y_prev_qg: 0,
-                is_cu_qp_delta_coded: false,
-                cu_qp_delta_val: 0,
-                cu_x0: 0,
-                cu_y0: 0,
-                wpp_saved_contexts: [CabacContext::default(); NUM_CABAC_CONTEXTS],
-                wpp_contexts_available: false,
-                wpp_enabled: false,
-            }
+    /// Build the per-row context for WPP from shared state (see the SAFETY
+    /// invariant on [`WppShared`]).
+    fn from_wpp(g: &WppShared<'a>, cabac: &'bs mut CabacEngine<'bs>) -> Self {
+        DecodingContext {
+            sps: g.sps,
+            pps: g.pps,
+            sh: g.sh,
+            pic: g.pic_mut(),
+            dpb: g.dpb,
+            cabac,
+            sps_scaling_list_enabled: g.sps_scaling_list_enabled,
+            sps_scaling_list: g.sps_scaling_list,
+            pps_scaling_list_present: g.pps_scaling_list_present,
+            pps_scaling_list: g.pps_scaling_list,
+            cu_info: g.cu_info_mut(),
+            cu_info_stride: g.cu_info_stride,
+            intra_pred_mode_y: g.intra_pred_mode_y_mut(),
+            intra_pred_mode_c: g.intra_pred_mode_c_mut(),
+            intra_pred_mode_stride: g.intra_pred_mode_stride,
+            motion_info: g.motion_info_mut(),
+            motion_info_stride: g.motion_info_stride,
+            cbf_luma_grid: g.cbf_luma_grid_mut(),
+            log2_tu_size_grid: g.log2_tu_size_grid_mut(),
+            edge_flags_v: g.edge_flags_v_mut(),
+            edge_flags_h: g.edge_flags_h_mut(),
+            filter_grid_stride: g.filter_grid_stride,
+            sao_params: g.sao_params_mut(),
+            sao_params_stride: g.sao_params_stride,
+            slice_idx: g.slice_idx_opt(),
+            current_slice_idx: g.current_slice_idx,
+            qp_y_prev: 0,
+            qp_y_prev_qg: 0,
+            is_cu_qp_delta_coded: false,
+            cu_qp_delta_val: 0,
+            cu_x0: 0,
+            cu_y0: 0,
+            wpp_saved_contexts: [CabacContext::default(); NUM_CABAC_CONTEXTS],
+            wpp_contexts_available: false,
+            wpp_enabled: false,
         }
     }
 }
@@ -666,15 +650,24 @@ fn reconstruct_block(
 struct RowSync {
     /// Last completed column (-1 = not started).
     completed_col: AtomicI32,
-    lock: Mutex<()>,
+    lock: Mutex<RowState>,
     cv: Condvar,
+}
+
+/// State guarded by [`RowSync::lock`].
+struct RowState {
+    /// §9.3.2.4: this row's CABAC contexts, saved after its 2nd CTU and
+    /// consumed by the next row via [`RowSync::wait_col_take_contexts`].
+    wpp_contexts: [CabacContext; NUM_CABAC_CONTEXTS],
 }
 
 impl RowSync {
     fn new() -> Self {
         RowSync {
             completed_col: AtomicI32::new(-1),
-            lock: Mutex::new(()),
+            lock: Mutex::new(RowState {
+                wpp_contexts: [CabacContext::default(); NUM_CABAC_CONTEXTS],
+            }),
             cv: Condvar::new(),
         }
     }
@@ -687,21 +680,44 @@ impl RowSync {
             .unwrap();
     }
 
+    /// Publish this row's saved contexts. Called after CTU col 1, before
+    /// [`RowSync::complete_col`] for the same column, so any waiter that
+    /// observes `completed_col >= 1` (same mutex) also sees these contexts.
+    fn save_contexts(&self, ctx: &[CabacContext]) {
+        let mut state = self.lock.lock().unwrap();
+        state.wpp_contexts.copy_from_slice(ctx);
+    }
+
+    /// Wait for `col` to complete, then take this row's saved contexts.
+    /// The mutex makes the save happen-before the take.
+    fn wait_col_take_contexts(&self, col: i32) -> [CabacContext; NUM_CABAC_CONTEXTS] {
+        let guard = self.lock.lock().unwrap();
+        let state = self
+            .cv
+            .wait_while(guard, |_guard| self.completed_col.load(Ordering::Acquire) < col)
+            .unwrap();
+        state.wpp_contexts
+    }
+
     fn complete_col(&self, col: i32) {
         self.completed_col.store(col, Ordering::Release);
         self.cv.notify_all();
     }
 }
 
-/// Shared decode state for WPP row tasks. Raw pointers into the caller-owned
-/// grids/picture are shared across row threads.
+/// Shared decode state for WPP row tasks.
 ///
-/// SAFETY: The WPP diagonal dependency (row r+1 column c only proceeds after
-/// row r column min(c+1, last) completed) guarantees that any grid cell is
-/// read by a later row only after the writing row has finished it — the same
-/// invariant the C++ ThreadPool condvars enforce. Rows write disjoint CTU
-/// regions of every grid; the only cross-row reads are of already-completed
-/// neighbour rows.
+/// The grid/picture fields are raw pointers into caller-owned buffers, never
+/// exposed directly: all access goes through the accessors below. They alias
+/// each other in a controlled way, justified by one invariant:
+///
+/// SAFETY (basis of the `Send`/`Sync` impls and the `&mut`-returning
+/// accessors): the WPP diagonal dependency (row r+1 column c only proceeds
+/// after row r column min(c+1, last) completed, synchronized by `RowSync`
+/// condvars) guarantees that any grid cell is read by a later row only after
+/// the writing row has finished it — the same invariant the C++ ThreadPool
+/// condvars enforce. Rows write disjoint CTU regions of every grid and of the
+/// picture; the only cross-row reads are of already-completed neighbour rows.
 pub struct WppShared<'a> {
     pub sps: &'a Sps,
     pub pps: &'a Pps,
@@ -716,60 +732,125 @@ pub struct WppShared<'a> {
     pub pps_scaling_list_present: bool,
     pub pps_scaling_list: &'a ScalingListData,
 
-    pub pic: *mut Picture,
-    pub cu_info: (*mut CuInfo, usize),
+    pic: *mut Picture,
+    cu_info: (*mut CuInfo, usize),
     pub cu_info_stride: i32,
-    pub intra_pred_mode_y: (*mut i32, usize),
-    pub intra_pred_mode_c: (*mut i32, usize),
+    intra_pred_mode_y: (*mut i32, usize),
+    intra_pred_mode_c: (*mut i32, usize),
     pub intra_pred_mode_stride: i32,
-    pub motion_info: (*mut PuMotionInfo, usize),
+    motion_info: (*mut PuMotionInfo, usize),
     pub motion_info_stride: i32,
-    pub cbf_luma_grid: (*mut u8, usize),
-    pub log2_tu_size_grid: (*mut u8, usize),
-    pub edge_flags_v: (*mut u8, usize),
-    pub edge_flags_h: (*mut u8, usize),
+    cbf_luma_grid: (*mut u8, usize),
+    log2_tu_size_grid: (*mut u8, usize),
+    edge_flags_v: (*mut u8, usize),
+    edge_flags_h: (*mut u8, usize),
     pub filter_grid_stride: i32,
-    pub sao_params: (*mut SaoParams, usize),
+    sao_params: (*mut SaoParams, usize),
     pub sao_params_stride: i32,
     /// Null = no slice index tracking.
-    pub slice_idx: *mut u8,
-    pub slice_idx_len: usize,
+    slice_idx: *mut u8,
+    slice_idx_len: usize,
     pub current_slice_idx: i32,
 }
 
-// The raw pointers above alias each other only in the sense documented on
-// `WppShared`; access is synchronized by the WPP diagonal dependency.
+// See the SAFETY invariant on `WppShared`.
 unsafe impl<'a> Send for WppShared<'a> {}
 unsafe impl<'a> Sync for WppShared<'a> {}
 
-/// Per-row WPP context storage shared between the two concurrent row tasks
-/// of a `rayon::join` call. The per-chunk exclusivity invariant is
-/// documented on [`decode_wpp_row`].
-struct WppCtxStorage(*mut CabacContext);
-unsafe impl Sync for WppCtxStorage {}
+impl<'a> WppShared<'a> {
+    // Each accessor materializes a reference from a stored raw pointer.
+    // SAFETY: the `WppShared` invariant — concurrent row tasks only touch
+    // disjoint CTU regions, synchronized by the WPP diagonal dependency.
 
-impl WppCtxStorage {
-    /// Access via method so row closures capture the whole struct (whose
-    /// `Sync` impl documents the invariant), not the raw pointer field.
     #[inline]
-    fn ptr(&self) -> *mut CabacContext {
-        self.0
+    fn pic_mut(&self) -> &'a mut Picture {
+        unsafe { &mut *self.pic }
+    }
+
+    #[inline]
+    fn cu_info_mut(&self) -> &'a mut [CuInfo] {
+        let (p, len) = self.cu_info;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn intra_pred_mode_y_mut(&self) -> &'a mut [i32] {
+        let (p, len) = self.intra_pred_mode_y;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn intra_pred_mode_c_mut(&self) -> &'a mut [i32] {
+        let (p, len) = self.intra_pred_mode_c;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn motion_info_mut(&self) -> &'a mut [PuMotionInfo] {
+        let (p, len) = self.motion_info;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn cbf_luma_grid_mut(&self) -> &'a mut [u8] {
+        let (p, len) = self.cbf_luma_grid;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn log2_tu_size_grid_mut(&self) -> &'a mut [u8] {
+        let (p, len) = self.log2_tu_size_grid;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn edge_flags_v_mut(&self) -> &'a mut [u8] {
+        let (p, len) = self.edge_flags_v;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn edge_flags_h_mut(&self) -> &'a mut [u8] {
+        let (p, len) = self.edge_flags_h;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    #[inline]
+    fn sao_params_mut(&self) -> &'a mut [SaoParams] {
+        let (p, len) = self.sao_params;
+        unsafe { std::slice::from_raw_parts_mut(p, len) }
+    }
+
+    /// Slice-ownership grid, or `None` when tracking is off.
+    fn slice_idx_opt(&self) -> Option<&'a mut [u8]> {
+        if self.slice_idx.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts_mut(self.slice_idx, self.slice_idx_len) })
+        }
+    }
+
+    /// Record which slice owns CTU `idx` (no-op when tracking is off).
+    #[inline]
+    fn set_slice_idx(&self, idx: usize, v: u8) {
+        if !self.slice_idx.is_null() {
+            unsafe { *self.slice_idx.add(idx) = v };
+        }
     }
 }
 
 /// Decode one CTU row of the WPP pipeline.
-/// SAFETY: `wpp_ctx_storage` is a flat array of per-row context chunks;
-/// each row writes only its own chunk (chunk `row`) and reads only chunk
-/// `row-1` after waiting on the condvar below, so no two rows touch the same
-/// chunk concurrently.
+///
+/// The per-row CABAC context handoff (§9.3.2.4) goes through `RowSync`
+/// state: this row saves its contexts at CTU col 1, and the next row takes
+/// them after waiting on this row's `RowSync` — no shared mutable storage.
 #[allow(clippy::too_many_arguments)]
-unsafe fn decode_wpp_row(
+fn decode_wpp_row(
     g: &WppShared,
     row: i32,
     start_row: i32,
     substream_byte_pos: &[usize],
     sync: &[RowSync],
-    wpp_ctx_storage: *mut CabacContext,
 ) -> usize {
     let sps = g.sps;
     let sh = g.sh;
@@ -793,26 +874,13 @@ unsafe fn decode_wpp_row(
         }
     } else {
         // Wait for row-1 col 1 (2nd CTU) before restoring contexts
-        sync[(row - 1) as usize].wait_col(1);
-        let base = (row - 1) as usize * NUM_CABAC_CONTEXTS;
-        let mut saved = [CabacContext::default(); NUM_CABAC_CONTEXTS];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                wpp_ctx_storage.add(base),
-                saved.as_mut_ptr(),
-                NUM_CABAC_CONTEXTS,
-            );
-        }
+        let saved = sync[(row - 1) as usize].wait_col_take_contexts(1);
         row_cabac.load_contexts(&saved);
     }
     row_cabac.init_decoder();
 
-    // Context array pointer (valid for the engine's lifetime), captured
-    // before `row_ctx` mutably borrows the engine.
-    let cabac_ctx_ptr = row_cabac.contexts_ptr();
-
     // Per-row DecodingContext (shallow share — shared grids, pic, etc.)
-    let mut row_ctx = unsafe { DecodingContext::from_wpp(g, &mut row_cabac) };
+    let mut row_ctx = DecodingContext::from_wpp(g, &mut row_cabac);
     row_ctx.qp_y_prev = sh.slice_qp_y;
     row_ctx.qp_y_prev_qg = sh.slice_qp_y;
 
@@ -829,22 +897,15 @@ unsafe fn decode_wpp_row(
         let y_ctb = row << sps.ctb_log2_size_y;
 
         // Record slice ownership
-        if !g.slice_idx.is_null() {
-            unsafe { *g.slice_idx.add(ctb_addr_rs as usize) = g.current_slice_idx as u8 };
-        }
+        g.set_slice_idx(ctb_addr_rs as usize, g.current_slice_idx as u8);
 
         decode_coding_tree_unit(&mut row_ctx, x_ctb, y_ctb);
 
         // §9.3.2.4: save contexts after 2nd CTU (col 1) for next row
         if col == 1 {
-            let base = row as usize * NUM_CABAC_CONTEXTS;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    cabac_ctx_ptr,
-                    wpp_ctx_storage.add(base),
-                    NUM_CABAC_CONTEXTS,
-                );
-            }
+            let mut saved = [CabacContext::default(); NUM_CABAC_CONTEXTS];
+            row_ctx.cabac.save_contexts(&mut saved);
+            sync[row as usize].save_contexts(&saved);
         }
 
         // Signal completion and notify waiting rows
@@ -866,11 +927,21 @@ unsafe fn decode_wpp_row(
     row_ctx.cabac.bitstream().bits_read()
 }
 
-/// WPP parallel decode via rayon. Each CTU row is a unit of work; at most two
-/// rows run concurrently (row r+1 waits on row r's per-column progress). The
-/// output is byte-identical to the serial path — only the scheduling differs.
-/// Returns the final bit position of the slice segment (max over all rows' 
-/// private readers — substreams are laid out sequentially, so only the last 
+/// WPP parallel decode via rayon. Each CTU row is a unit of work submitted
+/// to the pool (mirroring the C++ ThreadPool design): rows form a deep
+/// pipeline — row r+1 tracks row r one column behind, row r+2 tracks row r+1,
+/// and so on — so with enough workers several rows decode concurrently and
+/// each new row starts as soon as its predecessor's 2nd CTU completes instead
+/// of after the whole previous row. The output is byte-identical to the
+/// serial path — only the scheduling differs.
+///
+/// Deadlock-freedom: a row only ever waits on the row directly above it, and
+/// only after that row has made progress (col >= 1). For the lowest-indexed
+/// blocked row, its producer is therefore either running or finished — never
+/// queued behind blocked rows — so some worker is always free to make progress.
+///
+/// Returns the final bit position of the slice segment (max over all rows'
+/// private readers — substreams are laid out sequentially, so only the last
 /// row can reach the true end).
 pub fn decode_wpp_parallel(g: &WppShared, substream_byte_pos: &[usize]) -> usize {
     let sps = g.sps;
@@ -883,32 +954,24 @@ pub fn decode_wpp_parallel(g: &WppShared, substream_byte_pos: &[usize]) -> usize
     let end_row = start_row + substream_byte_pos.len() as i32;
 
     let sync: Vec<RowSync> = (0..num_rows).map(|_| RowSync::new()).collect();
-    // Per-row WPP saved contexts (row r saves at col 1, row r+1 restores)
-    let mut wpp_ctx_storage = vec![CabacContext::default(); num_rows as usize * NUM_CABAC_CONTEXTS];
-    // SAFETY: per-chunk exclusivity is documented on `decode_wpp_row`; the
-    // buffer outlives all row tasks.
-    let storage = WppCtxStorage(wpp_ctx_storage.as_mut_ptr());
+    let final_pos = std::sync::atomic::AtomicUsize::new(0);
 
-    let mut r = start_row;
-    let mut final_pos = 0usize;
-    while r < end_row {
-        if r + 1 < end_row {
-            // Two-row pipeline: the left closure never blocks, so the right
-            // one's waits always have a running producer (no deadlock).
-            let (p1, p2) = rayon::join(
-                || unsafe { decode_wpp_row(g, r, start_row, substream_byte_pos, &sync, storage.ptr()) },
-                || unsafe { decode_wpp_row(g, r + 1, start_row, substream_byte_pos, &sync, storage.ptr()) },
-            );
-            final_pos = final_pos.max(p1).max(p2);
-            r += 2;
-        } else {
-            let p = unsafe { decode_wpp_row(g, r, start_row, substream_byte_pos, &sync, storage.ptr()) };
-            final_pos = final_pos.max(p);
-            r += 1;
+    rayon::scope(|s| {
+        let sync = &sync;
+        let final_pos = &final_pos;
+        // Submit worker rows; run the first row on the current thread (same
+        // shape as the C++ original: pool jobs + inline front row).
+        for r in (start_row + 1)..end_row {
+            s.spawn(move |_| {
+                let p = decode_wpp_row(g, r, start_row, substream_byte_pos, sync);
+                final_pos.fetch_max(p, std::sync::atomic::Ordering::Relaxed);
+            });
         }
-    }
+        let p = decode_wpp_row(g, start_row, start_row, substream_byte_pos, sync);
+        final_pos.fetch_max(p, std::sync::atomic::Ordering::Relaxed);
+    });
 
-    final_pos
+    final_pos.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ============================================================
@@ -966,9 +1029,10 @@ pub fn decode_slice_segment_data(
         let start_row = sh.slice_segment_address / sps.pic_width_in_ctbs_y;
         let end_row = start_row + substream_byte_pos.len() as i32;
         if end_row - start_row > 1 {
-            // SAFETY: exclusive access to all buffers for the duration of
-            // the call (see WppShared).
-            let g = unsafe { wpp_shared_from_ctx(ctx) };
+            // Exclusive access to all buffers for the duration of the call
+            // is guaranteed by the `&mut ctx` borrow held through `g`
+            // (see the SAFETY invariant on WppShared).
+            let g = wpp_shared_from_ctx(ctx);
             return (true, decode_wpp_parallel(&g, &substream_byte_pos));
         }
     }
@@ -1082,10 +1146,10 @@ pub fn decode_slice_segment_data(
     (true, ctx.cabac.bitstream().bits_read())
 }
 
-/// Build a `WppShared` from the current context's references.
-/// SAFETY: caller guarantees exclusive access to all referenced buffers for
-/// the duration of the parallel call (no other thread may touch them).
-unsafe fn wpp_shared_from_ctx<'bs, 'a, 'w>(ctx: &'w mut DecodingContext<'bs, 'a>) -> WppShared<'w> {
+/// Build a `WppShared` from the current context's references. Exclusive
+/// access to all referenced buffers for the duration of the parallel call is
+/// guaranteed by the `&mut ctx` borrow that `WppShared<'w>` keeps alive.
+fn wpp_shared_from_ctx<'bs, 'a, 'w>(ctx: &'w mut DecodingContext<'bs, 'a>) -> WppShared<'w> {
     let rbsp = ctx.cabac.bitstream().data();
     WppShared {
         sps: ctx.sps,
@@ -1764,13 +1828,6 @@ thread_local! {
     static TU_SCRATCH: RefCell<Vec<i16>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Guard over per-thread TU scratch: four writable slots of `n` i16 samples
-/// (coefficients, scaled, residual, pred_samples) plus a zero slot.
-struct TuScratchGuard {
-    base: *mut i16,
-    n: usize,
-}
-
 /// Five disjoint slices over the TU scratch. The `zero` slot is never
 /// written to.
 struct TuSlots<'a> {
@@ -1781,46 +1838,22 @@ struct TuSlots<'a> {
     zero: &'a [i16],
 }
 
-impl TuScratchGuard {
-    /// # Safety
-    /// The caller must guarantee that no other code on the current thread
-    /// accesses the TU scratch cell while this guard is alive. This holds in
-    /// practice: `decode_transform_unit` is a leaf kernel (nothing it calls
-    /// re-enters the scratch accessor, so the buffer can never be reallocated
-    /// under us) and each rayon worker thread owns its own TLS cell.
-    unsafe fn new(n: usize) -> Self {
-        debug_assert!(n <= MAX_TU_SAMPLES, "TU larger than 64x64");
-        let base = TU_SCRATCH.with(|c| {
-            let mut v = c.borrow_mut();
-            // No per-visit zeroing: decode_residual_coding self-zeroes
-            // coefficients, perform_dequant covers all scaled positions, and
-            // the inverse transform / copy_from_slice cover residual. The
-            // zero slot lives beyond every writable region, so it stays at
-            // its allocation-time zeros. pred_samples is zeroed at its
-            // intra-prediction call sites (matching C++'s per-visit
-            // `int16_t pred_samples[64*64] = {}`); the inter path overwrites
-            // it fully.
-            if v.len() < ZERO_SLOT_OFFSET + n {
-                v.resize(ZERO_SLOT_OFFSET + n, 0);
-            }
-            v.as_mut_ptr()
-        });
-        Self { base, n }
-    }
-
-    fn slots(&mut self) -> TuSlots<'_> {
-        unsafe {
-            let base = self.base;
-            let n = self.n;
-            TuSlots {
-                coefficients: std::slice::from_raw_parts_mut(base, n),
-                scaled: std::slice::from_raw_parts_mut(base.add(n), n),
-                residual: std::slice::from_raw_parts_mut(base.add(2 * n), n),
-                pred_samples: std::slice::from_raw_parts_mut(base.add(3 * n), n),
-                zero: std::slice::from_raw_parts(base.add(ZERO_SLOT_OFFSET), n),
-            }
-        }
-    }
+/// Split the per-thread scratch into the five slots for a TU visit of `n`
+/// samples. The caller must keep the scratch's `RefMut` alive for as long as
+/// the returned slices are used (re-entrant access then panics on the
+/// double borrow instead of reallocating under live slots).
+fn tu_slots(scratch: &mut [i16], n: usize) -> TuSlots<'_> {
+    // Layout (absolute offsets): [0, n) coefficients, [n, 2n) scaled,
+    // [2n, 3n) residual, [3n, 4n) pred_samples, and the zero slot at the
+    // fixed absolute offset ZERO_SLOT_OFFSET (beyond every writable region,
+    // so its allocation-time zeros persist).
+    let (writable, zero_region) = scratch.split_at_mut(ZERO_SLOT_OFFSET);
+    let (coefficients, rest) = writable.split_at_mut(n);
+    let (scaled, rest) = rest.split_at_mut(n);
+    let (residual, rest) = rest.split_at_mut(n);
+    let (pred_samples, _) = rest.split_at_mut(n);
+    let zero = &zero_region[..n];
+    TuSlots { coefficients, scaled, residual, pred_samples, zero }
 }
 
 // ============================================================
@@ -1850,54 +1883,95 @@ fn decode_transform_unit(
     let cu_bypass = ctx.cu_at(x0, y0).cu_transquant_bypass;
 
     let tr_size = 1i32 << log2_trafo_size;
+    let n = (tr_size * tr_size) as usize;
+    debug_assert!(n <= MAX_TU_SAMPLES, "TU larger than 64x64");
     // Per-thread scratch for this TU visit (5 slots of tr_size^2 samples).
     // `coefficients` is zeroed by decode_residual_coding itself; the other
     // writable slots are fully overwritten by their producers, and `zero`
-    // is never written to.
-    let mut scratch = unsafe { TuScratchGuard::new((tr_size * tr_size) as usize) };
-    let TuSlots { coefficients, scaled, residual, pred_samples, zero } = scratch.slots();
+    // is never written to. No per-visit zeroing: the zero slot lives beyond
+    // every writable region, so it stays at its allocation-time zeros;
+    // pred_samples is zeroed at its intra-prediction call sites (matching
+    // C++'s per-visit `int16_t pred_samples[64*64] = {}`), and the inter
+    // path overwrites it fully.
+    // The RefMut must be held for the whole visit; thread_local::with does
+    // not let borrows escape the closure, so the entire TU decode runs
+    // inside it. Anything re-entering the scratch cell mid-visit then
+    // panics (double borrow) instead of a reallocation dangling live slots.
+    TU_SCRATCH.with(|c| {
+        let mut scratch = c.borrow_mut();
+        if scratch.len() < ZERO_SLOT_OFFSET + n {
+            scratch.resize(ZERO_SLOT_OFFSET + n, 0);
+        }
+        let TuSlots { coefficients, scaled, residual, pred_samples, zero } = tu_slots(&mut scratch[..], n);
 
-    // QP delta
-    if (cbf_luma || cbf_cb || cbf_cr) && pps.cu_qp_delta_enabled_flag && !ctx.is_cu_qp_delta_coded {
-        ctx.cu_qp_delta_val = decode_cu_qp_delta(ctx.cabac);
-        ctx.is_cu_qp_delta_coded = true;
-    }
-
-    // §8.6.1: QP derivation uses CU position (xCb, yCb), not TU position
-    let qp_y = derive_qp_y(ctx, ctx.cu_x0, ctx.cu_y0);
-
-    // Luma residual
-    if cbf_luma {
-        let mut transform_skip = false;
-        if pps.transform_skip_enabled_flag && !cu_bypass && log2_trafo_size <= 2 {
-            transform_skip = decode_transform_skip_flag(ctx.cabac, 0) != 0;
+        // QP delta
+        if (cbf_luma || cbf_cb || cbf_cr) && pps.cu_qp_delta_enabled_flag && !ctx.is_cu_qp_delta_coded {
+            ctx.cu_qp_delta_val = decode_cu_qp_delta(ctx.cabac);
+            ctx.is_cu_qp_delta_coded = true;
         }
 
-        decode_residual_coding(ctx, x0, y0, log2_trafo_size, 0, coefficients);
+        // §8.6.1: QP derivation uses CU position (xCb, yCb), not TU position
+        let qp_y = derive_qp_y(ctx, ctx.cu_x0, ctx.cu_y0);
 
-        if !cu_bypass {
-            let qp_prime = qp_y + sps.qp_bd_offset_y;
-            let dq = dequant_params(ctx, cu_pred_mode);
-            perform_dequant(&dq, log2_trafo_size as u32, 0, qp_prime, coefficients, scaled);
+        // Luma residual
+        if cbf_luma {
+            let mut transform_skip = false;
+            if pps.transform_skip_enabled_flag && !cu_bypass && log2_trafo_size <= 2 {
+                transform_skip = decode_transform_skip_flag(ctx.cabac, 0) != 0;
+            }
 
-            perform_transform_inverse(
-                log2_trafo_size as u32,
-                0,
-                cu_pred_mode == PredMode::Intra,
-                transform_skip,
-                sps.bit_depth_y as u32,
-                scaled,
-                residual,
-            );
-        } else {
-            residual.copy_from_slice(coefficients);
-        }
+            decode_residual_coding(ctx, x0, y0, log2_trafo_size, 0, coefficients);
 
-        // Prediction for luma
-        if cu_pred_mode == PredMode::Intra {
+            if !cu_bypass {
+                let qp_prime = qp_y + sps.qp_bd_offset_y;
+                let dq = dequant_params(ctx, cu_pred_mode);
+                perform_dequant(&dq, log2_trafo_size as u32, 0, qp_prime, coefficients, scaled);
+
+                perform_transform_inverse(
+                    log2_trafo_size as u32,
+                    0,
+                    cu_pred_mode == PredMode::Intra,
+                    transform_skip,
+                    sps.bit_depth_y as u32,
+                    scaled,
+                    residual,
+                );
+            } else {
+                residual.copy_from_slice(coefficients);
+            }
+
+            // Prediction for luma
+            if cu_pred_mode == PredMode::Intra {
+                let intra_mode = ctx.intra_mode_at(x0, y0);
+                // C++ zeroes pred_samples per visit; intra prediction does
+                // partial writes relying on zero-init.
+                pred_samples.fill(0);
+                perform_intra_prediction(
+                    ctx.pic,
+                    ctx.sps,
+                    ctx.pps,
+                    x0,
+                    y0,
+                    log2_trafo_size,
+                    0,
+                    intra_mode,
+                    ctx.slice_idx.as_deref(),
+                    pred_samples,
+                );
+            } else {
+                // Inter: pred already in picture from PU-level MC, read it back
+                for y in 0..tr_size {
+                    for x in 0..tr_size {
+                        pred_samples[(y * tr_size + x) as usize] = ctx.pic.sample(0, x0 + x, y0 + y) as i16;
+                    }
+                }
+            }
+
+            // Reconstruct
+            reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, residual);
+        } else if cu_pred_mode == PredMode::Intra {
+            // No residual but still need intra prediction
             let intra_mode = ctx.intra_mode_at(x0, y0);
-            // C++ zeroes pred_samples per visit; intra prediction does
-            // partial writes relying on zero-init.
             pred_samples.fill(0);
             perform_intra_prediction(
                 ctx.pic,
@@ -1911,112 +1985,115 @@ fn decode_transform_unit(
                 ctx.slice_idx.as_deref(),
                 pred_samples,
             );
-        } else {
-            // Inter: pred already in picture from PU-level MC, read it back
-            for y in 0..tr_size {
-                for x in 0..tr_size {
-                    pred_samples[(y * tr_size + x) as usize] = ctx.pic.sample(0, x0 + x, y0 + y) as i16;
-                }
-            }
+
+            // Reconstruct with zero residual
+            reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, zero);
         }
 
-        // Reconstruct
-        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, residual);
-    } else if cu_pred_mode == PredMode::Intra {
-        // No residual but still need intra prediction
-        let intra_mode = ctx.intra_mode_at(x0, y0);
-        pred_samples.fill(0);
-        perform_intra_prediction(
-            ctx.pic,
-            ctx.sps,
-            ctx.pps,
-            x0,
-            y0,
-            log2_trafo_size,
-            0,
-            intra_mode,
-            ctx.slice_idx.as_deref(),
-            pred_samples,
-        );
+        // Chroma residual (4:2:0: chroma TU is log2TrafoSize-1, min 2)
+        if sps.chroma_array_type != 0 {
+            let log2_trafo_size_c = (log2_trafo_size - 1).max(2);
+            let tr_size_c = 1i32 << log2_trafo_size_c;
 
-        // Reconstruct with zero residual
-        reconstruct_block(ctx, x0, y0, log2_trafo_size, 0, pred_samples, zero);
-    }
+            // For 4:2:0 with log2TrafoSize==2, chroma is deferred to blkIdx==3
+            let process_chroma = log2_trafo_size > 2 || blk_idx == 3;
 
-    // Chroma residual (4:2:0: chroma TU is log2TrafoSize-1, min 2)
-    if sps.chroma_array_type != 0 {
-        let log2_trafo_size_c = (log2_trafo_size - 1).max(2);
-        let tr_size_c = 1i32 << log2_trafo_size_c;
+            // §7.3.8.10: chroma position uses xBase/yBase when log2TrafoSize==2
+            let x_c = if sps.chroma_array_type != 3 && log2_trafo_size == 2 { x_base } else { x0 };
+            let y_c = if sps.chroma_array_type != 3 && log2_trafo_size == 2 { y_base } else { y0 };
 
-        // For 4:2:0 with log2TrafoSize==2, chroma is deferred to blkIdx==3
-        let process_chroma = log2_trafo_size > 2 || blk_idx == 3;
+            if process_chroma {
+                for c_idx in 1..=2 {
+                    let cbf_c = if c_idx == 1 { cbf_cb } else { cbf_cr };
+                    if cbf_c {
+                        let n_c = (tr_size_c * tr_size_c) as usize;
+                        let coefficients = &mut coefficients[..n_c];
+                        let scaled = &mut scaled[..n_c];
+                        let residual = &mut residual[..n_c];
 
-        // §7.3.8.10: chroma position uses xBase/yBase when log2TrafoSize==2
-        let x_c = if sps.chroma_array_type != 3 && log2_trafo_size == 2 { x_base } else { x0 };
-        let y_c = if sps.chroma_array_type != 3 && log2_trafo_size == 2 { y_base } else { y0 };
+                        let mut transform_skip = false;
+                        if pps.transform_skip_enabled_flag
+                            && !cu_bypass
+                            && log2_trafo_size_c <= 2
+                        {
+                            transform_skip = decode_transform_skip_flag(ctx.cabac, c_idx) != 0;
+                        }
 
-        if process_chroma {
-            for c_idx in 1..=2 {
-                let cbf_c = if c_idx == 1 { cbf_cb } else { cbf_cr };
-                if cbf_c {
-                    let n_c = (tr_size_c * tr_size_c) as usize;
-                    let coefficients = &mut coefficients[..n_c];
-                    let scaled = &mut scaled[..n_c];
-                    let residual = &mut residual[..n_c];
+                        decode_residual_coding(ctx, x_c, y_c, log2_trafo_size_c, c_idx, coefficients);
 
-                    let mut transform_skip = false;
-                    if pps.transform_skip_enabled_flag
-                        && !cu_bypass
-                        && log2_trafo_size_c <= 2
-                    {
-                        transform_skip = decode_transform_skip_flag(ctx.cabac, c_idx) != 0;
-                    }
+                        if !cu_bypass {
+                            // Chroma QP derivation
+                            let qp_offset = if c_idx == 1 {
+                                pps.pps_cb_qp_offset + sh.slice_cb_qp_offset
+                            } else {
+                                pps.pps_cr_qp_offset + sh.slice_cr_qp_offset
+                            };
+                            let q_p_i = clip3(-sps.qp_bd_offset_c, 57, qp_y + qp_offset);
+                            let q_p_c = if q_p_i < 0 {
+                                q_p_i
+                            } else if q_p_i < 58 {
+                                crate::hevc::cabac_tables::QP_CHROMA_TABLE[q_p_i as usize] as i32
+                            } else {
+                                q_p_i - 6
+                            };
+                            let qp_prime_c = q_p_c + sps.qp_bd_offset_c;
 
-                    decode_residual_coding(ctx, x_c, y_c, log2_trafo_size_c, c_idx, coefficients);
-
-                    if !cu_bypass {
-                        // Chroma QP derivation
-                        let qp_offset = if c_idx == 1 {
-                            pps.pps_cb_qp_offset + sh.slice_cb_qp_offset
+                            let dq = dequant_params(ctx, cu_pred_mode);
+                            perform_dequant(
+                                &dq,
+                                log2_trafo_size_c as u32,
+                                c_idx as u32,
+                                qp_prime_c,
+                                coefficients,
+                                scaled,
+                            );
+                            perform_transform_inverse(
+                                log2_trafo_size_c as u32,
+                                c_idx as u32,
+                                cu_pred_mode == PredMode::Intra,
+                                transform_skip,
+                                sps.bit_depth_c as u32,
+                                scaled,
+                                residual,
+                            );
                         } else {
-                            pps.pps_cr_qp_offset + sh.slice_cr_qp_offset
-                        };
-                        let q_p_i = clip3(-sps.qp_bd_offset_c, 57, qp_y + qp_offset);
-                        let q_p_c = if q_p_i < 0 {
-                            q_p_i
-                        } else if q_p_i < 58 {
-                            crate::hevc::cabac_tables::QP_CHROMA_TABLE[q_p_i as usize] as i32
+                            residual.copy_from_slice(coefficients);
+                        }
+
+                        // Chroma prediction
+                        let pred_samples = &mut pred_samples[..n_c];
+                        if cu_pred_mode == PredMode::Intra {
+                            let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
+                            pred_samples.fill(0);
+                            perform_intra_prediction(
+                                ctx.pic,
+                                ctx.sps,
+                                ctx.pps,
+                                x_c,
+                                y_c,
+                                log2_trafo_size_c,
+                                c_idx,
+                                chroma_mode,
+                                ctx.slice_idx.as_deref(),
+                                pred_samples,
+                            );
                         } else {
-                            q_p_i - 6
-                        };
-                        let qp_prime_c = q_p_c + sps.qp_bd_offset_c;
+                            // Inter: pred already written by PU-level MC
+                            let x_cc = x_c / sps.sub_width_c;
+                            let y_cc = y_c / sps.sub_height_c;
+                            for y in 0..tr_size_c {
+                                for x in 0..tr_size_c {
+                                    pred_samples[(y * tr_size_c + x) as usize] =
+                                        ctx.pic.sample(c_idx as usize, x_cc + x, y_cc + y) as i16;
+                                }
+                            }
+                        }
 
-                        let dq = dequant_params(ctx, cu_pred_mode);
-                        perform_dequant(
-                            &dq,
-                            log2_trafo_size_c as u32,
-                            c_idx as u32,
-                            qp_prime_c,
-                            coefficients,
-                            scaled,
-                        );
-                        perform_transform_inverse(
-                            log2_trafo_size_c as u32,
-                            c_idx as u32,
-                            cu_pred_mode == PredMode::Intra,
-                            transform_skip,
-                            sps.bit_depth_c as u32,
-                            scaled,
-                            residual,
-                        );
-                    } else {
-                        residual.copy_from_slice(coefficients);
-                    }
-
-                    // Chroma prediction
-                    let pred_samples = &mut pred_samples[..n_c];
-                    if cu_pred_mode == PredMode::Intra {
+                        reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, residual);
+                    } else if cu_pred_mode == PredMode::Intra {
                         let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
+                        let n_c = (tr_size_c * tr_size_c) as usize;
+                        let pred_samples = &mut pred_samples[..n_c];
                         pred_samples.fill(0);
                         perform_intra_prediction(
                             ctx.pic,
@@ -2030,42 +2107,13 @@ fn decode_transform_unit(
                             ctx.slice_idx.as_deref(),
                             pred_samples,
                         );
-                    } else {
-                        // Inter: pred already written by PU-level MC
-                        let x_cc = x_c / sps.sub_width_c;
-                        let y_cc = y_c / sps.sub_height_c;
-                        for y in 0..tr_size_c {
-                            for x in 0..tr_size_c {
-                                pred_samples[(y * tr_size_c + x) as usize] =
-                                    ctx.pic.sample(c_idx as usize, x_cc + x, y_cc + y) as i16;
-                            }
-                        }
+                        let zero = &zero[..n_c];
+                        reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, zero);
                     }
-
-                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, residual);
-                } else if cu_pred_mode == PredMode::Intra {
-                    let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
-                    let n_c = (tr_size_c * tr_size_c) as usize;
-                    let pred_samples = &mut pred_samples[..n_c];
-                    pred_samples.fill(0);
-                    perform_intra_prediction(
-                        ctx.pic,
-                        ctx.sps,
-                        ctx.pps,
-                        x_c,
-                        y_c,
-                        log2_trafo_size_c,
-                        c_idx,
-                        chroma_mode,
-                        ctx.slice_idx.as_deref(),
-                        pred_samples,
-                    );
-                    let zero = &zero[..n_c];
-                    reconstruct_block(ctx, x_c, y_c, log2_trafo_size_c, c_idx, pred_samples, zero);
                 }
             }
         }
-    }
+    });
 }
 
 /// Build dequant parameters from the context's scaling list state.

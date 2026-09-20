@@ -523,9 +523,13 @@ impl SoftwareH265Decoder {
             }
         }
 
-        let y_ptr = buf.as_ptr();
-        let u_ptr = unsafe { buf.as_ptr().add(y_len) };
-        let v_ptr = unsafe { buf.as_ptr().add(y_len + c_len) };
+        // Plane pointers into the single backing buffer (safe splits; the
+        // pointers stay valid while `buf` lives inside PixelData).
+        let (y_part, uv_part) = buf.split_at_mut(y_len);
+        let (u_part, v_part) = uv_part.split_at_mut(c_len);
+        let y_ptr = y_part.as_ptr();
+        let u_ptr = u_part.as_ptr();
+        let v_ptr = v_part.as_ptr();
 
         // The slot may have been recycled since decode; only mark displayed
         // if a live slot still holds this POC.

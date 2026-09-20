@@ -611,11 +611,12 @@ mod sse2 {
         }
     }
 
-    /// Luma 8-tap horizontal FIR for one row. `base` must point at a row with
-    /// at least `out.len() + 7` valid u16 samples (interior guarantee).
+    /// Luma 8-tap horizontal FIR for one row. `row` must hold at least
+    /// `out.len() + 7` valid u16 samples (interior guarantee).
     #[inline]
-    fn luma_hfir_row(base: *const u16, f: [i16; 8], shift: i32, out: &mut [i16]) {
+    fn luma_hfir_row(row: &[u16], f: [i16; 8], shift: i32, out: &mut [i16]) {
         let c = unsafe { _mm_setr_epi16(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]) };
+        let base = row.as_ptr();
         let mut x = 0usize;
         while x + 4 <= out.len() {
             for j in 0..4usize {
@@ -630,7 +631,7 @@ mod sse2 {
         while x < out.len() {
             let mut sum = 0i32;
             for (k, &tap) in f.iter().enumerate() {
-                sum += tap as i32 * unsafe { *base.add(x + k) } as i32;
+                sum += tap as i32 * row[x + k] as i32;
             }
             out[x] = (sum >> shift) as i16;
             x += 1;
@@ -680,10 +681,12 @@ mod sse2 {
         }
     }
 
-    /// Integer-MV copy with `<< shift3`, 4 samples at a time. `base` must
-    /// point at a row with at least `n` valid u16 samples.
+    /// Integer-MV copy with `<< shift3`, 4 samples at a time. `row` must
+    /// hold at least `out.len()` valid u16 samples.
     #[inline]
-    fn copy_shifted(base: *const u16, n: usize, shift: i32, out: &mut [i16]) {
+    fn copy_shifted(row: &[u16], shift: i32, out: &mut [i16]) {
+        let base = row.as_ptr();
+        let n = out.len();
         let mut x = 0usize;
         while x + 4 <= n {
             unsafe {
@@ -693,7 +696,7 @@ mod sse2 {
             x += 4;
         }
         while x < n {
-            let s = unsafe { *base.add(x) };
+            let s = row[x];
             out[x] = ((s as i32) << shift) as i16;
             x += 1;
         }
@@ -721,18 +724,19 @@ mod sse2 {
         debug_assert_eq!(n_pb_w % 4, 0);
         if x_frac == 0 && y_frac == 0 {
             for y in 0..n_pb_h {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32) * stride + x_int) as usize)
-                };
-                copy_shifted(base, n_pb_w, shift3, &mut pred[y * n_pb_w..(y + 1) * n_pb_w]);
+                let off = ((y_int + y as i32) * stride + x_int) as usize;
+                copy_shifted(&plane[off..off + n_pb_w], shift3, &mut pred[y * n_pb_w..(y + 1) * n_pb_w]);
             }
         } else if y_frac == 0 {
             let f = LUMA_FILTER[x_frac as usize];
             for y in 0..n_pb_h {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32) * stride + (x_int - 3)) as usize)
-                };
-                luma_hfir_row(base, f, shift1, &mut pred[y * n_pb_w..(y + 1) * n_pb_w]);
+                let off = ((y_int + y as i32) * stride + (x_int - 3)) as usize;
+                luma_hfir_row(
+                    &plane[off..off + n_pb_w + 7],
+                    f,
+                    shift1,
+                    &mut pred[y * n_pb_w..(y + 1) * n_pb_w],
+                );
             }
         } else if x_frac == 0 {
             let f = LUMA_FILTER[y_frac as usize];
@@ -747,12 +751,12 @@ mod sse2 {
                 while x0 + 4 <= n_pb_w {
                     let (mut even_acc, mut odd_acc) = (zero, zero);
                     for (k, &bev) in bevens.iter().enumerate() {
+                        let off =
+                            ((y_int + y as i32 + k as i32 - 3) * stride + x_int + x0 as i32)
+                                as usize;
+                        let row = &plane[off..off + 4];
                         unsafe {
-                            let base = plane.as_ptr().add(
-                                ((y_int + y as i32 + k as i32 - 3) * stride + x_int + x0 as i32)
-                                    as usize,
-                            );
-                            let v = _mm_loadl_epi64(base as *const __m128i);
+                            let v = _mm_loadl_epi64(row.as_ptr() as *const __m128i);
                             even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
                             odd_acc = _mm_add_epi32(
                                 odd_acc,
@@ -774,21 +778,25 @@ mod sse2 {
             let mut tmp = [0i16; 64 * 71];
             let f_h = LUMA_FILTER[x_frac as usize];
             for y in 0..tmp_h {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize)
-                };
-                luma_hfir_row(base, f_h, shift1, &mut tmp[y * n_pb_w..(y + 1) * n_pb_w]);
+                let off = ((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize;
+                luma_hfir_row(
+                    &plane[off..off + n_pb_w + 7],
+                    f_h,
+                    shift1,
+                    &mut tmp[y * n_pb_w..(y + 1) * n_pb_w],
+                );
             }
             let f_v = LUMA_FILTER[y_frac as usize];
             luma_vfir(&tmp, n_pb_w, n_pb_h, f_v, shift2, pred);
         }
     }
 
-    /// Chroma 4-tap horizontal FIR for one row. `base` must point at a row
-    /// with at least `out.len() + 3` valid u16 samples (interior guarantee).
+    /// Chroma 4-tap horizontal FIR for one row. `row` must hold at least
+    /// `out.len() + 3` valid u16 samples (interior guarantee).
     #[inline]
-    fn chroma_hfir_row(base: *const u16, f: [i16; 4], shift: i32, out: &mut [i16]) {
+    fn chroma_hfir_row(row: &[u16], f: [i16; 4], shift: i32, out: &mut [i16]) {
         let c = unsafe { _mm_setr_epi16(f[0], f[1], f[2], f[3], 0, 0, 0, 0) };
+        let base = row.as_ptr();
         let mut x = 0usize;
         while x + 4 <= out.len() {
             for j in 0..4usize {
@@ -803,7 +811,7 @@ mod sse2 {
         while x < out.len() {
             let mut sum = 0i32;
             for (k, &tap) in f.iter().enumerate() {
-                sum += tap as i32 * unsafe { *base.add(x + k) } as i32;
+                sum += tap as i32 * row[x + k] as i32;
             }
             out[x] = (sum >> shift) as i16;
             x += 1;
@@ -874,18 +882,23 @@ mod sse2 {
         debug_assert_eq!(n_pb_wc % 4, 0);
         if x_frac == 0 && y_frac == 0 {
             for y in 0..n_pb_hc {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32) * stride + x_int) as usize)
-                };
-                copy_shifted(base, n_pb_wc, shift3, &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc]);
+                let off = ((y_int + y as i32) * stride + x_int) as usize;
+                copy_shifted(
+                    &plane[off..off + n_pb_wc],
+                    shift3,
+                    &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc],
+                );
             }
         } else if y_frac == 0 {
             let f = CHROMA_FILTER[x_frac as usize];
             for y in 0..n_pb_hc {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32) * stride + (x_int - 1)) as usize)
-                };
-                chroma_hfir_row(base, f, shift1, &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc]);
+                let off = ((y_int + y as i32) * stride + (x_int - 1)) as usize;
+                chroma_hfir_row(
+                    &plane[off..off + n_pb_wc + 3],
+                    f,
+                    shift1,
+                    &mut pred[y * n_pb_wc..(y + 1) * n_pb_wc],
+                );
             }
         } else if x_frac == 0 {
             let f = CHROMA_FILTER[y_frac as usize];
@@ -900,12 +913,12 @@ mod sse2 {
                 while x0 + 4 <= n_pb_wc {
                     let (mut even_acc, mut odd_acc) = (zero, zero);
                     for (k, &bev) in bevens.iter().enumerate() {
+                        let off =
+                            ((y_int + y as i32 + k as i32 - 1) * stride + x_int + x0 as i32)
+                                as usize;
+                        let row = &plane[off..off + 4];
                         unsafe {
-                            let base = plane.as_ptr().add(
-                                ((y_int + y as i32 + k as i32 - 1) * stride + x_int + x0 as i32)
-                                    as usize,
-                            );
-                            let v = _mm_loadl_epi64(base as *const __m128i);
+                            let v = _mm_loadl_epi64(row.as_ptr() as *const __m128i);
                             even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(v, bev));
                             odd_acc = _mm_add_epi32(
                                 odd_acc,
@@ -927,10 +940,13 @@ mod sse2 {
             let mut tmp = [0i16; 32 * 35];
             let f_h = CHROMA_FILTER[x_frac as usize];
             for y in 0..tmp_h {
-                let base = unsafe {
-                    plane.as_ptr().add(((y_int + y as i32 - 1) * stride + (x_int - 1)) as usize)
-                };
-                chroma_hfir_row(base, f_h, shift1, &mut tmp[y * n_pb_wc..(y + 1) * n_pb_wc]);
+                let off = ((y_int + y as i32 - 1) * stride + (x_int - 1)) as usize;
+                chroma_hfir_row(
+                    &plane[off..off + n_pb_wc + 3],
+                    f_h,
+                    shift1,
+                    &mut tmp[y * n_pb_wc..(y + 1) * n_pb_wc],
+                );
             }
             let f_v = CHROMA_FILTER[y_frac as usize];
             chroma_vfir(&tmp, n_pb_wc, n_pb_hc, f_v, shift2, pred);
