@@ -2049,6 +2049,16 @@ impl H265Parser {
         Ok(info)
     }
 
+    /// Discard the cached NAL list and reset the cursor. Callers that mutate
+    /// a packet payload in place (e.g. compacting consumed bytes before
+    /// appending new data) must call this, since the length check in
+    /// [`Self::parse`] cannot detect a same-length content change.
+    pub fn invalidate_nal_cache(&mut self) {
+        self.cached_nals.clear();
+        self.cached_payload_len = 0;
+        self.nal_cursor = 0;
+    }
+
     fn extract_nal_units(&self, data: &[u8]) -> Vec<NalUnit> {
         let mut nal_units = Vec::new();
         let mut offset = 0;

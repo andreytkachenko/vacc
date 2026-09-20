@@ -86,12 +86,14 @@ pub struct SoftwareH265Decoder {
     chroma_w: u32,
     chroma_h: u32,
 
-    // Pending input.
-    pending_data: Vec<u8>,
+    // Pending input. One stable packet over all pending bytes: the parser's
+    // NAL cache is keyed by payload length and its cursor advances per
+    // picture, so each byte of the bitstream is scanned once per submit().
+    packet: BitstreamPacket,
     parse_offset: usize,
-    /// Parameter-set NALs stay in `pending_data` until the first slice of
-    /// the next picture arrives (the parser's `bytes_consumed` for that
-    /// slice covers them).
+    /// Parameter-set NALs stay in `packet` until the first slice of the next
+    /// picture arrives (the parser's `bytes_consumed` for that slice covers
+    /// them).
     ps_pending: bool,
 
     // Display-order reorder state.
@@ -415,15 +417,12 @@ impl SoftwareH265Decoder {
     /// Parse pending data and decode the next picture, if a complete access
     /// unit is available. Returns `Ok(true)` when a picture was decoded.
     fn decode_next_picture(&mut self) -> Result<bool> {
-        if self.parse_offset >= self.pending_data.len() {
+        if self.parse_offset >= self.packet.payload.len() {
             return Ok(false);
         }
 
-        let remaining = &self.pending_data[self.parse_offset..];
-        let packet = BitstreamPacket::new(remaining.to_vec());
-
         loop {
-            match self.parser.parse(&packet) {
+            match self.parser.parse(&self.packet) {
                 Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
                     if let Some(b) = sps
                         && let Some(s) = b.downcast_ref::<H265Sps>()
@@ -452,8 +451,9 @@ impl SoftwareH265Decoder {
                         _ => return Ok(false),
                     };
 
-                    let au_end = self.parse_offset + bytes_consumed;
-                    if au_end > self.pending_data.len() {
+                    // `bytes_consumed` is an absolute offset within the packet
+                    // payload (end of the last slice NAL).
+                    if bytes_consumed > self.packet.payload.len() {
                         return Err(Error::Parser(
                             "bytes_consumed exceeds pending data".to_string(),
                         ));
@@ -462,7 +462,7 @@ impl SoftwareH265Decoder {
                     // the Rust driver reads each slice's NAL bytes directly.
                     let slices_owned = slices.clone();
                     let info = first_info.clone();
-                    self.parse_offset = au_end;
+                    self.parse_offset = bytes_consumed;
                     self.ps_pending = false;
 
                     self.decode_picture(&slices_owned, &info)?;
@@ -473,11 +473,11 @@ impl SoftwareH265Decoder {
                         // PS NALs buffered but no slice yet: wait for more data.
                         return Ok(false);
                     }
-                    self.parse_offset = self.pending_data.len();
+                    self.parse_offset = self.packet.payload.len();
                     return Ok(false);
                 }
                 Ok(ParseResult::EndOfStream) => {
-                    self.parse_offset = self.pending_data.len();
+                    self.parse_offset = self.packet.payload.len();
                     return Ok(false);
                 }
                 Err(e) => return Err(Error::Parser(e.to_string())),
@@ -619,7 +619,7 @@ impl SoftwareH265Decoder {
         self.max_seq = 0;
         self.seq_counter = 0;
         self.ps_pending = false;
-        self.parse_offset = self.pending_data.len();
+        self.parse_offset = self.packet.payload.len();
     }
 }
 
@@ -659,7 +659,7 @@ impl Decoder for SoftwareH265Decoder {
             cstride: 0,
             chroma_w: 0,
             chroma_h: 0,
-            pending_data: data,
+            packet: BitstreamPacket::new(data),
             parse_offset: 0,
             ps_pending: false,
             reorder: BTreeMap::new(),
@@ -730,15 +730,18 @@ impl Decoder for SoftwareH265Decoder {
     }
 
     fn submit(&mut self, data: &[u8]) -> Result<()> {
-        if self.parse_offset >= self.pending_data.len() {
-            self.pending_data.clear();
-            self.parse_offset = 0;
+        // Compact the packet in place (drop consumed bytes), append the new
+        // data, and force a NAL-cache rebuild: the payload length alone is not
+        // a reliable change detector after an in-place compaction.
+        let payload = &mut self.packet.payload;
+        if self.parse_offset >= payload.len() {
+            payload.clear();
         } else {
-            let unconsumed = self.pending_data[self.parse_offset..].to_vec();
-            self.pending_data = unconsumed;
-            self.parse_offset = 0;
+            payload.drain(..self.parse_offset);
         }
-        self.pending_data.extend_from_slice(data);
+        self.parse_offset = 0;
+        payload.extend_from_slice(data);
+        self.parser.invalidate_nal_cache();
         Ok(())
     }
 
