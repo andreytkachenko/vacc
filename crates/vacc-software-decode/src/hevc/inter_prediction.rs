@@ -11,7 +11,7 @@ use crate::hevc::interpolation::{
 };
 use crate::hevc::picture::PuMotionInfo;
 use crate::hevc::syntax_elements::*;
-use crate::hevc::types::{Mv, SliceType, clip3};
+use crate::hevc::types::{Mv, Pps, SliceHeader, SliceType, Sps, clip3};
 
 // ============================================================
 // DPB view for inter prediction
@@ -1027,10 +1027,14 @@ pub fn decode_prediction_unit_inter(
 
 /// Derive motion-compensated prediction samples for one PU/component,
 /// mirroring C++ `perform_inter_prediction`. Writes `n_samples` = compW*compH
-/// values into `pred_samples`.
+/// values into `pred_samples`; `pred_l0`/`pred_l1` are caller-provided
+/// scratch of at least `n_samples` (all samples are written before use).
 #[allow(clippy::too_many_arguments)]
 pub fn perform_inter_prediction(
-    ctx: &DecodingContext,
+    sps: &Sps,
+    pps: &Pps,
+    sh: &SliceHeader,
+    dpb: &DpbView,
     x_pb: i32,
     y_pb: i32,
     n_pb_w: i32,
@@ -1042,9 +1046,10 @@ pub fn perform_inter_prediction(
     ref_idx_l1: i32,
     pred_flag_l0: bool,
     pred_flag_l1: bool,
+    pred_l0: &mut [i16],
+    pred_l1: &mut [i16],
     pred_samples: &mut [i16],
 ) {
-    let sps = ctx.sps;
     let bit_depth = if c_idx == 0 { sps.bit_depth_y } else { sps.bit_depth_c };
 
     // Component dimensions and MV conversion
@@ -1054,13 +1059,10 @@ pub fn perform_inter_prediction(
     let comp_h = n_pb_h / sub_h;
     let n_samples = (comp_w * comp_h) as usize;
 
-    let mut pred_l0 = vec![0i16; n_samples];
-    let mut pred_l1 = vec![0i16; n_samples];
-
     // L0 prediction
     let mut pred_flag_l0 = pred_flag_l0;
     if pred_flag_l0 {
-        let ref_pic = if ref_idx_l0 >= 0 { ctx.dpb.ref_pic_list0(ref_idx_l0) } else { None };
+        let ref_pic = if ref_idx_l0 >= 0 { dpb.ref_pic_list0(ref_idx_l0) } else { None };
         match ref_pic {
             Some(ref_pic) => {
                 if c_idx == 0 {
@@ -1082,7 +1084,7 @@ pub fn perform_inter_prediction(
                         comp_w as usize,
                         comp_h as usize,
                         bit_depth,
-                        &mut pred_l0,
+                        pred_l0,
                     );
                 } else {
                     // §8.5.3.3.2: chroma MV derivation from luma MV. For 4:2:0
@@ -1107,7 +1109,7 @@ pub fn perform_inter_prediction(
                         comp_w as usize,
                         comp_h as usize,
                         bit_depth,
-                        &mut pred_l0,
+                        pred_l0,
                     );
                 }
             }
@@ -1120,7 +1122,7 @@ pub fn perform_inter_prediction(
     // L1 prediction
     let mut pred_flag_l1 = pred_flag_l1;
     if pred_flag_l1 {
-        let ref_pic = if ref_idx_l1 >= 0 { ctx.dpb.ref_pic_list1(ref_idx_l1) } else { None };
+        let ref_pic = if ref_idx_l1 >= 0 { dpb.ref_pic_list1(ref_idx_l1) } else { None };
         match ref_pic {
             Some(ref_pic) => {
                 if c_idx == 0 {
@@ -1141,7 +1143,7 @@ pub fn perform_inter_prediction(
                         comp_w as usize,
                         comp_h as usize,
                         bit_depth,
-                        &mut pred_l1,
+                        pred_l1,
                     );
                 } else {
                     let x_pb_c = x_pb / sub_w;
@@ -1164,7 +1166,7 @@ pub fn perform_inter_prediction(
                         comp_w as usize,
                         comp_h as usize,
                         bit_depth,
-                        &mut pred_l1,
+                        pred_l1,
                     );
                 }
             }
@@ -1182,10 +1184,10 @@ pub fn perform_inter_prediction(
     }
 
     // §8.5.3.3.4.1: determine weightedPredFlag
-    let weighted_pred_flag = if ctx.sh.slice_type == SliceType::P {
-        ctx.pps.weighted_pred_flag
-    } else if ctx.sh.slice_type == SliceType::B {
-        ctx.pps.weighted_bipred_flag
+    let weighted_pred_flag = if sh.slice_type == SliceType::P {
+        pps.weighted_pred_flag
+    } else if sh.slice_type == SliceType::B {
+        pps.weighted_bipred_flag
     } else {
         false
     };
@@ -1202,7 +1204,7 @@ pub fn perform_inter_prediction(
             c_idx,
             n_samples as i32,
             bit_depth,
-            &ctx.sh.pred_weight_table,
+            &sh.pred_weight_table,
             pred_samples,
         );
     } else {

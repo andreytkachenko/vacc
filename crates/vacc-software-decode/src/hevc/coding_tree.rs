@@ -152,6 +152,16 @@ pub struct DecodingContext<'bs, 'a> {
     /// Test knob: force the serial CTU scan even when WPP is enabled. Mirrors
     /// the C++ gate `thread_pool && num_workers > 1` (the oracle has no pool).
     pub wpp_enabled: bool,
+
+    // Reusable MC scratch buffers (grow-only, never re-zeroed): every MC
+    // consumer writes all samples of the block it fills (interpolation paths
+    // cover the full PU; weighted prediction clips and covers the full block),
+    // so stale contents from the previous user are never read.
+    pub mc_l0: Vec<i16>,
+    pub mc_l1: Vec<i16>,
+    /// Final MC output for the current component (written by weighted
+    /// prediction, consumed by `write_mc_block`).
+    pub mc_out: Vec<i16>,
 }
 
 impl<'bs, 'a> DecodingContext<'bs, 'a> {
@@ -244,6 +254,9 @@ impl<'bs, 'a> DecodingContext<'bs, 'a> {
             wpp_saved_contexts: [CabacContext::default(); NUM_CABAC_CONTEXTS],
             wpp_contexts_available: false,
             wpp_enabled: false,
+            mc_l0: Vec::new(),
+            mc_l1: Vec::new(),
+            mc_out: Vec::new(),
         }
     }
 }
@@ -1531,13 +1544,45 @@ fn decode_coding_unit(ctx: &mut DecodingContext, x0: i32, y0: i32, log2_cb_size:
 
 /// Motion-compensate one PU and write prediction to the picture (luma +
 /// chroma), mirroring the C++ `mc_pu` lambda in `decode_coding_unit`.
+/// Write MC prediction into the picture plane. Values are already clipped to
+/// `[0, 2^bd-1]` by weighted prediction, so i16 → u16 is a plain widening and
+/// each row is a bulk copy (no per-sample clamp/index arithmetic).
+fn write_mc_block(pic: &mut Picture, c: usize, x0: i32, y0: i32, w: i32, h: i32, pred: &[i16]) {
+    let stride = pic.stride[c];
+    let plane = &mut pic.planes[c];
+    for y in 0..h {
+        let row = ((y0 + y) * stride + x0) as usize;
+        let off = (y * w) as usize;
+        let dst = &mut plane[row..row + w as usize];
+        let src = &pred[off..off + w as usize];
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d = *s as u16;
+        }
+    }
+}
+
 fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, n_pb_h: i32, mi: &PuMotionInfo) {
     let sps = ctx.sps;
     // Luma
     {
-        let mut pred = vec![0i16; (n_pb_w * n_pb_h) as usize];
+        let n = (n_pb_w * n_pb_h) as usize;
+        if ctx.mc_l0.len() < n {
+            ctx.mc_l0.resize(n, 0);
+        }
+        if ctx.mc_l1.len() < n {
+            ctx.mc_l1.resize(n, 0);
+        }
+        if ctx.mc_out.len() < n {
+            ctx.mc_out.resize(n, 0);
+        }
+        let l0 = &mut ctx.mc_l0[..n];
+        let l1 = &mut ctx.mc_l1[..n];
+        let out = &mut ctx.mc_out[..n];
         perform_inter_prediction(
-            ctx,
+            sps,
+            ctx.pps,
+            ctx.sh,
+            ctx.dpb,
             x_pb,
             y_pb,
             n_pb_w,
@@ -1549,13 +1594,11 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
             mi.ref_idx[1] as i32,
             mi.pred_flag[0],
             mi.pred_flag[1],
-            &mut pred,
+            l0,
+            l1,
+            out,
         );
-        for y in 0..n_pb_h {
-            for x in 0..n_pb_w {
-                *ctx.pic.sample_mut(0, x_pb + x, y_pb + y) = pred[(y * n_pb_w + x) as usize] as u16;
-            }
-        }
+        write_mc_block(ctx.pic, 0, x_pb, y_pb, n_pb_w, n_pb_h, out);
     }
     // Chroma (4:2:0)
     if sps.chroma_array_type != 0 {
@@ -1563,10 +1606,25 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         let c_h = n_pb_h / sps.sub_height_c;
         let x_c = x_pb / sps.sub_width_c;
         let y_c = y_pb / sps.sub_height_c;
+        let c_n = (c_w * c_h) as usize;
+        if ctx.mc_l0.len() < c_n {
+            ctx.mc_l0.resize(c_n, 0);
+        }
+        if ctx.mc_l1.len() < c_n {
+            ctx.mc_l1.resize(c_n, 0);
+        }
+        if ctx.mc_out.len() < c_n {
+            ctx.mc_out.resize(c_n, 0);
+        }
         for c in 1..=2 {
-            let mut pred = vec![0i16; (c_w * c_h) as usize];
+            let l0 = &mut ctx.mc_l0[..c_n];
+            let l1 = &mut ctx.mc_l1[..c_n];
+            let out = &mut ctx.mc_out[..c_n];
             perform_inter_prediction(
-                ctx,
+                sps,
+                ctx.pps,
+                ctx.sh,
+                ctx.dpb,
                 x_pb,
                 y_pb,
                 n_pb_w,
@@ -1578,13 +1636,11 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
                 mi.ref_idx[1] as i32,
                 mi.pred_flag[0],
                 mi.pred_flag[1],
-                &mut pred,
+                l0,
+                l1,
+                out,
             );
-            for y in 0..c_h {
-                for x in 0..c_w {
-                    *ctx.pic.sample_mut(c as usize, x_c + x, y_c + y) = pred[(y * c_w + x) as usize] as u16;
-                }
-            }
+            write_mc_block(ctx.pic, c as usize, x_c, y_c, c_w, c_h, out);
         }
     }
 }
@@ -1943,9 +1999,8 @@ fn decode_transform_unit(
             // Prediction for luma
             if cu_pred_mode == PredMode::Intra {
                 let intra_mode = ctx.intra_mode_at(x0, y0);
-                // C++ zeroes pred_samples per visit; intra prediction does
-                // partial writes relying on zero-init.
-                pred_samples.fill(0);
+                // Intra predictors (planar/DC/angular) write every sample of
+                // the block, so no zero-init is needed.
                 perform_intra_prediction(
                     ctx.pic,
                     ctx.sps,
@@ -1972,7 +2027,6 @@ fn decode_transform_unit(
         } else if cu_pred_mode == PredMode::Intra {
             // No residual but still need intra prediction
             let intra_mode = ctx.intra_mode_at(x0, y0);
-            pred_samples.fill(0);
             perform_intra_prediction(
                 ctx.pic,
                 ctx.sps,
@@ -2064,7 +2118,6 @@ fn decode_transform_unit(
                         let pred_samples = &mut pred_samples[..n_c];
                         if cu_pred_mode == PredMode::Intra {
                             let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
-                            pred_samples.fill(0);
                             perform_intra_prediction(
                                 ctx.pic,
                                 ctx.sps,
@@ -2094,7 +2147,6 @@ fn decode_transform_unit(
                         let chroma_mode = ctx.chroma_mode_at(x_c, y_c);
                         let n_c = (tr_size_c * tr_size_c) as usize;
                         let pred_samples = &mut pred_samples[..n_c];
-                        pred_samples.fill(0);
                         perform_intra_prediction(
                             ctx.pic,
                             ctx.sps,

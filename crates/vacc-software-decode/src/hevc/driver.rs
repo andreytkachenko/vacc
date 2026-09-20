@@ -290,6 +290,9 @@ pub fn decode_picture(
                 wpp_saved_contexts: wpp_saved,
                 wpp_contexts_available: wpp_avail,
                 wpp_enabled: true,
+                mc_l0: Vec::new(),
+                mc_l1: Vec::new(),
+                mc_out: Vec::new(),
             };
             let (ok, _) = decode_slice_segment_data(&mut ctx, &epb, sh_coded);
             (ok, (ctx.wpp_saved_contexts, ctx.wpp_contexts_available))
