@@ -12,6 +12,17 @@ pub(crate) use self::tests::golden_entries;
 use crate::hevc::cabac_tables::LEVEL_SCALE;
 use crate::hevc::types::{clip3, PredMode};
 
+/// AVX2 availability (CPUID leaf 7, EBX bit 5), cached by std after first use.
+#[cfg(target_arch = "x86_64")]
+fn detect_avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn detect_avx2() -> bool {
+    false
+}
+
 // ============================================================
 // Partial butterfly inverse transforms
 // ============================================================
@@ -277,6 +288,25 @@ fn inverse_transform_2d(
     let shift2 = 20 - bit_depth as i32;
 
     let pass = |src: &[i16], dst: &mut [i16], shift: i32| {
+        #[cfg(target_arch = "x86_64")]
+        if detect_avx2() {
+            unsafe {
+                match log2_trafo_size {
+                    2 => {
+                        if use_dst {
+                            avx2::idst4(src, dst, shift, tr_size);
+                        } else {
+                            avx2::idct4(src, dst, shift, tr_size);
+                        }
+                    }
+                    3 => avx2::idct8(src, dst, shift, tr_size),
+                    4 => avx2::idct16(src, dst, shift, tr_size),
+                    5 => avx2::idct32(src, dst, shift, tr_size),
+                    _ => unreachable!("invalid log2TrafoSize"),
+                }
+            }
+            return;
+        }
         if use_dst && log2_trafo_size == 2 {
             idst4(src, dst, shift, tr_size);
         } else {
@@ -544,6 +574,438 @@ pub fn perform_transform_inverse(
     inverse_transform_2d(log2_trafo_size, use_dst, bit_depth, scaled, residual);
 }
 
+// ============================================================
+// AVX2 inverse transform — vectorized across columns
+// ============================================================
+//
+// Each pass transforms `line` independent 1-D transforms (the columns of
+// the current pass). Lanes hold one column each, so every butterfly term —
+// all constant×coefficient sums — becomes a lane-wise i32 op. Batches are
+// 8 columns (AVX2 width); 4x4 uses the low half of a 256-bit vector. The
+// i32 lanes keep the exact scalar arithmetic, and the final shift plus
+// saturating pack to i16 reproduces `clip3(-32768, 32767, x)` exactly.
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::{
+        __m128i, __m256i, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
+        _mm_storeu_si128, _mm256_add_epi32, _mm256_castsi256_si128,
+        _mm256_cvtepi16_epi32, _mm256_extracti128_si256, _mm256_mullo_epi32,
+        _mm256_set1_epi32, _mm256_setzero_si256, _mm256_srai_epi32,
+        _mm256_sub_epi32,
+    };
+
+    use super::TM_32;
+
+    /// Load 8 contiguous i16s, sign-extended to 8 i32 lanes.
+    #[inline]
+    fn ld8(p: *const i16) -> __m256i {
+        unsafe { _mm256_cvtepi16_epi32(_mm_loadu_si128(p as *const __m128i)) }
+    }
+
+    /// Load 4 contiguous i16s into the low half (upper lanes zero).
+    #[inline]
+    fn ld4(p: *const i16) -> __m256i {
+        unsafe { _mm256_cvtepi16_epi32(_mm_loadl_epi64(p as *const __m128i)) }
+    }
+
+    #[inline]
+    fn mulc(v: __m256i, c: i32) -> __m256i {
+        unsafe { _mm256_mullo_epi32(v, _mm256_set1_epi32(c)) }
+    }
+
+    #[inline]
+    fn vadd(a: __m256i, b: __m256i) -> __m256i {
+        unsafe { _mm256_add_epi32(a, b) }
+    }
+
+    #[inline]
+    fn vsub(a: __m256i, b: __m256i) -> __m256i {
+        unsafe { _mm256_sub_epi32(a, b) }
+    }
+
+    /// `(v + add) >> shift` — exact i32 arithmetic right shift.
+    ///
+    /// `shift` is 7 (vertical pass) or `20 - bit_depth` with bit depth 8..=12,
+    /// so only these values are reachable.
+    #[inline]
+    fn fin(v: __m256i, add: i32, shift: i32) -> __m256i {
+        let v = unsafe { vadd(v, _mm256_set1_epi32(add)) };
+        match shift {
+            7 => unsafe { _mm256_srai_epi32::<7>(v) },
+            8 => unsafe { _mm256_srai_epi32::<8>(v) },
+            9 => unsafe { _mm256_srai_epi32::<9>(v) },
+            10 => unsafe { _mm256_srai_epi32::<10>(v) },
+            11 => unsafe { _mm256_srai_epi32::<11>(v) },
+            12 => unsafe { _mm256_srai_epi32::<12>(v) },
+            s => unreachable!("unsupported transform shift {s}"),
+        }
+    }
+
+    /// Store 8 i32 lanes as 8 contiguous saturated i16s.
+    #[inline]
+    fn store8(p: *mut i16, v: __m256i) {
+        unsafe {
+            let lo = _mm256_castsi256_si128(v);
+            let hi = _mm256_extracti128_si256(v, 1);
+            _mm_storeu_si128(p as *mut __m128i, _mm_packs_epi32(lo, hi));
+        }
+    }
+
+    /// Store the low halves of two i32 vectors as 8 contiguous saturated i16s.
+    #[inline]
+    fn store4(p: *mut i16, a: __m256i, b: __m256i) {
+        unsafe {
+            _mm_storeu_si128(
+                p as *mut __m128i,
+                _mm_packs_epi32(_mm256_castsi256_si128(a), _mm256_castsi256_si128(b)),
+            );
+        }
+    }
+
+    /// DST-VII 4x4 — 4 columns per batch (low half of a 256-bit vector).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn idst4(src: &[i16], dst: &mut [i16], shift: i32, line: usize) {
+        debug_assert!(line % 4 == 0);
+        let add = 1i32 << (shift - 1);
+        let src = src.as_ptr();
+        let dst = dst.as_mut_ptr();
+        let mut j = 0usize;
+        while j + 4 <= line {
+            unsafe {
+                let v0 = ld4(src.add(j));
+                let v1 = ld4(src.add(line + j));
+                let v2 = ld4(src.add(2 * line + j));
+                let v3 = ld4(src.add(3 * line + j));
+                let r0 = fin(
+                    vadd(vadd(vadd(mulc(v0, 29), mulc(v1, 74)), mulc(v2, 84)), mulc(v3, 55)),
+                    add,
+                    shift,
+                );
+                let r1 = fin(
+                    vsub(vadd(mulc(v0, 55), mulc(v1, 74)), vadd(mulc(v2, 29), mulc(v3, 84))),
+                    add,
+                    shift,
+                );
+                let r2 = fin(vadd(vadd(mulc(v0, 74), mulc(v3, 74)), mulc(v2, -74)), add, shift);
+                let r3 = fin(
+                    vsub(vadd(mulc(v0, 84), mulc(v2, 55)), vadd(mulc(v1, 74), mulc(v3, 29))),
+                    add,
+                    shift,
+                );
+                store4(dst.add(j), r0, r1);
+                store4(dst.add(2 * line + j), r2, r3);
+            }
+            j += 4;
+        }
+    }
+
+    /// IDCT-4 — 4 columns per batch (low half of a 256-bit vector).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn idct4(src: &[i16], dst: &mut [i16], shift: i32, line: usize) {
+        debug_assert!(line % 4 == 0);
+        let add = 1i32 << (shift - 1);
+        let src = src.as_ptr();
+        let dst = dst.as_mut_ptr();
+        let mut j = 0usize;
+        while j + 4 <= line {
+            unsafe {
+                let v0 = ld4(src.add(j));
+                let v1 = ld4(src.add(line + j));
+                let v2 = ld4(src.add(2 * line + j));
+                let v3 = ld4(src.add(3 * line + j));
+                let m0 = mulc(v0, 64);
+                let m2 = mulc(v2, 64);
+                let e0 = vadd(m0, m2);
+                let e1 = vsub(m0, m2);
+                let a = mulc(v1, 83);
+                let b = mulc(v3, 36);
+                let o0 = vadd(a, b);
+                let o1 = vsub(mulc(v1, 36), mulc(v3, 83));
+                let r0 = fin(vadd(e0, o0), add, shift);
+                let r1 = fin(vadd(e1, o1), add, shift);
+                let r2 = fin(vsub(e1, o1), add, shift);
+                let r3 = fin(vsub(e0, o0), add, shift);
+                store4(dst.add(j), r0, r1);
+                store4(dst.add(2 * line + j), r2, r3);
+            }
+            j += 4;
+        }
+    }
+
+    /// IDCT-8 — 8 columns per batch.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn idct8(src: &[i16], dst: &mut [i16], shift: i32, line: usize) {
+        debug_assert!(line % 8 == 0);
+        let add = 1i32 << (shift - 1);
+        let src = src.as_ptr();
+        let dst = dst.as_mut_ptr();
+        let mut j = 0usize;
+        while j + 8 <= line {
+            unsafe {
+                let v0 = ld8(src.add(j));
+                let v1 = ld8(src.add(line + j));
+                let v2 = ld8(src.add(2 * line + j));
+                let v3 = ld8(src.add(3 * line + j));
+                let v4 = ld8(src.add(4 * line + j));
+                let v5 = ld8(src.add(5 * line + j));
+                let v6 = ld8(src.add(6 * line + j));
+                let v7 = ld8(src.add(7 * line + j));
+
+                let m0 = mulc(v0, 64);
+                let m4 = mulc(v4, 64);
+                let ee0 = vadd(m0, m4);
+                let ee1 = vsub(m0, m4);
+                let m2 = mulc(v2, 83);
+                let m6 = mulc(v6, 36);
+                let eo0 = vadd(m2, m6);
+                let eo1 = vsub(mulc(v2, 36), mulc(v6, 83));
+                let e0 = vadd(ee0, eo0);
+                let e3 = vsub(ee0, eo0);
+                let e1 = vadd(ee1, eo1);
+                let e2 = vsub(ee1, eo1);
+
+                let a1 = mulc(v1, 89);
+                let b1 = mulc(v1, 75);
+                let c1 = mulc(v1, 50);
+                let d1 = mulc(v1, 18);
+                let a3 = mulc(v3, 75);
+                let b3 = mulc(v3, -18);
+                let c3 = mulc(v3, -89);
+                let d3 = mulc(v3, -50);
+                let a5 = mulc(v5, 50);
+                let b5 = mulc(v5, -89);
+                let c5 = mulc(v5, 18);
+                let d5 = mulc(v5, 75);
+                let a7 = mulc(v7, 18);
+                let b7 = mulc(v7, -50);
+                let c7 = mulc(v7, 75);
+                let d7 = mulc(v7, -89);
+                let o0 = vadd(vadd(a1, a3), vadd(a5, a7));
+                let o1 = vadd(vadd(b1, b3), vadd(b5, b7));
+                let o2 = vadd(vadd(c1, c3), vadd(c5, c7));
+                let o3 = vadd(vadd(d1, d3), vadd(d5, d7));
+
+                let r0 = fin(vadd(e0, o0), add, shift);
+                let r1 = fin(vadd(e1, o1), add, shift);
+                let r2 = fin(vadd(e2, o2), add, shift);
+                let r3 = fin(vadd(e3, o3), add, shift);
+                let r4 = fin(vsub(e3, o3), add, shift);
+                let r5 = fin(vsub(e2, o2), add, shift);
+                let r6 = fin(vsub(e1, o1), add, shift);
+                let r7 = fin(vsub(e0, o0), add, shift);
+                store8(dst.add(j), r0);
+                store8(dst.add(line + j), r1);
+                store8(dst.add(2 * line + j), r2);
+                store8(dst.add(3 * line + j), r3);
+                store8(dst.add(4 * line + j), r4);
+                store8(dst.add(5 * line + j), r5);
+                store8(dst.add(6 * line + j), r6);
+                store8(dst.add(7 * line + j), r7);
+            }
+            j += 8;
+        }
+    }
+
+    /// IDCT-16 — 8 columns per batch.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn idct16(src: &[i16], dst: &mut [i16], shift: i32, line: usize) {
+        debug_assert!(line % 8 == 0);
+        let add = 1i32 << (shift - 1);
+        let src = src.as_ptr();
+        let dst = dst.as_mut_ptr();
+        // Odd submatrix over c(1), c(3), ..., c(15) — same constants as the
+        // scalar butterfly below.
+        const M16: [[i32; 8]; 8] = [
+            [90, 87, 80, 70, 57, 43, 25, 9],
+            [87, 57, 9, -43, -80, -90, -70, -25],
+            [80, 9, -70, -87, -25, 57, 90, 43],
+            [70, -43, -87, 9, 90, 25, -80, -57],
+            [57, -80, -25, 90, -9, -87, 43, 70],
+            [43, -90, 57, 25, -87, 70, 9, -80],
+            [25, -70, 90, -80, 43, 9, -57, 87],
+            [9, -25, 43, -57, 70, -80, 87, -90],
+        ];
+        let mut j = 0usize;
+        while j + 8 <= line {
+            unsafe {
+                // Odd part: o[k] = sum_n M16[k][n] * c(2n+1).
+                let zero = _mm256_setzero_si256();
+                let mut o = [zero; 8];
+                for n in 0..8usize {
+                    let v = ld8(src.add((2 * n + 1) * line + j));
+                    for k in 0..8usize {
+                        o[k] = vadd(o[k], mulc(v, M16[k][n]));
+                    }
+                }
+                // Even part.
+                let v0 = ld8(src.add(j));
+                let v4 = ld8(src.add(4 * line + j));
+                let v8 = ld8(src.add(8 * line + j));
+                let v12 = ld8(src.add(12 * line + j));
+                let m0 = mulc(v0, 64);
+                let m8 = mulc(v8, 64);
+                let eee0 = vadd(m0, m8);
+                let eee1 = vsub(m0, m8);
+                let m4 = mulc(v4, 83);
+                let m12 = mulc(v12, 36);
+                let eeo0 = vadd(m4, m12);
+                let eeo1 = vsub(mulc(v4, 36), mulc(v12, 83));
+                let ee0 = vadd(eee0, eeo0);
+                let ee3 = vsub(eee0, eeo0);
+                let ee1 = vadd(eee1, eeo1);
+                let ee2 = vsub(eee1, eeo1);
+                let v2 = ld8(src.add(2 * line + j));
+                let v6 = ld8(src.add(6 * line + j));
+                let v10 = ld8(src.add(10 * line + j));
+                let v14 = ld8(src.add(14 * line + j));
+                let a2 = mulc(v2, 89);
+                let b2 = mulc(v2, 75);
+                let c2 = mulc(v2, 50);
+                let d2 = mulc(v2, 18);
+                let a6 = mulc(v6, 75);
+                let b6 = mulc(v6, -18);
+                let c6 = mulc(v6, -89);
+                let d6 = mulc(v6, -50);
+                let a10 = mulc(v10, 50);
+                let b10 = mulc(v10, -89);
+                let c10 = mulc(v10, 18);
+                let d10 = mulc(v10, 75);
+                let a14 = mulc(v14, 18);
+                let b14 = mulc(v14, -50);
+                let c14 = mulc(v14, 75);
+                let d14 = mulc(v14, -89);
+                let eo0 = vadd(vadd(a2, a6), vadd(a10, a14));
+                let eo1 = vadd(vadd(b2, b6), vadd(b10, b14));
+                let eo2 = vadd(vadd(c2, c6), vadd(c10, c14));
+                let eo3 = vadd(vadd(d2, d6), vadd(d10, d14));
+                let e = [
+                    vadd(ee0, eo0),
+                    vadd(ee1, eo1),
+                    vadd(ee2, eo2),
+                    vadd(ee3, eo3),
+                    vsub(ee3, eo3),
+                    vsub(ee2, eo2),
+                    vsub(ee1, eo1),
+                    vsub(ee0, eo0),
+                ];
+                for k in 0..8usize {
+                    store8(dst.add(k * line + j), fin(vadd(e[k], o[k]), add, shift));
+                    store8(
+                        dst.add((15 - k) * line + j),
+                        fin(vsub(e[k], o[k]), add, shift),
+                    );
+                }
+            }
+            j += 8;
+        }
+    }
+
+    /// IDCT-32 — 8 columns per batch. The odd/eo/eeo parts are the dense
+    /// TM_32 submatrices of the scalar butterfly; lanes are columns.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn idct32(src: &[i16], dst: &mut [i16], shift: i32, line: usize) {
+        debug_assert!(line % 8 == 0);
+        let add = 1i32 << (shift - 1);
+        let src = src.as_ptr();
+        let dst = dst.as_mut_ptr();
+        let mut j = 0usize;
+        while j + 8 <= line {
+            unsafe {
+                let zero = _mm256_setzero_si256();
+                // Odd part: o[k] = sum_n TM_32[2n+1][k] * c(2n+1).
+                let mut o_lo = [zero; 8];
+                for n in 0..16usize {
+                    let v = ld8(src.add((2 * n + 1) * line + j));
+                    for k in 0..8usize {
+                        o_lo[k] = vadd(o_lo[k], mulc(v, TM_32[2 * n + 1][k]));
+                    }
+                }
+                let mut o_hi = [zero; 8];
+                for n in 0..16usize {
+                    let v = ld8(src.add((2 * n + 1) * line + j));
+                    for k in 0..8usize {
+                        o_hi[k] = vadd(o_hi[k], mulc(v, TM_32[2 * n + 1][k + 8]));
+                    }
+                }
+                // Even-odd: eo[k] = sum_n TM_32[2(2n+1)][k] * c(2(2n+1)).
+                let mut eo = [zero; 8];
+                for n in 0..8usize {
+                    let v = ld8(src.add((2 * (2 * n + 1)) * line + j));
+                    for k in 0..8usize {
+                        eo[k] = vadd(eo[k], mulc(v, TM_32[2 * (2 * n + 1)][k]));
+                    }
+                }
+                // Even-even-odd: eeo[k] = sum_n TM_32[4(2n+1)][k] * c(4(2n+1)).
+                let mut eeo = [zero; 4];
+                for n in 0..4usize {
+                    let v = ld8(src.add((4 * (2 * n + 1)) * line + j));
+                    for k in 0..4usize {
+                        eeo[k] = vadd(eeo[k], mulc(v, TM_32[4 * (2 * n + 1)][k]));
+                    }
+                }
+                // Even-even-even: 2-point butterflies.
+                let v0 = ld8(src.add(j));
+                let v16 = ld8(src.add(16 * line + j));
+                let m0 = mulc(v0, 64);
+                let m16 = mulc(v16, 64);
+                let eeee0 = vadd(m0, m16);
+                let eeee1 = vsub(m0, m16);
+                let v8 = ld8(src.add(8 * line + j));
+                let v24 = ld8(src.add(24 * line + j));
+                let m8 = mulc(v8, 83);
+                let m24 = mulc(v24, 36);
+                let eeoo0 = vadd(m8, m24);
+                let eeoo1 = vsub(mulc(v8, 36), mulc(v24, 83));
+                let eee = [
+                    vadd(eeee0, eeoo0),
+                    vadd(eeee1, eeoo1),
+                    vsub(eeee1, eeoo1),
+                    vsub(eeee0, eeoo0),
+                ];
+                let ee = [
+                    vadd(eee[0], eeo[0]),
+                    vadd(eee[1], eeo[1]),
+                    vadd(eee[2], eeo[2]),
+                    vadd(eee[3], eeo[3]),
+                    vsub(eee[3], eeo[3]),
+                    vsub(eee[2], eeo[2]),
+                    vsub(eee[1], eeo[1]),
+                    vsub(eee[0], eeo[0]),
+                ];
+                let mut e = [zero; 16];
+                for k in 0..8usize {
+                    e[k] = vadd(ee[k], eo[k]);
+                    e[15 - k] = vsub(ee[k], eo[k]);
+                }
+                for k in 0..8usize {
+                    store8(dst.add(k * line + j), fin(vadd(e[k], o_lo[k]), add, shift));
+                    store8(
+                        dst.add((31 - k) * line + j),
+                        fin(vsub(e[k], o_lo[k]), add, shift),
+                    );
+                }
+                for k in 0..8usize {
+                    store8(
+                        dst.add((8 + k) * line + j),
+                        fin(vadd(e[8 + k], o_hi[k]), add, shift),
+                    );
+                    store8(
+                        dst.add((23 - k) * line + j),
+                        fin(vsub(e[8 + k], o_hi[k]), add, shift),
+                    );
+                }
+            }
+            j += 8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +1255,64 @@ mod tests {
         assert_eq!(sl.scaling_list[21], DEFAULT_8X8_INTER);
         assert_eq!(sl.scaling_list[19], [0u8; 64]);
         assert!(sl.scaling_list_dc.iter().all(|&v| v == 16));
+    }
+
+    /// The AVX2 kernels must be bit-identical to the scalar butterflies.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_idct_matches_scalar() {
+        if !detect_avx2() {
+            return;
+        }
+        let mut rng = Rng::new(0xA7A2);
+        for log2 in 2..=5u32 {
+            let tr = 1usize << log2;
+            for use_dst in [false, true] {
+                if use_dst && log2 != 2 {
+                    continue;
+                }
+                for shift in [7i32, 8, 10, 12] {
+                    for iter in 0..25 {
+                        let n = tr * tr;
+                        let mut src = vec![0i16; n];
+                        for s in src.iter_mut() {
+                            *s = random_coeff(&mut rng);
+                        }
+                        let mut out_scalar = vec![0i16; n];
+                        let mut out_avx2 = vec![0i16; n];
+                        if use_dst {
+                            idst4(&src, &mut out_scalar, shift, tr);
+                        } else {
+                            match log2 {
+                                2 => idct4(&src, &mut out_scalar, shift, tr),
+                                3 => idct8(&src, &mut out_scalar, shift, tr),
+                                4 => idct16(&src, &mut out_scalar, shift, tr),
+                                5 => idct32(&src, &mut out_scalar, shift, tr),
+                                _ => unreachable!(),
+                            }
+                        }
+                        unsafe {
+                            if use_dst {
+                                avx2::idst4(&src, &mut out_avx2, shift, tr);
+                            } else {
+                                match log2 {
+                                    2 => avx2::idct4(&src, &mut out_avx2, shift, tr),
+                                    3 => avx2::idct8(&src, &mut out_avx2, shift, tr),
+                                    4 => avx2::idct16(&src, &mut out_avx2, shift, tr),
+                                    5 => avx2::idct32(&src, &mut out_avx2, shift, tr),
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            out_scalar, out_avx2,
+                            "avx2 mismatch: log2={} use_dst={} shift={} iter={}",
+                            log2, use_dst, shift, iter
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn golden_entries() -> Vec<(String, String)> {
