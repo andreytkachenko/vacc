@@ -91,10 +91,13 @@ pub fn interpolate_luma(
     let shift2 = 6;
     let shift3 = 2.max(14 - bit_depth);
 
-    // Check if all reference accesses are within bounds (including filter margin)
+    // Check if all reference accesses are within bounds (including filter
+    // margin). The right margin is 5, not 4: the AVX2 horizontal FIR reads
+    // one vector past its last needed sample, and PUs short of that take the
+    // clamped-window edge path instead.
     let interior = x_int - 3 >= 0
         && y_int - 3 >= 0
-        && x_int + n_pb_w as i32 + 4 <= pic_w
+        && x_int + n_pb_w as i32 + 5 <= pic_w
         && y_int + n_pb_h as i32 + 4 <= pic_h;
 
     if interior {
@@ -264,6 +267,29 @@ fn as_u16(buf: &[i16]) -> &[u16] {
     unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, buf.len()) }
 }
 
+/// Horizontal FIR row with AVX2/SSE2 dispatch — the edge paths run on any
+/// x86_64 (AVX2 detection is cached in std).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn hfir_row_luma(row: &[u16], f: [i16; 8], shift: i32, out: &mut [i16]) {
+    if detect_avx2() {
+        unsafe { avx2::luma_hfir_row(row, f, shift, out) }
+    } else {
+        sse2::luma_hfir_row(row, f, shift, out)
+    }
+}
+
+/// Chroma variant of [`hfir_row_luma`].
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn hfir_row_chroma(row: &[u16], f: [i16; 4], shift: i32, out: &mut [i16]) {
+    if detect_avx2() {
+        unsafe { avx2::chroma_hfir_row(row, f, shift, out) }
+    } else {
+        sse2::chroma_hfir_row(row, f, shift, out)
+    }
+}
+
 /// Fill `dst` with the reference row starting at column `x_start`,
 /// replicating edge samples for out-of-range columns (spec §8.5.3.3.3).
 /// The in-range middle is a straight copy; only the ends are per-sample.
@@ -333,7 +359,7 @@ fn luma_edge(
         for wy in 0..tmp_h {
             let src_y = (y_int - 3 + wy as i32).clamp(0, pic_h - 1);
             clamped_row(row_buf, &plane[(src_y * stride) as usize..], x_int - 3, pic_w);
-            sse2::luma_hfir_row(
+            hfir_row_luma(
                 as_u16(row_buf),
                 f_h,
                 shift1,
@@ -360,7 +386,7 @@ fn luma_edge(
                 let src_y = (y_int + wy as i32).clamp(0, pic_h - 1);
                 let row = &mut fir_tmp[wy * win_w..(wy + 1) * win_w];
                 clamped_row(row, &plane[(src_y * stride) as usize..], x_int - 3, pic_w);
-                sse2::luma_hfir_row(
+                hfir_row_luma(
                     as_u16(row),
                     f,
                     shift1,
@@ -422,7 +448,7 @@ fn chroma_edge(
         for wy in 0..tmp_h {
             let src_y = (y_int - 1 + wy as i32).clamp(0, pic_h - 1);
             clamped_row(row_buf, &plane[(src_y * stride) as usize..], x_int - 1, pic_w);
-            sse2::chroma_hfir_row(
+            hfir_row_chroma(
                 as_u16(row_buf),
                 f_h,
                 shift1,
@@ -447,7 +473,7 @@ fn chroma_edge(
                 let src_y = (y_int + wy as i32).clamp(0, pic_h - 1);
                 let row = &mut fir_tmp[wy * win_w..(wy + 1) * win_w];
                 clamped_row(row, &plane[(src_y * stride) as usize..], x_int - 1, pic_w);
-                sse2::chroma_hfir_row(
+                hfir_row_chroma(
                     as_u16(row),
                     f,
                     shift1,
@@ -1035,7 +1061,7 @@ mod sse2 {
             for y in 0..n_pb_h {
                 let off = ((y_int + y as i32) * stride + (x_int - 3)) as usize;
                 luma_hfir_row(
-                    &plane[off..off + n_pb_w + 7],
+                    &plane[off..off + n_pb_w + 8],
                     f,
                     shift1,
                     &mut pred[y * n_pb_w..(y + 1) * n_pb_w],
@@ -1084,7 +1110,7 @@ mod sse2 {
             for y in 0..tmp_h {
                 let off = ((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize;
                 luma_hfir_row(
-                    &plane[off..off + n_pb_w + 7],
+                    &plane[off..off + n_pb_w + 8],
                     f_h,
                     shift1,
                     &mut tmp[y * n_pb_w..(y + 1) * n_pb_w],
@@ -1283,9 +1309,16 @@ mod sse2 {
 // Integer-pel copy: zero-extend 8 u16 samples to i32, shift, pack — exact
 // for any input (no saturation).
 //
-// The horizontal FIR reuses the SSE2 row kernels: with an 8-tap filter the
-// per-output reduction does not amortize over 256-bit width, so it does not
-// pay off there.
+// Horizontal FIR: each output splits its taps into even/odd pairs (2j,
+// 2j+1); a `madd` of the sample window starting at offset 2j with the
+// broadcast `[f2j, f2j+1]` yields both products for one output in a single
+// i32 lane. Even outputs use windows aligned to the chunk base, odd outputs
+// the same windows shifted by one sample (`alignr`) — every lane is a real
+// product, so no zero-fill correction. Windows are built from 128-bit
+// `alignr` (the 256-bit form shifts each half independently); an 8-output
+// pass covers `[R0..R15]`, and a 16-wide chunk is two such passes. Chunks
+// that would read past `row` fall through to smaller chunks, then to the
+// SSE2 row kernel for the tail.
 //
 // Callers route here only when the block width is a multiple of 4; anything
 // else uses the scalar core.
@@ -1293,14 +1326,17 @@ mod sse2 {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        __m128i, __m256i, _mm256_add_epi32, _mm256_alignr_epi8, _mm256_and_si256,
+        _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+        _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
         _mm256_set1_epi32, _mm256_setr_epi32, _mm256_setzero_si256, _mm256_srai_epi32,
-        _mm_loadu_si128, _mm_packus_epi32, _mm_setr_epi16, _mm_slli_epi16,
-        _mm_storeu_si128, _mm_unpackhi_epi32, _mm_unpacklo_epi32,
+        _mm_add_epi32, _mm_and_si128, _mm_loadu_si128, _mm_madd_epi16, _mm_or_si128,
+        _mm_packus_epi32, _mm_set1_epi32, _mm_setr_epi16, _mm_setr_epi32, _mm_setzero_si128,
+        _mm_slli_epi16, _mm_slli_si128, _mm_srai_epi32, _mm_srli_si128, _mm_storeu_si128,
+        _mm_unpackhi_epi32, _mm_unpacklo_epi32,
     };
 
-    use super::sse2::{chroma_hfir_row, luma_hfir_row};
+    use super::sse2;
     use super::{CHROMA_FILTER, LUMA_FILTER};
 
     /// Logical left-shift 8 i16 lanes by `n` (always 2..=6 in this module).
@@ -1400,6 +1436,61 @@ mod avx2 {
         }
     }
 
+    /// Broadcast tap pair `(a, b)` into every i16 lane (low 16 = `a`, high 16
+    /// = `b`, per i32 lane) — 256-bit and 128-bit forms.
+    #[inline]
+    fn pair256(a: i16, b: i16) -> __m256i {
+        unsafe { _mm256_set1_epi32((a as i32 & 0xFFFF) | ((b as i32) << 16)) }
+    }
+
+    #[inline]
+    fn pair128(a: i16, b: i16) -> __m128i {
+        unsafe { _mm_set1_epi32((a as i32 & 0xFFFF) | ((b as i32) << 16)) }
+    }
+
+    /// Arithmetic right-shift 4 i32 lanes by `n` (always 0..=6 in this module).
+    #[inline]
+    fn srai32_128(v: __m128i, n: i32) -> __m128i {
+        match n {
+            0 => v,
+            1 => unsafe { _mm_srai_epi32::<1>(v) },
+            2 => unsafe { _mm_srai_epi32::<2>(v) },
+            3 => unsafe { _mm_srai_epi32::<3>(v) },
+            4 => unsafe { _mm_srai_epi32::<4>(v) },
+            5 => unsafe { _mm_srai_epi32::<5>(v) },
+            6 => unsafe { _mm_srai_epi32::<6>(v) },
+            _ => {
+                // Unreachable for our shift values; exact scalar fallback.
+                let mut a = [0i32; 4];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &v as *const __m128i as *const i32,
+                        a.as_mut_ptr(),
+                        4,
+                    );
+                }
+                for x in a.iter_mut() {
+                    *x = *x >> n;
+                }
+                unsafe { _mm_setr_epi32(a[0], a[1], a[2], a[3]) }
+            }
+        }
+    }
+
+    /// Merge even/odd column accumulators into in-order output, shift, and
+    /// store 8 i16 samples — 128-bit variant of `merge_shift_store16`.
+    #[inline]
+    fn merge_shift_store8(even: __m128i, odd: __m128i, shift: i32, out: &mut [i16]) {
+        unsafe {
+            let mask = _mm_set1_epi32(0xFFFF);
+            let e = _mm_and_si128(srai32_128(even, shift), mask);
+            let o = _mm_and_si128(srai32_128(odd, shift), mask);
+            // Columns 0..7: [E0,O0,E1,O1] then [E2,O2,E3,O3].
+            let p = _mm_packus_epi32(_mm_unpacklo_epi32(e, o), _mm_unpackhi_epi32(e, o));
+            _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
+        }
+    }
+
     /// Vertical FIR over rows at `base + y * row_stride` — width `n`
     /// (multiple of 4, at least `rows_out + TAPS` rows). The i16
     /// reinterpretation of u16 plane samples is exact (samples < 2^15).
@@ -1479,6 +1570,242 @@ mod avx2 {
         }
     }
 
+    /// 8 luma outputs from the 16-sample window held in `[a || b]` (i16
+    /// lanes: `a` = R[0..7], `b` = R[8..15]).
+    ///
+    /// Even output 2i, tap pair j needs R[2i+2j], R[2i+2j+1]; odd output
+    /// 2i+1 needs R[2i+2j+1], R[2i+2j+2]. So even pair j uses the window
+    /// starting at sample 2j (byte 4j of the 128-bit concat) and odd pair j
+    /// the window starting at sample 2j+1 (byte 4j+2). A `madd` of that
+    /// window with the broadcast tap pair yields both products for one
+    /// output in a single i32 lane.
+    #[inline]
+    fn hfir8_luma(a: __m128i, b: __m128i, d: [__m128i; 4], shift: i32, out: &mut [i16]) {
+        unsafe {
+            // Window k = bytes 2k..2k+15 of the 32-byte stream [a || b]:
+            // shift `a` right by 2k bytes and `b` left by 16-2k, then or.
+            let e1 = _mm_or_si128(_mm_srli_si128::<4>(a), _mm_slli_si128::<12>(b));
+            let e2 = _mm_or_si128(_mm_srli_si128::<8>(a), _mm_slli_si128::<8>(b));
+            let e3 = _mm_or_si128(_mm_srli_si128::<12>(a), _mm_slli_si128::<4>(b));
+            let o0 = _mm_or_si128(_mm_srli_si128::<2>(a), _mm_slli_si128::<14>(b));
+            let o1 = _mm_or_si128(_mm_srli_si128::<6>(a), _mm_slli_si128::<10>(b));
+            let o2 = _mm_or_si128(_mm_srli_si128::<10>(a), _mm_slli_si128::<6>(b));
+            let o3 = _mm_or_si128(_mm_srli_si128::<14>(a), _mm_slli_si128::<2>(b));
+            let even_acc = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(a, d[0]), _mm_madd_epi16(e1, d[1])),
+                _mm_add_epi32(_mm_madd_epi16(e2, d[2]), _mm_madd_epi16(e3, d[3])),
+            );
+            let odd_acc = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(o0, d[0]), _mm_madd_epi16(o1, d[1])),
+                _mm_add_epi32(_mm_madd_epi16(o2, d[2]), _mm_madd_epi16(o3, d[3])),
+            );
+            merge_shift_store8(even_acc, odd_acc, shift, out);
+        }
+    }
+
+    /// Luma 8-tap horizontal FIR for one row. `row` must hold at least
+    /// `out.len() + 7` valid u16 samples (interior guarantee).
+    ///
+    /// See the module docs for the tap-pair window design. A 16-wide chunk
+    /// is one 256-bit computation over `[R0..R23]` (three 128-bit loads);
+    /// an 8-wide chunk is one 128-bit computation. Chunks that would read
+    /// past `row` (tight edge windows) fall through to smaller chunks and
+    /// finally to the SSE2 row kernel for the tail.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn luma_hfir_row(row: &[u16], f: [i16; 8], shift: i32, out: &mut [i16]) {
+        let d = [
+            pair128(f[0], f[1]),
+            pair128(f[2], f[3]),
+            pair128(f[4], f[5]),
+            pair128(f[6], f[7]),
+        ];
+        let base = row.as_ptr();
+        let n = out.len();
+        let mut x = 0usize;
+        while x + 16 <= n && x + 24 <= row.len() {
+            unsafe {
+                let a = _mm_loadu_si128(base.add(x) as *const __m128i); // R[0..7]
+                let b = _mm_loadu_si128(base.add(x + 8) as *const __m128i); // R[8..15]
+                let c = _mm_loadu_si128(base.add(x + 16) as *const __m128i); // R[16..23]
+                // v0 = [R0..R7 | R8..R15], v1 = [R8..R15 | R16..R23].
+                // `_mm256_alignr_epi8` shifts each 128-bit half over its own
+                // 32-byte stream `[v0_half || v1_half]`, so for even k the
+                // low half holds the window of even output k/2 in [R0..R15]
+                // and the high half the window of even output 8 + k/2 in
+                // [R8..R23]; one madd accumulates both at once.
+                let v0 = _mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1);
+                let v1 = _mm256_inserti128_si256(_mm256_castsi128_si256(b), c, 1);
+                // Tap-pair j (byte shift 4j / 4j+2) pairs every lane with
+                // (f[2j], f[2j+1]); accumulate across the four shifts.
+                let d = [
+                    pair256(f[0], f[1]),
+                    pair256(f[2], f[3]),
+                    pair256(f[4], f[5]),
+                    pair256(f[6], f[7]),
+                ];
+                let (mut even_acc, mut odd_acc) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+                even_acc = _mm256_add_epi32(
+                    even_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<0>(v1, v0), d[0]),
+                );
+                even_acc = _mm256_add_epi32(
+                    even_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<4>(v1, v0), d[1]),
+                );
+                even_acc = _mm256_add_epi32(
+                    even_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<8>(v1, v0), d[2]),
+                );
+                even_acc = _mm256_add_epi32(
+                    even_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<12>(v1, v0), d[3]),
+                );
+                odd_acc = _mm256_add_epi32(
+                    odd_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<2>(v1, v0), d[0]),
+                );
+                odd_acc = _mm256_add_epi32(
+                    odd_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<6>(v1, v0), d[1]),
+                );
+                odd_acc = _mm256_add_epi32(
+                    odd_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<10>(v1, v0), d[2]),
+                );
+                odd_acc = _mm256_add_epi32(
+                    odd_acc,
+                    _mm256_madd_epi16(_mm256_alignr_epi8::<14>(v1, v0), d[3]),
+                );
+                merge_shift_store16(even_acc, odd_acc, shift, &mut out[x..x + 16]);
+            }
+            x += 16;
+        }
+        while x + 8 <= n && x + 16 <= row.len() {
+            unsafe {
+                let a = _mm_loadu_si128(base.add(x) as *const __m128i); // R[0..7]
+                let b = _mm_loadu_si128(base.add(x + 8) as *const __m128i); // R[8..15]
+                hfir8_luma(a, b, d, shift, &mut out[x..x + 8]);
+            }
+            x += 8;
+        }
+        if x < n {
+            sse2::luma_hfir_row(&row[x..], f, shift, &mut out[x..]);
+        }
+    }
+
+    /// Chroma 4-tap horizontal FIR for one row. `row` must hold at least
+    /// `out.len() + 3` valid u16 samples (interior guarantee).
+    ///
+    /// Same tap-pair window design as `luma_hfir_row` with two tap pairs. A
+    /// 16-wide chunk reads exactly `R[0..18]` (two 128-bit loads plus three
+    /// scalar tail samples), so it fits the interior `+3` margin; an 8-wide
+    /// chunk reads `R[0..10]`. Tighter windows fall through to the SSE2 row
+    /// kernel for the tail.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn chroma_hfir_row(row: &[u16], f: [i16; 4], shift: i32, out: &mut [i16]) {
+        let c = [pair256(f[0], f[1]), pair256(f[2], f[3])];
+        let d = [pair128(f[0], f[1]), pair128(f[2], f[3])];
+        let base = row.as_ptr();
+        let n = out.len();
+        let mut x = 0usize;
+        while x + 16 <= n && x + 19 <= row.len() {
+            unsafe {
+                let a = _mm_loadu_si128(base.add(x) as *const __m128i); // R[0..7]
+                let b = _mm_loadu_si128(base.add(x + 8) as *const __m128i); // R[8..15]
+                let xt = _mm_setr_epi16(
+                    *base.add(x + 16) as i16,
+                    *base.add(x + 17) as i16,
+                    *base.add(x + 18) as i16,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let zero = _mm256_setzero_si256();
+                let (mut even_acc, mut odd_acc) = (zero, zero);
+                // j=0: windows R[0..15] / R[1..16].
+                let w0e = _mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1);
+                even_acc = _mm256_add_epi32(even_acc, _mm256_madd_epi16(w0e, c[0]));
+                let w0o = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(
+                        _mm_or_si128(_mm_srli_si128::<2>(a), _mm_slli_si128::<14>(b)),
+                    ),
+                    _mm_or_si128(_mm_srli_si128::<2>(b), _mm_slli_si128::<14>(xt)),
+                    1,
+                );
+                odd_acc = _mm256_add_epi32(odd_acc, _mm256_madd_epi16(w0o, c[0]));
+                // j=1: windows R[2..17] / R[3..18].
+                let w1e = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(
+                        _mm_or_si128(_mm_srli_si128::<4>(a), _mm_slli_si128::<12>(b)),
+                    ),
+                    _mm_or_si128(_mm_srli_si128::<4>(b), _mm_slli_si128::<12>(xt)),
+                    1,
+                );
+                even_acc = _mm256_add_epi32(even_acc, _mm256_madd_epi16(w1e, c[1]));
+                let w1o = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(
+                        _mm_or_si128(_mm_srli_si128::<6>(a), _mm_slli_si128::<10>(b)),
+                    ),
+                    _mm_or_si128(_mm_srli_si128::<6>(b), _mm_slli_si128::<10>(xt)),
+                    1,
+                );
+                odd_acc = _mm256_add_epi32(odd_acc, _mm256_madd_epi16(w1o, c[1]));
+                merge_shift_store16(even_acc, odd_acc, shift, &mut out[x..x + 16]);
+            }
+            x += 16;
+        }
+        while x + 8 <= n && x + 11 <= row.len() {
+            unsafe {
+                let a = _mm_loadu_si128(base.add(x) as *const __m128i); // R[0..7]
+                let xt = _mm_setr_epi16(
+                    *base.add(x + 8) as i16,
+                    *base.add(x + 9) as i16,
+                    *base.add(x + 10) as i16,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let zero = _mm_setzero_si128();
+                let (mut even_acc, mut odd_acc) = (zero, zero);
+                // j=0: windows R[0..7] / R[1..8].
+                even_acc = _mm_add_epi32(even_acc, _mm_madd_epi16(a, d[0]));
+                odd_acc = _mm_add_epi32(
+                    odd_acc,
+                    _mm_madd_epi16(
+                        _mm_or_si128(_mm_srli_si128::<2>(a), _mm_slli_si128::<14>(xt)),
+                        d[0],
+                    ),
+                );
+                // j=1: windows R[2..9] / R[3..10].
+                even_acc = _mm_add_epi32(
+                    even_acc,
+                    _mm_madd_epi16(
+                        _mm_or_si128(_mm_srli_si128::<4>(a), _mm_slli_si128::<12>(xt)),
+                        d[1],
+                    ),
+                );
+                odd_acc = _mm_add_epi32(
+                    odd_acc,
+                    _mm_madd_epi16(
+                        _mm_or_si128(_mm_srli_si128::<6>(a), _mm_slli_si128::<10>(xt)),
+                        d[1],
+                    ),
+                );
+                merge_shift_store8(even_acc, odd_acc, shift, &mut out[x..x + 8]);
+            }
+            x += 8;
+        }
+        if x < n {
+            sse2::chroma_hfir_row(&row[x..], f, shift, &mut out[x..]);
+        }
+    }
+
     /// Luma interior kernel — all four frac combinations, direct access.
     /// Precondition: the interior bounds checked by `interpolate_luma` hold
     /// and `n_pb_w % 4 == 0`.
@@ -1514,7 +1841,7 @@ mod avx2 {
             for y in 0..n_pb_h {
                 let off = ((y_int + y as i32) * stride + (x_int - 3)) as usize;
                 luma_hfir_row(
-                    &plane[off..off + n_pb_w + 7],
+                    &plane[off..off + n_pb_w + 8],
                     f,
                     shift1,
                     &mut pred[y * n_pb_w..(y + 1) * n_pb_w],
@@ -1534,7 +1861,7 @@ mod avx2 {
             for y in 0..tmp_h {
                 let off = ((y_int + y as i32 - 3) * stride + (x_int - 3)) as usize;
                 luma_hfir_row(
-                    &plane[off..off + n_pb_w + 7],
+                    &plane[off..off + n_pb_w + 8],
                     f_h,
                     shift1,
                     &mut tmp[y * n_pb_w..(y + 1) * n_pb_w],
@@ -1821,6 +2148,91 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Direct coverage of the AVX2 horizontal FIR rows: every chunk/tail
+    /// boundary (16-wide, 8-wide, SSE2 tail) and both margin variants for
+    /// luma (tight edge window `+7` vs interior `+8`). Byte-exact against a
+    /// scalar reference.
+    #[test]
+    fn avx2_hfir_rows_match_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = Rng::new(0xA11CE_0006);
+        for &w in &[4usize, 8, 12, 16, 20, 24, 28, 32, 44, 48, 52, 64] {
+            for x_frac in 1..4 {
+                let shift = 4i32;
+                for margin in [7usize, 8] {
+                    let row: Vec<u16> = (0..w + margin).map(|_| rng.below(1025) as u16).collect();
+                    let mut out_avx = vec![0i16; w];
+                    let mut out_ref = vec![0i16; w];
+                    unsafe { avx2::luma_hfir_row(&row, LUMA_FILTER[x_frac], shift, &mut out_avx) };
+                    for (c, o) in out_ref.iter_mut().enumerate() {
+                        let sum: i32 = LUMA_FILTER[x_frac]
+                            .iter()
+                            .enumerate()
+                            .map(|(t, &tap)| tap as i32 * row[c + t] as i32)
+                            .sum();
+                        *o = (sum >> shift) as i16;
+                    }
+                    assert_eq!(
+                        out_avx, out_ref,
+                        "luma hfir w={w} frac={x_frac} margin={margin}"
+                    );
+                }
+            }
+        }
+        for &w in &[4usize, 8, 12, 16, 20, 24, 32] {
+            for x_frac in 1..8 {
+                let shift = 4i32;
+                let row: Vec<u16> = (0..w + 3).map(|_| rng.below(1025) as u16).collect();
+                let mut out_avx = vec![0i16; w];
+                let mut out_ref = vec![0i16; w];
+                unsafe { avx2::chroma_hfir_row(&row, CHROMA_FILTER[x_frac], shift, &mut out_avx) };
+                for (c, o) in out_ref.iter_mut().enumerate() {
+                    let sum: i32 = CHROMA_FILTER[x_frac]
+                        .iter()
+                        .enumerate()
+                        .map(|(t, &tap)| tap as i32 * row[c + t] as i32)
+                        .sum();
+                    *o = (sum >> shift) as i16;
+                }
+                assert_eq!(out_avx, out_ref, "chroma hfir w={w} frac={x_frac}");
+            }
+        }
+    }
+
+    #[test]
+    fn dbg_hfir_dump() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = Rng::new(0xA11CE_0006);
+        for &w in &[4usize, 8, 12] {
+            for _x_frac in 1..4 {
+                for &margin in &[7usize, 8] {
+                    let _row: Vec<u16> = (0..w + margin).map(|_| rng.below(1025) as u16).collect();
+                }
+            }
+        }
+        let w = 16usize;
+        let x_frac = 1;
+        for &margin in &[7usize, 8] {
+            let row: Vec<u16> = (0..w + margin).map(|_| rng.below(1025) as u16).collect();
+            eprintln!("margin={margin} row: {row:?}");
+            let f = LUMA_FILTER[x_frac];
+            let mut out_ref = vec![0i16; w];
+            for (c, o) in out_ref.iter_mut().enumerate() {
+                let sum: i32 =
+                    f.iter().enumerate().map(|(t, &tap)| tap as i32 * row[c + t] as i32).sum();
+                *o = (sum >> 4) as i16;
+            }
+            eprintln!("  ref: {out_ref:?}");
+            let mut out_avx = vec![0i16; w];
+            unsafe { avx2::luma_hfir_row(&row, f, 4, &mut out_avx) };
+            eprintln!("  avx: {out_avx:?}");
         }
     }
 
