@@ -191,11 +191,6 @@ impl<'bs> CabacEngine<'bs> {
         self.contexts.copy_from_slice(src);
     }
 
-    /// Raw pointer to the context array (WPP save path).
-    pub fn contexts_ptr(&self) -> *const CabacContext {
-        self.contexts.as_ptr()
-    }
-
     /// Access to the underlying bitstream reader (raw-bit reads such as PCM
     /// sample access and byte alignment).
     pub fn bitstream(&mut self) -> &mut BitstreamReader<'bs> {

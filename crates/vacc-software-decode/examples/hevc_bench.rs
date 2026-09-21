@@ -16,7 +16,7 @@ fn run_once(data: Vec<u8>) -> u32 {
     while let Some(_f) = dec.decode().expect("decode") {
         n += 1;
     }
-    dec.flush().expect("flush");
+    n += dec.flush().expect("flush").len() as u32;
     n
 }
 
