@@ -3805,7 +3805,12 @@ impl<'a> SliceContext<'a> {
                         unavail16x16 |= 2;
                         filter_edges &= !(self.disable_deblocking_filter_idc as i32); // impacts only bit 1
                         if decoded == width - 1 {
-                            // C becomes available
+                            // C becomes available (for the next row); for this
+                            // macroblock it is the top-right corner, where C
+                            // does not exist — keep the pointer valid (the
+                            // unavail bitmap marks C unavailable here, so its
+                            // data is never consumed).
+                            mb_c = UNAVAIL as *mut RustMb;
                             let offC_int32 = (width * smb) >> 2;
                             self.mvs_c[5] = 10 - offC_int32;
                         } else {
