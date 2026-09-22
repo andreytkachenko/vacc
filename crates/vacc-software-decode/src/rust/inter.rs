@@ -176,24 +176,17 @@ mod oracle_tests {
 
     /// Bit-exact check of the luma MC against the real C `decode_inter_luma`
     /// (edge264_inter.c) with a deterministic LCG neighborhood. The C source
-    /// was removed in the E4 cutover but lives on in git history:
-    ///   git archive 9cdae1f^ crates/vacc-software-decode/c | tar -x -C /tmp/ziptest3
-    /// Regenerate the oracle file with:
-    ///   gcc -O2 -march=native -std=gnu11 -flax-vector-conversions \
-    ///       -I <baseline>/c/src harness.c -o harness && ./harness > oracle_luma.txt
+    /// was removed in the E4 cutover but lives on in git history (9cdae1f^).
+    /// `oracle_luma.txt` pins this machine's GCC/SSE output for all 48 luma
+    /// modes x 7 (w,h) combos x 3 weight patterns; it encodes machine-specific
+    /// SIMD behavior (e.g. the _mm_sra_epi16 floor-division quirk), so
+    /// regenerate it ON THE MACHINE where the tests run, via `oracle/harness.c`
+    /// (extract the C tree first: `git archive 9cdae1f^ crates/vacc-sw-decode/c | tar -x`
+    /// and point the compile line's -I at the extracted c/src). See the
+    /// harness header for the exact steps.
     #[test]
-    #[ignore = "requires /tmp/ziptest3/oracle_luma.txt (see docs; C tree in git history)"]
     fn oracle_luma() {
-        let text = match std::fs::read_to_string("/tmp/ziptest3/oracle_luma.txt") {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "oracle_luma: skipping ({e}); restore the C tree from git \
-history (9cdae1f^) and regenerate /tmp/ziptest3/oracle_luma.txt"
-                );
-                return;
-            }
-        };
+        let text = include_str!("oracle_luma.txt");
         let mut lines = text.lines();
         let mut rng: u32 = 0x12345678;
         let rnd = |st: &mut u32| -> u8 {
