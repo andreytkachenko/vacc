@@ -15,7 +15,7 @@ path = "src/decode.rs"
 #   cargo build -p vacc-examples --no-default-features --features "hevcjs vaapi"
 [features]
 default = ["edge264", "hevcjs", "nvdec", "vaapi", "vulkan"]
-edge264 = ["dep:vacc-sw-decode"]
+edge264 = ["dep:vacc-software-decode"]
 hevcjs = ["dep:vacc-software-decode"]
 nvdec = ["dep:vacc-nvdec-decode"]
 vaapi = ["dep:vacc-vaapi-decode"]
@@ -27,5 +27,4 @@ vacc-vulkan = { workspace = true, optional = true }
 vacc-nvdec-decode = { workspace = true, optional = true }
 vacc-vaapi-decode = { workspace = true, optional = true }
 vacc-software-decode = { workspace = true, optional = true }
-vacc-sw-decode = { workspace = true, optional = true }
 vacc-vulkan-decode = { workspace = true, optional = true }

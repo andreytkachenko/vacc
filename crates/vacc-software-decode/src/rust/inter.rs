@@ -177,7 +177,7 @@ mod oracle_tests {
     /// Bit-exact check of the luma MC against the real C `decode_inter_luma`
     /// (edge264_inter.c) with a deterministic LCG neighborhood. The C source
     /// was removed in the E4 cutover but lives on in git history:
-    ///   git archive 9cdae1f^ crates/vacc-sw-decode/c | tar -x -C /tmp/ziptest3
+    ///   git archive 9cdae1f^ crates/vacc-software-decode/c | tar -x -C /tmp/ziptest3
     /// Regenerate the oracle file with:
     ///   gcc -O2 -march=native -std=gnu11 -flax-vector-conversions \
     ///       -I <baseline>/c/src harness.c -o harness && ./harness > oracle_luma.txt

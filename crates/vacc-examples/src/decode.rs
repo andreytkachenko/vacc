@@ -770,7 +770,7 @@ fn main() {
             let frames = match codec {
                 #[cfg(feature = "edge264")]
                 Codec::H264 => {
-                    let mut d = vacc_sw_decode::SwH264Decoder::new(data)
+                    let mut d = vacc_software_decode::SwH264Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("sw decoder init: {}", e)));
                     decode_all_core(&mut d, args.max_frames)
                 }
