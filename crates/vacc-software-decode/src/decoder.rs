@@ -387,9 +387,9 @@ impl SwH264Decoder {
             if self.parse_offset >= self.pending_data.len() {
                 return Ok(None);
             }
-            let remaining = &self.pending_data[self.parse_offset..];
-            let packet = BitstreamPacket::new(remaining.to_vec());
-            match self.parser.parse(&packet) {
+              let remaining = &self.pending_data[self.parse_offset..];
+              let packet = BitstreamPacket::new(remaining.to_vec());
+              match self.parser.parse(&packet) {
                 Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
                     if let Some(b) = sps {
                         let new_sps = b
@@ -1109,14 +1109,18 @@ impl Decoder for SwH264Decoder {
     }
 
     fn submit(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+        // Compact the pending buffer in place (drop consumed bytes), append the
+        // new data, and force a NAL-cache rebuild: the payload length alone is
+        // not a reliable change detector (two consecutive access units may have
+        // the same byte length).
         if self.parse_offset >= self.pending_data.len() {
             self.pending_data.clear();
         } else {
-            let unconsumed = self.pending_data[self.parse_offset..].to_vec();
-            self.pending_data = unconsumed;
-            self.parse_offset = 0;
+            self.pending_data.drain(..self.parse_offset);
         }
+        self.parse_offset = 0;
         self.pending_data.extend_from_slice(data);
+        self.parser.invalidate_nal_cache();
         Ok(())
     }
 

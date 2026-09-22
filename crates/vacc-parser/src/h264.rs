@@ -115,6 +115,16 @@ impl H264Parser {
         self.active_pps = Some(pps);
     }
 
+    /// Discard the cached NAL list and reset the cursor. Callers that mutate
+    /// a packet payload in place (e.g. compacting consumed bytes before
+    /// appending new data) must call this, since the length check in
+    /// `parse` cannot detect a same-length content change.
+    pub fn invalidate_nal_cache(&mut self) {
+        self.cached_nals.clear();
+        self.cached_payload_len = 0;
+        self.nal_cursor = 0;
+    }
+
     /// Parse VUI parameters from the bitstream.
     /// Returns H264SpsVui with parsed values when vui_parameters_present_flag is set.
     fn parse_vui_parameters(r: &mut BitReader) -> ParserResult<vacc_core::picture::H264SpsVui> {
