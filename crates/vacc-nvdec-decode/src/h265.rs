@@ -48,7 +48,9 @@ struct H265DpbCtx {
     /// Common DPB (spec 8.3.2 marking / eviction / allocation).
     dpb: H265Dpb,
     /// Common-DPB slot -> physical cuvid surface index (None = unassigned).
-    slot_surfaces: [Option<i32>; NUM_SURFACES as usize],
+    /// Grows with the common DPB's slot pool, which can exceed
+    /// `NUM_SURFACES` when all surfaces are occupied.
+    slot_surfaces: Vec<Option<i32>>,
     /// Surfaces holding a decoded but not-yet-extracted frame; protected from
     /// reuse until the frame is read back.
     surface_pending: [bool; NUM_SURFACES as usize],
@@ -58,19 +60,28 @@ impl H265DpbCtx {
     fn new() -> Self {
         Self {
             dpb: H265Dpb::new(NUM_SURFACES as usize),
-            slot_surfaces: [None; NUM_SURFACES as usize],
+            slot_surfaces: vec![None; NUM_SURFACES as usize],
             surface_pending: [false; NUM_SURFACES as usize],
         }
     }
 
     fn reset(&mut self) {
         self.dpb.invalidate_all();
-        self.slot_surfaces = [None; NUM_SURFACES as usize];
+        self.slot_surfaces = vec![None; NUM_SURFACES as usize];
         self.surface_pending = [false; NUM_SURFACES as usize];
+    }
+
+    /// Grow the surface bindings to match the DPB slot pool.
+    fn sync_slots(&mut self) {
+        let n = self.dpb.slots().len();
+        if self.slot_surfaces.len() < n {
+            self.slot_surfaces.resize(n, None);
+        }
     }
 
     /// Drop surface bindings for slots invalidated by `picture_start`.
     fn drop_invalidated(&mut self) {
+        self.sync_slots();
         for (i, s) in self.dpb.slots().iter().enumerate() {
             if !s.valid {
                 self.slot_surfaces[i] = None;
@@ -103,6 +114,7 @@ impl H265DpbCtx {
     /// Bind the current slot to its surface and commit the picture to the
     /// common DPB.
     fn commit(&mut self, slot: usize, surface: i32) {
+        self.sync_slots();
         self.slot_surfaces[slot] = Some(surface);
         self.surface_pending[surface as usize] = true;
         self.dpb.commit_current(slot);
@@ -432,7 +444,7 @@ impl NvdecH265Decoder {
                         let mut state = H265DpbState::default();
                         for i in 0..NUM_SURFACES as usize {
                             if ctx.dpb.slots()[i].valid {
-                                state.ref_pic_idx[i] = ctx.slot_surfaces[i].unwrap_or(-1);
+                                state.ref_pic_idx[i] = ctx.slot_surfaces.get(i).copied().flatten().unwrap_or(-1);
                                 state.pic_order_cnt_val[i] = ctx.dpb.slots()[i].poc;
                                 state.is_long_term[i] = ctx.dpb.slots()[i].is_long_term as u8;
                             }
