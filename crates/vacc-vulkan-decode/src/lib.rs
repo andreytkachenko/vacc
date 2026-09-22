@@ -12,7 +12,8 @@ pub use device::VulkanDecoderDevice;
 
 /// Re-export common types from vacc-vulkan.
 pub use vacc_vulkan::{
-    AccessUnit, BitstreamBuffer, BitstreamBufferPool, CodecProfileInfo, DecodedPixels, DpbEntry,
+    AccessUnit, BitstreamBuffer, BitstreamBufferPool, CodecProfileInfo, DecodedFrame, DecodedPixels,
+    DpbEntry,
     DpbManager, H264OrH265Pps, H264OrH265Sps, LastAccessType, VideoCodec,
     VideoCodec as AccessUnitCodec, VideoSession, VideoSessionParameters, VideoSessionParams,
     Vp9Frame, readback_decoded_image,

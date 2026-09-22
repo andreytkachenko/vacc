@@ -1179,6 +1179,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "vacc"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "thiserror 2.0.20",
+ "vacc-core",
+ "vacc-nvdec-decode",
+ "vacc-software-decode",
+ "vacc-vaapi-decode",
+ "vacc-vulkan-decode",
+]
+
+[[package]]
 name = "vacc-core"
 version = "0.1.1"
 dependencies = [
@@ -1196,7 +1209,6 @@ dependencies = [
  "vacc-core",
  "vacc-nvdec-decode",
  "vacc-software-decode",
- "vacc-sw-decode",
  "vacc-vaapi-decode",
  "vacc-vulkan",
  "vacc-vulkan-decode",
@@ -1232,16 +1244,6 @@ version = "0.1.1"
 dependencies = [
  "log",
  "rayon",
- "thiserror 2.0.20",
- "vacc-core",
- "vacc-parser",
-]
-
-[[package]]
-name = "vacc-sw-decode"
-version = "0.1.1"
-dependencies = [
- "log",
  "thiserror 2.0.20",
  "vacc-core",
  "vacc-parser",

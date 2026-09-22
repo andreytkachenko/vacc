@@ -1,3 +1,30 @@
+[package]
+name = "vacc"
+description = "Vacc video decoder: unified API over Vulkan, NVDEC, VAAPI and software backends with automatic fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Each decode backend is a compile-time feature (all on by default). Build
+# with a subset, e.g.:
+#   cargo build -p vacc --no-default-features --features "vaapi sw"
+[features]
+default = ["vulkan", "nvdec", "vaapi", "sw"]
+vulkan = ["dep:vacc-vulkan-decode"]
+nvdec = ["dep:vacc-nvdec-decode"]
+vaapi = ["dep:vacc-vaapi-decode"]
+sw = ["dep:vacc-software-decode"]
+
+[dependencies]
+vacc-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+vacc-vulkan-decode = { workspace = true, optional = true }
+vacc-nvdec-decode = { workspace = true, optional = true }
+vacc-vaapi-decode = { workspace = true, optional = true }
+vacc-software-decode = { workspace = true, optional = true }
+
 [workspace]
 members = [
     "crates/vacc-core",
