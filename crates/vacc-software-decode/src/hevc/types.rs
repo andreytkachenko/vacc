@@ -1,10 +1,7 @@
 //! Port of `hevc/common/types.h` — shared enums, structs and helpers.
 
-/// Clip3 — spec §5.9.
-#[inline]
-pub fn clip3<T: Ord>(min_val: T, max_val: T, x: T) -> T {
-    x.clamp(min_val, max_val)
-}
+/// Clip3 — spec §5.9 (single implementation in `vacc_common::clip`).
+pub use vacc_common::clip::clip3;
 
 /// Pixel type — 16-bit for 8/10-bit support (AD-002).
 pub type Pixel = u16;

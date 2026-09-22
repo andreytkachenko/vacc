@@ -16,25 +16,7 @@ use crate::rust::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
 
 const PAD: usize = 32;
 
-/// Deterministic xorshift64* RNG (no external deps).
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 31;
-        self.0 = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn byte(&mut self) -> u8 {
-        self.next() as u8
-    }
-}
+use vacc_common::rng::XorShift64Star;
 
 /// Run `ops` through the Rust port on a zero-padded copy of `payload`.
 fn run_r(payload: &[u8], ops: &[i32]) -> (Vec<i32>, i64, u64, u64, [u8; 1024]) {
@@ -112,7 +94,7 @@ fn compare(payload: &[u8], ops: &[i32], tag: &str) {
 }
 
 /// Random payload with EPB / stop sequences sprinkled in.
-fn random_payload(rng: &mut Rng, min_len: usize, max_len: usize) -> Vec<u8> {
+fn random_payload(rng: &mut XorShift64Star, min_len: usize, max_len: usize) -> Vec<u8> {
     let len = min_len + rng.below((max_len - min_len) as u64) as usize;
     let mut v: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
     // Inject a few 00 00 03 (EPB) and 00 00 00 (stop) sequences.
@@ -128,7 +110,7 @@ fn random_payload(rng: &mut Rng, min_len: usize, max_len: usize) -> Vec<u8> {
     v
 }
 
-fn random_cavlc_ops(rng: &mut Rng, payload_len: usize) -> Vec<i32> {
+fn random_cavlc_ops(rng: &mut XorShift64Star, payload_len: usize) -> Vec<i32> {
     let mut ops: Vec<i32> = Vec::new();
     // Budget roughly the payload in bits plus some overread.
     let budget = (payload_len * 8 / 3 + 40) as u64;
@@ -166,7 +148,7 @@ fn cavlc_fuzz() {
 }
 
 fn cavlc_fuzz_body() {
-    let mut rng = Rng(0x5eed_cabac);
+    let mut rng = XorShift64Star(0x5eed_cabac);
     for iter in 0..300 {
         let payload = random_payload(&mut rng, 1, 64);
         let ops = random_cavlc_ops(&mut rng, payload.len());
@@ -203,7 +185,7 @@ fn cavlc_structured_body() {
             0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ],
     ];
-    let mut rng = Rng(0x5eed_57a5);
+    let mut rng = XorShift64Star(0x5eed_57a5);
     for (ci, payload) in cases.iter().enumerate() {
         let ops = random_cavlc_ops(&mut rng, payload.len());
         compare(payload, &ops, &format!("cavlc-structured #{ci}"));
@@ -213,7 +195,7 @@ fn cavlc_structured_body() {
 /// CABAC op sequence: some CAVLC reads, cabac_start, cabac_init, a mix of
 /// get_ae/get_bypass, cabac_terminate, then trailing CAVLC reads (exercising
 /// the terminate LPS refill path). The cache is already primed by SliceBits::new.
-fn random_cabac_ops(rng: &mut Rng) -> Vec<i32> {
+fn random_cabac_ops(rng: &mut XorShift64Star) -> Vec<i32> {
     let mut ops: Vec<i32> = Vec::new();
     ops.extend(std::iter::repeat_n(0, (1 + rng.below(4)) as usize)); // get_u1
     ops.push(4); // cabac_start
@@ -245,7 +227,7 @@ fn cabac_fuzz() {
 }
 
 fn cabac_fuzz_body() {
-    let mut rng = Rng(0x5eed_cabac2);
+    let mut rng = XorShift64Star(0x5eed_cabac2);
     for iter in 0..300 {
         let payload = random_payload(&mut rng, 8, 96);
         let ops = random_cabac_ops(&mut rng);
@@ -260,7 +242,7 @@ fn cabac_init_full_domain() {
 
 fn cabac_init_full_domain_body() {
     // Every (idc, qp) pair: init and compare all 1024 context states.
-    let mut rng = Rng(0x5eed_cab4);
+    let mut rng = XorShift64Star(0x5eed_cab4);
     for idc in 0..4i32 {
         for qp in 0..=51i32 {
             // A few CAVLC bits so cabac_start has a primed cache, then start+init.
@@ -321,7 +303,7 @@ fn intra_fuzz_all_modes() {
 }
 
 fn intra_fuzz_all_modes_body() {
-    let mut rng = Rng(0x5eed_13a1);
+    let mut rng = XorShift64Star(0x5eed_13a1);
     for kind in 0..4i32 {
         for mode in 0..=intra_max_mode(kind) {
             for iter in 0..50 {
@@ -356,7 +338,7 @@ fn intra_structured_body() {
         if (i / 48 + i % 48) & 1 == 0 { 0 } else { 255 }
     })); // checkerboard
     // Left half and top row constant, interior random (typical MB boundary).
-    let mut rng = Rng(0x5eed_13a2);
+    let mut rng = XorShift64Star(0x5eed_13a2);
     for _ in 0..8 {
         let v = rng.byte();
         let mut b = [0u8; INTRA_BUF];
@@ -445,7 +427,7 @@ fn residual_fuzz() {
 }
 
 fn residual_fuzz_body() {
-    let mut rng = Rng(0x5eed_4c42);
+    let mut rng = XorShift64Star(0x5eed_4c42);
     for iter in 0..1000 {
         // Coeffs: mostly realistic magnitude, occasionally extreme to exercise
         // i32 wraparound in the dequant.
@@ -626,7 +608,7 @@ fn transform_dc_fuzz() {
 }
 
 fn transform_dc_fuzz_body() {
-    let mut rng = Rng(0x5eed_dc42);
+    let mut rng = XorShift64Star(0x5eed_dc42);
     for iter in 0..1000 {
         // Coeffs: realistic magnitude, occasionally extreme to exercise the
         // i32 wraparound in f*LS and the (dc+32)>>6 stage.
@@ -709,7 +691,7 @@ fn inter_fuzz_all_modes() {
 
 fn inter_fuzz_all_modes_body() {
     // All 48 luma QPEL modes, no_weight, random fills.
-    let mut rng = Rng(0x5eed_132b);
+    let mut rng = XorShift64Star(0x5eed_132b);
     for &(w, base) in &[(4usize, 0u32), (8, 16), (16, 32)] {
         let sstride = w + 8; // >= w+7 neighborhood cols; <= 48
         let dstride = w + 8;
@@ -753,7 +735,7 @@ fn inter_fuzz_weighted_body() {
     // Weighted prediction: per-pixel weighting is mode-independent, but the
     // per-lane shift (wod[2] vs wod[6]) needs w>=8; include one pattern with
     // different shifts to pin the exact C lane behavior.
-    let mut rng = Rng(0x5eed_7a11);
+    let mut rng = XorShift64Star(0x5eed_7a11);
     let pats: [([i16; 8], &str); 5] = [
         (mk_wod(1, 1, 1, 1), "wq=1 wp=1 o=1 L=1"),
         (mk_wod(-2, 3, -5, 4), "wq=-2 wp=3 o=-5 L=4"),
@@ -823,7 +805,7 @@ fn chroma_fuzz_all_fracs() {
 
 fn chroma_fuzz_all_fracs_body() {
     // All 64 sub-chroma-pel positions, no_weight, random fills.
-    let mut rng = Rng(0x5eed_c1a4);
+    let mut rng = XorShift64Star(0x5eed_c1a4);
     for &w in &[4usize, 8, 16] {
         let cw = w / 2;
         let sstride = cw + 6; // >= cw+1; <= 48
@@ -867,7 +849,7 @@ fn chroma_fuzz_weighted_body() {
     // Weighted prediction: signed weight bytes (pmaddubsw second operand),
     // per-plane offsets, and shift counts that pin this machine's
     // floor-division sra quirk (sh >= 15 saturates to sign, not i16 -32768).
-    let mut rng = Rng(0x5eed_7c2d);
+    let mut rng = XorShift64Star(0x5eed_7c2d);
     let pats: [([i16; 8], &str); 9] = [
         (crate::rust::inter::WOD_NO_WEIGHT, "no_weight"),
         (mk_wodc(1, 1, 1, 1, 1), "wq=1 wp=1 sh=1"),
@@ -950,7 +932,7 @@ fn residual_full_qp_domain_body() {
 #[test]
 fn deblock_oracle_smoke() {
     use crate::rust::deblock::run_rust_deblock;
-    let mut rng = Rng(0xdeb1_0ca7);
+    let mut rng = XorShift64Star(0xdeb1_0ca7);
     // Zero MB state (intra, QP=18) for all three slots; only the current MB's
     // filter_edges is varied. QP[3]@0, mbIsInterFlag@3, filter_edges@4.
     let mut mb_state = vec![0u8; 3 * DEBLOCK_MB_STATE_LEN];
@@ -1044,7 +1026,7 @@ fn deblock_fuzz() {
 
 fn deblock_fuzz_body() {
     use DEBLOCK_MB_STATE_LEN as L;
-    let mut rng = Rng(0xdb10_c7a5_2690);
+    let mut rng = XorShift64Star(0xdb10_c7a5_2690);
     let mut fired = 0usize;
     for iter in 0..400usize {
         // Branch profile: 0=P, 1=B-16x16, 2=B-8x8, 3=intra, 4=random.
@@ -1177,7 +1159,7 @@ fn deblock_structured() {
 
 fn deblock_structured_body() {
     use DEBLOCK_MB_STATE_LEN as L;
-    let mut rng = Rng(0x510c_7a5e_deb1);
+    let mut rng = XorShift64Star(0x510c_7a5e_deb1);
     // A flat-sides step pattern (constant within each 4x4 block, stepped
     // across every boundary) so internal and boundary edges all cross the
     // alpha/beta gates and actually filter (see the y_in note below).
@@ -1259,11 +1241,11 @@ fn deblock_structured_body() {
 /// Random mv component kept in [-100, 80]: final mvs (mvp+mvd / temporal
 /// scale) then stay within [-200, 160] quarter-pel, so every decode_inter MC
 /// fetch inside the C oracle stays inside its scratch plane.
-fn mvpred_mv_comp(rng: &mut Rng) -> i16 {
+fn mvpred_mv_comp(rng: &mut XorShift64Star) -> i16 {
     (rng.below(181) as i32 - 100) as i16
 }
 
-fn mvpred_mv_pair_le(rng: &mut Rng) -> [u8; 4] {
+fn mvpred_mv_pair_le(rng: &mut XorShift64Star) -> [u8; 4] {
     let p = (mvpred_mv_comp(rng) as i32) | ((mvpred_mv_comp(rng) as i32) << 16);
     p.to_le_bytes()
 }
@@ -1275,7 +1257,7 @@ fn mvpred_fuzz() {
 
 fn mvpred_fuzz_body() {
     use MVPRED_MB_LEN as L;
-    let mut rng = Rng(0x2690_db10_c7a5);
+    let mut rng = XorShift64Star(0x2690_db10_c7a5);
     for iter in 0..400usize {
         let op = rng.below(13) as i32;
         let mut inb = vec![0u8; MVPRED_IN_LEN];

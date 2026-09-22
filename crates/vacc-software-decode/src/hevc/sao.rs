@@ -468,34 +468,14 @@ mod tests {
     use super::*;
     use crate::hevc::goldens;
 
-    /// Deterministic xorshift64* RNG (same scheme as other kernel tests).
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
-        /// i32 in [0, n).
-        fn i32(&mut self, n: u64) -> i32 {
-            self.below(n) as i32
-        }
-    }
+    use vacc_common::rng::SplitMix64;
 
     /// One randomized SAO scenario through the Rust implementation; the
     /// filtered planes are appended to `out` (golden serialization).
     /// `multi_slice`/`use_tiles` exercise the slow path; `with_pcm` adds
     /// PCM/transquant-bypass CUs.
     fn run_sao_case(
-        rng: &mut Rng,
+        rng: &mut SplitMix64,
         multi_slice: bool,
         use_tiles: bool,
         with_pcm: bool,
@@ -678,7 +658,7 @@ mod tests {
     }
 
     fn compute_sao_fast_path() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5a01);
+        let mut rng = SplitMix64::seeded(0x5a01);
         let mut buf = Vec::new();
         for _ in 0..80 {
             run_sao_case(&mut rng, false, false, false, &mut buf);
@@ -694,7 +674,7 @@ mod tests {
     }
 
     fn compute_sao_multi_slice_tiles() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5a02);
+        let mut rng = SplitMix64::seeded(0x5a02);
         let mut buf = Vec::new();
         for _ in 0..80 {
             run_sao_case(&mut rng, true, true, false, &mut buf);
@@ -710,7 +690,7 @@ mod tests {
     }
 
     fn compute_sao_pcm_bypass() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5a03);
+        let mut rng = SplitMix64::seeded(0x5a03);
         let mut buf = Vec::new();
         for _ in 0..60 {
             let ms = rng.below(2) == 0;

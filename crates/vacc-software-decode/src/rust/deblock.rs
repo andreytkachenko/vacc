@@ -2604,19 +2604,7 @@ mod prim_tests {
         assert_eq!(r[4], 70); // |-50-20|
     }
 
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn byte(&mut self) -> u8 {
-            self.next() as u8
-        }
-    }
+    use vacc_common::rng::Lcg;
 
     /// One in-slice deblock must equal the canonical run on the window and
     /// leave every pixel outside the window untouched.
@@ -2624,53 +2612,53 @@ mod prim_tests {
     fn inplace_matches_canonical() {
         let mut rng = Lcg(0x1b5e_269c_4d00);
         for iter in 0..200usize {
-            let prof = (rng.next() % 5) as u32;
+            let prof = (rng.next64() % 5) as u32;
             let mut mb_state = [0u8; 606];
             for slot in 0..3usize {
                 let b = slot * 202;
-                mb_state[b] = (rng.next() % 52) as u8;
-                mb_state[b + 1] = (rng.next() % 52) as u8;
-                mb_state[b + 2] = (rng.next() % 52) as u8;
+                mb_state[b] = (rng.next64() % 52) as u8;
+                mb_state[b + 1] = (rng.next64() % 52) as u8;
+                mb_state[b + 2] = (rng.next64() % 52) as u8;
                 mb_state[b + 3] = match prof {
                     0..=2 => 1,
                     3 => 0,
-                    _ => (rng.next() & 1) as u8,
+                    _ => (rng.next64() & 1) as u8,
                 };
-                mb_state[b + 4] = (rng.next() % 4) as u8;
+                mb_state[b + 4] = (rng.next64() % 4) as u8;
                 let eq = if prof == 1 && slot == 2 {
                     0x1b5f_bbff
                 } else {
-                    rng.next() as u32
+                    rng.next64() as u32
                 };
                 mb_state[b + 5..b + 9].copy_from_slice(&eq.to_le_bytes());
-                mb_state[b + 9] = (rng.next() % 2) as u8;
+                mb_state[b + 9] = (rng.next64() % 2) as u8;
                 for k in 0..48 {
-                    mb_state[b + 10 + k] = if rng.next().is_multiple_of(5) { 0 } else { 1 };
+                    mb_state[b + 10 + k] = if rng.next64().is_multiple_of(5) { 0 } else { 1 };
                 }
                 for k in 0..8 {
                     mb_state[b + 58 + k] = if prof == 0 {
                         (-1i8) as u8
                     } else {
-                        [-1i8, -1, 0, 1][(rng.next() % 4) as usize] as u8
+                        [-1i8, -1, 0, 1][(rng.next64() % 4) as usize] as u8
                     };
                 }
                 for k in 0..8 {
-                    mb_state[b + 66 + k] = (rng.next() % 3) as u8;
+                    mb_state[b + 66 + k] = (rng.next64() % 3) as u8;
                 }
                 for k in 0..64 {
-                    let mv = ((rng.next() % 21) as i16) - 10;
+                    let mv = ((rng.next64() % 21) as i16) - 10;
                     mb_state[b + 74 + 2 * k..b + 74 + 2 * k + 2].copy_from_slice(&mv.to_le_bytes());
                 }
             }
-            let fe = 1 + (rng.next() % 3) as i32;
-            let entropy = (rng.next() & 1) as i32;
-            let off_a = ((rng.next() % 3) as i32) - 2;
-            let off_b = ((rng.next() % 3) as i32) - 2;
+            let fe = 1 + (rng.next64() % 3) as i32;
+            let entropy = (rng.next64() & 1) as i32;
+            let off_a = ((rng.next64() % 3) as i32) - 2;
+            let off_b = ((rng.next64() % 3) as i32) - 2;
 
             // Real-frame geometry: a few luma MBs wide/tall with a stride pad.
-            let w_mbs = 1 + (rng.next() % 4) as usize; // 1..4
-            let h_mbs = 1 + (rng.next() % 3) as usize; // 1..3
-            let pad = (rng.next() % 8) as usize;
+            let w_mbs = 1 + (rng.next64() % 4) as usize; // 1..4
+            let h_mbs = 1 + (rng.next64() % 3) as usize; // 1..3
+            let pad = (rng.next64() % 8) as usize;
             let w = w_mbs * 16;
             let h = h_mbs * 16;
             let ly_stride = w + pad;
@@ -2680,8 +2668,8 @@ mod prim_tests {
 
             // MB under test: any position; corner positions exercise the
             // clamped (zero-filled) window parts.
-            let mbx = (rng.next() % w_mbs as u64) as usize;
-            let mby = (rng.next() % h_mbs as u64) as usize;
+            let mbx = (rng.next64() % w_mbs as u64) as usize;
+            let mby = (rng.next64() % h_mbs as u64) as usize;
             let ly = DeblockRect {
                 stride: ly_stride,
                 x: mbx * 16,
@@ -2805,51 +2793,51 @@ mod prim_tests {
         use super::{DEBLOCK_LC_SIZE, DEBLOCK_LY_SIZE};
         let mut rng = Lcg(0x1b5e_269c_4d00);
         for iter in 0..500usize {
-            let kind = (rng.next() % 3) as u32; // 0=P, 1=B-16x16, 2=B-other
+            let kind = (rng.next64() % 3) as u32; // 0=P, 1=B-16x16, 2=B-other
             let mut mb_state = [0u8; 606];
             for slot in 0..3usize {
                 let b = slot * 202;
-                mb_state[b] = (rng.next() % 52) as u8; // QP_y
-                mb_state[b + 1] = (rng.next() % 52) as u8; // QP_cb
-                mb_state[b + 2] = (rng.next() % 52) as u8; // QP_cr
+                mb_state[b] = (rng.next64() % 52) as u8; // QP_y
+                mb_state[b + 1] = (rng.next64() % 52) as u8; // QP_cb
+                mb_state[b + 2] = (rng.next64() % 52) as u8; // QP_cr
                 mb_state[b + 3] = 1; // inter
                 mb_state[b + 4] = 7; // filter_edges (all bits)
                 let eq = if kind == 1 {
                     0x1b5f_bbff
                 } else {
-                    rng.next() as u32
+                    rng.next64() as u32
                 };
                 mb_state[b + 5..b + 9].copy_from_slice(&eq.to_le_bytes());
-                mb_state[b + 9] = (rng.next() % 2) as u8; // ts8x8
+                mb_state[b + 9] = (rng.next64() % 2) as u8; // ts8x8
                 for k in 0..48 {
-                    mb_state[b + 10 + k] = if rng.next().is_multiple_of(4) { 0 } else { 1 };
+                    mb_state[b + 10 + k] = if rng.next64().is_multiple_of(4) { 0 } else { 1 };
                 }
                 for k in 0..8 {
                     mb_state[b + 58 + k] = if k < 4 {
-                        (rng.next() % 4) as u8 // L0 refIdx valid
+                        (rng.next64() % 4) as u8 // L0 refIdx valid
                     } else if kind == 0 {
                         (-1i8) as u8 // P: L1 unused
                     } else {
-                        [-1i8, -1, 0, 1][(rng.next() % 4) as usize] as u8
+                        [-1i8, -1, 0, 1][(rng.next64() % 4) as usize] as u8
                     };
                 }
                 for k in 0..8 {
                     mb_state[b + 66 + k] = if k < 4 {
-                        (rng.next() % 3) as u8
+                        (rng.next64() % 3) as u8
                     } else {
                         (-1i8) as u8
                     };
                 }
                 for k in 0..64 {
                     // wide MV range to cross the bS |dMV|<=3 threshold both ways
-                    let mv = ((rng.next() % 401) as i16) - 200;
+                    let mv = ((rng.next64() % 401) as i16) - 200;
                     mb_state[b + 74 + 2 * k..b + 74 + 2 * k + 2].copy_from_slice(&mv.to_le_bytes());
                 }
             }
-            let fe = 1 + (rng.next() % 3) as i32;
-            let entropy = (rng.next() & 1) as i32;
-            let off_a = ((rng.next() % 5) as i32) - 2;
-            let off_b = ((rng.next() % 5) as i32) - 2;
+            let fe = 1 + (rng.next64() % 3) as i32;
+            let entropy = (rng.next64() & 1) as i32;
+            let off_a = ((rng.next64() % 5) as i32) - 2;
+            let off_b = ((rng.next64() % 5) as i32) - 2;
             let y_in: Vec<u8> = (0..DEBLOCK_LY_SIZE).map(|_| rng.byte()).collect();
             let c_in: Vec<u8> = (0..DEBLOCK_LC_SIZE).map(|_| rng.byte()).collect();
 
@@ -2934,9 +2922,9 @@ mod prim_tests {
                         rv8(&mut rng),
                         rv8(&mut rng),
                     );
-                    let ia = rng.next() as i32;
-                    let ib = rng.next() as i32;
-                    let itc = (rng.next() % 40) as i32 - 5;
+                    let ia = rng.next64() as i32;
+                    let ib = rng.next64() as i32;
+                    let itc = (rng.next64() % 40) as i32 - 5;
                     assert_eq!(
                         luma_soft_scalar(p2, p1, p0, q0, q1, q2, ia, ib, itc),
                         unsafe { sse::luma_soft_sse(p2, p1, p0, q0, q1, q2, ia, ib, itc) },
@@ -2947,7 +2935,7 @@ mod prim_tests {
                         unsafe { sse::luma_hard_sse(p3, p2, p1, p0, q0, q1, q2, q3, ia, ib) },
                         "luma_hard"
                     );
-                    let itc64 = rng.next() as i64;
+                    let itc64 = rng.next64() as i64;
                     assert_eq!(
                         chroma_soft_scalar(p1, p0, q0, q1, ia, ib, itc64),
                         unsafe { sse::chroma_soft_sse(p1, p0, q0, q1, ia, ib, itc64) },
@@ -2973,7 +2961,7 @@ mod prim_tests {
             }
             let mut rng = Lcg(0xd3b1_0cc5_f7aa);
             for _ in 0..20_000 {
-                let kind = (rng.next() % 4) as u32; // 0=intra, 1=P, 2=B-16x16, 3=B-other
+                let kind = (rng.next64() % 4) as u32; // 0=intra, 1=P, 2=B-16x16, 3=B-other
                 let mut mb_state = [0u8; 606];
                 for slot in 0..3usize {
                     let b = slot * 202;
@@ -2985,7 +2973,7 @@ mod prim_tests {
                     let eq = if kind == 2 {
                         0x1b5f_bbff
                     } else {
-                        rng.next() as u32
+                        rng.next64() as u32
                     };
                     mb_state[b + 5..b + 9].copy_from_slice(&eq.to_le_bytes());
                     mb_state[b + 9] = rng.byte(); // ts8x8
@@ -3015,7 +3003,7 @@ mod prim_tests {
                     parse_mb(&mb_state[202..404]),
                     parse_mb(&mb_state[404..606]),
                 ];
-                let entropy = (rng.next() & 1) as i32;
+                let entropy = (rng.next64() & 1) as i32;
                 let off_a = rng.byte() as i32 - 128;
                 let off_b = rng.byte() as i32 - 128;
                 assert_eq!(

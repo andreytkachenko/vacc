@@ -1011,27 +1011,11 @@ mod tests {
     use super::*;
     use crate::hevc::goldens;
 
-    /// Deterministic PRNG (splitmix64).
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
-    }
+    use vacc_common::rng::SplitMix64;
 
     /// Coefficients biased toward small values with occasional extremes, so
     /// both the rounding and the clip paths get exercised.
-    fn random_coeff(rng: &mut Rng) -> i16 {
+    fn random_coeff(rng: &mut SplitMix64) -> i16 {
         match rng.below(10) {
             0 => -32768,
             1 => 32767,
@@ -1055,7 +1039,7 @@ mod tests {
     // verified byte-exact agreement with the C++ oracle.
 
     fn compute_transform_inverse() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(42);
+        let mut rng = SplitMix64::new(42);
         let mut buf = Vec::new();
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
@@ -1090,7 +1074,7 @@ mod tests {
 
     fn compute_dequant_flat() -> Vec<(String, Vec<u8>)> {
         let mut buf = Vec::new();
-        let mut rng = Rng::new(7);
+        let mut rng = SplitMix64::new(7);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
             for c_idx in 0..3u32 {
@@ -1134,7 +1118,7 @@ mod tests {
 
     fn compute_dequant_scaling_lists() -> Vec<(String, Vec<u8>)> {
         let mut buf = Vec::new();
-        let mut rng = Rng::new(11);
+        let mut rng = SplitMix64::new(11);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
             for c_idx in 0..3u32 {
@@ -1192,7 +1176,7 @@ mod tests {
     fn compute_dequant_default_lists() -> Vec<(String, Vec<u8>)> {
         // Spec-default scaling lists (ScalingListData::set_defaults()).
         let mut buf = Vec::new();
-        let mut rng = Rng::new(13);
+        let mut rng = SplitMix64::new(13);
         for log2 in 2..=5u32 {
             let n = (1 << log2) * (1 << log2);
             for c_idx in 0..3u32 {
@@ -1264,7 +1248,7 @@ mod tests {
         if !detect_avx2() {
             return;
         }
-        let mut rng = Rng::new(0xA7A2);
+        let mut rng = SplitMix64::new(0xA7A2);
         for log2 in 2..=5u32 {
             let tr = 1usize << log2;
             for use_dst in [false, true] {

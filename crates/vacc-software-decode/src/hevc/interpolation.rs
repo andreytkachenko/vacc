@@ -1944,23 +1944,7 @@ mod tests {
     use super::*;
     use crate::hevc::goldens;
 
-    /// Deterministic xorshift64* RNG (same scheme as bitreader tests).
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
-    }
+    use vacc_common::rng::SplitMix64;
 
     #[test]
     fn filter_tables_match_spec() {
@@ -1989,7 +1973,7 @@ mod tests {
     }
 
     fn compute_luma_interp() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5EED_0001);
+        let mut rng = SplitMix64::seeded(0x5EED_0001);
         let pic_w = 64i32;
         let pic_h = 64i32;
         let stride = pic_w;
@@ -2030,7 +2014,7 @@ mod tests {
     }
 
     fn compute_chroma_interp() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5EED_0002);
+        let mut rng = SplitMix64::seeded(0x5EED_0002);
         let pic_w = 32i32;
         let pic_h = 16i32;
         let stride = pic_w;
@@ -2076,7 +2060,7 @@ mod tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let mut rng = Rng::new(0xA11CE_0005);
+        let mut rng = SplitMix64::seeded(0xA11CE_0005);
         for &(w, h) in &[(4usize, 4), (8, 8), (12, 6), (16, 16), (20, 8), (24, 12), (32, 8), (64, 16)] {
             for bit_depth in [8i32, 10] {
                 let shift1 = 4.min(bit_depth - 8);
@@ -2160,7 +2144,7 @@ mod tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let mut rng = Rng::new(0xA11CE_0006);
+        let mut rng = SplitMix64::seeded(0xA11CE_0006);
         for &w in &[4usize, 8, 12, 16, 20, 24, 28, 32, 44, 48, 52, 64] {
             for x_frac in 1..4 {
                 let shift = 4i32;
@@ -2209,7 +2193,7 @@ mod tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let mut rng = Rng::new(0xA11CE_0006);
+        let mut rng = SplitMix64::seeded(0xA11CE_0006);
         for &w in &[4usize, 8, 12] {
             for _x_frac in 1..4 {
                 for &margin in &[7usize, 8] {
@@ -2237,7 +2221,7 @@ mod tests {
     }
 
     /// Random weight table (same RNG draw order as the original oracle test).
-    fn random_pwt(rng: &mut Rng, log2_denom: u32) -> PredWeightTable {
+    fn random_pwt(rng: &mut SplitMix64, log2_denom: u32) -> PredWeightTable {
         let mut pwt = PredWeightTable {
             luma_log2_weight_denom: log2_denom,
             ..Default::default()
@@ -2257,7 +2241,7 @@ mod tests {
     }
 
     fn compute_weighted_pred_default() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5EED_0003);
+        let mut rng = SplitMix64::seeded(0x5EED_0003);
         let mut buf = Vec::new();
         for bit_depth in [8i32, 10] {
             for &(flag_l0, flag_l1) in &[(true, false), (false, true), (true, true)] {
@@ -2289,7 +2273,7 @@ mod tests {
     }
 
     fn compute_weighted_pred_explicit() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5EED_0004);
+        let mut rng = SplitMix64::seeded(0x5EED_0004);
         let mut buf = Vec::new();
         for bit_depth in [8i32, 10] {
             for log2_denom in 0..3u32 {

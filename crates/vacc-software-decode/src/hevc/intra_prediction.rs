@@ -497,23 +497,7 @@ mod tests {
     use crate::hevc::goldens;
     use crate::hevc::types::ChromaFormat;
 
-    /// Deterministic xorshift64* RNG (same scheme as bitreader tests).
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
-    }
+    use vacc_common::rng::SplitMix64;
 
     #[test]
     fn angle_tables_match_spec() {
@@ -556,7 +540,7 @@ mod tests {
     }
 
     fn compute_intra() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x5EED_0010);
+        let mut rng = SplitMix64::seeded(0x5EED_0010);
         let pic_w = 64i32;
         let pic_h = 64i32;
         let mut buf = Vec::new();
@@ -638,7 +622,7 @@ mod tests {
 
     fn compute_intra_smoothing_disabled() -> Vec<(String, Vec<u8>)> {
         // intra_smoothing_disabled_flag = 1 (skips §8.4.4.2.3).
-        let mut rng = Rng::new(0x5EED_0011);
+        let mut rng = SplitMix64::seeded(0x5EED_0011);
         let pic_w = 64i32;
         let pic_h = 64i32;
         let bit_depth = 8;

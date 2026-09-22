@@ -92,13 +92,13 @@ const NORM_ADJUST_8X8: [[i8; 16]; 12] = [
 /// C `packs32` lane: saturating i32 -> i16.
 #[inline]
 fn sat16(v: i32) -> i16 {
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    vacc_common::clip::saturate_i16(v)
 }
 
 /// C `packus16` lane: saturating i16 -> u8.
 #[inline]
 fn sat8(v: i16) -> u8 {
-    v.clamp(0, i16::from(u8::MAX)) as u8
+    vacc_common::clip::saturate_u8(v as i32)
 }
 
 /// 4-point IDCT butterfly (C e0..e3/f0..f3): output components 0..3.
@@ -1112,20 +1112,7 @@ mod sse {
 mod tests {
     use super::*;
 
-    /// SplitMix64-style LCG (same family as the deblock params test).
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n
-        }
-    }
+    use vacc_common::rng::Lcg;
 
     /// SSE (via the dispatchers) vs scalar fallback for the three IDCT/DC
     /// kernels: random + extreme coefficients (i32::MAX/MIN/full range), full
@@ -1138,15 +1125,15 @@ mod tests {
                 core::array::from_fn(|_| match rng.below(16) {
                     0 => i32::MAX,
                     1 => i32::MIN,
-                    2 => rng.next() as i32, // full range
+                    2 => rng.next32() as i32, // full range
                     _ => (rng.below(4096) as i32) - 2048,
                 })
             };
-            let ws4: [i8; 16] = core::array::from_fn(|_| rng.next() as i8);
-            let ws8: [i8; 64] = core::array::from_fn(|_| rng.next() as i8);
+            let ws4: [i8; 16] = core::array::from_fn(|_| rng.next32() as i8);
+            let ws8: [i8; 64] = core::array::from_fn(|_| rng.next32() as i8);
             // Mostly spec range (qp <= 51), occasionally beyond.
             let qp = if rng.below(32) == 0 {
-                rng.next() as u8
+                rng.next32() as u8
             } else {
                 rng.below(52) as u8
             };
@@ -1156,7 +1143,7 @@ mod tests {
             let stride4 = 4 + (rng.below(4) as usize) * 4;
             let mut pix = [0u8; 4 * 20];
             for v in pix.iter_mut() {
-                *v = rng.next() as u8;
+                *v = rng.next32() as u8;
             }
             let c0 = mk_c(&mut rng);
             let (mut c_a, mut c_b) = (c0, c0);
@@ -1194,7 +1181,7 @@ mod tests {
             let stride8 = 8 + (rng.below(4) as usize) * 8;
             let mut pix8 = [0u8; 8 * 40];
             for v in pix8.iter_mut() {
-                *v = rng.next() as u8;
+                *v = rng.next32() as u8;
             }
             let c0 = mk_c(&mut rng);
             let (mut c_a, mut c_b) = (c0, c0);

@@ -1192,6 +1192,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-common"
+version = "0.1.1"
+
+[[package]]
 name = "vacc-core"
 version = "0.1.1"
 dependencies = [
@@ -1245,6 +1249,7 @@ dependencies = [
  "log",
  "rayon",
  "thiserror 2.0.20",
+ "vacc-common",
  "vacc-core",
  "vacc-parser",
 ]

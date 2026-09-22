@@ -16,7 +16,7 @@ const F: [i32; 6] = [1, -5, 20, 20, -5, 1];
 
 #[inline]
 fn sat8(x: i32) -> u8 {
-    x.clamp(0, 255) as u8
+    vacc_common::clip::saturate_u8(x)
 }
 
 #[inline]

@@ -504,23 +504,7 @@ mod tests {
     use crate::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
     use crate::hevc::types::PredMode;
 
-    /// Deterministic xorshift64* RNG (same scheme as other hevc tests).
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
-        }
-    }
+    use vacc_common::rng::SplitMix64;
 
     /// Op dispatch mirrors the C++ hevc.js test oracle (`hevc_test_api.cpp`,
     /// since removed); op codes keep that historical numbering.
@@ -637,7 +621,7 @@ mod tests {
     }
 
     fn compute_cabac_syntax() -> Vec<(String, Vec<u8>)> {
-        let mut rng = Rng::new(0x000C_ABAC_0001);
+        let mut rng = SplitMix64::seeded(0x000C_ABAC_0001);
         const ITERS: u32 = 400;
         let mut buf = Vec::new();
         for _it in 0..ITERS {
