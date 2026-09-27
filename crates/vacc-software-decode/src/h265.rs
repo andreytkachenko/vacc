@@ -890,9 +890,9 @@ impl Decoder for SoftwareH265Decoder {
             chroma_bit_depth,
             profile_idc,
             dpb_slots: self
-                .dpb
+                .sps
                 .as_ref()
-                .map(|d| d.slots().len() as u32)
+                .map(|s| s.max_dec_pic_buffering_minus1[0] as u32 + 1)
                 .unwrap_or(0),
         }
     }

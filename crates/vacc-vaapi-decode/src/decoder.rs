@@ -1587,6 +1587,19 @@ impl Decoder for VaapiDecoder {
                 )
             };
 
+        // Spec-mandated DPB slot count (see DecoderInfo::dpb_slots).
+        let dpb_slots = if let Some(ref sps) = self.stream.sps {
+            sps.max_num_ref_frames + 1
+        } else if let Some(ref sps) = self.stream.h265_sps {
+            sps.max_dec_pic_buffering_minus1[0] as u32 + 1
+        } else if self.stream.codec == CoreVideoCodec::DecodeAv1 {
+            16 // AV1 NumRefFrames (spec constant)
+        } else if self.stream.codec == CoreVideoCodec::DecodeVp9 {
+            8 // VP9 NumRefFrames (spec constant)
+        } else {
+            0
+        };
+
         DecoderInfo {
             backend: "vaapi".to_string(),
             codec: self.stream.codec,
@@ -1596,7 +1609,7 @@ impl Decoder for VaapiDecoder {
             luma_bit_depth,
             chroma_bit_depth,
             profile_idc,
-            dpb_slots: self.surface_pool.entries.len() as u32,
+            dpb_slots,
         }
     }
 

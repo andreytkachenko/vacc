@@ -806,7 +806,7 @@ impl NvdecH264Decoder {
                 _ => ComponentBitDepth::Bit8,
             },
             profile_idc: Some(sps.profile_idc as u32),
-            dpb_slots: num_surfaces,
+            dpb_slots: sps.max_num_ref_frames + 1,
         };
 
         // Store display area

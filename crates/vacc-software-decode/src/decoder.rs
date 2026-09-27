@@ -1206,7 +1206,7 @@ impl Decoder for SwH264Decoder {
                 _ => ComponentBitDepth::Bit8,
             },
             profile_idc: sps.map(|s| s.profile_idc as u32),
-            dpb_slots: self.n_slots as u32,
+            dpb_slots: sps.map(|s| s.max_num_ref_frames + 1).unwrap_or(0),
         }
     }
 

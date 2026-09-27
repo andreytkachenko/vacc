@@ -414,7 +414,7 @@ impl NvdecVp9Decoder {
                 luma_bit_depth: ComponentBitDepth::Bit8,
                 chroma_bit_depth: ComponentBitDepth::Bit8,
                 profile_idc: None,
-                dpb_slots: NUM_SURFACES,
+                dpb_slots: vacc_core::picture::VP9_NUM_REF_FRAMES,
             }),
             pending_frames: Mutex::new(VecDeque::new()),
             frame_count: Mutex::new(0),
@@ -710,7 +710,7 @@ impl NvdecVp9Decoder {
             luma_bit_depth: bit_depth_component(cc.bit_depth),
             chroma_bit_depth: bit_depth_component(cc.bit_depth),
             profile_idc: Some(first.picture_info.profile as u32),
-            dpb_slots: NUM_SURFACES,
+            dpb_slots: vacc_core::picture::VP9_NUM_REF_FRAMES,
         };
 
         {

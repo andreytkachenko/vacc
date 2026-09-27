@@ -4,10 +4,6 @@
 //! trait from vacc-core, including info(), submit(), decode(), flush(),
 //! reset(), and new_with_format().
 //!
-//! Note: Most tests require actual NVDEC hardware and are marked with #[ignore].
-//! Run with `cargo test --test decoder_trait_tests -- --ignored` on a system
-//! with NVIDIA hardware and proper drivers.
-
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
@@ -34,7 +30,6 @@ fn load_sps_pps_data() -> Vec<u8> {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_backend() {
     let data = load_sps_pps_data();
     let decoder = NvdecH264Decoder::new(data).expect("Failed to create decoder");
@@ -48,7 +43,6 @@ fn test_decoder_info_backend() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_codec() {
     let data = load_sps_pps_data();
     let decoder = NvdecH264Decoder::new(data).expect("Failed to create decoder");
@@ -66,7 +60,6 @@ fn test_decoder_info_codec() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_coded_size() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -117,7 +110,6 @@ fn test_decoder_info_coded_size() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_display_size() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -190,7 +182,6 @@ fn test_decoder_info_display_size() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_chroma_subsampling() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -237,7 +228,6 @@ fn test_decoder_info_chroma_subsampling() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_bit_depth() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -296,7 +286,6 @@ fn test_decoder_info_bit_depth() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_profile_idc() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -337,7 +326,6 @@ fn test_decoder_info_profile_idc() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_info_dpb_slots() {
     use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h264::H264Parser};
 
@@ -367,15 +355,12 @@ fn test_decoder_info_dpb_slots() {
     let decoder = NvdecH264Decoder::new(data).expect("Failed to create decoder");
     let info = decoder.info();
 
-    // Backends allocate their DPB/surface pools with reorder headroom (e.g.
-    // cuvid surface counts are clamped to a sane range), so assert the
-    // invariant that matters: the allocation covers the SPS reference
-    // requirement (max_num_ref_frames references plus the current picture).
-    assert!(
-        info.dpb_slots >= expected_dpb_slots,
-        "DPB slots ({}) must cover max_num_ref_frames + 1 ({})",
+    // Unified contract: dpb_slots is the spec-mandated DPB size
+    // (max_num_ref_frames references plus the current picture).
+    assert_eq!(
         info.dpb_slots,
-        expected_dpb_slots
+        expected_dpb_slots,
+        "dpb_slots must equal max_num_ref_frames + 1"
     );
 }
 
@@ -384,7 +369,6 @@ fn test_decoder_info_dpb_slots() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_submit_and_decode() {
     let data = load_sps_pps_data();
     let mut decoder = NvdecDecoder::new(data).expect("Failed to create decoder");
@@ -414,7 +398,6 @@ fn test_decoder_submit_and_decode() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_flush() {
     let data = load_sps_pps_data();
     let mut decoder = NvdecDecoder::new(data).expect("Failed to create decoder");
@@ -445,7 +428,6 @@ fn test_decoder_flush() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_reset() {
     let data = load_sps_pps_data();
     let mut decoder = NvdecDecoder::new(data).expect("Failed to create decoder");
@@ -480,7 +462,6 @@ fn test_decoder_reset() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_new_with_format_h264() {
     let data = load_sps_pps_data();
 
@@ -559,7 +540,6 @@ fn test_decoder_new_with_format_unsupported() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_decoder_from_born_trailer() {
     let data = load_born_trailer();
 

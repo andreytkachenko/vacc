@@ -198,7 +198,7 @@ impl NvdecH265Decoder {
                 luma_bit_depth: ComponentBitDepth::Bit8,
                 chroma_bit_depth: ComponentBitDepth::Bit8,
                 profile_idc: None,
-                dpb_slots: NUM_SURFACES as u32,
+                dpb_slots: 0,
             }),
             pending_frames: Mutex::new(VecDeque::new()),
             frame_count: Mutex::new(0),
@@ -780,7 +780,7 @@ impl NvdecH265Decoder {
                 _ => ComponentBitDepth::Bit8,
             },
             profile_idc: Some(sps.profile_idc as u32),
-            dpb_slots: NUM_SURFACES as u32,
+            dpb_slots: sps.max_dec_pic_buffering_minus1[0] as u32 + 1,
         };
 
         {

@@ -5,10 +5,6 @@
 //! DecodeFailed, InvalidState, NoFramesAvailable, EndOfStream, CudaError,
 //! and IoError propagation.
 //!
-//! Note: Most tests require actual NVDEC hardware and are marked with #[ignore].
-//! Run with `cargo test --test error_handling_tests -- --ignored` on a system
-//! with NVIDIA hardware and proper drivers.
-
 use vacc_core::{
     codec::VideoCodec,
     decoder::Decoder,
@@ -99,7 +95,6 @@ fn test_error_unsupported_codec() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_no_sps_pps() {
     // Create synthetic data that looks like H.264 but has no valid SPS/PPS
     // Just some random bytes with a fake start code
@@ -129,7 +124,6 @@ fn test_error_no_sps_pps() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_invalid_bitstream() {
     // Completely invalid data - no start codes, no valid NAL units
     let invalid_data: Vec<u8> = (0..1024).map(|i| (i * 7 + 3) as u8).collect();
@@ -159,7 +153,6 @@ fn test_error_invalid_bitstream() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_empty_bitstream() {
     let empty_data = Vec::<u8>::new();
 
@@ -185,7 +178,6 @@ fn test_error_empty_bitstream() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_decoder_creation_failed() {
     // Use SPS/PPS data from a valid stream - if decoder creation fails,
     // it should be DecoderCreationFailed
@@ -226,7 +218,6 @@ fn test_error_decoder_creation_failed() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_parser_error_propagation() {
     // Create data with a start code but corrupted SPS header
     // NAL type 7 (SPS) but with invalid content
@@ -259,7 +250,6 @@ fn test_error_parser_error_propagation() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_decode_failed_handling() {
     let data = load_born_trailer();
 
@@ -302,7 +292,6 @@ fn test_error_decode_failed_handling() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_invalid_state_after_reset() {
     let data = load_born_trailer();
 
@@ -348,7 +337,6 @@ fn test_error_invalid_state_after_reset() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_no_frames_available() {
     let data = load_sps_pps_data();
 
@@ -383,7 +371,6 @@ fn test_error_no_frames_available() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_end_of_stream() {
     let data = load_born_trailer();
 
@@ -426,7 +413,6 @@ fn test_error_end_of_stream() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_cuda_error_handling() {
     let data = load_sps_pps_data();
 
@@ -500,7 +486,6 @@ fn test_error_io_error_propagation() {
 // ============================================================================
 
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_from_born_trailer_partial() {
     let full_data = load_born_trailer();
 
@@ -533,14 +518,47 @@ fn test_error_from_born_trailer_partial() {
 // (e.g., cut in the middle of a slice NAL unit).
 // ============================================================================
 
+/// Offsets of Annex-B NAL payloads (byte after each 00...01 start code).
+fn nal_start_offsets(data: &[u8]) -> Vec<usize> {
+    let mut offs = Vec::new();
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let mut j = i;
+            while j < data.len() && data[j] == 0 {
+                j += 1;
+            }
+            if j < data.len() && data[j] == 1 {
+                offs.push(j + 1);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    offs
+}
+
 #[test]
-#[ignore = "requires NVDEC hardware"]
 fn test_error_from_born_trailer_truncated() {
     let full_data = load_born_trailer();
 
-    // Take a reasonable chunk that includes SPS/PPS and some frames,
-    // but truncate in the middle of what's likely a slice NAL
-    let truncation_point = std::cmp::min(full_data.len(), 50_000);
+    // Truncate in the middle of a NAL that follows the first slice NAL, so at
+    // least one complete frame precedes the cut. A fixed byte offset is not
+    // safe: this stream's first IDR slice alone spans ~57KB, so an early cut
+    // lands inside it and yields zero decodable frames.
+    let starts = nal_start_offsets(&full_data);
+    let first_slice = starts
+        .iter()
+        .copied()
+        .find(|&o| matches!(full_data[o] & 0x1F, 1 | 5))
+        .expect("stream contains a slice NAL");
+    let next_nal = starts
+        .iter()
+        .copied()
+        .find(|&o| o > first_slice)
+        .expect("stream has a NAL after the first slice");
+    let truncation_point = (next_nal + 64).min(full_data.len());
     let truncated_data = full_data[..truncation_point].to_vec();
 
     let mut decoder = NvdecH264Decoder::new(truncated_data)
@@ -574,6 +592,15 @@ fn test_error_from_born_trailer_truncated() {
                 hit_error = true;
                 break;
             }
+        }
+    }
+
+    // Frames held in the reorder buffer are only released by flush().
+    match decoder.flush() {
+        Ok(mut flushed) => frame_count += flushed.len(),
+        Err(e) => {
+            println!("Got error on flush with truncated data: {:?}", e);
+            hit_error = true;
         }
     }
 

@@ -37,7 +37,12 @@ pub struct DecoderInfo {
     pub chroma_bit_depth: ComponentBitDepth,
     /// Profile ID.
     pub profile_idc: Option<u32>,
-    /// Number of DPB slots in use.
+    /// Number of DPB picture slots mandated by the codec spec for this
+    /// stream: H.264 = `max_num_ref_frames + 1` (SPS), H.265 =
+    /// `max_dec_pic_buffering_minus1[0] + 1` (SPS), AV1 = 16, VP9 = 8 (spec
+    /// NumRefFrames constants). 0 if the value is stream-derived and the
+    /// sequence header has not been parsed yet. Backends may allocate more
+    /// slots internally; this is the spec minimum, not the allocated pool.
     pub dpb_slots: u32,
 }
 
