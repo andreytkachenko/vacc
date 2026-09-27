@@ -18,5 +18,3 @@ mod tables;
 
 #[cfg(test)]
 pub mod goldens;
-#[cfg(test)]
-mod tests;

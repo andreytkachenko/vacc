@@ -246,16 +246,13 @@ impl<'a> SliceBits<'a> {
 
     // ------------------------------------------------------- diff-test state
 
-    #[cfg(test)]
-    pub(crate) fn cpb_off(&self) -> i64 {
+    pub fn cpb_off(&self) -> i64 {
         self.cpb as i64
     }
-    #[cfg(test)]
-    pub(crate) fn cache0(&self) -> u64 {
+    pub fn cache0(&self) -> u64 {
         self.msb
     }
-    #[cfg(test)]
-    pub(crate) fn cache1(&self) -> u64 {
+    pub fn cache1(&self) -> u64 {
         self.lsb
     }
 }

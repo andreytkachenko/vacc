@@ -16,7 +16,7 @@ use super::tables;
 
 /// CABAC context states (1024 contexts, one byte each; see module docs).
 pub struct Cabac {
-    pub(crate) ctx: [u8; 1024],
+    pub ctx: [u8; 1024],
 }
 
 impl Default for Cabac {

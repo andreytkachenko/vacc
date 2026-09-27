@@ -1,4 +1,4 @@
-//! Tier E golden tests — real-stream slice-segment replay.
+//! H.265 slice-segment golden tests — real-stream slice-segment replay.
 //!
 //! Each picture of a sample stream is decoded in Rust from parser-derived
 //! syntax (SPS/PPS/slice headers via `syntax_map`, the same mapping the
@@ -17,16 +17,18 @@ use vacc_core::picture::{H265Pps, H265Sps};
 use vacc_parser::h265::{H265Parser, SliceHeaderInfo};
 use vacc_parser::{BitstreamPacket, ParseResult, SliceHeader, VideoParser};
 
-use crate::hevc::bitreader::{BitstreamReader, extract_rbsp_with_epb};
-use crate::hevc::goldens;
-use crate::hevc::cabac::{CabacContext, CabacEngine};
-use crate::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
-use crate::hevc::coding_tree::{CuInfo, DecodingContext, SaoParams, decode_slice_segment_data, hevc_trace};
-use crate::hevc::inter_prediction::{DpbView, PlaneView, RefPic};
-use crate::hevc::picture::{Picture, PuMotionInfo};
-use crate::hevc::syntax_map;
-use crate::hevc::transform::ScalingListData;
-use crate::hevc::types::{ChromaFormat, Mv, PartMode, PredMode, Pps, SliceHeader as HevcSh, Sps};
+use vacc_software_decode::hevc::bitreader::{BitstreamReader, extract_rbsp_with_epb};
+use vacc_common::goldens;
+
+include!("data/hevc_slice_segment_golden_data.rs");
+use vacc_software_decode::hevc::cabac::{CabacContext, CabacEngine};
+use vacc_software_decode::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
+use vacc_software_decode::hevc::coding_tree::{CuInfo, DecodingContext, SaoParams, decode_slice_segment_data, hevc_trace};
+use vacc_software_decode::hevc::inter_prediction::{DpbView, PlaneView, RefPic};
+use vacc_software_decode::hevc::picture::{Picture, PuMotionInfo};
+use vacc_software_decode::hevc::syntax_map;
+use vacc_software_decode::hevc::transform::ScalingListData;
+use vacc_software_decode::hevc::types::{ChromaFormat, Mv, PartMode, PredMode, Pps, SliceHeader as HevcSh, Sps};
 
 /// Synthetic reference list length (streams use ≤3/≤2 active refs).
 const N_LIST: i32 = 6;
@@ -618,7 +620,7 @@ fn run_stream(name: &str) -> Option<Vec<(String, String)>> {
             return None;
         }
     };
-    // Parse the stream with the Rust parser (same driving pattern as tier_f).
+    // Parse the stream with the Rust parser (same driving pattern as hevc_end_to_end_golden_tests.rs).
     let mut parser = H265Parser::new();
     let mut sps_h: Option<H265Sps> = None;
     let mut pps_h: Option<H265Pps> = None;
@@ -697,29 +699,29 @@ fn run_stream(name: &str) -> Option<Vec<(String, String)>> {
 }
 
 #[test]
-fn tier_e_main() {
+fn slice_segment_main() {
     check_stream_goldens("main");
 }
 
 #[test]
-fn tier_e_main10() {
+fn slice_segment_main10() {
     check_stream_goldens("main10");
 }
 
 #[test]
-fn tier_e_cra() {
+fn slice_segment_cra() {
     check_stream_goldens("cra");
 }
 
 #[test]
-fn tier_e_msp() {
+fn slice_segment_msp() {
     check_stream_goldens("msp");
 }
 
 fn check_stream_goldens(name: &str) {
     if let Some(entries) = run_stream(name) {
         for (key, hash) in entries {
-            goldens::assert_hash(&key, &hash);
+            goldens::assert_hash(GOLDENS, &key, &hash);
         }
     }
 }
@@ -732,4 +734,27 @@ pub(crate) fn golden_entries() -> Vec<(String, String)> {
         }
     }
     v
+}
+
+// ============================================================
+// Regeneration
+// ============================================================
+
+/// Rewrite this test's golden table from a fresh run of every stream. Only
+/// after an intentional, re-verified behavior change (see `src/hevc/goldens`).
+#[test]
+fn regenerate_goldens() {
+    if env::var_os("H265_REGEN_GOLDENS").is_none() {
+        eprintln!("regenerate_goldens: set H265_REGEN_GOLDENS=1 to rewrite tests/data/hevc_slice_segment_golden_data.rs");
+        return;
+    }
+    let entries = golden_entries();
+    assert!(!entries.is_empty(), "no golden entries produced");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hevc_slice_segment_golden_data.rs");
+    let n = vacc_common::goldens::write_golden_file(
+        entries,
+        &path,
+        "H265_REGEN_GOLDENS=1 cargo test -p vacc-software-decode --test hevc_slice_segment_golden_tests regenerate_goldens",
+    );
+    eprintln!("wrote {n} golden entries to {}", path.display());
 }

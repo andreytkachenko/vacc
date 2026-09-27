@@ -9,7 +9,10 @@
 //! The digest, lookup, record/collect, and `golden_data.rs` writer live in
 //! `vacc_common::goldens`; this module keeps only this crate's `GOLDENS`
 //! table, the module registry (`collect_entries`), and the regeneration
-//! test.
+//! test. The slice-segment and end-to-end stream tests live in
+//! `tests/hevc_slice_segment_golden_tests.rs` / `tests/hevc_end_to_end_golden_tests.rs`
+//! with their own golden tables (`tests/data/hevc_*_golden_data.rs`); their
+//! regeneration tests share this module's `H265_REGEN_GOLDENS` env var.
 //!
 //! Regeneration (only after an intentional, re-verified behavior change,
 //! with the sample streams available):
@@ -19,10 +22,6 @@
 //! ```
 
 include!("golden_data.rs");
-
-pub(crate) fn golden(key: &str) -> Option<&'static str> {
-    vacc_common::goldens::lookup(GOLDENS, key)
-}
 
 /// SHA-256 of `data` as lowercase hex (shared implementation).
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
@@ -66,8 +65,6 @@ pub(crate) fn collect_entries() -> Vec<(String, String)> {
     v.extend(super::intra_prediction::golden_entries());
     v.extend(super::sao::golden_entries());
     v.extend(super::syntax_elements::golden_entries());
-    v.extend(super::tier_e::golden_entries());
-    v.extend(super::tier_f::golden_entries());
     v.extend(super::transform::golden_entries());
     v.extend(crate::h265::golden_entries());
     v

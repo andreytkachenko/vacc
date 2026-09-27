@@ -24,9 +24,5 @@ pub mod residual_coding;
 pub mod sao;
 pub mod syntax_elements;
 pub mod syntax_map;
-#[cfg(test)]
-pub mod tier_e;
-#[cfg(test)]
-pub mod tier_f;
 pub mod transform;
 pub mod types;

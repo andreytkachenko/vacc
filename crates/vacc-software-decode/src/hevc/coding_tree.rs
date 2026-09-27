@@ -27,7 +27,7 @@ use crate::hevc::types::{
 
 // Test-only: per-CTU bit-position trace for differential debugging (compare
 // against the C++ `HEVC_DEBUG_FILTER=TREE` output).
-pub(crate) fn hevc_trace() -> bool {
+pub fn hevc_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("TIER_E_TRACE").is_some() || std::env::var_os("RUST_TREE_TRACE").is_some()

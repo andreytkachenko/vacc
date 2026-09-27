@@ -3,16 +3,17 @@
 //! state (cpb offset, both cache halves, all 1024 context states) to its
 //! golden hash.
 
-#![cfg(test)]
 
-use crate::avc::bits::SliceBits;
-use crate::avc::cabac::Cabac;
-use crate::avc::deblock::{
+use vacc_software_decode::avc::bits::SliceBits;
+use vacc_software_decode::avc::cabac::Cabac;
+use vacc_software_decode::avc::deblock::{
     DEBLOCK_LC_ROWS, DEBLOCK_LC_SIZE, DEBLOCK_LC_STRIDE, DEBLOCK_LY_ROWS, DEBLOCK_LY_SIZE,
     DEBLOCK_LY_STRIDE, DEBLOCK_MB_STATE_LEN, DEBLOCK_Y_COL,
 };
-use crate::avc::goldens;
-use crate::avc::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
+use vacc_common::goldens;
+
+include!("data/avc_fuzz_golden_data.rs");
+use vacc_software_decode::avc::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
 
 const PAD: usize = 32;
 
@@ -89,7 +90,7 @@ fn compare(payload: &[u8], ops: &[i32], tag: &str) {
     data.extend_from_slice(&r_c0.to_le_bytes());
     data.extend_from_slice(&r_c1.to_le_bytes());
     data.extend_from_slice(&r_ctx);
-    goldens::assert_golden(tag, &data);
+    goldens::assert_data(GOLDENS, tag, &data);
     goldens::record(tag, &data);
 }
 
@@ -274,10 +275,10 @@ fn compare_intra(kind: i32, mode: u32, buf: &[u8; INTRA_BUF], tag: &str) {
     // Rust run on the same inputs.
     let mut b = *buf;
     match kind {
-        0 => crate::avc::intra::intra4x4(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        1 => crate::avc::intra::intra8x8(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        2 => crate::avc::intra::intra16x16(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        3 => crate::avc::intra::intra_chroma(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        0 => vacc_software_decode::avc::intra::intra4x4(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        1 => vacc_software_decode::avc::intra::intra8x8(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        2 => vacc_software_decode::avc::intra::intra16x16(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        3 => vacc_software_decode::avc::intra::intra_chroma(&mut b, INTRA_O, INTRA_STRIDE, mode),
         _ => panic!("{tag}: bad kind {kind}"),
     }
     let rows = match kind {
@@ -293,7 +294,7 @@ fn compare_intra(kind: i32, mode: u32, buf: &[u8; INTRA_BUF], tag: &str) {
         }
     }
 
-    goldens::assert_golden(tag, &r_out);
+    goldens::assert_data(GOLDENS, tag, &r_out);
     goldens::record(tag, &r_out);
 }
 
@@ -379,7 +380,7 @@ fn compare_residual(
     tag: &str,
 ) {
     // Rust run on the same inputs.
-    let mut st = crate::avc::residual::Residual {
+    let mut st = vacc_software_decode::avc::residual::Residual {
         c: *coeffs,
         qp: *qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -417,7 +418,7 @@ fn compare_residual(
     for v in &st.c {
         data.extend_from_slice(&v.to_le_bytes());
     }
-    goldens::assert_golden(tag, &data);
+    goldens::assert_data(GOLDENS, tag, &data);
     goldens::record(tag, &data);
 }
 
@@ -501,7 +502,7 @@ fn compare_transform_dc(
 ) {
     // Rust run on the same inputs. op: 0 = transform_dc4x4(plane, flag),
     // 1 = transform_dc2x2(flag); flag = store_later (C guard bit).
-    let mut st = crate::avc::residual::Residual {
+    let mut st = vacc_software_decode::avc::residual::Residual {
         c: *coeffs,
         qp: *qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -548,7 +549,7 @@ fn compare_transform_dc(
     for v in &st.c {
         data.extend_from_slice(&v.to_le_bytes());
     }
-    goldens::assert_golden(tag, &data);
+    goldens::assert_data(GOLDENS, tag, &data);
     goldens::record(tag, &data);
 }
 
@@ -563,7 +564,7 @@ fn transform_dc_handcheck() {
     let mut coeffs: [i32; 64] = [0; 64];
     coeffs[0] = 1024;
     let mut pix = [100u8; DC_PIX];
-    let mut st = crate::avc::residual::Residual {
+    let mut st = vacc_software_decode::avc::residual::Residual {
         c: coeffs,
         qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -674,13 +675,13 @@ fn compare_inter(
         dst[r * dstride..r * dstride + w].copy_from_slice(&dst_in[r * dstride..r * dstride + w]);
     }
     // `src` is the (h+5) x (w+5) neighborhood; block top-left at src+2*ss+2.
-    crate::avc::inter::inter_luma(src, &mut dst, w, h, mode, sstride, dstride, wod);
+    vacc_software_decode::avc::inter::inter_luma(src, &mut dst, w, h, mode, sstride, dstride, wod);
 
     let r_out: Vec<u8> = dst
         .chunks(dstride)
         .flat_map(|row| row[..w].iter().copied())
         .collect();
-    goldens::assert_golden(tag, &r_out);
+    goldens::assert_data(GOLDENS, tag, &r_out);
     goldens::record(tag, &r_out);
 }
 
@@ -711,7 +712,7 @@ fn inter_fuzz_all_modes_body() {
                             &src,
                             dstride,
                             &dst_in,
-                            &crate::avc::inter::WOD_NO_WEIGHT,
+                            &vacc_software_decode::avc::inter::WOD_NO_WEIGHT,
                             &format!("inter {w}x{h} mode={mode} #{iter}"),
                         );
                     }
@@ -788,13 +789,13 @@ fn compare_chroma(
     for r in 0..h {
         dst[r * dstride..r * dstride + cw].copy_from_slice(&dst_in[r * dstride..r * dstride + cw]);
     }
-    crate::avc::inter::inter_chroma(src, &mut dst, w, h, x_frac, y_frac, sstride, dstride, wod);
+    vacc_software_decode::avc::inter::inter_chroma(src, &mut dst, w, h, x_frac, y_frac, sstride, dstride, wod);
 
     let r_out: Vec<u8> = dst
         .chunks(dstride)
         .flat_map(|row| row[..cw].iter().copied())
         .collect();
-    goldens::assert_golden(tag, &r_out);
+    goldens::assert_data(GOLDENS, tag, &r_out);
     goldens::record(tag, &r_out);
 }
 
@@ -825,7 +826,7 @@ fn chroma_fuzz_all_fracs_body() {
                             &dst_in,
                             x,
                             y,
-                            &crate::avc::inter::WOD_NO_WEIGHT,
+                            &vacc_software_decode::avc::inter::WOD_NO_WEIGHT,
                             &format!("chroma {w}x{h} x{x} y{y} #{iter}"),
                         );
                     }
@@ -851,7 +852,7 @@ fn chroma_fuzz_weighted_body() {
     // floor-division sra quirk (sh >= 15 saturates to sign, not i16 -32768).
     let mut rng = XorShift64Star(0x5eed_7c2d);
     let pats: [([i16; 8], &str); 9] = [
-        (crate::avc::inter::WOD_NO_WEIGHT, "no_weight"),
+        (vacc_software_decode::avc::inter::WOD_NO_WEIGHT, "no_weight"),
         (mk_wodc(1, 1, 1, 1, 1), "wq=1 wp=1 sh=1"),
         (mk_wodc(-2, 3, -5, 4, -4), "signed wq/wp, sh=-5"),
         (mk_wodc(127, -128, 6, 32767, -32768), "extremes+sat"),
@@ -931,7 +932,7 @@ fn residual_full_qp_domain_body() {
 
 #[test]
 fn deblock_oracle_smoke() {
-    use crate::avc::deblock::run_rust_deblock;
+    use vacc_software_decode::avc::deblock::run_rust_deblock;
     let mut rng = XorShift64Star(0xdeb1_0ca7);
     // Zero MB state (intra, QP=18) for all three slots; only the current MB's
     // filter_edges is varied. QP[3]@0, mbIsInterFlag@3, filter_edges@4.
@@ -1002,7 +1003,7 @@ fn compare_deblock(
     c_in: &[u8],
     tag: &str,
 ) -> bool {
-    let (r_y, r_c) = crate::avc::deblock::run_rust_deblock(
+    let (r_y, r_c) = vacc_software_decode::avc::deblock::run_rust_deblock(
         mb_state,
         fe,
         entropy,
@@ -1014,7 +1015,7 @@ fn compare_deblock(
     let mut data = Vec::with_capacity(r_y.len() + r_c.len());
     data.extend_from_slice(&r_y);
     data.extend_from_slice(&r_c);
-    goldens::assert_golden(tag, &data);
+    goldens::assert_data(GOLDENS, tag, &data);
     goldens::record(tag, &data);
     r_y != y_in || r_c != c_in // true if the filter actually modified pixels
 }
@@ -1138,7 +1139,7 @@ fn deblock_fe_bits_firing_pattern_body() {
             }
         }
         let (r_y, r_c) =
-            crate::avc::deblock::run_rust_deblock(&mb_state, fe, 0, 0, 0, &y_in, &c_in);
+            vacc_software_decode::avc::deblock::run_rust_deblock(&mb_state, fe, 0, 0, 0, &y_in, &c_in);
         assert_ne!(
             r_y, y_in,
             "fe={fe}: no luma pixels filtered — pattern not firing"
@@ -1147,7 +1148,7 @@ fn deblock_fe_bits_firing_pattern_body() {
         data.extend_from_slice(&r_y);
         data.extend_from_slice(&r_c);
         let key = format!("deblock-fe fe={fe}");
-        goldens::assert_golden(&key, &data);
+        goldens::assert_data(GOLDENS, &key, &data);
         goldens::record(&key, &data);
     }
 }
@@ -1375,16 +1376,16 @@ fn mvpred_fuzz_body() {
             }
         }
 
-        let r_out = crate::avc::mvpred::run_rust_mvpred(&inb, op);
+        let r_out = vacc_software_decode::avc::mvpred::run_rust_mvpred(&inb, op);
         let key = format!("mvpred #{iter} op={op}");
-        goldens::assert_golden(&key, &r_out);
+        goldens::assert_data(GOLDENS, &key, &r_out);
         goldens::record(&key, &r_out);
     }
 }
 
 /// Re-run every golden-producing body with collection armed (for
 /// `regenerate_goldens`).
-pub(crate) fn golden_entries() -> Vec<(String, String)> {
+fn golden_entries() -> Vec<(String, String)> {
     goldens::collect(|| {
         cavlc_fuzz_body();
         cavlc_structured_body();
@@ -1404,4 +1405,27 @@ pub(crate) fn golden_entries() -> Vec<(String, String)> {
         deblock_structured_body();
         mvpred_fuzz_body();
     })
+}
+
+// ============================================================
+// Regeneration
+// ============================================================
+
+/// Rewrite this test's golden table from a fresh run of every fuzz body. Only
+/// after an intentional, re-verified behavior change (see `src/avc/goldens`).
+#[test]
+fn regenerate_goldens() {
+    if std::env::var_os("SW264_REGEN_GOLDENS").is_none() {
+        eprintln!("regenerate_goldens: set SW264_REGEN_GOLDENS=1 to rewrite tests/data/avc_fuzz_golden_data.rs");
+        return;
+    }
+    let entries = golden_entries();
+    assert!(!entries.is_empty(), "no golden entries produced");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/avc_fuzz_golden_data.rs");
+    let n = vacc_common::goldens::write_golden_file(
+        entries,
+        &path,
+        "SW264_REGEN_GOLDENS=1 cargo test -p vacc-software-decode --test avc_fuzz_golden_tests regenerate_goldens",
+    );
+    eprintln!("wrote {n} golden entries to {}", path.display());
 }

@@ -250,8 +250,9 @@ pub fn decode_picture(
         // ceil(header_bits/8). The two coincide unless the header length is an
         // exact multiple of 8, in which case ceil under-counts by one byte.
         // `seek_target` then subtracts the EPB bytes the header absorbed
-        // (C++ fixpoint condition `ep < sh_coded + 2` — see tier_e /
-        // hevc_test_api.cpp) to land in the RBSP (EPB-removed) domain.
+        // (C++ fixpoint condition `ep < sh_coded + 2` — see
+        // tests/hevc_slice_segment_golden_tests.rs) to land in the RBSP
+        // (EPB-removed) domain.
         let sh_coded = (seg.header_bit_size as usize + 8) / 8;
         let epb_in_hdr = epb.iter().filter(|&&e| e < sh_coded + 2).count();
         let seek_target = sh_coded - epb_in_hdr;

@@ -10,7 +10,9 @@
 //! The digest, lookup, record/collect, and `golden_data.rs` writer live in
 //! `vacc_common::goldens`; this module keeps only this crate's `GOLDENS`
 //! table, the module registry (`collect_entries`), and the regeneration
-//! test.
+//! test. The op-sequence fuzz tests live in `tests/avc_fuzz_golden_tests.rs`
+//! with their own golden table (`tests/data/avc_fuzz_golden_data.rs`); its
+//! regeneration test shares this module's `SW264_REGEN_GOLDENS` env var.
 //!
 //! Regeneration (only after an intentional, re-verified behavior change,
 //! with the sample streams available):
@@ -20,10 +22,6 @@
 //! ```
 
 include!("golden_data.rs");
-
-pub(crate) fn golden(key: &str) -> Option<&'static str> {
-    vacc_common::goldens::lookup(GOLDENS, key)
-}
 
 /// SHA-256 of `data` as lowercase hex (shared implementation).
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
@@ -58,7 +56,6 @@ pub(crate) fn collect<R: FnOnce()>(f: R) -> Vec<(String, String)> {
 pub(crate) fn collect_entries() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = Vec::new();
     // See the `golden_entries` re-exports in the test modules.
-    v.extend(crate::avc::tests::golden_entries());
     v.extend(crate::avc::deblock::golden_entries());
     v.extend(crate::decoder::golden_entries());
     v
