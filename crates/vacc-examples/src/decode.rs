@@ -20,8 +20,8 @@
 //!   vaapi    H.264/H.265/VP9 (Intel/AMD iGPU)
 //!   vulkan   H.264/H.265/VP9/AV1
 //!   nvdec    H.264/H.265/VP9/AV1 (NVIDIA GPU + CUDA driver)
-//!   edge264  CPU H.264, selected with -b sw (vendored edge264 C routines)
-//!   hevcjs   CPU H.265, selected with -b sw (hevc.js C++ core)
+//!   edge264  CPU H.264, selected with -b sw (pure-Rust port of the edge264 core)
+//!   hevcjs   CPU H.265, selected with -b sw (pure-Rust port of the hevc.js kernels)
 //!
 //! Build with a subset of backends:
 //!   cargo run --release -p vacc-examples --example decode --no-default-features \

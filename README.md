@@ -1,37 +1,85 @@
 # vacc
 
 A Rust workspace for video decoding with five interchangeable backends:
-**Vulkan Video**, **NVIDIA NVDEC** (cuvid), **VAAPI**, and CPU software decoders
-(pure-Rust H.264 core ported from edge264, **hevc.js** for H.265). Based on the
+**Vulkan Video**, **NVIDIA NVDEC** (cuvid), **VAAPI**, and two CPU software decoders —
+**H.264/AVC** (pure-Rust port of the **edge264** core) and **H.265/HEVC** (pure-Rust port of
+the **hevc.js** kernels). The root `vacc` crate ties them together into a single
+[`VaccDecoder`](src/lib.rs) with automatic backend fallback. Based on the
 [Khronos Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples).
 
 Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see the
 [Decode Support Matrix](#decode-support-matrix) for what each GPU/driver actually decodes
 byte-exact (verified against FFmpeg, 300 frames per sample).
 
+## Quick Start
+
+```rust
+use vacc::{Backend, DecoderConfig, VaccDecoder};
+
+let data = std::fs::read("video.h264").unwrap();
+
+// Default chain: vulkan -> nvdec -> vaapi -> software. The first backend that
+// can initialize AND decode the stream wins; a failing backend falls through.
+let mut decoder = VaccDecoder::new_auto(data).unwrap();
+println!("using backend: {}", decoder.backend());
+for frame in decoder.decode_all(usize::MAX).unwrap() {
+    println!("frame {}: {}x{}", frame.frame_index, frame.width, frame.height);
+}
+
+// Or pick the fallback order yourself:
+let config = DecoderConfig::new([Backend::Nvdec, Backend::Software]);
+let decoder = VaccDecoder::new(&std::fs::read("video.h265").unwrap(), &config).unwrap();
+```
+
+Each backend is an optional cargo feature (`vulkan`, `nvdec`, `vaapi`, `sw`, all on by
+default), so a distribution build can omit any GPU dependency:
+
+```toml
+# Cargo.toml
+[dependencies]
+vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
+```
+
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        vacc (workspace)                          │
-│                                                                  │
-│   vacc-core        shared types, traits, errors              │
-│   vacc-parser      bitstream parsing (H.264/HEVC/VP9/AV1),   │
-│                        common DPB + POC state (one manager       │
-│                        across backends)                          │
-│                                                                  │
-│   Backends:                                                      │
-│     vacc-vulkan    Vulkan Video (ash)                        │
-│     vacc-nvdec-decode  NVIDIA NVDEC via libnvcuvid (cuvid)        │
-│     vacc-vaapi-decode  VAAPI stateless decode                     │
-│     vacc-sw-decode     CPU H.264 (pure-Rust core, edge264 port)   │
-│     vacc-software-decode CPU H.265 (pure-Rust hevc.js port)       │
-│                                                                  │
-│   vacc-examples: decode  unified CLI: -b <backend> -i <file>     │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                        vacc (workspace)                            │
+│                                                                    │
+│   vacc               unified decoder: VaccDecoder + fallback       │
+│                        chain vulkan → nvdec → vaapi → sw           │
+│                                                                    │
+│   vacc-core          shared types, traits, errors                  │
+│   vacc-parser        bitstream parsing (H.264/HEVC/VP9/AV1),       │
+│                        common DPB + POC + ref-list state           │
+│   vacc-common        shared SW-decoder test infra (golden hashes,  │
+│                        PRNGs, saturation helpers)                  │
+│                                                                    │
+│   Backends:                                                        │
+│     vacc-vulkan          Vulkan Video core (ash)                   │
+│     vacc-vulkan-common   device init / queue management            │
+│     vacc-vulkan-decode   Decoder-trait wrapper over vacc-vulkan    │
+│     vacc-nvdec-decode    NVIDIA NVDEC via libnvcuvid (cuvid)       │
+│     vacc-vaapi-decode    VAAPI stateless decode                    │
+│     vacc-software-decode CPU H.264 (edge264 port) +                │
+│                          CPU H.265 (hevc.js port), pure Rust       │
+│                                                                    │
+│   vacc-examples: decode  unified CLI: -b <backend> -i <file>       │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Crate Overview
+
+### `vacc` (root package)
+The unified decoder:
+- `VaccDecoder` / `new_auto()` — one API over all backends; default fallback chain
+  `vulkan → nvdec → vaapi → software`
+- `DecoderConfig` — custom fallback order (`new([Backend…])`, `only(…)`, `default_order()`)
+- `detect_codec()` — H.264/H.265/VP9/AV1 bitstream detection
+- Per-backend features (`vulkan`, `nvdec`, `vaapi`, `sw`); if every configured backend
+  fails, the returned error lists each per-backend failure so callers can report *why*
+- PTS normalization: frames carry monotonic presentation timestamps (synthetic 1/30 s
+  steps when a backend's PTS is invalid or goes backwards under B-frame reordering)
 
 ### `vacc-core`
 Core types and traits shared across all crates:
@@ -45,17 +93,24 @@ Core types and traits shared across all crates:
 Bitstream parsing for each codec:
 - **H.264**: SPS, PPS, slice header parsing
 - **H.265**: VPS, SPS, PPS, slice header parsing
-- **AV1**: Sequence header parsing
+- **AV1**: Sequence header parsing (incl. film-grain params, signed segmentation
+  features, show-existing-frame OBUs)
 - NAL unit extraction and start-code detection
-- RBSP (Raw Byte Sequence Payload) handling
-- Emulation prevention byte removal
+- RBSP (Raw Byte Sequence Payload) handling, emulation prevention byte removal
+- **Common state used by every backend**: DPB managers (`H264Dpb`, `H265Dpb`, AV1 DPB),
+  POC calculators (types 0/1/2), and spec-correct reference-list construction
 
-### `vacc-vulkan`
+### `vacc-common`
+Code shared by the H.264/H.265 software decoders: golden-hash test infrastructure,
+deterministic test PRNGs, saturation helpers.
+
+### `vacc-vulkan` / `vacc-vulkan-common` / `vacc-vulkan-decode`
 Vulkan Video implementation using `ash`:
-- `VulkanDevice` - Device initialization with video decode support
-- `VideoSession` - `VkVideoSessionKHR` management
-- `BitstreamBuffer` - `VkBuffer` for compressed video data
-- Codec-specific decoders (H.264 / H.265 / VP9 / AV1) and readback
+- `vacc-vulkan-common` - shared device initialization, queue management, debug messenger
+- `vacc-vulkan` - low-level pipeline: `VideoSession` (`VkVideoSessionKHR`),
+  `BitstreamBuffer`, DPB images, codec-specific decoders (H.264 / H.265 / VP9 / AV1)
+  and readback
+- `vacc-vulkan-decode` - implements the core `Decoder` trait over the pipeline
 
 ### `vacc-nvdec-decode`
 NVIDIA NVDEC via `libnvcuvid.so` (loaded dynamically with `libloading`):
@@ -69,65 +124,47 @@ VAAPI stateless decode on any libva driver (verified with Intel iHD):
 - Per-codec decoders using the common DPB/POC state from `vacc-parser`
 - Early capability rejections (e.g. H.264 4:2:2 on drivers whose AVC
   pipeline is NV12-only) instead of mid-decode driver errors
+- Bindings via the `cros-libva` git dependency
 
-### `libva`
-Rust bindings for libva (display, config, context, surface, picture).
+### `vacc-software-decode`
+The CPU backends — see [Software (CPU) Backends](#software-cpu-backends--b-sw).
 
-## Quick Start
+### `vacc-examples`
+- `decode` — unified CLI: `-b <vulkan|nvdec|vaapi|sw> -i <file> [-n frames] [-o outdir]`;
+  prints pts/size/pixel-hash per frame (the hash is what the verification matrix compares)
 
-```toml
-# Cargo.toml
-[dependencies]
-vacc-core = { path = "crates/vacc-core" }
-vacc-parser = { path = "crates/vacc-parser" }
-vacc-vulkan = { path = "crates/vacc-vulkan" }
-```
+## Software (CPU) Backends (`-b sw`)
 
-```rust
-use vacc_core::codec::VideoCodec;
-use vacc_parser::h264::H264Parser;
-use vacc_vulkan::{VideoDeviceBuilder, VideoPipeline, VideoCodec};
+`sw` decodes on CPU only and needs **nothing but a CPU — both cores are pure Rust**
+(no C/C++ toolchain). The codec is auto-detected: H.264 → edge264 port, H.265 → hevc.js
+port. Both keep the *control plane* (bitstream parsing, DPB, POC, ref lists, display-order
+reordering) on the shared `vacc-parser` state; only pixel reconstruction is codec-specific.
 
-// 1. Initialize Vulkan device
-let device = VideoDeviceBuilder::new()
-    .with_video_codecs(ash::vk::VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR)
-    .with_validation(true)
-    .build()?;
+### H.264 — edge264 port (`src/rust/`)
+- Bit-exact pure-Rust reimplementation of the edge264 slice-decode core: CABAC/CAVLC
+  entropy decoding, intra/inter prediction, IDCT + dequantization, deblocking filter
+- SSE SIMD kernels for motion compensation (luma/chroma), the deblock filter, and
+  IDCT/dequant; every output is pinned to golden hashes (`src/rust/golden_data.rs`)
+- Supported: 8-bit 4:2:0 (and monochrome) progressive frame coding. Other formats
+  (10-bit, 4:2:2/4:4:4, field/MBAFF, separate colour plane) are rejected up front with a
+  clear error instead of mis-decoding
 
-// 2. Create pipeline
-let mut pipeline = VideoPipeline::new(&device, VideoCodec::DecodeH264)?;
-pipeline.init()?;
+### H.265 — hevc.js port (`src/hevc/`)
+- Pure-Rust port of the [hevc.js](https://github.com/lid-labs/hevc.js) decoder kernels
+  (MIT, see `crates/vacc-software-decode/HEVC_LICENSE`): CABAC engine, coding tree +
+  residual coding, intra/inter prediction, transform/dequantization, deblocking (§8.7.2),
+  SAO (§8.7.3)
+- AVX2 SIMD kernels for inverse transforms (4x4–32x32 IDCT/DST) and MC FIR
+  interpolation; WPP parallel pipeline over CTU rows
+- Verified byte-exact: Main / Main 10 4:2:0, including CRA open-GOP and multi-slice WPP
+  streams; outputs pinned to SHA-256 goldens
 
-// 3. Parse bitstream
-let mut parser = H264Parser::new();
-let format = DetectedVideoFormat::new(VideoCodec::DecodeH264);
-parser.init(&format)?;
+Threading: WPP CTU rows run on the rayon global pool (tune with `RAYON_NUM_THREADS`).
 
-// 4. Feed packets and decode
-for packet in bitstream_packets {
-    let result = parser.parse(&packet)?;
-    match result {
-        ParseResult::ParameterSet { sps, pps, .. } => {
-            if let Some(sps) = sps {
-                pipeline.decoder_mut()
-                    .and_then(|d| match d {
-                        DecoderWrapper::H264(dec) => {
-                            dec.set_sps(sps.downcast_ref::<H264Sps>()?.clone());
-                            Some(())
-                        }
-                        _ => None,
-                    });
-            }
-        }
-        ParseResult::Slice { slice_data_offset, slice_data_len, .. } => {
-            // Record decode command
-            pipeline.record_decode(...)?;
-        }
-        ParseResult::EndOfStream => break,
-        _ => {}
-    }
-}
-```
+Verification: golden-hash unit tests + full-stream pixel oracles
+(`cargo test -p vacc-software-decode`), plus byte-exact agreement with the FFmpeg
+reference and hash-identical output vs the GPU backends on the committed sample set and
+21 real-world streams (see [Decode Support Matrix](#decode-support-matrix)).
 
 ## Vulkan Video Pipeline
 
@@ -135,15 +172,15 @@ The decode pipeline follows the Vulkan Video extension workflow:
 
 ```
 Bitstream ──► Parser ──► SPS/PPS/VPS ──► Session Parameters
-                                        │
+                                         │
 Bitstream ──► BitstreamBuffer ──────────┤
-                                        ▼
-                              VideoSession ──► vkCmdDecodeVideoKHR
-                                        │               │
-                              DPB Images  ───────────────┘
-                                        │
-                                        ▼
-                                  Decoded Frame (YCbCr)
+                                         ▼
+                               VideoSession ──► vkCmdDecodeVideoKHR
+                                         │               │
+                               DPB Images  ───────────────┘
+                                         │
+                                         ▼
+                                   Decoded Frame (YCbCr)
 ```
 
 ### Key Vulkan Objects
@@ -158,16 +195,16 @@ Bitstream ──► BitstreamBuffer ──────────┤
 
 ## Decode Support Matrix
 
-Verified 2026-08-31 with `verify-all.py`: Big Buck Bunny 640x360 @ 30 fps, **300 frames** per
+Verified 2026-09-27 with `verify-all.py`: Big Buck Bunny 640x360 @ 30 fps, **300 frames** per
 sample (the six `t*`/`x*` stress samples are 30-frame files — every available frame is verified).
 Each decoded frame is compared **byte-exact** against an FFmpeg software-decode reference in the
 stream's native pixel format. Environment:
 
 - **NVIDIA GeForce RTX 3060 (GA106)** — Vulkan Video and NVDEC (`cuvid`) columns
-- **Intel Meteor Lake-P iGPU** — VAAPI column (iHD driver 26.1.2). Its Vulkan driver exposes no
+- **Intel Meteor Lake-P iGPU** — VAAPI column (iHD driver). Its Vulkan driver exposes no
   video decode queue in this environment, so the Vulkan column runs on GA106.
 
-Legend: ✅ = 300/300 byte-exact | S(n/m) = sample has only n frames, all verified exact |
+Legend: ✅ = 300/300 byte-exact | S(30/30) = sample has only n frames, all verified exact |
 HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardware or driver
 (evidence below; not a bug in this codebase).
 
@@ -194,8 +231,19 @@ HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardwa
 | `av1_main` (main · 4:2:0 · 8b) | ✅ | ✅ | ✅ |
 | `av1_high` (high · 4:2:0 · 10b) | ✅ | ✅ | ✅ |
 | `av1_professional` (professional · 4:2:2 · 10b) | HW-n/a | HW-n/a | HW-n/a |
+| `av1_grain` (main · film-grain SPS, grain not applied) | ✅ | ✅ | ✅ |
+| `av1_seg` (main · segmentation + show-existing OBU stress) | ✅ | ✅ | ✅ |
 
-**Result: 40/40 decodable cells byte-exact; 0 failures.** 14 cells are HW-n/a.
+**Result: 64/64 decodable cells byte-exact; 0 failures.** 14 cells are HW-n/a.
+
+### Software backend (`sw`) coverage
+
+The CPU backends implement H.264 and H.265 only (no VP9/AV1), so they have no column in
+the table above. Verified against the same FFmpeg references: **all eight-bit 4:2:0 H.264
+samples** (baseline → `xfd`, via the edge264 port) and **all four H.265 samples**
+(main, cra, msp, main10, via the hevc.js port) decode byte-exact, with per-frame hashes
+identical to the GPU backends in every cell above. The three H.264 high-profile 10/4:2:2/4:4:4
+samples are rejected up front (the edge264 port targets 8-bit 4:2:0 progressive).
 
 ### HW-n/a evidence (measured, not assumed)
 
@@ -221,6 +269,9 @@ HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardwa
 - `h265_msp` exercises multi-slice pictures (multiple slice segments per frame) end-to-end on all
   three backends — each segment carries its own slice header, and dependent segments inherit the
   first segment's parameters per spec 7.3.8.
+- `av1_grain` carries a film-grain SPS + grain block in every frame header (decoded with
+  `apply_grain` forced off to stay pixel-identical to FFmpeg); `av1_seg` is a rav1e encode with
+  signed segmentation features and ~half the pictures as show-existing-frame OBUs.
 - NVDEC 10/12-bit content decodes into P016 surfaces (the only >8-bit output format in the public
   cuvid API); readback scales to 8-bit with round+clamp, matching the other backends.
 - Diagnostics: `VACC_PROBE_CUVID=1` dumps the full cuvid decoder-caps table; `VACC_VA_DUMP=1`
@@ -229,9 +280,11 @@ HW-n/a = the stream's profile/chroma/depth is not supported by that GPU's hardwa
 ## Test Samples
 
 The single master source is `assets/big_buck_bunney.h265` (Big Buck Bunny, 1920x1080,
-300 frames). All 24 samples in `assets/samples/` are codec variants of that one video,
+300 frames). All 26 samples in `assets/samples/` are codec variants of that one video,
 produced by the ffmpeg recipes embedded in `verify-all.py` (per-sample encoder options:
-profile, chroma format, bit depth, GOP/stress flags).
+profile, chroma format, bit depth, GOP/stress flags) — including two AV1 stress encodes:
+`av1_grain.ivf` (aomenc film-grain table) and `av1_seg.ivf` (rav1e segmentation +
+show-existing-frame OBUs).
 
 - `python3 verify-all.py` — verifies the committed samples (default; no encoding).
 - `python3 verify-all.py --generate` — encodes only **missing** samples from the master.
@@ -260,12 +313,16 @@ YUV dumps via `-o`), decodes the same frames with FFmpeg (software reference, na
 format), and byte-compares every frame. Cells whose hardware/driver genuinely cannot decode the
 stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
 
+Beyond the sample matrix, the decoders are cross-checked on real-world streams: 21/21 streams
+(18 H.264/H.265 files × 4 backends including `sw`, 3 VP9/AV1 files × 3 backends; ~654k frames)
+produce hash-identical per-frame output across every applicable backend (2026-09-26).
+
 ## Unified Decode Example
 
 ```bash
 # Decode with a chosen backend; prints pts/size/pixel-hash per frame
 ./target/release/examples/decode -b <vulkan|nvdec|vaapi|sw> -i <file> [-n frames] [-o outdir]
-# sw = CPU: H.264 pure-Rust (edge264 port), H.265 via hevc.js (codec auto-detected)
+# sw = CPU, pure Rust: H.264 (edge264 port) / H.265 (hevc.js port), codec auto-detected
 ```
 
 ## Vulkan Extensions Required
@@ -283,6 +340,9 @@ stream are listed (with evidence) in `HW_UNSUPPORTED` and reported as `HW-n/a`.
 - **bitflags** - Vulkan flag types
 - **thiserror** - Error handling
 - **log** / **tracing** - Logging
+- **rayon** - Software-decoder threading (WPP CTU rows)
+- **libloading** - Dynamic `libnvcuvid.so` loading (NVDEC)
+- **cros-libva** - VAAPI bindings (git dependency)
 
 ## Building
 
@@ -294,17 +354,20 @@ cargo build --release --examples   # NOTE: --examples is required; plain builds 
 ```
 
 Backend requirements: Vulkan Video device (VAAPI also works on the same stack), NVIDIA driver with
-`libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively. `sw` needs nothing but a
-C/C++ toolchain — both cores are vendored and statically compiled.
+`libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively. `sw` needs nothing but a CPU —
+both cores are pure Rust.
 
-Each backend of the `decode` example is a cargo feature (all on by default), so a build can be
-trimmed to the backends you need:
+Each backend of the root `vacc` package is a cargo feature (all on by default), as are the
+backends of the `decode` example, so a build can be trimmed to the backends you need:
 
 ```bash
-cargo build --release -p vacc-examples --example decode --no-default-features --features "hevcjs vaapi"
+cargo build -p vacc --no-default-features --features "vaapi sw"          # root library subset
+cargo build --release -p vacc-examples --example decode --no-default-features \
+    --features "hevcjs vaapi"                                            # example subset
 ```
 
-Features: `edge264` (CPU H.264), `hevcjs` (CPU H.265), `nvdec`, `vaapi`, `vulkan`.
+Features: `edge264` (CPU H.264), `hevcjs` (CPU H.265), `nvdec`, `vaapi`, `vulkan`
+(example crate); `sw` (both CPU cores) on the root package.
 
 ## Reference
 
@@ -313,7 +376,12 @@ This library is based on the [Vulkan-Video-Samples](https://github.com/KhronosGr
 - [Vulkan Video Deep Dive](https://www.khronos.org/assets/uploads/apis/Vulkan-Video-Deep-Dive-Apr21.pdf)
 - [Vulkan Video Extensions Spec](https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/vkspec.html)
 - [NVIDIA Vulkan Video Driver](https://developer.nvidia.com/vulkan-driver)
+- Software cores: the H.264 data plane is a bit-exact port of the edge264 decoder core; the
+  H.265 data plane is a port of the [hevc.js](https://github.com/lid-labs/hevc.js) kernels (MIT).
 
 ## License
 
 MIT OR Apache-2.0
+
+The H.265 software kernels are derived from hevc.js and remain MIT-licensed
+(`crates/vacc-software-decode/HEVC_LICENSE`).
