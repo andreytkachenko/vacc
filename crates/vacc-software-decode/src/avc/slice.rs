@@ -4013,7 +4013,7 @@ mod layout_tests {
         };
         m.f.inter_eqs = [0x1b, 0x5f, 0xbb, 0xff];
         m.f.transform_size_8x8_flag = 1;
-        let parsed = crate::rust::deblock::parse_mb(&m.serialize_deblock());
+        let parsed = crate::avc::deblock::parse_mb(&m.serialize_deblock());
         assert_eq!(m.serialize_deblock(), parsed.to_bytes());
     }
 }

@@ -58,8 +58,8 @@ pub(crate) fn collect<R: FnOnce()>(f: R) -> Vec<(String, String)> {
 pub(crate) fn collect_entries() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = Vec::new();
     // See the `golden_entries` re-exports in the test modules.
-    v.extend(crate::rust::tests::golden_entries());
-    v.extend(crate::rust::deblock::golden_entries());
+    v.extend(crate::avc::tests::golden_entries());
+    v.extend(crate::avc::deblock::golden_entries());
     v.extend(crate::decoder::golden_entries());
     v
 }
@@ -72,7 +72,7 @@ fn regenerate_goldens() {
     }
     let entries = collect_entries();
     assert!(!entries.is_empty(), "no modules produced golden entries");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rust/golden_data.rs");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/avc/golden_data.rs");
     let n = vacc_common::goldens::write_golden_file(
         entries,
         &path,

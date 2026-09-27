@@ -6,10 +6,10 @@
 //! - [`PocCalculator`] — picture order count (types 0/1/2)
 //! - `h264_reflist::build_ref_pic_lists` — spec 8.2.3.1+8.2.3.2 ref lists
 //!
-//! Data plane: the pure-Rust slice-decode core in [`crate::rust`] (macroblock
+//! Data plane: the pure-Rust slice-decode core in [`crate::avc`] (macroblock
 //! parse, intra/inter prediction, transform, deblocking), driven per-slice.
 //! Ported bit-exactly from the edge264 C routines; every output is pinned to
-//! golden hashes (`src/rust/golden_data.rs`).
+//! golden hashes (`src/avc/golden_data.rs`).
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::RefCell;
@@ -29,9 +29,9 @@ use vacc_parser::h264_poc::PocCalculator;
 use vacc_parser::h264_reflist::RefPicLists;
 use vacc_parser::{DetectedVideoFormat, ParseResult, SliceEntry, SliceHeader, VideoParser};
 
-use crate::rust::bits::SliceBits;
-use crate::rust::cabac::Cabac;
-use crate::rust::slice::{
+use crate::avc::bits::SliceBits;
+use crate::avc::cabac::Cabac;
+use crate::avc::slice::{
     PIXEL_MARGIN, RustMb, RustMbFlags, SLICEDATA_RECORD_LEN, SliceContext, UNAVAIL_MB,
 };
 
@@ -936,8 +936,8 @@ impl SwH264Decoder {
             ref_plane_bases,
             mc_y: [0u8; 672],
             mc_c: [0u8; 320],
-            dblk_y: [0u8; crate::rust::deblock::DEBLOCK_LY_SIZE],
-            dblk_c: [0u8; crate::rust::deblock::DEBLOCK_LC_SIZE],
+            dblk_y: [0u8; crate::avc::deblock::DEBLOCK_LY_SIZE],
+            dblk_c: [0u8; crate::avc::deblock::DEBLOCK_LC_SIZE],
             ws4: if sps.seq_scaling_matrix_present_flag {
                 // C memcpys the 96 spec-ordered bytes straight into
                 // weightScale4x4 (the kernel then indexes plane+inter*3).
@@ -1435,8 +1435,8 @@ mod tests {
         let mut pin = |frame: &DecodedFrame| {
             if let Some(pd) = &frame.pixel_data {
                 let key = format!("stream::{name}::f{frames}");
-                crate::rust::goldens::assert_golden(&key, &pd.buffer);
-                crate::rust::goldens::record(&key, &pd.buffer);
+                crate::avc::goldens::assert_golden(&key, &pd.buffer);
+                crate::avc::goldens::record(&key, &pd.buffer);
                 out.push((key, pd.buffer.clone()));
             }
             frames += 1;
@@ -1452,8 +1452,8 @@ mod tests {
         assert!(frames > 0, "{name}: no frames decoded");
         for (si, rec) in dec.take_rust_records().iter().enumerate() {
             let key = format!("stream::{name}::s{si}");
-            crate::rust::goldens::assert_golden(&key, rec);
-            crate::rust::goldens::record(&key, rec);
+            crate::avc::goldens::assert_golden(&key, rec);
+            crate::avc::goldens::record(&key, rec);
             out.push((key, rec.clone()));
         }
         out
@@ -1501,7 +1501,7 @@ mod tests {
             "h264_high.h264",
         ] {
             for (k, b) in stream_golden(name) {
-                v.push((k, crate::rust::goldens::sha256_hex(&b)));
+                v.push((k, crate::avc::goldens::sha256_hex(&b)));
             }
         }
         v

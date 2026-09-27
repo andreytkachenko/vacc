@@ -140,11 +140,11 @@ The CPU backends — see [Software (CPU) Backends](#software-cpu-backends--b-sw)
 port. Both keep the *control plane* (bitstream parsing, DPB, POC, ref lists, display-order
 reordering) on the shared `vacc-parser` state; only pixel reconstruction is codec-specific.
 
-### H.264 — edge264 port (`src/rust/`)
+### H.264 — edge264 port (`src/avc/`)
 - Bit-exact pure-Rust reimplementation of the edge264 slice-decode core: CABAC/CAVLC
   entropy decoding, intra/inter prediction, IDCT + dequantization, deblocking filter
 - SSE SIMD kernels for motion compensation (luma/chroma), the deblock filter, and
-  IDCT/dequant; every output is pinned to golden hashes (`src/rust/golden_data.rs`)
+  IDCT/dequant; every output is pinned to golden hashes (`src/avc/golden_data.rs`)
 - Supported: 8-bit 4:2:0 (and monochrome) progressive frame coding. Other formats
   (10-bit, 4:2:2/4:4:4, field/MBAFF, separate colour plane) are rejected up front with a
   clear error instead of mis-decoding

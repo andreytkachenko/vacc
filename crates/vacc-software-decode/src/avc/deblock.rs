@@ -2482,7 +2482,7 @@ pub(crate) use self::prim_tests::golden_entries;
 #[cfg(test)]
 mod prim_tests {
     use super::*;
-    use crate::rust::goldens;
+    use crate::avc::goldens;
 
     #[test]
     fn reinterpret_i16_i32_negatives() {
@@ -2852,7 +2852,7 @@ mod prim_tests {
     }
 
     pub(crate) fn golden_entries() -> Vec<(String, String)> {
-        crate::rust::goldens::collect(inter_deblock_fuzz_body)
+        crate::avc::goldens::collect(inter_deblock_fuzz_body)
     }
 
     /// fe=0 must be a guaranteed no-op (deblock_mb returns early).

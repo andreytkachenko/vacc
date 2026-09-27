@@ -1,5 +1,5 @@
-// Regenerates src/rust/oracle_luma.txt (the oracle used by
-// `oracle_luma` in src/rust/inter.rs).
+// Regenerates src/avc/oracle_luma.txt (the oracle used by
+// `oracle_luma` in src/avc/inter.rs).
 //
 // The Rust port of decode_inter_luma (edge264_inter.c, C tree deleted in the
 // E4 cutover, commit 9cdae1f^; see git history) is bit-exact against this
@@ -21,7 +21,7 @@
 //            -I /tmp/ziptest3/crates/vacc-sw-decode/c/src \
 //            crates/vacc-software-decode/oracle/harness.c -o /tmp/harness
 //   3. Regenerate (target path must be a tracked absolute path):
-//        /tmp/harness > <repo>/crates/vacc-software-decode/src/rust/oracle_luma.txt
+//        /tmp/harness > <repo>/crates/vacc-software-decode/src/avc/oracle_luma.txt
 //
 #include <stdint.h>
 #include <stdio.h>

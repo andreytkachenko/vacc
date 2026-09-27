@@ -3,7 +3,7 @@
 //! Every byte-exact output of a deterministic test case is reduced to a
 //! SHA-256 digest and pinned in a per-crate generated `golden_data.rs`
 //! (a `pub(crate) const GOLDENS: &[(&str, &str)]` table, `include!`d by the
-//! crate's `#[cfg(test)] goldens` module, e.g. `rust/goldens.rs` /
+//! crate's `#[cfg(test)] goldens` module, e.g. `avc/goldens.rs` /
 //! `hevc/goldens.rs`). The goldens pin behavior that was originally
 //! verified byte-exact against the C/C++ oracles (since deleted); no oracle
 //! sources are needed at test time.

@@ -2,7 +2,7 @@
 //! dependencies).
 //!
 //! These streams historically existed as copy-pasted blocks in up to ten
-//! test modules (`rust/tests.rs`, `rust/residual.rs`, `rust/deblock.rs`,
+//! test modules (`avc/tests.rs`, `avc/residual.rs`, `avc/deblock.rs`,
 //! `hevc/{bitreader,transform,interpolation,intra_prediction,deblocking,
 //! syntax_elements,sao}.rs`). The exact state updates and getters are
 //! pinned by the test vectors below — changing the streams INVALIDATES the
@@ -54,7 +54,7 @@ impl SplitMix64 {
     }
 }
 
-/// xorshift64* — used by the H.264 (`rust/`) slice-decode test matrices.
+/// xorshift64* — used by the H.264 (`avc/`) slice-decode test matrices.
 #[derive(Clone, Copy, Debug)]
 pub struct XorShift64Star(pub u64);
 
@@ -85,7 +85,7 @@ impl XorShift64Star {
 
 /// 64-bit LCG with the Numerical Recipes constants
 /// (`a = 6364136223846793005`, `c = 1442695040888963407`) — used by the
-/// H.264 `rust/{residual,deblock}.rs` tests.
+/// H.264 `avc/{residual,deblock}.rs` tests.
 #[derive(Clone, Copy, Debug)]
 pub struct Lcg(pub u64);
 

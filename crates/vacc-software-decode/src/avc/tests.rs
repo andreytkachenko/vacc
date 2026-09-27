@@ -5,14 +5,14 @@
 
 #![cfg(test)]
 
-use crate::rust::bits::SliceBits;
-use crate::rust::cabac::Cabac;
-use crate::rust::deblock::{
+use crate::avc::bits::SliceBits;
+use crate::avc::cabac::Cabac;
+use crate::avc::deblock::{
     DEBLOCK_LC_ROWS, DEBLOCK_LC_SIZE, DEBLOCK_LC_STRIDE, DEBLOCK_LY_ROWS, DEBLOCK_LY_SIZE,
     DEBLOCK_LY_STRIDE, DEBLOCK_MB_STATE_LEN, DEBLOCK_Y_COL,
 };
-use crate::rust::goldens;
-use crate::rust::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
+use crate::avc::goldens;
+use crate::avc::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
 
 const PAD: usize = 32;
 
@@ -274,10 +274,10 @@ fn compare_intra(kind: i32, mode: u32, buf: &[u8; INTRA_BUF], tag: &str) {
     // Rust run on the same inputs.
     let mut b = *buf;
     match kind {
-        0 => crate::rust::intra::intra4x4(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        1 => crate::rust::intra::intra8x8(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        2 => crate::rust::intra::intra16x16(&mut b, INTRA_O, INTRA_STRIDE, mode),
-        3 => crate::rust::intra::intra_chroma(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        0 => crate::avc::intra::intra4x4(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        1 => crate::avc::intra::intra8x8(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        2 => crate::avc::intra::intra16x16(&mut b, INTRA_O, INTRA_STRIDE, mode),
+        3 => crate::avc::intra::intra_chroma(&mut b, INTRA_O, INTRA_STRIDE, mode),
         _ => panic!("{tag}: bad kind {kind}"),
     }
     let rows = match kind {
@@ -379,7 +379,7 @@ fn compare_residual(
     tag: &str,
 ) {
     // Rust run on the same inputs.
-    let mut st = crate::rust::residual::Residual {
+    let mut st = crate::avc::residual::Residual {
         c: *coeffs,
         qp: *qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -501,7 +501,7 @@ fn compare_transform_dc(
 ) {
     // Rust run on the same inputs. op: 0 = transform_dc4x4(plane, flag),
     // 1 = transform_dc2x2(flag); flag = store_later (C guard bit).
-    let mut st = crate::rust::residual::Residual {
+    let mut st = crate::avc::residual::Residual {
         c: *coeffs,
         qp: *qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -563,7 +563,7 @@ fn transform_dc_handcheck() {
     let mut coeffs: [i32; 64] = [0; 64];
     coeffs[0] = 1024;
     let mut pix = [100u8; DC_PIX];
-    let mut st = crate::rust::residual::Residual {
+    let mut st = crate::avc::residual::Residual {
         c: coeffs,
         qp,
         ws4: std::array::from_fn(|i| std::array::from_fn(|j| ws4[i * 16 + j])),
@@ -674,7 +674,7 @@ fn compare_inter(
         dst[r * dstride..r * dstride + w].copy_from_slice(&dst_in[r * dstride..r * dstride + w]);
     }
     // `src` is the (h+5) x (w+5) neighborhood; block top-left at src+2*ss+2.
-    crate::rust::inter::inter_luma(src, &mut dst, w, h, mode, sstride, dstride, wod);
+    crate::avc::inter::inter_luma(src, &mut dst, w, h, mode, sstride, dstride, wod);
 
     let r_out: Vec<u8> = dst
         .chunks(dstride)
@@ -711,7 +711,7 @@ fn inter_fuzz_all_modes_body() {
                             &src,
                             dstride,
                             &dst_in,
-                            &crate::rust::inter::WOD_NO_WEIGHT,
+                            &crate::avc::inter::WOD_NO_WEIGHT,
                             &format!("inter {w}x{h} mode={mode} #{iter}"),
                         );
                     }
@@ -788,7 +788,7 @@ fn compare_chroma(
     for r in 0..h {
         dst[r * dstride..r * dstride + cw].copy_from_slice(&dst_in[r * dstride..r * dstride + cw]);
     }
-    crate::rust::inter::inter_chroma(src, &mut dst, w, h, x_frac, y_frac, sstride, dstride, wod);
+    crate::avc::inter::inter_chroma(src, &mut dst, w, h, x_frac, y_frac, sstride, dstride, wod);
 
     let r_out: Vec<u8> = dst
         .chunks(dstride)
@@ -825,7 +825,7 @@ fn chroma_fuzz_all_fracs_body() {
                             &dst_in,
                             x,
                             y,
-                            &crate::rust::inter::WOD_NO_WEIGHT,
+                            &crate::avc::inter::WOD_NO_WEIGHT,
                             &format!("chroma {w}x{h} x{x} y{y} #{iter}"),
                         );
                     }
@@ -851,7 +851,7 @@ fn chroma_fuzz_weighted_body() {
     // floor-division sra quirk (sh >= 15 saturates to sign, not i16 -32768).
     let mut rng = XorShift64Star(0x5eed_7c2d);
     let pats: [([i16; 8], &str); 9] = [
-        (crate::rust::inter::WOD_NO_WEIGHT, "no_weight"),
+        (crate::avc::inter::WOD_NO_WEIGHT, "no_weight"),
         (mk_wodc(1, 1, 1, 1, 1), "wq=1 wp=1 sh=1"),
         (mk_wodc(-2, 3, -5, 4, -4), "signed wq/wp, sh=-5"),
         (mk_wodc(127, -128, 6, 32767, -32768), "extremes+sat"),
@@ -931,7 +931,7 @@ fn residual_full_qp_domain_body() {
 
 #[test]
 fn deblock_oracle_smoke() {
-    use crate::rust::deblock::run_rust_deblock;
+    use crate::avc::deblock::run_rust_deblock;
     let mut rng = XorShift64Star(0xdeb1_0ca7);
     // Zero MB state (intra, QP=18) for all three slots; only the current MB's
     // filter_edges is varied. QP[3]@0, mbIsInterFlag@3, filter_edges@4.
@@ -1002,7 +1002,7 @@ fn compare_deblock(
     c_in: &[u8],
     tag: &str,
 ) -> bool {
-    let (r_y, r_c) = crate::rust::deblock::run_rust_deblock(
+    let (r_y, r_c) = crate::avc::deblock::run_rust_deblock(
         mb_state,
         fe,
         entropy,
@@ -1138,7 +1138,7 @@ fn deblock_fe_bits_firing_pattern_body() {
             }
         }
         let (r_y, r_c) =
-            crate::rust::deblock::run_rust_deblock(&mb_state, fe, 0, 0, 0, &y_in, &c_in);
+            crate::avc::deblock::run_rust_deblock(&mb_state, fe, 0, 0, 0, &y_in, &c_in);
         assert_ne!(
             r_y, y_in,
             "fe={fe}: no luma pixels filtered — pattern not firing"
@@ -1375,7 +1375,7 @@ fn mvpred_fuzz_body() {
             }
         }
 
-        let r_out = crate::rust::mvpred::run_rust_mvpred(&inb, op);
+        let r_out = crate::avc::mvpred::run_rust_mvpred(&inb, op);
         let key = format!("mvpred #{iter} op={op}");
         goldens::assert_golden(&key, &r_out);
         goldens::record(&key, &r_out);

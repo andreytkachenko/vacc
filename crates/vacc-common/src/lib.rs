@@ -1,17 +1,17 @@
-//! Code shared by the H.264 (`rust/`) and H.265 (`hevc/`) software decoders
+//! Code shared by the H.264 (`avc/`) and H.265 (`hevc/`) software decoders
 //! in `vacc-software-decode`.
 //!
 //! Scope (established by the DRY audit of the two decoders):
 //!
 //! - [`goldens`] — the golden-hash test infrastructure (SHA-256, keyed
 //!   assertions, record/collect, `golden_data.rs` writer) previously
-//!   duplicated line-by-line in `rust/goldens.rs` and `hevc/goldens.rs`.
+//!   duplicated line-by-line in `avc/goldens.rs` and `hevc/goldens.rs`.
 //! - [`rng`] — the deterministic test PRNGs (splitmix64, xorshift64*,
 //!   Numerical Recipes LCG) previously copy-pasted into up to ten test
 //!   modules.
 //! - [`clip`] — the bit-depth-agnostic saturation helpers.
 //!
-//! Deliberately NOT shared: the entropy layer (`rust/bits` + `rust/cabac`
+//! Deliberately NOT shared: the entropy layer (`avc/bits` + `avc/cabac`
 //! vs `hevc/bitreader` + `hevc/cabac`) and the reconstruction kernels
 //! (interpolation, intra, residual/transform, mvpred, deblocking). Those are
 //! ports of *different* reference implementations (edge264's C algorithms vs
