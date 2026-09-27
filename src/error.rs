@@ -30,7 +30,7 @@ fn format_failures(failures: &[BackendFailure]) -> String {
 #[derive(Debug, Error)]
 pub enum UnifiedError {
     /// Every backend in the configured order failed to initialize the stream.
-    #[error("all configured backends failed to initialize the stream:\n{details}", details = format_failures(&failures))]
+    #[error("all configured backends failed to initialize the stream:\n{details}", details = format_failures(failures))]
     AllBackendsFailed { failures: Vec<BackendFailure> },
 
     /// The configured backend list is empty.

@@ -17,7 +17,7 @@ use vacc_core::{
     session::Extent2D,
 };
 use vacc_parser::h265_dpb::{H265Dpb, resolve_refs};
-use vacc_parser::{BitstreamPacket, ParseResult, VideoParser, h265::H265Parser};
+use vacc_parser::{BitstreamPacket, PacketFlags, ParseResult, VideoParser, h265::H265Parser};
 
 use crate::{
     device::{
@@ -146,6 +146,11 @@ pub struct NvdecH265Decoder {
     pending_data: Vec<u8>,
     parsed_offset: usize,
 
+    /// End-of-stream latch set by [`Decoder::flush`]: the window's tail NAL is
+    /// then provably complete, so it is no longer held back. Cleared by
+    /// [`Decoder::reset`].
+    eos: bool,
+
     /// Reorder buffer for display-order presentation: (unwrapped_poc, seq) ->
     /// (surface_idx, seq, poc).
     reorder: BTreeMap<(i32, i32), (i32, i32, i32)>,
@@ -203,6 +208,7 @@ impl NvdecH265Decoder {
             prev_coded_size: Mutex::new((0, 0)),
             pending_data: data,
             parsed_offset: 0,
+            eos: false,
             reorder: BTreeMap::new(),
             presented_count: 0,
             seq_counter: 0,
@@ -290,10 +296,17 @@ impl NvdecH265Decoder {
             break;
         }
 
+        // Only a window that reaches the end of the buffered data can have its
+        // last NAL split across submits. A window cut at an internal start
+        // code contains only complete NALs — flagging it would make the parser
+        // hold back the (complete) tail NAL, which this pass would then
+        // consume without decoding.
+        let tail_hold = !self.eos && off + cut == self.pending_data.len();
         let window = self.pending_data[off..off + cut].to_vec();
 
         self.parser.invalidate_nal_cache();
-        let packet = BitstreamPacket::new(window);
+        let mut packet = BitstreamPacket::new(window);
+        packet.flags.set(PacketFlags::TRUNCATED_TAIL, tail_hold);
 
         let mut pictures = 0u32;
         let mut capped = false;
@@ -576,13 +589,33 @@ impl NvdecH265Decoder {
         }
 
         // A pass stopped at the picture budget resumes right after its last
-        // slice; any other exit consumed the whole window.
-        self.parsed_offset += if capped { last_consumed } else { cut };
-        Ok(if self.parsed_offset < self.pending_data.len() {
-            PassOutcome::More
+        // slice. A tail-hold pass (window reached the end of the buffered data
+        // and its last NAL may be incomplete) resumes right after the last
+        // complete NAL and reports Stalled: nothing more can be produced until
+        // new data is submitted or flush() runs. Any other exit consumed the
+        // whole window.
+        self.parsed_offset += if capped || tail_hold { last_consumed } else { cut };
+        let more = self.parsed_offset < self.pending_data.len();
+        self.compact();
+        Ok(if more {
+            if tail_hold {
+                PassOutcome::Stalled
+            } else {
+                PassOutcome::More
+            }
         } else {
             PassOutcome::Exhausted
         })
+    }
+
+    /// Free consumed input bytes so host memory stays flat on long streams.
+    /// Cut points are always start-code aligned (see [`window_end`]), so the
+    /// remaining data re-anchors cleanly at the new offset 0.
+    fn compact(&mut self) {
+        if self.parsed_offset > 0 {
+            self.pending_data.drain(..self.parsed_offset);
+            self.parsed_offset = 0;
+        }
     }
 
     /// Create the NVDEC decoder from SPS parameters.
@@ -1269,12 +1302,17 @@ impl Decoder for NvdecH265Decoder {
             }
             match self.parse_and_decode()? {
                 PassOutcome::More => continue,
-                PassOutcome::Exhausted => return Ok(None),
+                // The window tail NAL may be incomplete: wait for the next
+                // submit() (or flush() at end of stream).
+                PassOutcome::Stalled | PassOutcome::Exhausted => return Ok(None),
             }
         }
     }
 
     fn flush(&mut self) -> NvdecResult<Vec<DecodedFrame>> {
+        // End of stream: the window tail NAL is provably complete, so release
+        // it and process any remaining pending data first.
+        self.eos = true;
         while !matches!(self.parse_and_decode()?, PassOutcome::Exhausted) {}
         let mut frames: Vec<DecodedFrame> = {
             let mut pending = self.pending_frames.lock().unwrap();
@@ -1312,7 +1350,11 @@ impl Decoder for NvdecH265Decoder {
             let mut pending = self.pending_frames.lock().unwrap();
             pending.clear();
         }
+        // Drop all buffered input: the decoder is now ready for a new stream
+        // fed via submit() (same contract as the sw and vaapi backends).
+        self.pending_data.clear();
         self.parsed_offset = 0;
+        self.eos = false;
         self.reset_presentation_state();
         {
             let mut initialized = self.initialized.lock().unwrap();
@@ -1323,13 +1365,6 @@ impl Decoder for NvdecH265Decoder {
             *prev = (0, 0);
         }
         self.init_parser_format()?;
-        self.parse_and_decode()?;
-        let initialized = *self.initialized.lock().unwrap();
-        if !initialized {
-            return Err(NvdecError::DecoderCreationFailed(
-                "Parser did not reinitialize decoder after reset".into(),
-            ));
-        }
         Ok(())
     }
 }

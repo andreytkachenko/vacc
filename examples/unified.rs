@@ -9,14 +9,25 @@
 //!   -n, --max      <num>    stop after this many frames (default: all)
 //! ```
 
+use std::io::Read;
 use std::time::Instant;
 
 use vacc_core::decoder::Decoder;
-use vacc::{Backend, DecoderConfig, VaccDecoder};
+use vacc::{Backend, DecodedFrame, DecoderConfig, VaccDecoder};
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1)
+}
+
+/// Print one decoded frame and bump the counter.
+fn print_frame(frame: &DecodedFrame, total: &mut usize) {
+    let hash = frame.pixel_data.as_ref().map(|p| fnv1a(&p.buffer)).unwrap_or(0);
+    println!(
+        "frame {}: ts={} size={}x{} hash={:016x}",
+        *total, frame.timestamp, frame.width, frame.height, hash
+    );
+    *total += 1;
 }
 
 /// FNV-1a 64 over the frame's pixel buffer (smoke hash, no deps).
@@ -56,7 +67,6 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    let data = std::fs::read(&args.input).unwrap_or_else(|e| die(&format!("cannot read {}: {}", args.input, e)));
 
     let order: Vec<Backend> = args
         .order
@@ -67,9 +77,21 @@ fn main() {
         .collect();
     let config = DecoderConfig::new(order);
 
+    // Stream the file in chunks: seed the decoder with the head, then feed
+    // the rest via submit() and pull frames one at a time.
+    let mut file =
+        std::fs::File::open(&args.input).unwrap_or_else(|e| die(&format!("cannot read {}: {}", args.input, e)));
+    let mut probe = [0u8; 64 * 1024];
+    let n = file
+        .read(&mut probe)
+        .unwrap_or_else(|e| die(&format!("read: {}", e)));
+    if n == 0 {
+        die("empty input");
+    }
+
     let start = Instant::now();
     let mut decoder =
-        VaccDecoder::new(data, &config).unwrap_or_else(|e| die(&format!("init: {}", e)));
+        VaccDecoder::new(&probe[..n], &config).unwrap_or_else(|e| die(&format!("init: {}", e)));
     println!(
         "backend={} codec={:?} order={} size={}x{} profile={:?}",
         decoder.backend(),
@@ -80,22 +102,37 @@ fn main() {
         decoder.info().profile_idc
     );
 
-    let frames = decoder.decode_all(args.max_frames).unwrap_or_else(|e| die(&format!("decode: {}", e)));
-    if frames.is_empty() {
-        die("no frames decoded");
+    let mut total = 0usize;
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).unwrap_or_else(|e| die(&format!("read: {}", e)));
+        if n == 0 {
+            break;
+        }
+        decoder.submit(&buf[..n]).unwrap_or_else(|e| die(&format!("decode: {}", e)));
+        while total < args.max_frames {
+            match decoder.decode().unwrap_or_else(|e| die(&format!("decode: {}", e))) {
+                Some(frame) => print_frame(&frame, &mut total),
+                None => break,
+            }
+        }
     }
-    for (i, frame) in frames.iter().enumerate() {
-        let hash = frame.pixel_data.as_ref().map(|p| fnv1a(&p.buffer)).unwrap_or(0);
-        println!(
-            "frame {}: ts={} size={}x{} hash={:016x}",
-            i, frame.timestamp, frame.width, frame.height, hash
-        );
+    for frame in decoder.flush().unwrap_or_else(|e| die(&format!("decode: {}", e))) {
+        if total >= args.max_frames {
+            break;
+        }
+        print_frame(&frame, &mut total);
+    }
+
+    if total == 0 {
+        die("no frames decoded");
     }
     let elapsed = start.elapsed();
     println!(
         "total_frames={} elapsed={:?} fps={:.1}",
-        frames.len(),
+        total,
         elapsed,
-        frames.len() as f64 / elapsed.as_secs_f64()
+        total as f64 / elapsed.as_secs_f64()
     );
 }

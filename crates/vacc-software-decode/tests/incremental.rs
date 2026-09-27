@@ -59,6 +59,13 @@ fn whole_file() {
 /// as when the whole file is up front. Catches the `parse_offset` not being
 /// reset after full consumption in `submit()`, and the stale NAL cache being
 /// reused for two same-length chunks (parse() keys its cache on length).
+///
+/// Streaming contract: a picture may be held back until its display-order
+/// successor has decoded, so an individual submit can emit zero frames. What
+/// must never happen is an out-of-order emission: at every point the frames
+/// emitted so far are an exact prefix of the final display-order sequence.
+/// Held-back frames are released by later submits or by flush() at end of
+/// stream.
 #[test]
 fn incremental_per_access_unit() {
     let data = fs::read(SAMPLE).unwrap();
@@ -69,10 +76,8 @@ fn incremental_per_access_unit() {
     // Whole-file decode emits pictures in display order: POC is strictly
     // increasing within a GOP and restarts at each IDR.
     let mut last_poc = i32::MIN;
-    let mut restarts = 0;
     for f in &whole_frames {
         if f.poc <= last_poc {
-            restarts += 1;
             last_poc = i32::MIN;
         }
         assert!(f.poc > last_poc, "POC went backwards within a GOP: {} -> {}", last_poc, f.poc);
@@ -91,32 +96,39 @@ fn incremental_per_access_unit() {
         bootstrap.extend_from_slice(b);
     }
     let mut d = SwH264Decoder::new(bootstrap).unwrap();
-    let mut frames = 0usize;
-    let mut missing_frames_at: Vec<(usize, u8)> = Vec::new();
+    let mut emitted: Vec<vacc_core::frame::DecodedFrame> = Vec::new();
     for (idx, (_, t, chunk)) in units.iter().enumerate().skip(sidx) {
         if !is_slice_ty(*t) {
             continue; // parameter-set units produce no frames
         }
-        let before = frames;
         d.submit(chunk).unwrap();
-        while d.decode().unwrap().is_some() {
-            frames += 1;
-        }
-        if frames == before {
-            missing_frames_at.push((idx, *t));
+        while let Some(f) = d.decode().unwrap() {
+            // Mid-stream emissions must be an ordered prefix of the final
+            // display order: the next frame is exactly the next whole-file
+            // frame, pixel for pixel.
+            assert_eq!(
+                f.pixel_data.as_ref().unwrap().buffer,
+                whole_frames[emitted.len()].pixel_data.as_ref().unwrap().buffer,
+                "out-of-order emission at unit {idx} (frame {})",
+                emitted.len()
+            );
+            emitted.push(f);
         }
     }
-    frames += d.flush().unwrap().len();
-    println!(
-        "incremental: frames={frames} whole={whole_n} units={} missing_at={missing_frames_at:?}",
-        units.len()
-    );
-    assert!(
-        missing_frames_at.is_empty(),
-        "access units that produced no frame: {missing_frames_at:?}",
-    );
+    for f in d.flush().unwrap() {
+        assert_eq!(
+            f.pixel_data.as_ref().unwrap().buffer,
+            whole_frames[emitted.len()].pixel_data.as_ref().unwrap().buffer,
+            "out-of-order frame in flush (frame {})",
+            emitted.len()
+        );
+        emitted.push(f);
+    }
+    println!("incremental: frames={} whole={whole_n} units={}", emitted.len(), units.len());
     assert_eq!(
-        frames, whole_n,
-        "incremental decode produced {frames} frames, whole-file produced {whole_n}"
+        emitted.len(),
+        whole_n,
+        "incremental decode produced {} frames, whole-file produced {whole_n}",
+        emitted.len()
     );
 }

@@ -40,7 +40,7 @@ use vacc_core::{
 use vacc_parser::{
     DetectedVideoFormat, ParseResult, SliceHeader, VideoParser,
     av1::Av1Parser,
-    bitstream::BitstreamPacket,
+    bitstream::{BitstreamPacket, PacketFlags},
     h264::H264Parser,
     h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG, MARKING_SHORT},
     h264_poc::PocCalculator,
@@ -471,6 +471,10 @@ pub struct VaapiDecoder {
     /// `pending_data` every frame is O(n^2) on long files). Cleared on
     /// exhaustion or when [`Self::submit`] appends new data.
     stable_packet: Option<BitstreamPacket>,
+    /// End-of-stream latch set by [`Decoder::flush`]: the parse window's tail
+    /// NAL is then provably complete, so it is no longer held back. Cleared by
+    /// [`Decoder::reset`].
+    eos: bool,
     frame_count: u32,
     /// Reorder buffer of decoded-but-not-yet-emitted frames, keyed by display order.
     pending_frames: VecDeque<(i64, DecodedFrame) >,
@@ -733,6 +737,7 @@ impl VaapiDecoder {
             pending_data,
             parse_offset,
             stable_packet,
+            eos: false,
             frame_count: 0,
             pending_frames: VecDeque::new(),
             gop_count: 0,
@@ -1708,9 +1713,10 @@ impl Decoder for VaapiDecoder {
                     continue; // Loop back to try emitting.
                 }
                 None => {
-                    // No frame decoded. If we made no progress and nothing is
-                    // buffered, stop to avoid spinning.
-                    if self.parse_offset == offset_before && self.pending_frames.is_empty() {
+                    // No frame decoded. Any no-progress exit must return to
+                    // the caller: with a held-back tail NAL (or an unreleased
+                    // buffered frame) continuing here would spin.
+                    if self.parse_offset == offset_before {
                         return Ok(None);
                     }
                     continue;
@@ -1720,6 +1726,11 @@ impl Decoder for VaapiDecoder {
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+        // End of stream: the window tail NAL is provably complete, so decode
+        // any remaining input before draining buffered frames.
+        self.eos = true;
+        while self.decode()?.is_some() {}
+
         // Sync all Pending surfaces to make them Ready
         for i in 0..self.surface_pool.entries.len() {
             if let SurfaceState::Pending(_) = self.surface_pool.entries[i].state {
@@ -1777,6 +1788,7 @@ impl Decoder for VaapiDecoder {
         self.pending_data.clear();
         self.parse_offset = 0;
         self.stable_packet = None;
+        self.eos = false;
         self.pending_frames.clear();
         self.frame_count = 0;
         self.gop_count = 0;
@@ -1846,7 +1858,12 @@ impl VaapiDecoder {
     /// re-scan/re-copy per frame); otherwise rebuilds a packet from the
     /// unconsumed tail of `pending_data`.
     fn parse_next_h264(&mut self) -> Result<ParseResult> {
+        // The window's tail NAL may be split across submits: flag it as
+        // possibly truncated until end of stream (set explicitly — a
+        // re-inserted stable packet may carry a stale flag from an earlier
+        // non-eos call).
         if let Some(pkt) = &mut self.stable_packet {
+            pkt.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
             let parser = self
                 .parser
                 .as_mut()
@@ -1857,7 +1874,8 @@ impl VaapiDecoder {
             return Ok(ParseResult::Nothing);
         }
         let remaining = &self.pending_data[self.parse_offset..];
-        let packet = BitstreamPacket::new(remaining.to_vec());
+        let mut packet = BitstreamPacket::new(remaining.to_vec());
+        packet.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
         let parser = self
             .parser
             .as_mut()
@@ -1867,7 +1885,9 @@ impl VaapiDecoder {
 
     /// Parse one unit from the H.265 input (see [`Self::parse_next_h264`]).
     fn parse_next_h265(&mut self) -> Result<ParseResult> {
+        // See [`Self::parse_next_h264`] for the truncation rule.
         if let Some(pkt) = &mut self.stable_packet {
+            pkt.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
             let parser = self
                 .h265_parser
                 .as_mut()
@@ -1878,7 +1898,8 @@ impl VaapiDecoder {
             return Ok(ParseResult::Nothing);
         }
         let remaining = &self.pending_data[self.parse_offset..];
-        let packet = BitstreamPacket::new(remaining.to_vec());
+        let mut packet = BitstreamPacket::new(remaining.to_vec());
+        packet.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
         let parser = self
             .h265_parser
             .as_mut()
@@ -2091,10 +2112,15 @@ impl VaapiDecoder {
                     return self.decode_h264_frame_multi_slice(&slices, timestamp);
                 }
                 ParseResult::Nothing | ParseResult::EndOfStream => {
-                    if let Some(pkt) = self.stable_packet.take() {
-                        self.parse_offset = pkt.payload.len();
-                    } else {
-                        self.parse_offset = self.pending_data.len();
+                    // At end of stream the window's tail NAL is complete; at
+                    // any other time it was held back — wait for more data or
+                    // flush() without consuming it.
+                    if self.eos {
+                        if let Some(pkt) = self.stable_packet.take() {
+                            self.parse_offset = pkt.payload.len();
+                        } else {
+                            self.parse_offset = self.pending_data.len();
+                        }
                     }
                     return Ok(None);
                 }
@@ -2161,10 +2187,15 @@ impl VaapiDecoder {
                     return self.decode_h265_frame(&h265_slices, timestamp);
                 }
                 ParseResult::Nothing | ParseResult::EndOfStream => {
-                    if let Some(pkt) = self.stable_packet.take() {
-                        self.parse_offset = pkt.payload.len();
-                    } else {
-                        self.parse_offset = self.pending_data.len();
+                    // At end of stream the window's tail NAL is complete; at
+                    // any other time it was held back — wait for more data or
+                    // flush() without consuming it.
+                    if self.eos {
+                        if let Some(pkt) = self.stable_packet.take() {
+                            self.parse_offset = pkt.payload.len();
+                        } else {
+                            self.parse_offset = self.pending_data.len();
+                        }
                     }
                     return Ok(None);
                 }

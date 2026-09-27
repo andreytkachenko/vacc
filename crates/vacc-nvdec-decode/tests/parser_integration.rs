@@ -501,6 +501,7 @@ fn test_picparams_sps_field_mapping() {
     let mock_slh = vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 4, // I-slice
+        adaptive_ref_pic_marking_mode_flag: false,
         pic_parameter_set_id: pps.pic_parameter_set_id,
         frame_num: 0,
         idr_pic_id: 0,
@@ -608,6 +609,7 @@ fn create_mock_slice_header(pps: &vacc_core::picture::H264Pps) -> vacc_parser::h
     vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 4,
+        adaptive_ref_pic_marking_mode_flag: false,
         pic_parameter_set_id: pps.pic_parameter_set_id,
         frame_num: 0,
         idr_pic_id: 0,

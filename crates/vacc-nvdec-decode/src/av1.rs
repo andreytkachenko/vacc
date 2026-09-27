@@ -789,22 +789,6 @@ impl NvdecAv1Decoder {
                 {
                     match self.parser.parse_sequence_header_obu(&sps_payload) {
                         Ok(s) => {
-                            eprintln!(
-                                "[AV1-DBG] SPS: profile={} maxw-1={} maxh-1={} ohb-1={} 128x128={} sub={}/{} mono={} highbit={} 12bit={} cdef={} restoration={} superres={}",
-                                s.profile,
-                                s.max_frame_width_minus_1,
-                                s.max_frame_height_minus_1,
-                                s.order_hint_bits_minus1,
-                                s.use_128x128_superblock,
-                                s.subsampling_x,
-                                s.subsampling_y,
-                                s.mono_chrome,
-                                s.high_bitdepth,
-                                s.twelve_bit,
-                                s.enable_cdef,
-                                s.enable_restoration,
-                                s.enable_superres
-                            );
                             *self.sps.lock().unwrap() = Some(s);
                         }
                         Err(e) => {
@@ -825,6 +809,7 @@ impl NvdecAv1Decoder {
                 }
                 self.parsed_offset += 12 + size;
                 if pictures >= MAX_PICTURES_PER_PASS {
+                    self.compact();
                     return Ok(PassOutcome::More);
                 }
             }
@@ -836,7 +821,18 @@ impl NvdecAv1Decoder {
                 self.parsed_offset = self.pending_data.len();
             }
         }
+        self.compact();
         Ok(PassOutcome::Exhausted)
+    }
+
+    /// Free consumed input bytes so host memory stays flat on long streams.
+    /// IVF packet boundaries are self-delimiting, so the remaining data
+    /// re-anchors cleanly at the new offset 0.
+    fn compact(&mut self) {
+        if self.parsed_offset > 0 {
+            self.pending_data.drain(..self.parsed_offset);
+            self.parsed_offset = 0;
+        }
     }
 
     /// Stage `src` into the cached pinned (page-locked) host buffer and return
@@ -1136,10 +1132,6 @@ impl NvdecAv1Decoder {
 
     /// Handle a coded-size change on a later frame.
     fn recreate_decoder(&mut self, fd: &Av1FrameHeader, sps: &Av1Sps) -> NvdecResult<()> {
-        eprintln!(
-            "[recreate] AV1 decoder reconfigured {}x{}",
-            fd.frame_width, fd.frame_height
-        );
         let funcs = get_funcs()?;
         let _ = cu_ctx_set_current();
         let decoder_handle = {
@@ -1545,7 +1537,9 @@ impl Decoder for NvdecAv1Decoder {
             }
             match self.parse_and_decode()? {
                 PassOutcome::More => continue,
-                PassOutcome::Exhausted => return Ok(None),
+                // IVF packets are self-delimiting: a partial trailing packet
+                // simply waits for the next submit().
+                PassOutcome::Stalled | PassOutcome::Exhausted => return Ok(None),
             }
         }
     }
@@ -1580,6 +1574,10 @@ impl Decoder for NvdecAv1Decoder {
             *count = 0;
         }
         self.display_count = 0;
+        // Drop all buffered input: ready for a new stream fed via submit()
+        // (same contract as the sw and vaapi backends). For IVF, skip the
+        // 32-byte container header of the next stream.
+        self.pending_data.clear();
         self.parsed_offset = if self.is_ivf { IVF_HEADER_SIZE } else { 0 };
         {
             let mut initialized = self.initialized.lock().unwrap();
@@ -1590,13 +1588,6 @@ impl Decoder for NvdecAv1Decoder {
             *prev = (0, 0);
         }
         self.init_parser_format()?;
-        self.parse_and_decode()?;
-        let initialized = *self.initialized.lock().unwrap();
-        if !initialized {
-            return Err(NvdecError::DecoderCreationFailed(
-                "Parser did not reinitialize decoder after reset".into(),
-            ));
-        }
         Ok(())
     }
 }

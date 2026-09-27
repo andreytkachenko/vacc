@@ -13,6 +13,14 @@ bitflags::bitflags! {
         const TIMESTAMP = 0x02;
         const DISCONTINUITY = 0x04;
         const END_OF_PICTURE = 0x08;
+        /// The payload tail may be incomplete: this is an incremental window
+        /// that can still grow with further data. A parser honoring this flag
+        /// must not commit NAL units that reach the end of the payload without
+        /// a terminating start code — such a NAL may be truncated, and
+        /// decoding a truncated slice corrupts the picture and every frame
+        /// that references it. The consumer clears the flag (or signals end
+        /// of stream) once no more data will arrive.
+        const TRUNCATED_TAIL = 0x10;
     }
 }
 

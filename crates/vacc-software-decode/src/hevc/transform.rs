@@ -1225,12 +1225,23 @@ mod tests {
     }
 
     #[test]
-    fn transform_skip_identity_at_15bit() {
-        // At 15-bit depth the transform-skip shift is 0: identity.
+    fn transform_skip_shift_regimes() {
+        // Transform-skip shift = 15 - BitDepth - log2_size (matches FFmpeg
+        // hevcdsp.dequant; verified byte-exact vs ffmpeg on bussiness.h265,
+        // which contains 200+ transform-skip TUs).
         let coeffs = [3i16, -4, 5, 6, 7, -8, 9, 10, 11, -12, 13, 14, 15, -16, 17, 18];
+        // shift == 0 -> identity (13-bit depth, 4x4: 15 - 13 - 2 = 0).
         let mut out = vec![0i16; 16];
-        perform_transform_inverse(2, 1, false, true, 15, &coeffs, &mut out);
+        perform_transform_inverse(2, 1, false, true, 13, &coeffs, &mut out);
         assert_eq!(out, coeffs);
+        // shift > 0 -> round-right (8-bit 4x4: shift 5, add 16).
+        perform_transform_inverse(2, 1, false, true, 8, &coeffs, &mut out);
+        let expect: Vec<i16> = coeffs.iter().map(|&c| ((c as i32 + 16) >> 5) as i16).collect();
+        assert_eq!(out, expect);
+        // shift < 0 -> left shift (15-bit 4x4: shift -2).
+        perform_transform_inverse(2, 1, false, true, 15, &coeffs, &mut out);
+        let expect: Vec<i16> = coeffs.iter().map(|&c| ((c as i32) << 2) as i16).collect();
+        assert_eq!(out, expect);
     }
 
     #[test]

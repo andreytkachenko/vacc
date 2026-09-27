@@ -22,7 +22,7 @@ use vacc_core::format::{ChromaSubsampling, ComponentBitDepth, VideoFormat};
 use vacc_core::frame::{DecodedFrame, PixelData, PixelPlane};
 use vacc_core::picture::{H264Pps, H264Sps};
 use vacc_core::session::Extent2D;
-use vacc_parser::bitstream::BitstreamPacket;
+use vacc_parser::bitstream::{BitstreamPacket, PacketFlags};
 use vacc_parser::h264::H264Parser;
 use vacc_parser::h264_dpb::{H264Dpb, H264MmcoCommand, MARKING_LONG};
 use vacc_parser::h264_poc::PocCalculator;
@@ -134,6 +134,10 @@ pub struct SwH264Decoder {
     /// every frame is O(n^2) on long files). Cleared on exhaustion or when
     /// [`Self::feed`] appends new data.
     stable_packet: Option<BitstreamPacket>,
+    /// End-of-stream latch set by [`Decoder::flush`]: the parse window's tail
+    /// NAL is then provably complete, so it is no longer held back. Cleared by
+    /// [`Decoder::reset`].
+    eos: bool,
 
     // Output reordering (B frames).
     frame_count: u32,
@@ -240,6 +244,7 @@ impl SwH264Decoder {
             gop_count: 0,
             pending_key: 0,
             pending_frames: VecDeque::new(),
+            eos: false,
             mb_dump: RefCell::default(),
             flip_bits: 0,
             dec_next: 0,
@@ -425,8 +430,14 @@ impl SwH264Decoder {
         if let Some(packet) = self.stable_packet.take() {
             // Stable-packet path: the parser's NAL cache spans the whole
             // payload, so successive parse() calls advance the internal
-            // cursor with no re-scan and no per-frame copy.
+            // cursor with no re-scan and no per-frame copy. The packet may be
+            // a streaming probe (more data can still arrive via submit()), so
+            // its tail NAL is held back until end of stream — same rule as
+            // the incremental path below.
             let mut pkt = packet;
+            // The re-inserted packet may still carry the flag from an earlier
+            // (non-eos) call, so set it explicitly instead of OR-ing.
+            pkt.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
             loop {
                 match self.parser.parse(&pkt) {
                     Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
@@ -445,8 +456,14 @@ impl SwH264Decoder {
                         return r;
                     }
                     Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => {
-                        // Stream exhausted; the packet is consumed for good.
-                        self.parse_offset = pkt.payload.len();
+                        if self.eos {
+                            // Stream exhausted; the packet is consumed for good.
+                            self.parse_offset = pkt.payload.len();
+                        } else {
+                            // Tail NAL held back: keep the packet (and its
+                            // parser cursor) for the next call.
+                            self.stable_packet = Some(pkt);
+                        }
                         return Ok(None);
                     }
                     Err(e) => return Err(Error::Parser(e.to_string())),
@@ -455,13 +472,19 @@ impl SwH264Decoder {
         }
 
         // Incremental path (after feed()): rebuild a packet from the
-        // unconsumed tail.
+        // unconsumed tail. The tail NAL may be split across submits, so flag
+        // the window as possibly truncated until end of stream: the parser
+        // then holds back a NAL that reaches the payload end without a
+        // terminating start code instead of decoding it truncated.
         loop {
             if self.parse_offset >= self.pending_data.len() {
                 return Ok(None);
             }
             let remaining = &self.pending_data[self.parse_offset..];
-            let packet = BitstreamPacket::new(remaining.to_vec());
+            let mut packet = BitstreamPacket::new(remaining.to_vec());
+            if !self.eos {
+                packet.flags |= PacketFlags::TRUNCATED_TAIL;
+            }
             match self.parser.parse(&packet) {
                 Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
                     self.apply_parameter_set(sps, pps)?;
@@ -478,7 +501,12 @@ impl SwH264Decoder {
                     return self.decode_h264_frame(&slices);
                 }
                 Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => {
-                    self.parse_offset = self.pending_data.len();
+                    // At end of stream the window's tail NAL is complete; at
+                    // any other time it was held back — wait for more data or
+                    // flush() without consuming it.
+                    if self.eos {
+                        self.parse_offset = self.pending_data.len();
+                    }
                     return Ok(None);
                 }
                 Err(e) => return Err(Error::Parser(e.to_string())),
@@ -1212,10 +1240,15 @@ impl Decoder for SwH264Decoder {
             // IDR would be correct but unbounded — on long-GOP 4K content it
             // accumulates whole GOPs of pixel buffers and OOMs.
             if let Some(&(front_key, _)) = self.pending_frames.front() {
-                if self.input_exhausted() || front_key < self.pending_key {
+                if front_key < self.pending_key {
                     return Ok(Some(self.pending_frames.pop_front().unwrap().1));
                 }
             }
+            // No releasable frame. A temporarily empty input buffer (between
+            // submits) is NOT end of stream: releasing held-back frames here
+            // would emit them ahead of display-order successors arriving in
+            // later chunks. They are released when their successors decode,
+            // or by flush() at true end of stream.
             if self.input_exhausted() {
                 return Ok(None);
             }
@@ -1232,7 +1265,9 @@ impl Decoder for SwH264Decoder {
                     continue;
                 }
                 None => {
-                    if self.parse_offset == offset_before && self.pending_frames.is_empty() {
+                    // No complete access unit right now (mid-AU): return to
+                    // the caller instead of spinning.
+                    if self.parse_offset == offset_before {
                         return Ok(None);
                     }
                     continue;
@@ -1242,6 +1277,28 @@ impl Decoder for SwH264Decoder {
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>, Self::Error> {
+        // End of stream: the window tail NAL is provably complete, so release
+        // it and decode any remaining input before draining the reorder buffer.
+        self.eos = true;
+        while !self.input_exhausted() {
+            let offset_before = self.parse_offset;
+            match self.decode_one()? {
+                Some(frame) => {
+                    let key = self.pending_key;
+                    let pos = self
+                        .pending_frames
+                        .iter()
+                        .position(|(k, _)| *k > key)
+                        .unwrap_or(self.pending_frames.len());
+                    self.pending_frames.insert(pos, (key, frame));
+                }
+                None => {
+                    if self.parse_offset == offset_before {
+                        break;
+                    }
+                }
+            }
+        }
         let mut frames = Vec::new();
         while let Some((_, frame)) = self.pending_frames.pop_front() {
             frames.push(frame);
@@ -1261,6 +1318,7 @@ impl Decoder for SwH264Decoder {
         self.pending_data.clear();
         self.parse_offset = 0;
         self.stable_packet = None;
+        self.eos = false;
         self.frame_count = 0;
         self.gop_count = 0;
         self.pending_frames.clear();
@@ -1374,7 +1432,7 @@ mod tests {
         dec.arm_mb_dump();
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
         let mut frames = 0usize;
-        while let Some(frame) = dec.decode().unwrap() {
+        let mut pin = |frame: &DecodedFrame| {
             if let Some(pd) = &frame.pixel_data {
                 let key = format!("stream::{name}::f{frames}");
                 crate::rust::goldens::assert_golden(&key, &pd.buffer);
@@ -1382,8 +1440,15 @@ mod tests {
                 out.push((key, pd.buffer.clone()));
             }
             frames += 1;
+        };
+        while let Some(frame) = dec.decode().unwrap() {
+            pin(&frame);
         }
-        frames += dec.flush().unwrap().len();
+        // Reorder-held tail frames come out of flush(); pin them with the
+        // same per-frame keys.
+        for frame in dec.flush().unwrap() {
+            pin(&frame);
+        }
         assert!(frames > 0, "{name}: no frames decoded");
         for (si, rec) in dec.take_rust_records().iter().enumerate() {
             let key = format!("stream::{name}::s{si}");

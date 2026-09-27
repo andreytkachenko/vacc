@@ -6851,5 +6851,5 @@ pub(crate) const GOLDENS: &[(&str, &str)] = &[
     ("transform::dequant_default_lists", "302161798aa48d2fa18dacd9243419882f8d141f79532acd6dd9728d869c1596"),
     ("transform::dequant_flat", "8ba4e7375c962b854768653f98a668d9e6aa324ca60fc67155bbe4f009f98f93"),
     ("transform::dequant_scaling_lists", "ce83dc71fe4d2e879c68e9e968f66e78725d42d570ea846dae039187646851be"),
-    ("transform::inverse", "17d66c310719306bce3f7741e18f44d601a77a0ee7d8df04b44f12a27d12f71e"),
+    ("transform::inverse", "bd350f3a8a38d5c5b15d9ff8d6a71620d2493007f281f53c9a10f300c7a72256"),
 ];

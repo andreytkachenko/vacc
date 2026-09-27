@@ -42,6 +42,11 @@ pub struct H264Parser {
     cached_payload_len: usize,
     /// Cursor into `cached_nals`: index of the next NAL unit to process.
     nal_cursor: usize,
+    /// True when the last cached NAL reaches the end of its payload without a
+    /// terminating start code. Such a NAL is complete only if the payload is
+    /// the true stream end; for a window flagged [`PacketFlags::TRUNCATED_TAIL`]
+    /// it may be truncated and is held back (see `parse`).
+    last_nal_unterminated: bool,
 }
 
 /// Fields of a prediction weight table (H.264 spec 7.4.4), in bitstream order.
@@ -88,6 +93,7 @@ impl H264Parser {
             cached_nals: Vec::new(),
             cached_payload_len: 0,
             nal_cursor: 0,
+            last_nal_unterminated: false,
         }
     }
 
@@ -123,6 +129,7 @@ impl H264Parser {
         self.cached_nals.clear();
         self.cached_payload_len = 0;
         self.nal_cursor = 0;
+        self.last_nal_unterminated = false;
     }
 
     /// Parse VUI parameters from the bitstream.
@@ -1307,6 +1314,12 @@ impl VideoParser for H264Parser {
             self.cached_payload_len = packet.payload.len();
             self.nal_cursor = 0;
             self.processed_up_to = 0;
+            // A NAL that runs to the payload end without a terminating start
+            // code is only provably complete at the true stream end.
+            self.last_nal_unterminated = self
+                .cached_nals
+                .last()
+                .is_some_and(|n| n.offset + n.size == packet.payload.len());
         }
 
         if self.nal_cursor >= self.cached_nals.len() {
@@ -1327,6 +1340,31 @@ impl VideoParser for H264Parser {
 
         let mut i = self.nal_cursor;
         while i < self.cached_nals.len() {
+            // Hold back a possibly-incomplete trailing NAL: without a
+            // terminating start code a window flagged TRUNCATED_TAIL cannot
+            // distinguish a complete NAL from a truncated one. It is
+            // re-considered once more data arrives or at end of stream (when
+            // the consumer clears the flag). A partially collected picture is
+            // held back as a whole — its remaining slices may lie in the
+            // truncated tail, and decoding a partial picture corrupts output.
+            if packet.flags.contains(crate::bitstream::PacketFlags::TRUNCATED_TAIL)
+                && self.last_nal_unterminated
+                && i + 1 == self.cached_nals.len()
+            {
+                if !slices.is_empty() {
+                    // Roll the picture back so it is re-collected next pass.
+                    i = first_slice_cursor.unwrap_or(i);
+                    slices.clear();
+                    self.current_frame_num = None;
+                    self.current_poc_lsb = None;
+                    self.first_slice_header.take();
+                    // Undo the count taken when the first slice header was
+                    // parsed, so the retry does not double-count.
+                    self.frame_count = self.frame_count.saturating_sub(1);
+                }
+                break;
+            }
+
             let nal = &self.cached_nals[i];
 
             match H264NalUnitType::from_u8(nal.nal_unit_type) {
@@ -1543,6 +1581,7 @@ impl VideoParser for H264Parser {
         self.cached_nals.clear();
         self.cached_payload_len = 0;
         self.nal_cursor = 0;
+        self.last_nal_unterminated = false;
     }
 
     fn detected_format(&self) -> &DetectedVideoFormat {

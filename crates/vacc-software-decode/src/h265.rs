@@ -25,7 +25,10 @@ use vacc_core::session::Extent2D;
 
 use vacc_parser::h265::H265Parser;
 use vacc_parser::h265_dpb::H265Dpb;
-use vacc_parser::{BitstreamPacket, DetectedVideoFormat, ParseResult, SliceEntry, SliceHeader, VideoParser};
+use vacc_parser::{
+    BitstreamPacket, DetectedVideoFormat, PacketFlags, ParseResult, SliceEntry, SliceHeader,
+    VideoParser,
+};
 
 use crate::error::{Error, Result};
 use crate::hevc::driver::{self, PictureStore, RefListEntry, SliceInput};
@@ -95,6 +98,10 @@ pub struct SoftwareH265Decoder {
     /// picture arrives (the parser's `bytes_consumed` for that slice covers
     /// them).
     ps_pending: bool,
+    /// End-of-stream latch set by [`Decoder::flush`]: the packet's tail NAL is
+    /// then provably complete, so it is no longer held back. Cleared by
+    /// [`Self::reset_state`].
+    eos: bool,
 
     // Display-order reorder state.
     reorder: BTreeMap<(i32, i32), BufferedFrame>, // (uw_poc, seq) -> frame
@@ -503,6 +510,11 @@ impl SoftwareH265Decoder {
             return Ok(false);
         }
 
+        // The packet holds all unconsumed bytes, so its tail NAL may be split
+        // across submits: flag the window as possibly truncated until end of
+        // stream and let the parser hold back an unterminated trailing NAL.
+        self.packet.flags.set(PacketFlags::TRUNCATED_TAIL, !self.eos);
+
         loop {
             match self.parser.parse(&self.packet) {
                 Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
@@ -576,7 +588,12 @@ impl SoftwareH265Decoder {
                         // PS NALs buffered but no slice yet: wait for more data.
                         return Ok(false);
                     }
-                    self.parse_offset = self.packet.payload.len();
+                    // At end of stream the window's tail NAL is complete; at
+                    // any other time it was held back — wait for more data or
+                    // flush() without consuming it.
+                    if self.eos {
+                        self.parse_offset = self.packet.payload.len();
+                    }
                     return Ok(false);
                 }
                 Ok(ParseResult::EndOfStream) => {
@@ -766,6 +783,7 @@ impl SoftwareH265Decoder {
         self.max_seq = 0;
         self.seq_counter = 0;
         self.ps_pending = false;
+        self.eos = false;
         self.parse_offset = self.packet.payload.len();
     }
 }
@@ -809,6 +827,7 @@ impl Decoder for SoftwareH265Decoder {
             packet: BitstreamPacket::new(data),
             parse_offset: 0,
             ps_pending: false,
+            eos: false,
             reorder: BTreeMap::new(),
             pending: VecDeque::new(),
             poc_period: 1,
@@ -912,6 +931,15 @@ impl Decoder for SoftwareH265Decoder {
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+        // End of stream: the tail NAL is provably complete, so decode any
+        // remaining input before draining the reorder buffer.
+        self.eos = true;
+        while self.parse_offset < self.packet.payload.len() {
+            let before = self.parse_offset;
+            if !self.decode_next_picture()? && self.parse_offset == before {
+                break; // no progress (e.g. a parameter-set-only tail)
+            }
+        }
         let mut out: Vec<DecodedFrame> = self.pending.drain(..).collect();
         // Drain the reorder buffer in display (POC) order.
         while let Some((&key, _)) = self.reorder.iter().next() {

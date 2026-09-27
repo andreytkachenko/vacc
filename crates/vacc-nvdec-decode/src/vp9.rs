@@ -485,6 +485,7 @@ impl NvdecVp9Decoder {
                 }
                 self.parsed_offset += 12 + size;
                 if pictures >= MAX_PICTURES_PER_PASS {
+                    self.compact();
                     return Ok(PassOutcome::More);
                 }
             }
@@ -496,7 +497,18 @@ impl NvdecVp9Decoder {
                 self.parsed_offset = self.pending_data.len();
             }
         }
+        self.compact();
         Ok(PassOutcome::Exhausted)
+    }
+
+    /// Free consumed input bytes so host memory stays flat on long streams.
+    /// IVF packet boundaries are self-delimiting, so the remaining data
+    /// re-anchors cleanly at the new offset 0.
+    fn compact(&mut self) {
+        if self.parsed_offset > 0 {
+            self.pending_data.drain(..self.parsed_offset);
+            self.parsed_offset = 0;
+        }
     }
 
     /// Parse and decode one (superframe-expanded) VP9 frame.
@@ -1142,7 +1154,9 @@ impl Decoder for NvdecVp9Decoder {
             }
             match self.parse_and_decode()? {
                 PassOutcome::More => continue,
-                PassOutcome::Exhausted => return Ok(None),
+                // IVF packets are self-delimiting: a partial trailing packet
+                // simply waits for the next submit().
+                PassOutcome::Stalled | PassOutcome::Exhausted => return Ok(None),
             }
         }
     }
@@ -1179,6 +1193,10 @@ impl Decoder for NvdecVp9Decoder {
             *count = 0;
         }
         self.display_count = 0;
+        // Drop all buffered input: ready for a new stream fed via submit()
+        // (same contract as the sw and vaapi backends). For IVF, skip the
+        // 32-byte container header of the next stream.
+        self.pending_data.clear();
         self.parsed_offset = if self.is_ivf { IVF_HEADER_SIZE } else { 0 };
         {
             let mut initialized = self.initialized.lock().unwrap();
@@ -1189,13 +1207,6 @@ impl Decoder for NvdecVp9Decoder {
             *prev = (0, 0);
         }
         self.init_parser_format()?;
-        self.parse_and_decode()?;
-        let initialized = *self.initialized.lock().unwrap();
-        if !initialized {
-            return Err(NvdecError::DecoderCreationFailed(
-                "Parser did not reinitialize decoder after reset".into(),
-            ));
-        }
         Ok(())
     }
 }

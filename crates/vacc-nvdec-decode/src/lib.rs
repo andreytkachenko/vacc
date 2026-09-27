@@ -187,6 +187,11 @@ pub enum PassOutcome {
     /// The per-pass picture budget was hit while input remained in the
     /// current window. Call `decode` (or `flush`) again to continue.
     More,
+    /// The window was processed as far as possible, but its tail NAL may be
+    /// incomplete (the window reached the end of the buffered data). No
+    /// further pictures can be produced until new data is submitted — or
+    /// `flush()` runs at end of stream, which releases the held tail.
+    Stalled,
     /// The current input window is fully consumed; no further pictures will be
     /// produced from it until new data is submitted.
     Exhausted,

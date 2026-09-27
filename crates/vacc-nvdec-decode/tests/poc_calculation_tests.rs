@@ -142,6 +142,7 @@ fn create_slice_header(
     vacc_parser::h264::SliceHeader {
         first_mb_in_slice: 0,
         slice_type: 0, // P slice
+        adaptive_ref_pic_marking_mode_flag: false,
         pic_parameter_set_id: 0,
         frame_num,
         idr_pic_id: 0,

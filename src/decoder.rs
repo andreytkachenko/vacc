@@ -1,4 +1,18 @@
-//! The unified decoder: one API over all backends, with fallback.
+//! The unified decoder: one streaming API over all backends, with fallback.
+//!
+//! The public surface is streaming-only:
+//!
+//! 1. Construct from an initial bitstream chunk (header + first access
+//!    units) via [`VaccDecoder::new`] / [`VaccDecoder::new_auto`]. That chunk
+//!    is consumed as the first input; it must be large enough for the
+//!    selected backend to find its parameter sets (a few tens of KiB always
+//!    suffices for Annex-B / IVF streams).
+//! 2. Feed the remainder of the stream with [`Decoder::submit`] and pull
+//!    frames with [`Decoder::decode`], interleaving as data arrives.
+//! 3. At end of stream, drain the reordering buffer with [`Decoder::flush`].
+//!
+//! No API takes or returns the whole stream: input is owned by the caller
+//! and output is pulled one frame at a time.
 
 use std::collections::VecDeque;
 
@@ -66,8 +80,13 @@ impl_any_decode!(vacc_software_decode::SoftwareH265Decoder);
 
 /// Adapter around the Vulkan backend, which decodes the whole stream at once
 /// (its inner decoder has no incremental submit/decode API). Submitted data is
-/// buffered; on the first `decode()` call the full stream is decoded and
-/// frames are served one by one.
+/// buffered; on the first `decode()` call the accumulated stream is decoded in
+/// one pass and frames are served one by one.
+///
+/// Memory note: unlike the streaming backends, this backend holds the entire
+/// input stream (buffered here, plus a GPU bitstream copy) and every decoded
+/// frame until it is pulled. For long-running streams prefer `nvdec`,
+/// `vaapi` or `software` in the backend order.
 #[cfg(feature = "vulkan")]
 struct VulkanAdapter {
     data: Vec<u8>,
@@ -105,27 +124,13 @@ impl VulkanAdapter {
 
 /// Convert a Vulkan backend frame (coded-size planes) into the core frame
 /// type with cropped, display-size planes — the same convention the other
-/// backends use.
+/// backends use. All three planes are packed into a single allocation: one
+/// `Vec`, one copy per pixel, no per-plane temporaries.
 #[cfg(feature = "vulkan")]
 fn to_core_frame(vk_frame: vacc_vulkan_decode::DecodedFrame, index: u32) -> DecodedFrame {
     let pixels = vk_frame.pixels;
     let ss = pixels.sample_size.max(1) as usize;
-
-    let crop_y = |plane: &[u8], w: u32, left: u32, top: u32| -> Vec<u8> {
-        let (dw, dh) = (vk_frame.display_width, vk_frame.display_height);
-        let row = w as usize * ss;
-        let out_row = dw as usize * ss;
-        let mut out = Vec::with_capacity(out_row * dh as usize);
-        for r in 0..dh {
-            let src = plane
-                .chunks_exact(row)
-                .nth((top + r) as usize)
-                .unwrap_or(&[]);
-            let start = (left as usize) * ss;
-            out.extend_from_slice(&src[start..start.saturating_add(out_row).min(src.len())]);
-        }
-        out
-    };
+    let (dw, dh) = (vk_frame.display_width as usize, vk_frame.display_height as usize);
 
     // Chroma crop is in chroma-sample space (half-pel for 4:2:0).
     let half = pixels.chroma_width * 2 == vk_frame.coded_width;
@@ -135,18 +140,43 @@ fn to_core_frame(vk_frame: vacc_vulkan_decode::DecodedFrame, index: u32) -> Deco
         (vk_frame.crop_left, vk_frame.crop_top)
     };
 
-    let y = crop_y(&pixels.y_plane, vk_frame.coded_width, vk_frame.crop_left, vk_frame.crop_top);
-    let u = crop_y(&pixels.u_plane, pixels.chroma_width, cl_c, ct_c);
-    let v = crop_y(&pixels.v_plane, pixels.chroma_width, cl_c, ct_c);
+    // Exact output size: luma rows are cropped to the display width; chroma
+    // rows exist while the source row exists and run from the crop offset to
+    // the end of the source row.
+    let y_row_bytes = (vk_frame.coded_width as usize)
+        .saturating_sub(vk_frame.crop_left as usize)
+        .min(dw)
+        * ss;
+    let ch_rows = (pixels.chroma_height as usize).saturating_sub(ct_c as usize).min(dh);
+    let ch_row_bytes =
+        (pixels.chroma_width as usize).saturating_sub(cl_c as usize).min(dw) * ss;
 
-    let mut buffer = Vec::new();
-    buffer.extend_from_slice(&y);
+    let mut buffer = Vec::with_capacity(y_row_bytes * dh + ch_row_bytes * ch_rows * 2);
+
+    // Copy the cropped rows of `plane` into `buffer`; rows beyond the plane
+    // contribute nothing (same per-row clamp as before).
+    let crop_into = |buffer: &mut Vec<u8>, plane: &[u8], row_stride: usize, left: u32, top: u32| {
+        let out_row = dw * ss;
+        for r in 0..dh {
+            let src = plane.chunks_exact(row_stride).nth(top as usize + r).unwrap_or(&[]);
+            let start = (left as usize) * ss;
+            buffer.extend_from_slice(&src[start..start.saturating_add(out_row).min(src.len())]);
+        }
+    };
+
+    crop_into(
+        &mut buffer,
+        &pixels.y_plane,
+        vk_frame.coded_width as usize * ss,
+        vk_frame.crop_left,
+        vk_frame.crop_top,
+    );
     let u_off = buffer.len();
-    buffer.extend_from_slice(&u);
+    let chroma_stride = pixels.chroma_width as usize * ss;
+    crop_into(&mut buffer, &pixels.u_plane, chroma_stride, cl_c, ct_c);
     let v_off = buffer.len();
-    buffer.extend_from_slice(&v);
+    crop_into(&mut buffer, &pixels.v_plane, chroma_stride, cl_c, ct_c);
 
-    let (dw, dh) = (vk_frame.display_width as usize, vk_frame.display_height as usize);
     let (cw, ch) = (pixels.chroma_width as usize, pixels.chroma_height as usize);
     let frame = DecodedFrame::new(index, 0, dw as u32, dh as u32, false);
     let mut frame = frame;
@@ -219,23 +249,43 @@ impl AnyDecode for VulkanAdapter {
 /// A video decoder that tries a configured list of backends in order and uses
 /// the first one that can initialize the stream.
 ///
+/// The API is streaming-only: construct from an initial chunk of the
+/// bitstream, feed the rest with [`Decoder::submit`], and pull frames one at
+/// a time with [`Decoder::decode`].
+///
 /// ```no_run
+/// use std::io::Read;
 /// use vacc_core::decoder::Decoder;
 /// use vacc::{Backend, DecoderConfig, VaccDecoder};
 ///
-/// let data = std::fs::read("video.h264").unwrap();
+/// // Seed the decoder with the stream head (parameter sets + first access
+/// // units). The chunk is consumed as the first input; submit the rest.
+/// let mut file = std::fs::File::open("video.h264").unwrap();
+/// let mut probe = [0u8; 64 * 1024];
+/// let n = file.read(&mut probe).unwrap();
 ///
 /// // One-liner: default chain vulkan -> nvdec -> vaapi -> software.
-/// let mut decoder = VaccDecoder::new_auto(data).unwrap();
+/// let mut decoder = VaccDecoder::new_auto(&probe[..n]).unwrap();
 /// println!("using backend: {}", decoder.backend());
-/// for frame in decoder.decode_all(usize::MAX).unwrap() {
-///     println!("frame {}: {}x{}", frame.frame_index, frame.width, frame.height);
-/// }
 ///
 /// // Or pick the preferred order yourself:
-/// let data = std::fs::read("video.h264").unwrap();
-/// let config = DecoderConfig::new([Backend::Nvdec, Backend::Software]);
-/// let decoder = VaccDecoder::new(data, &config).unwrap();
+/// // let config = DecoderConfig::new([Backend::Nvdec, Backend::Software]);
+/// // let mut decoder = VaccDecoder::new(&probe[..n], &config).unwrap();
+///
+/// let mut buf = vec![0u8; 1024 * 1024];
+/// loop {
+///     let n = file.read(&mut buf).unwrap();
+///     if n == 0 {
+///         break;
+///     }
+///     decoder.submit(&buf[..n]).unwrap();
+///     while let Some(frame) = decoder.decode().unwrap() {
+///         println!("frame {}: {}x{}", frame.frame_index, frame.width, frame.height);
+///     }
+/// }
+/// for frame in decoder.flush().unwrap() {
+///     println!("frame {}: {}x{}", frame.frame_index, frame.width, frame.height);
+/// }
 /// ```
 pub struct VaccDecoder {
     backend: Backend,
@@ -254,7 +304,14 @@ const SYNTHETIC_PTS_STEP: i64 = 33_333;
 impl VaccDecoder {
     /// Create a decoder, trying each backend in `config.order()` until one
     /// succeeds. If all fail, the error lists every per-backend failure.
-    pub fn new(data: Vec<u8>, config: &DecoderConfig) -> UnifiedResult<Self> {
+    ///
+    /// `probe` is the initial chunk of the bitstream (header + first access
+    /// units). It is consumed as the first input: keep feeding the remainder
+    /// of the stream with [`Decoder::submit`], starting right after the bytes
+    /// passed here. The chunk must contain enough of the stream head for the
+    /// selected backend to find its parameter sets; a few tens of KiB always
+    /// suffices for Annex-B and IVF streams.
+    pub fn new(probe: &[u8], config: &DecoderConfig) -> UnifiedResult<Self> {
         if config.is_empty() {
             return Err(UnifiedError::EmptyBackendOrder);
         }
@@ -264,7 +321,7 @@ impl VaccDecoder {
             // down the caller: treat it like any other init failure and fall
             // through to the next backend.
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                create(backend, &data)
+                create(backend, probe)
             }));
             match created {
                 Ok(Ok(inner)) => {
@@ -292,40 +349,16 @@ impl VaccDecoder {
     }
 
     /// Create a decoder with the default fallback chain
-    /// (`vulkan -> nvdec -> vaapi -> software`).
-    pub fn new_auto(data: Vec<u8>) -> UnifiedResult<Self> {
-        Self::new(data, &DecoderConfig::default())
+    /// (`vulkan -> nvdec -> vaapi -> software`). See [`Self::new`] for the
+    /// meaning of `probe`.
+    pub fn new_auto(probe: &[u8]) -> UnifiedResult<Self> {
+        Self::new(probe, &DecoderConfig::default())
     }
 
     /// The backend actually in use.
     pub fn backend(&self) -> Backend {
         self.backend
     }
-
-    /// Decode up to `max_frames` frames: drain `decode()` until the stream is
-    /// exhausted, then flush any frames still held back by reordering.
-    pub fn decode_all(&mut self, max_frames: usize) -> UnifiedResult<Vec<DecodedFrame>> {
-        // Go through the trait methods so PTS normalization applies.
-        let mut frames = Vec::new();
-        while frames.len() < max_frames {
-            match self.decode()? {
-                Some(frame) => frames.push(frame),
-                None => break,
-            }
-        }
-        if frames.len() < max_frames {
-            frames.extend(self.flush()?);
-            frames.truncate(max_frames);
-        }
-        Ok(frames)
-    }
-}
-
-/// One-shot convenience: decode `data` with the default fallback chain and
-/// return every frame.
-pub fn decode_all(data: Vec<u8>) -> UnifiedResult<Vec<DecodedFrame>> {
-    let mut decoder = VaccDecoder::new_auto(data)?;
-    decoder.decode_all(usize::MAX)
 }
 
 fn create(backend: Backend, data: &[u8]) -> UnifiedResult<Box<dyn AnyDecode>> {
@@ -384,6 +417,12 @@ fn create(backend: Backend, data: &[u8]) -> UnifiedResult<Box<dyn AnyDecode>> {
     }
 }
 
+#[cfg(any(
+    not(feature = "vulkan"),
+    not(feature = "nvdec"),
+    not(feature = "vaapi"),
+    not(feature = "sw")
+))]
 fn disabled(name: &str) -> UnifiedError {
     UnifiedError::Unsupported {
         message: format!("{name} backend is not enabled in this build (enable the feature)"),
@@ -403,7 +442,7 @@ impl Decoder for VaccDecoder {
     where
         Self: Sized,
     {
-        Self::new_auto(data)
+        Self::new_auto(&data)
     }
 
     fn new_with_format(
@@ -457,7 +496,7 @@ impl VaccDecoder {
     /// backend-provided PTS is kept only when it is valid and strictly
     /// greater than the previously emitted one.
     fn normalize_pts(&mut self, frame: &mut DecodedFrame) {
-        let monotonic = self.last_pts.map_or(true, |last| frame.timestamp > last);
+        let monotonic = self.last_pts.is_none_or(|last| frame.timestamp > last);
         if !frame.pts_valid || !monotonic {
             frame.timestamp = self.pts_next;
             frame.pts_valid = true;
@@ -477,19 +516,28 @@ mod tests {
         std::fs::read(format!("{path}{name}")).unwrap()
     }
 
+    /// Drain everything: pull ready frames, then flush at end of stream.
     fn drain<D: Decoder>(d: &mut D) -> Vec<DecodedFrame> {
+        let mut frames = drain_ready(d);
+        frames.extend(d.flush().unwrap());
+        frames
+    }
+
+    /// Pull frames that are ready *without* flushing. Flushing mid-stream is
+    /// an end-of-stream operation: it releases reorder-held frames before
+    /// their display-order successors have been decoded.
+    fn drain_ready<D: Decoder>(d: &mut D) -> Vec<DecodedFrame> {
         let mut frames = Vec::new();
         while let Some(f) = Decoder::decode(d).unwrap() {
             frames.push(f);
         }
-        frames.extend(d.flush().unwrap());
         frames
     }
 
     #[test]
     fn empty_config_rejected() {
         let data = sample("h264_main.h264");
-        let err = VaccDecoder::new(data, &DecoderConfig::new([])).unwrap_err();
+        let err = VaccDecoder::new(&data, &DecoderConfig::new([])).unwrap_err();
         assert!(matches!(err, UnifiedError::EmptyBackendOrder));
     }
 
@@ -497,7 +545,7 @@ mod tests {
     fn software_only_fails_for_unsupported_codec() {
         // AV1 has no software backend; the error must list the failure.
         let data = sample("av1_main.ivf");
-        let err = VaccDecoder::new(data, &DecoderConfig::only(Backend::Software)).unwrap_err();
+        let err = VaccDecoder::new(&data, &DecoderConfig::only(Backend::Software)).unwrap_err();
         match err {
             UnifiedError::AllBackendsFailed { failures } => {
                 assert_eq!(failures.len(), 1);
@@ -512,9 +560,9 @@ mod tests {
     fn unified_matches_direct_sw_h264() {
         let data = sample("h264_main.h264");
         let mut unified =
-            VaccDecoder::new(data.clone(), &DecoderConfig::only(Backend::Software)).unwrap();
+            VaccDecoder::new(&data, &DecoderConfig::only(Backend::Software)).unwrap();
         assert_eq!(unified.backend(), Backend::Software);
-        let a = unified.decode_all(usize::MAX).unwrap();
+        let a = drain(&mut unified);
         assert_pts(&a);
 
         let mut direct = vacc_software_decode::SwH264Decoder::new(data).unwrap();
@@ -540,13 +588,45 @@ mod tests {
         }
     }
 
+    /// The streaming contract: feeding the stream in arbitrary chunks (split
+    /// mid-NAL) must produce exactly the same frames as feeding it whole.
+    #[test]
+    fn streaming_chunked_input_matches_whole_stream() {
+        let data = sample("h264_main.h264");
+        let config = DecoderConfig::only(Backend::Software);
+
+        // Prime with a head chunk, then feed the rest in 70 KiB pieces,
+        // pulling ready frames after every submit. Flush only at end of
+        // stream (it releases reorder-held frames).
+        let (head, rest) = data.split_at(70_001);
+        let mut unified = VaccDecoder::new(head, &config).unwrap();
+        let mut a: Vec<DecodedFrame> = drain_ready(&mut unified);
+        for chunk in rest.chunks(70_001) {
+            Decoder::submit(&mut unified, chunk).unwrap();
+            a.extend(drain_ready(&mut unified));
+        }
+        a.extend(unified.flush().unwrap());
+        assert_pts(&a);
+
+        let mut direct = vacc_software_decode::SwH264Decoder::new(data).unwrap();
+        let b = drain(&mut direct);
+
+        assert_eq!(a.len(), b.len());
+        for (fa, fb) in a.iter().zip(&b) {
+            assert_eq!((fa.width, fa.height), (fb.width, fb.height));
+            let pa = fa.pixel_data.as_ref().unwrap();
+            let pb = fb.pixel_data.as_ref().unwrap();
+            assert_eq!(pa.buffer, pb.buffer);
+        }
+    }
+
     #[test]
     fn unified_matches_direct_sw_h265() {
         let data = sample("h265_main.h265");
         let mut unified =
-            VaccDecoder::new(data.clone(), &DecoderConfig::only(Backend::Software)).unwrap();
+            VaccDecoder::new(&data, &DecoderConfig::only(Backend::Software)).unwrap();
         assert_eq!(unified.backend(), Backend::Software);
-        let a = unified.decode_all(usize::MAX).unwrap();
+        let a = drain(&mut unified);
         assert_pts(&a);
 
         let mut direct = vacc_software_decode::SoftwareH265Decoder::new(data).unwrap();
@@ -560,5 +640,82 @@ mod tests {
             let pb = fb.pixel_data.as_ref().unwrap();
             assert_eq!(pa.buffer, pb.buffer);
         }
+    }
+
+    #[test]
+    fn streaming_chunked_h265_input_matches_whole_stream() {
+        // Same contract as the H.264 chunked test: a NAL split across two
+        // submits must not be decoded truncated (70_001 lands mid-NAL in this
+        // sample).
+        let data = sample("h265_main.h265");
+        let config = DecoderConfig::only(Backend::Software);
+
+        let (head, rest) = data.split_at(70_001);
+        let mut unified = VaccDecoder::new(head, &config).unwrap();
+        let mut a: Vec<DecodedFrame> = drain_ready(&mut unified);
+        for chunk in rest.chunks(70_001) {
+            Decoder::submit(&mut unified, chunk).unwrap();
+            a.extend(drain_ready(&mut unified));
+        }
+        a.extend(unified.flush().unwrap());
+        assert_pts(&a);
+
+        let mut direct = vacc_software_decode::SoftwareH265Decoder::new(data).unwrap();
+        let b = drain(&mut direct);
+
+        assert_eq!(a.len(), b.len());
+        for (fa, fb) in a.iter().zip(&b) {
+            assert_eq!((fa.width, fa.height), (fb.width, fb.height));
+            let pa = fa.pixel_data.as_ref().unwrap();
+            let pb = fb.pixel_data.as_ref().unwrap();
+            assert_eq!(pa.buffer, pb.buffer);
+        }
+    }
+
+    /// GPU variant of the chunked-streaming test: feeding the stream in small
+    /// pieces (NAL units split across submits) must produce exactly the frames
+    /// a whole-stream feed produces. Skips when the backend's hardware is not
+    /// available on this machine.
+    fn chunked_matches_whole(backend: Backend, sample_name: &str) {
+        let data = sample(sample_name);
+        let config = DecoderConfig::only(backend);
+
+        let (head, rest) = data.split_at(70_001);
+        let mut unified = match VaccDecoder::new(head, &config) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skip {backend:?}: backend unavailable: {e}");
+                return;
+            }
+        };
+        let mut a: Vec<DecodedFrame> = drain_ready(&mut unified);
+        for chunk in rest.chunks(70_001) {
+            Decoder::submit(&mut unified, chunk).unwrap();
+            a.extend(drain_ready(&mut unified));
+        }
+        a.extend(unified.flush().unwrap());
+        assert_pts(&a);
+
+        let mut whole = VaccDecoder::new(&data, &config).unwrap();
+        let b = drain(&mut whole);
+
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), b.len(), "frame count mismatch");
+        for (fa, fb) in a.iter().zip(&b) {
+            assert_eq!((fa.width, fa.height), (fb.width, fb.height));
+            let pa = fa.pixel_data.as_ref().unwrap();
+            let pb = fb.pixel_data.as_ref().unwrap();
+            assert_eq!(pa.buffer, pb.buffer);
+        }
+    }
+
+    #[test]
+    fn streaming_chunked_input_matches_whole_stream_nvdec() {
+        chunked_matches_whole(Backend::Nvdec, "h264_main.h264");
+    }
+
+    #[test]
+    fn streaming_chunked_input_matches_whole_stream_vaapi() {
+        chunked_matches_whole(Backend::Vaapi, "h264_main.h264");
     }
 }
