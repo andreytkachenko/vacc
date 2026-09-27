@@ -1,0 +1,14 @@
+[package]
+name = "vacc-image"
+description = "SIMD-optimized image conversion (YUV->RGB, 10/12-bit->8-bit) and scaling for vacc"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+libc = "0.2"

@@ -18,6 +18,9 @@ sw = ["dep:vacc-software-decode"]
 
 [dependencies]
 vacc-core = { workspace = true }
+vacc-image = { workspace = true }
+vacc-npp = { workspace = true }
+vacc-vkimage = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 vacc-vulkan-decode = { workspace = true, optional = true }
@@ -29,6 +32,7 @@ vacc-software-decode = { workspace = true, optional = true }
 members = [
     "crates/vacc-core",
     "crates/vacc-common",
+    "crates/vacc-image",
     "crates/vacc-parser",
     "crates/vacc-vulkan",
     "crates/vacc-nvdec-decode",
@@ -38,6 +42,8 @@ members = [
     "crates/vacc-vaapi-decode",
     "crates/vacc-software-decode",
     "crates/vacc-golden-tests",
+    "crates/vacc-npp",
+    "crates/vacc-vkimage",
 ]
 resolver = "2"
 
@@ -51,6 +57,9 @@ repository = "https://github.com/andreytkachenko/vacc"
 [workspace.dependencies]
 vacc-core = { path = "crates/vacc-core", version = "0.1.1" }
 vacc-common = { path = "crates/vacc-common", version = "0.1.1" }
+vacc-image = { path = "crates/vacc-image", version = "0.1.1" }
+vacc-npp = { path = "crates/vacc-npp", version = "0.1.1" }
+vacc-vkimage = { path = "crates/vacc-vkimage", version = "0.1.1" }
 vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.1" }
 vacc-parser = { path = "crates/vacc-parser", version = "0.1.1" }
 vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.1" }

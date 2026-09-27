@@ -1,0 +1,12 @@
+[package]
+name = "vacc-npp"
+description = "NVIDIA NPP backend (YUV->RGB, resize) for the vacc image pipeline; runtime-loaded via libloading"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+libloading = { workspace = true }
+thiserror = { workspace = true }
+vacc-image = { workspace = true }

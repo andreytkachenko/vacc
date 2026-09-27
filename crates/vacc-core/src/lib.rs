@@ -33,7 +33,7 @@ pub use decoder::{Decoder, DecoderInfo};
 pub use device::{DecodeCapabilities, DecoderDevice};
 pub use error::{VideoError, VideoResult};
 pub use format::{ChromaSubsampling, ComponentBitDepth, VideoFormat, VideoProfile};
-pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo, PixelData, PixelPlane};
+pub use frame::{DecodedFrame, FieldFlags, FrameSyncInfo, PixelData, PixelPlane, RgbFrame};
 pub use picture::{ParameterType, PictureParametersSet, StdType};
 pub use session::{PictureResourceInfo, VideoDecodeInfo, VideoSessionParams};
 

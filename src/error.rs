@@ -49,6 +49,10 @@ pub enum UnifiedError {
     /// A runtime error from the active backend (decode, flush, ...).
     #[error("decoder backend error: {source}")]
     Backend { source: Box<dyn std::error::Error + Send + Sync> },
+
+    /// Post-decode image processing (scale / Y'CbCr -> RGB) failed.
+    #[error("image processing error: {message}")]
+    ImageProcessing { message: String },
 }
 
 impl UnifiedError {

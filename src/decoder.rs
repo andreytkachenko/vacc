@@ -22,10 +22,13 @@ use vacc_core::format::{ChromaSubsampling, ComponentBitDepth, VideoFormat};
 use vacc_core::frame::{DecodedFrame, PixelData, PixelPlane};
 use vacc_core::session::Extent2D;
 
+use vacc_image::ImageConfig;
+
 use crate::backend::Backend;
 use crate::codec::detect_codec;
 use crate::config::DecoderConfig;
 use crate::error::{BackendFailure, UnifiedError, UnifiedResult};
+use crate::transform::ApplyOutcome;
 
 fn be(e: impl std::error::Error + Send + Sync + 'static) -> UnifiedError {
     UnifiedError::Backend { source: Box::new(e) }
@@ -295,6 +298,10 @@ pub struct VaccDecoder {
     pts_next: i64,
     /// PTS of the previously emitted frame (monotonicity check).
     last_pts: Option<i64>,
+    /// Post-decode image pipeline (no-op unless configured).
+    image: ImageConfig,
+    /// One-shot warning guard for skipped transforms.
+    warned_transform: bool,
 }
 
 /// Synthetic PTS step for streams that carry no timestamps: 1/30 s in
@@ -330,7 +337,14 @@ impl VaccDecoder {
                         backend,
                         config
                     );
-                    return Ok(Self { backend, inner, pts_next: 0, last_pts: None });
+                    return Ok(Self {
+                        backend,
+                        inner,
+                        pts_next: 0,
+                        last_pts: None,
+                        image: config.image(),
+                        warned_transform: false,
+                    });
                 }
                 Ok(Err(e)) => {
                     log::warn!("unified decoder: {} backend failed: {}", backend, e);
@@ -467,6 +481,7 @@ impl Decoder for VaccDecoder {
         let mut frame = self.inner.decode()?;
         if let Some(f) = &mut frame {
             self.normalize_pts(f);
+            self.apply_image(f)?;
         }
         Ok(frame)
     }
@@ -475,6 +490,7 @@ impl Decoder for VaccDecoder {
         let mut frames = self.inner.flush()?;
         for f in &mut frames {
             self.normalize_pts(f);
+            self.apply_image(f)?;
         }
         Ok(frames)
     }
@@ -487,6 +503,26 @@ impl Decoder for VaccDecoder {
 }
 
 impl VaccDecoder {
+    /// Run the configured image pipeline over a decoded frame. A no-op
+    /// config is a free pass-through; an untransformable frame (e.g. a
+    /// non-4:2:0 format) is passed through with a one-shot warning.
+    fn apply_image(&mut self, frame: &mut DecodedFrame) -> UnifiedResult<()> {
+        if self.image.is_noop() {
+            return Ok(());
+        }
+        match crate::transform::apply(frame, &self.image) {
+            Ok(ApplyOutcome::Transformed) => Ok(()),
+            Ok(ApplyOutcome::Skipped(reason)) => {
+                if !self.warned_transform {
+                    log::warn!("image transform skipped: {reason}");
+                    self.warned_transform = true;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Guarantee a presentation timestamp on every output frame.
     ///
     /// Backends that decode raw bitstreams (no container PTS) either leave

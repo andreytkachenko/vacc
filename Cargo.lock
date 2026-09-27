@@ -1185,9 +1185,12 @@ dependencies = [
  "log",
  "thiserror 2.0.20",
  "vacc-core",
+ "vacc-image",
+ "vacc-npp",
  "vacc-nvdec-decode",
  "vacc-software-decode",
  "vacc-vaapi-decode",
+ "vacc-vkimage",
  "vacc-vulkan-decode",
 ]
 
@@ -1223,6 +1226,24 @@ name = "vacc-golden-tests"
 version = "0.1.1"
 dependencies = [
  "vacc-core",
+]
+
+[[package]]
+name = "vacc-image"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "rayon",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "vacc-npp"
+version = "0.1.1"
+dependencies = [
+ "libloading",
+ "thiserror 2.0.20",
+ "vacc-image",
 ]
 
 [[package]]
@@ -1275,6 +1296,17 @@ dependencies = [
  "vacc-core",
  "vacc-golden-tests",
  "vacc-parser",
+]
+
+[[package]]
+name = "vacc-vkimage"
+version = "0.1.1"
+dependencies = [
+ "ash",
+ "log",
+ "naga",
+ "thiserror 2.0.20",
+ "vacc-image",
 ]
 
 [[package]]

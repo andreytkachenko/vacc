@@ -1257,6 +1257,7 @@ impl NvdecH265Decoder {
             },
             sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
+            rgb_pixels: None,
         })
     }
 

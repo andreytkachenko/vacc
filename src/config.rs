@@ -2,16 +2,22 @@
 
 use std::fmt;
 
+use vacc_image::ImageConfig;
+
 use crate::backend::Backend;
 
 /// Ordered list of backends to try when creating a
-/// [`VaccDecoder`](crate::VaccDecoder).
+/// [`VaccDecoder`](crate::VaccDecoder), plus the optional post-decode image
+/// pipeline ([`ImageConfig`]).
 ///
 /// The first backend that successfully initializes the stream is used; the
 /// rest are fallbacks. Duplicates are dropped, order is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecoderConfig {
     order: Vec<Backend>,
+    /// Post-decode image pipeline (scale and/or Y'CbCr -> RGB). No-op by
+    /// default: frames are emitted exactly as the backend produces them.
+    image: ImageConfig,
 }
 
 impl DecoderConfig {
@@ -33,7 +39,13 @@ impl DecoderConfig {
                 out.push(b);
             }
         }
-        Self { order: out }
+        Self { order: out, image: ImageConfig::default() }
+    }
+
+    /// Set the post-decode image pipeline (scale and/or RGB conversion).
+    pub fn with_image(mut self, image: ImageConfig) -> Self {
+        self.image = image;
+        self
     }
 
     /// The default fallback chain: `vulkan -> nvdec -> vaapi -> software`.
@@ -54,6 +66,11 @@ impl DecoderConfig {
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+
+    /// The configured post-decode image pipeline (copied out; it is `Copy`).
+    pub const fn image(&self) -> ImageConfig {
+        self.image
+    }
 }
 
 impl Default for DecoderConfig {
@@ -72,7 +89,26 @@ impl FromIterator<Backend> for DecoderConfig {
 impl fmt::Display for DecoderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let names: Vec<&str> = self.order.iter().map(|b| b.name()).collect();
-        f.write_str(&names.join(" -> "))
+        f.write_str(&names.join(" -> "))?;
+        if !self.image.is_noop() {
+            write!(f, " [image")?;
+            if let Some(s) = self.image.scale {
+                write!(f, " scale={}x{}:{}", s.width, s.height, filter_name(s.filter))?;
+            }
+            if let Some(r) = self.image.rgb {
+                write!(f, " rgb={}", if r == vacc_image::RgbChannels::Rgb24 { "rgb24" } else { "rgba32" })?;
+            }
+            f.write_str("]")?;
+        }
+        Ok(())
+    }
+}
+
+fn filter_name(filter: vacc_image::Filter) -> &'static str {
+    match filter {
+        vacc_image::Filter::Box => "box",
+        vacc_image::Filter::Bilinear => "bilinear",
+        vacc_image::Filter::Bicubic => "bicubic",
     }
 }
 

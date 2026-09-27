@@ -1,0 +1,16 @@
+[package]
+name = "vacc-vkimage"
+description = "GPU image pipeline (Y'CbCr -> RGB conversion and bilinear resize) on Vulkan compute"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-image = { workspace = true }
+ash = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+naga = { version = "29", default-features = false, features = ["wgsl-in", "spv-out"] }

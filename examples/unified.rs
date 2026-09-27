@@ -1,19 +1,27 @@
 //! Decode a file with the unified decoder and print per-frame info.
 //!
 //! ```text
-//! cargo run -p vacc --example unified -- -i <file> [-o order] [-n max_frames]
+//! cargo run -p vacc --example unified -- -i <file> [options]
 //!
 //!   -i, --input    <file>   bitstream (h264/h265 annex-b, vp9/av1 ivf) — required
 //!   -o, --order    <csv>    backend order, e.g. "nvdec,software"
 //!                           (default: vulkan,nvdec,vaapi,software)
 //!   -n, --max      <num>    stop after this many frames (default: all)
+//!   -w, --width    <px>     resize output width (with -H)
+//!   -H, --height   <px>     resize output height (with -w)
+//!   -f, --filter   <name>   resize filter: box | bilinear | bicubic
+//!                           (default: bilinear)
+//!       --rgb24          convert frames to packed RGB24
+//!       --rgb32          convert frames to packed RGBA32
+//!   -O, --out      <file>   write the first decoded frame as PPM (needs --rgb24/--rgb32)
 //! ```
 
 use std::io::Read;
 use std::time::Instant;
 
 use vacc_core::decoder::Decoder;
-use vacc::{Backend, DecodedFrame, DecoderConfig, VaccDecoder};
+use vacc_core::frame::RgbFrame;
+use vacc::{Backend, DecodedFrame, DecoderConfig, Filter, ImageConfig, RgbChannels, Scale, VaccDecoder};
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -22,12 +30,31 @@ fn die(msg: &str) -> ! {
 
 /// Print one decoded frame and bump the counter.
 fn print_frame(frame: &DecodedFrame, total: &mut usize) {
-    let hash = frame.pixel_data.as_ref().map(|p| fnv1a(&p.buffer)).unwrap_or(0);
+    // Hash whatever the frame carries after the image pipeline ran.
+    let (hash, kind) = if let Some(rgb) = &frame.rgb_pixels {
+        (fnv1a(&rgb.data), "rgb")
+    } else if let Some(p) = &frame.pixel_data {
+        (fnv1a(&p.buffer), "yuv")
+    } else {
+        (0, "none")
+    };
     println!(
-        "frame {}: ts={} size={}x{} hash={:016x}",
+        "frame {}: ts={} size={}x{} {kind} hash={:016x}",
         *total, frame.timestamp, frame.width, frame.height, hash
     );
     *total += 1;
+}
+
+/// Write the first RGB frame as PPM (once), when `-O` was given.
+fn maybe_write_ppm(args: &Args, frame: &DecodedFrame, wrote: &mut bool) {
+    if *wrote {
+        return;
+    }
+    if let (Some(path), Some(rgb)) = (&args.out, &frame.rgb_pixels) {
+        write_ppm(path, rgb);
+        println!("wrote {path} ({}x{})", rgb.width, rgb.height);
+        *wrote = true;
+    }
 }
 
 /// FNV-1a 64 over the frame's pixel buffer (smoke hash, no deps).
@@ -44,12 +71,22 @@ struct Args {
     input: String,
     order: String,
     max_frames: usize,
+    width: Option<u32>,
+    height: Option<u32>,
+    filter: Filter,
+    rgb: Option<RgbChannels>,
+    out: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut input = None;
     let mut order = "vulkan,nvdec,vaapi,software".to_string();
     let mut max_frames = usize::MAX;
+    let mut width = None;
+    let mut height = None;
+    let mut filter = Filter::Bilinear;
+    let mut rgb = None;
+    let mut out = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -59,10 +96,45 @@ fn parse_args() -> Args {
                 .next()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| die("-n needs a number")),
+            "-w" | "--width" => width = Some(args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die("-w needs a number"))),
+            "-H" | "--height" => height = Some(args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die("-H needs a number"))),
+            "-f" | "--filter" => {
+                let name = args.next().unwrap_or_else(|| die("-f needs a value"));
+                filter = match name.as_str() {
+                    "box" => Filter::Box,
+                    "bilinear" => Filter::Bilinear,
+                    "bicubic" => Filter::Bicubic,
+                    other => die(&format!("unknown filter '{other}' (box|bilinear|bicubic)")),
+                }
+            }
+            "--rgb24" => rgb = Some(RgbChannels::Rgb24),
+            "--rgb32" => rgb = Some(RgbChannels::Rgba32),
+            "-O" | "--out" => out = Some(args.next().unwrap_or_else(|| die("-O needs a value"))),
             other => die(&format!("unknown argument '{other}'")),
         }
     }
-    Args { input: input.unwrap_or_else(|| die("usage: unified -i <file> [-o order] [-n max]")), order, max_frames }
+    if (width.is_none() && height.is_some()) || (width.is_some() && height.is_none()) {
+        die("-w and -H must be given together");
+    }
+    if out.is_some() && rgb.is_none() {
+        die("--out writes RGB frames; pass --rgb24 or --rgb32");
+    }
+    let usage = "usage: unified -i <file> [-o order] [-n max] [-w px -H px] [-f filter] [--rgb24|--rgb32] [-O out.ppm]";
+    Args { input: input.unwrap_or_else(|| die(usage)), order, max_frames, width, height, filter, rgb, out }
+}
+
+/// Write the first frame as a binary PPM (alpha is dropped for RGBA32).
+fn write_ppm(path: &str, frame: &RgbFrame) {
+    let mut out = Vec::with_capacity(64 + frame.data.len());
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width, frame.height).as_bytes());
+    if frame.channels == 3 {
+        out.extend_from_slice(&frame.data);
+    } else {
+        for px in frame.data.chunks_exact(4) {
+            out.extend_from_slice(&px[..3]);
+        }
+    }
+    std::fs::write(path, out).unwrap_or_else(|e| die(&format!("cannot write {path}: {e}")));
 }
 
 fn main() {
@@ -75,7 +147,15 @@ fn main() {
         .filter(|s| !s.is_empty())
         .map(|s| s.parse().unwrap_or_else(|e: String| die(&e)))
         .collect();
-    let config = DecoderConfig::new(order);
+    let mut config = DecoderConfig::new(order);
+    if args.width.is_some() || args.rgb.is_some() {
+        let image = ImageConfig {
+            scale: args.width.zip(args.height).map(|(w, h)| Scale::new(w, h, args.filter)),
+            rgb: args.rgb,
+            ..Default::default()
+        };
+        config = config.with_image(image);
+    }
 
     // Stream the file in chunks: seed the decoder with the head, then feed
     // the rest via submit() and pull frames one at a time.
@@ -93,7 +173,7 @@ fn main() {
     let mut decoder =
         VaccDecoder::new(&probe[..n], &config).unwrap_or_else(|e| die(&format!("init: {}", e)));
     println!(
-        "backend={} codec={:?} order={} size={}x{} profile={:?}",
+        "backend={} codec={:?} config={} size={}x{} profile={:?}",
         decoder.backend(),
         decoder.info().codec,
         config,
@@ -103,6 +183,7 @@ fn main() {
     );
 
     let mut total = 0usize;
+    let mut wrote_out = false;
 
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -113,7 +194,10 @@ fn main() {
         decoder.submit(&buf[..n]).unwrap_or_else(|e| die(&format!("decode: {}", e)));
         while total < args.max_frames {
             match decoder.decode().unwrap_or_else(|e| die(&format!("decode: {}", e))) {
-                Some(frame) => print_frame(&frame, &mut total),
+                Some(frame) => {
+                    maybe_write_ppm(&args, &frame, &mut wrote_out);
+                    print_frame(&frame, &mut total);
+                }
                 None => break,
             }
         }
@@ -122,11 +206,15 @@ fn main() {
         if total >= args.max_frames {
             break;
         }
+        maybe_write_ppm(&args, &frame, &mut wrote_out);
         print_frame(&frame, &mut total);
     }
 
     if total == 0 {
         die("no frames decoded");
+    }
+    if args.out.is_some() && !wrote_out {
+        die("--out requested but no RGB frame was produced (pass --rgb24/--rgb32)");
     }
     let elapsed = start.elapsed();
     println!(

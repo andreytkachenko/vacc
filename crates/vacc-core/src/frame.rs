@@ -23,6 +23,10 @@ pub struct DecodedFrame {
     pub sync_info: FrameSyncInfo,
     /// Pixel data for the decoded frame (if available).
     pub pixel_data: Option<PixelData>,
+    /// Packed RGB/RGBA pixel data. Populated when a backend (or the
+    /// facade) converted the decoded frame to RGB, optionally after
+    /// scaling. `None` unless image conversion was requested.
+    pub rgb_pixels: Option<RgbFrame>,
 }
 
 impl DecodedFrame {
@@ -39,6 +43,7 @@ impl DecodedFrame {
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
+            rgb_pixels: None,
         }
     }
 
@@ -66,6 +71,7 @@ impl Default for DecodedFrame {
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
+            rgb_pixels: None,
         }
     }
 }
@@ -173,6 +179,34 @@ pub struct PixelPlane {
     pub width: usize,
     /// Plane height in pixels.
     pub height: usize,
+}
+
+/// Packed (interleaved) RGB(X) pixel data.
+///
+/// Produced by the image-conversion routines (YUV -> RGB) and resize.
+/// Rows are tightly packed: buffer length is `width * height * channels`.
+#[derive(Debug, Clone)]
+pub struct RgbFrame {
+    /// Pixel buffer (row-major, tight rows).
+    pub data: Vec<u8>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Number of channels: 3 = RGB24, 4 = RGBA32.
+    pub channels: u8,
+}
+
+impl RgbFrame {
+    /// Number of bytes per row (tight packing).
+    pub const fn row_bytes(&self) -> usize {
+        (self.width as usize) * self.channels as usize
+    }
+
+    /// Number of bytes per pixel.
+    pub const fn bytes_per_pixel(&self) -> usize {
+        self.channels as usize
+    }
 }
 
 /// Planar pixel data for a decoded frame.

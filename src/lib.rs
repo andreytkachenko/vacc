@@ -73,12 +73,24 @@
 //! Each backend is an optional crate feature (`vulkan`, `nvdec`, `vaapi`,
 //! `sw`, all on by default), so you can build a distribution without any
 //! given GPU dependency.
+//!
+//! ## Image pipeline
+//!
+//! A [`DecoderConfig`] may additionally carry an [`ImageConfig`]: after
+//! decoding, every frame is optionally down-cast (10/12 -> 8 bit), resized
+//! and/or converted to packed RGB(R)(A). On NVIDIA hosts the pipeline runs
+//! on the GPU through NPP; on any other host with a Vulkan compute device it
+//! runs on the GPU through `vacc-vkimage`; everywhere else (and whenever the
+//! GPU path fails) the SIMD software pipeline in `vacc-image` is used. The
+//! result lands in the frame itself: scaled 4:2:0 output replaces
+//! `pixel_data`, RGB output lands in `rgb_pixels`.
 
 pub mod backend;
 pub mod codec;
 pub mod config;
 pub mod decoder;
 pub mod error;
+mod transform;
 
 pub use backend::Backend;
 pub use codec::detect_codec;
@@ -88,3 +100,6 @@ pub use error::{BackendFailure, UnifiedError, UnifiedResult};
 
 // Re-export the core API so a user only needs this crate for the common path.
 pub use vacc_core::{decoder::Decoder, frame::DecodedFrame, DecoderInfo, VideoCodec};
+
+// Image-pipeline configuration types.
+pub use vacc_image::{ColorSpec, Filter, ImageConfig, RgbChannels, Scale};
