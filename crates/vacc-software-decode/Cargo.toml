@@ -12,3 +12,6 @@ vacc-parser = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+vacc-golden-tests = { workspace = true }

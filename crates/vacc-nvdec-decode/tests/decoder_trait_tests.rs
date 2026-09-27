@@ -367,9 +367,15 @@ fn test_decoder_info_dpb_slots() {
     let decoder = NvdecH264Decoder::new(data).expect("Failed to create decoder");
     let info = decoder.info();
 
-    assert_eq!(
-        info.dpb_slots, expected_dpb_slots,
-        "DPB slots should be max_num_ref_frames + 1"
+    // Backends allocate their DPB/surface pools with reorder headroom (e.g.
+    // cuvid surface counts are clamped to a sane range), so assert the
+    // invariant that matters: the allocation covers the SPS reference
+    // requirement (max_num_ref_frames references plus the current picture).
+    assert!(
+        info.dpb_slots >= expected_dpb_slots,
+        "DPB slots ({}) must cover max_num_ref_frames + 1 ({})",
+        info.dpb_slots,
+        expected_dpb_slots
     );
 }
 

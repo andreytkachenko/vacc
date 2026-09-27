@@ -1,15 +1,17 @@
 //! Golden-hash test infrastructure (replaces the C differential oracle).
 //!
 //! Every byte-exact output of a deterministic test case is reduced to a
-//! SHA-256 digest and pinned in the generated `golden_data.rs` (include!'d
-//! below). The goldens were generated from the build that verified
+//! SHA-256 digest and pinned in the generated table
+//! `tests/data/avc_golden_data.rs` (include!'d below). The goldens were
+//! generated from the build that verified
 //! byte-exact agreement with the C oracle (`c/src/vacc_sw264_test.c`,
 //! since deleted); they now pin that behavior permanently, so no C sources
 //! are needed at test time.
 //!
-//! The digest, lookup, record/collect, and `golden_data.rs` writer live in
-//! `vacc_common::goldens`; this module keeps only this crate's `GOLDENS`
-//! table, the module registry (`collect_entries`), and the regeneration
+//! The digest, lookup, record/collect, and golden-table writer live in
+//! `vacc_golden_tests::goldens`; this test-only bridge keeps only this
+//! crate's `GOLDENS` table include, the module registry
+//! (`collect_entries`), and the regeneration
 //! test. The op-sequence fuzz tests live in `tests/avc_fuzz_golden_tests.rs`
 //! with their own golden table (`tests/data/avc_fuzz_golden_data.rs`); its
 //! regeneration test shares this module's `SW264_REGEN_GOLDENS` env var.
@@ -21,31 +23,31 @@
 //! cargo test -p vacc-software-decode   # rebuild picks up the new file
 //! ```
 
-include!("golden_data.rs");
+include!("../../tests/data/avc_golden_data.rs");
 
 /// SHA-256 of `data` as lowercase hex (shared implementation).
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    vacc_common::goldens::sha256_hex(data)
+    vacc_golden_tests::goldens::sha256_hex(data)
 }
 
 /// Assert that `data` hashes to the golden pinned for `key`. Skipped while
 /// collection is armed (`regenerate_goldens`): the new values are accepted by
 /// the pending rewrite, and normal runs assert against the committed file.
 pub(crate) fn assert_golden(key: &str, data: &[u8]) {
-    vacc_common::goldens::assert_data(GOLDENS, key, data)
+    vacc_golden_tests::goldens::assert_data(GOLDENS, key, data)
 }
 
 /// Record one case's Rust output under `key`. No-op unless collection is
 /// armed on the current thread (i.e. inside [`collect`]).
 pub(crate) fn record(key: &str, data: &[u8]) {
-    vacc_common::goldens::record(key, data)
+    vacc_golden_tests::goldens::record(key, data)
 }
 
 /// Run `f` with golden collection armed on the current thread and return the
 /// recorded `(key, sha256)` pairs in recording order. The flag is reset even
 /// if `f` panics.
 pub(crate) fn collect<R: FnOnce()>(f: R) -> Vec<(String, String)> {
-    vacc_common::goldens::collect(f)
+    vacc_golden_tests::goldens::collect(f)
 }
 
 // ============================================================
@@ -64,13 +66,13 @@ pub(crate) fn collect_entries() -> Vec<(String, String)> {
 #[test]
 fn regenerate_goldens() {
     if std::env::var_os("SW264_REGEN_GOLDENS").is_none() {
-        eprintln!("regenerate_goldens: set SW264_REGEN_GOLDENS=1 to rewrite golden_data.rs");
+        eprintln!("regenerate_goldens: set SW264_REGEN_GOLDENS=1 to rewrite tests/data/avc_golden_data.rs");
         return;
     }
     let entries = collect_entries();
     assert!(!entries.is_empty(), "no modules produced golden entries");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/avc/golden_data.rs");
-    let n = vacc_common::goldens::write_golden_file(
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/avc_golden_data.rs");
+    let n = vacc_golden_tests::goldens::write_golden_file(
         entries,
         &path,
         "SW264_REGEN_GOLDENS=1 cargo test -p vacc-software-decode regenerate_goldens",

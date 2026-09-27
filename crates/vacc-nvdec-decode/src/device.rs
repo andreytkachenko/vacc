@@ -196,8 +196,45 @@ unsafe impl Sync for CtxPtr {}
 
 static CUDA_CTX: OnceLock<CtxPtr> = OnceLock::new();
 
-/// Initialize CUDA driver API.
+/// Serializes one-time library/context initialization so concurrent
+/// initializers don't race the `OnceLock::set` calls.
+static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Bind the shared CUDA context to the calling thread (contexts are
+/// thread-local). Errors if initialization has not completed.
+fn bind_current_context() -> NvdecResult<()> {
+    let ctx = CUDA_CTX
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA context not initialized".into()))?;
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    let result = unsafe { (funcs.cu_ctx_set_current)(ctx.0) };
+    if result != CUDA_SUCCESS {
+        return Err(NvdecError::CudaError(format!(
+            "cuCtxSetCurrent failed with error {}",
+            result
+        )));
+    }
+    Ok(())
+}
+
+/// Initialize CUDA driver API (idempotent; thread-safe).
+///
+/// Binds the shared context to the calling thread. A thread that finds the
+/// context already initialized (by another thread) simply re-binds it.
 fn init_cuda() -> NvdecResult<()> {
+    if CUDA_CTX.get().is_some() {
+        return bind_current_context();
+    }
+
+    let _init_lock = INIT_LOCK.lock().unwrap();
+    if CUDA_CTX.get().is_some() {
+        // Lost the race: another thread completed initialization while we
+        // waited on the lock. Bind its context to this thread.
+        return bind_current_context();
+    }
+
     CUDA_LIB
         .set(load_cuda_lib()?)
         .map_err(|_| NvdecError::LibLoadError("CUDA already initialized".to_string()))?;
@@ -432,16 +469,17 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
 /// init_nvdec().expect("Failed to initialize NVDEC");
 /// ```
 pub fn init_nvdec() -> NvdecResult<()> {
-    // Initialize CUDA first
-    if CUDA_LIB.get().is_none() {
-        init_cuda()?;
-    }
+    // Initialize CUDA first (idempotent; binds the context to this thread)
+    init_cuda()?;
 
     // Load NVDEC
     if NVDEC_LIB.get().is_none() {
-        NVDEC_LIB
-            .set(load_nvdec_lib()?)
-            .map_err(|_| NvdecError::LibLoadError("NVDEC already initialized".to_string()))?;
+        let _init_lock = INIT_LOCK.lock().unwrap();
+        if NVDEC_LIB.get().is_none() {
+            NVDEC_LIB
+                .set(load_nvdec_lib()?)
+                .map_err(|_| NvdecError::LibLoadError("NVDEC already initialized".to_string()))?;
+        }
     }
 
     if std::env::var("VACC_PROBE_CUVID").is_ok() {

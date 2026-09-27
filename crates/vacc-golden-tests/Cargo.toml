@@ -1,0 +1,10 @@
+[package]
+name = "vacc-golden-tests"
+description = "Backend-generic golden-hash test framework for vacc decoders: common stream tests and golden pinning over any Decoder backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }

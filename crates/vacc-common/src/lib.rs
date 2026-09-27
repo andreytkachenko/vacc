@@ -3,13 +3,13 @@
 //!
 //! Scope (established by the DRY audit of the two decoders):
 //!
-//! - [`goldens`] — the golden-hash test infrastructure (SHA-256, keyed
-//!   assertions, record/collect, `golden_data.rs` writer) previously
-//!   duplicated line-by-line in `avc/goldens.rs` and `hevc/goldens.rs`.
 //! - [`rng`] — the deterministic test PRNGs (splitmix64, xorshift64*,
 //!   Numerical Recipes LCG) previously copy-pasted into up to ten test
 //!   modules.
 //! - [`clip`] — the bit-depth-agnostic saturation helpers.
+//!
+//! (The golden-hash test infrastructure now lives in the backend-generic
+//! `vacc-golden-tests` crate.)
 //!
 //! Deliberately NOT shared: the entropy layer (`avc/bits` + `avc/cabac`
 //! vs `hevc/bitreader` + `hevc/cabac`) and the reconstruction kernels
@@ -23,5 +23,4 @@
 //! module docs of each data-plane module for its port source.
 
 pub mod clip;
-pub mod goldens;
 pub mod rng;

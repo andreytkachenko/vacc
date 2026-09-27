@@ -1219,6 +1219,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-golden-tests"
+version = "0.1.1"
+dependencies = [
+ "vacc-core",
+]
+
+[[package]]
 name = "vacc-nvdec-decode"
 version = "0.1.1"
 dependencies = [
@@ -1227,6 +1234,7 @@ dependencies = [
  "log",
  "thiserror 2.0.20",
  "vacc-core",
+ "vacc-golden-tests",
  "vacc-parser",
  "vacc-vulkan",
 ]
@@ -1251,6 +1259,7 @@ dependencies = [
  "thiserror 2.0.20",
  "vacc-common",
  "vacc-core",
+ "vacc-golden-tests",
  "vacc-parser",
 ]
 
@@ -1264,6 +1273,7 @@ dependencies = [
  "pkg-config",
  "thiserror 2.0.20",
  "vacc-core",
+ "vacc-golden-tests",
  "vacc-parser",
 ]
 
@@ -1301,6 +1311,7 @@ dependencies = [
  "ash",
  "thiserror 2.0.20",
  "vacc-core",
+ "vacc-golden-tests",
  "vacc-vulkan",
 ]
 

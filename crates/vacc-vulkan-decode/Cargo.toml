@@ -11,3 +11,6 @@ vacc-core = { workspace = true }
 vacc-vulkan = { workspace = true }
 ash = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+vacc-golden-tests = { workspace = true }

@@ -14,5 +14,8 @@ bitflags = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 
+[dev-dependencies]
+vacc-golden-tests = { workspace = true }
+
 [build-dependencies]
 pkg-config = "0.3"

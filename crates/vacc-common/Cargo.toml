@@ -1,6 +1,6 @@
 [package]
 name = "vacc-common"
-description = "Code shared by the vacc H.264/H.265 software decoders: golden-hash test infrastructure, deterministic test PRNGs, saturation helpers"
+description = "Code shared by the vacc H.264/H.265 software decoders: deterministic test PRNGs, saturation helpers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

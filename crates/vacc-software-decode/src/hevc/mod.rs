@@ -15,7 +15,7 @@ pub mod coding_tree;
 pub mod deblocking;
 pub mod driver;
 #[cfg(test)]
-pub mod goldens;
+pub(crate) mod goldens;
 pub mod interpolation;
 pub mod inter_prediction;
 pub mod intra_prediction;

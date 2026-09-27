@@ -1,18 +1,18 @@
-//! Golden-hash test infrastructure shared by the software decoders.
+//! Golden-hash test infrastructure shared by all vacc decoder backends.
 //!
 //! Every byte-exact output of a deterministic test case is reduced to a
-//! SHA-256 digest and pinned in a per-crate generated `golden_data.rs`
-//! (a `pub(crate) const GOLDENS: &[(&str, &str)]` table, `include!`d by the
-//! crate's `#[cfg(test)] goldens` module, e.g. `avc/goldens.rs` /
-//! `hevc/goldens.rs`). The goldens pin behavior that was originally
-//! verified byte-exact against the C/C++ oracles (since deleted); no oracle
-//! sources are needed at test time.
+//! SHA-256 digest and pinned in a generated golden table
+//! (a `pub(crate) const GOLDENS: &[(&str, &str)]` const, `include!`d at the
+//! top level of the integration test file that owns it, e.g.
+//! `tests/data/*_golden_data.rs`). The goldens pin behavior that was
+//! originally verified byte-exact against the C/C++ oracles (since deleted)
+//! and against ffmpeg (see `verify-all.py`); no oracle sources are needed at
+//! test time.
 //!
 //! This module is the single implementation of the digest, the keyed
-//! assertions, the thread-local record/collect capture, and the
-//! `golden_data.rs` writer; the per-crate modules only keep their own
-//! `GOLDENS` table, module registry (`collect_entries`), and regeneration
-//! env var.
+//! assertions, the thread-local record/collect capture, and the golden-table
+//! writer; each test file keeps only its own `GOLDENS` table and its
+//! regeneration env var.
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
@@ -405,6 +405,6 @@ mod tests {
             (String::from("a"), String::from("1")),
             (String::from("a"), String::from("2")),
         ];
-        write_golden_file(entries, &path, "TEST=1 cargo test regenerate_goldens");
+        let _ = write_golden_file(entries, &path, "TEST=1 cargo test regenerate_goldens");
     }
 }

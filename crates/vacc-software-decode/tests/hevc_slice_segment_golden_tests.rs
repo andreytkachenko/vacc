@@ -18,7 +18,7 @@ use vacc_parser::h265::{H265Parser, SliceHeaderInfo};
 use vacc_parser::{BitstreamPacket, ParseResult, SliceHeader, VideoParser};
 
 use vacc_software_decode::hevc::bitreader::{BitstreamReader, extract_rbsp_with_epb};
-use vacc_common::goldens;
+use vacc_golden_tests::goldens;
 
 include!("data/hevc_slice_segment_golden_data.rs");
 use vacc_software_decode::hevc::cabac::{CabacContext, CabacEngine};
@@ -751,7 +751,7 @@ fn regenerate_goldens() {
     let entries = golden_entries();
     assert!(!entries.is_empty(), "no golden entries produced");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hevc_slice_segment_golden_data.rs");
-    let n = vacc_common::goldens::write_golden_file(
+    let n = vacc_golden_tests::goldens::write_golden_file(
         entries,
         &path,
         "H265_REGEN_GOLDENS=1 cargo test -p vacc-software-decode --test hevc_slice_segment_golden_tests regenerate_goldens",

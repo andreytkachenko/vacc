@@ -1,14 +1,16 @@
 //! Golden-hash test infrastructure (replaces the C++ differential oracle).
 //!
 //! Every byte-exact output of a deterministic test case is reduced to a
-//! SHA-256 digest and pinned in the generated `golden_data.rs` (include!'d
-//! below). The goldens were generated from the build that verified
+//! SHA-256 digest and pinned in the generated table
+//! `tests/data/hevc_golden_data.rs` (include!'d below). The goldens were
+//! generated from the build that verified
 //! byte-exact agreement with the C++ oracle; they now pin that behavior
 //! permanently, so no C++ sources are needed at test time.
 //!
-//! The digest, lookup, record/collect, and `golden_data.rs` writer live in
-//! `vacc_common::goldens`; this module keeps only this crate's `GOLDENS`
-//! table, the module registry (`collect_entries`), and the regeneration
+//! The digest, lookup, record/collect, and golden-table writer live in
+//! `vacc_golden_tests::goldens`; this test-only bridge keeps only this
+//! crate's `GOLDENS` table include, the module registry
+//! (`collect_entries`), and the regeneration
 //! test. The slice-segment and end-to-end stream tests live in
 //! `tests/hevc_slice_segment_golden_tests.rs` / `tests/hevc_end_to_end_golden_tests.rs`
 //! with their own golden tables (`tests/data/hevc_*_golden_data.rs`); their
@@ -21,34 +23,34 @@
 //! cargo test -p vacc-software-decode   # rebuild picks up the new file
 //! ```
 
-include!("golden_data.rs");
+include!("../../tests/data/hevc_golden_data.rs");
 
 /// SHA-256 of `data` as lowercase hex (shared implementation).
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    vacc_common::goldens::sha256_hex(data)
+    vacc_golden_tests::goldens::sha256_hex(data)
 }
 
 /// Assert that a precomputed `actual` hash matches the golden for `key`.
 pub(crate) fn assert_hash(key: &str, actual: &str) {
-    vacc_common::goldens::assert_hash(GOLDENS, key, actual)
+    vacc_golden_tests::goldens::assert_hash(GOLDENS, key, actual)
 }
 
 /// Assert that `data` hashes to the golden pinned for `key`.
 pub(crate) fn assert_golden(key: &str, data: &[u8]) {
-    vacc_common::goldens::assert_data(GOLDENS, key, data)
+    vacc_golden_tests::goldens::assert_data(GOLDENS, key, data)
 }
 
 /// Canonical serialization helpers for grid/plane outputs (little-endian).
 pub(crate) fn push_i16(out: &mut Vec<u8>, v: i16) {
-    vacc_common::goldens::push_i16(out, v)
+    vacc_golden_tests::goldens::push_i16(out, v)
 }
 
 pub(crate) fn push_u16(out: &mut Vec<u8>, v: u16) {
-    vacc_common::goldens::push_u16(out, v)
+    vacc_golden_tests::goldens::push_u16(out, v)
 }
 
 pub(crate) fn push_i32(out: &mut Vec<u8>, v: i32) {
-    vacc_common::goldens::push_i32(out, v)
+    vacc_golden_tests::goldens::push_i32(out, v)
 }
 
 // ============================================================
@@ -73,13 +75,13 @@ pub(crate) fn collect_entries() -> Vec<(String, String)> {
 #[test]
 fn regenerate_goldens() {
     if std::env::var_os("H265_REGEN_GOLDENS").is_none() {
-        eprintln!("regenerate_goldens: set H265_REGEN_GOLDENS=1 to rewrite golden_data.rs");
+        eprintln!("regenerate_goldens: set H265_REGEN_GOLDENS=1 to rewrite tests/data/hevc_golden_data.rs");
         return;
     }
     let entries = collect_entries();
     assert!(!entries.is_empty(), "no modules produced golden entries");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hevc/golden_data.rs");
-    let n = vacc_common::goldens::write_golden_file(
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hevc_golden_data.rs");
+    let n = vacc_golden_tests::goldens::write_golden_file(
         entries,
         &path,
         "H265_REGEN_GOLDENS=1 cargo test -p vacc-software-decode regenerate_goldens",

@@ -128,7 +128,6 @@ pub struct NvdecH264Decoder {
     dpb_manager: Mutex<NvdecDpbManager>,
 
     /// Profile IDC.
-    profile_idc: Mutex<Option<u32>>,
 
     /// Previous coded dimensions (for detecting resolution changes).
     prev_coded_size: Mutex<(u32, u32)>,
@@ -240,7 +239,6 @@ impl NvdecH264Decoder {
             initialized: Mutex::new(false),
             poc_calculator: Mutex::new(PocCalculator::new()),
             dpb_manager: Mutex::new(NvdecDpbManager::new(16)), // default; updated from SPS
-            profile_idc: Mutex::new(None),
             prev_coded_size: Mutex::new((0, 0)),
             pending_data: data,
             parsed_offset: 0,
@@ -344,12 +342,6 @@ impl NvdecH264Decoder {
                             if decoder_handle.is_null() {
                                 self.create_decoder(h264_sps)?;
                             }
-                        }
-
-                        // Store profile_idc
-                        {
-                            let mut p = self.profile_idc.lock().unwrap();
-                            *p = Some(h264_sps.profile_idc as u32);
                         }
 
                         // Update DPB manager from SPS
@@ -781,10 +773,6 @@ impl NvdecH264Decoder {
         }
 
         // Update decoder info
-        let profile_idc = {
-            let p = self.profile_idc.lock().unwrap();
-            *p
-        };
 
         let mut info = self.info.lock().unwrap();
         *info = DecoderInfo {
@@ -817,7 +805,7 @@ impl NvdecH264Decoder {
                 4 => ComponentBitDepth::Bit12,
                 _ => ComponentBitDepth::Bit8,
             },
-            profile_idc,
+            profile_idc: Some(sps.profile_idc as u32),
             dpb_slots: num_surfaces,
         };
 

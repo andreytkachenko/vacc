@@ -10,7 +10,7 @@ use vacc_software_decode::avc::deblock::{
     DEBLOCK_LC_ROWS, DEBLOCK_LC_SIZE, DEBLOCK_LC_STRIDE, DEBLOCK_LY_ROWS, DEBLOCK_LY_SIZE,
     DEBLOCK_LY_STRIDE, DEBLOCK_MB_STATE_LEN, DEBLOCK_Y_COL,
 };
-use vacc_common::goldens;
+use vacc_golden_tests::goldens;
 
 include!("data/avc_fuzz_golden_data.rs");
 use vacc_software_decode::avc::mvpred::{MVPRED_IN_LEN, MVPRED_MB_LEN};
@@ -1422,7 +1422,7 @@ fn regenerate_goldens() {
     let entries = golden_entries();
     assert!(!entries.is_empty(), "no golden entries produced");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/avc_fuzz_golden_data.rs");
-    let n = vacc_common::goldens::write_golden_file(
+    let n = vacc_golden_tests::goldens::write_golden_file(
         entries,
         &path,
         "SW264_REGEN_GOLDENS=1 cargo test -p vacc-software-decode --test avc_fuzz_golden_tests regenerate_goldens",

@@ -8,6 +8,8 @@
 pub mod bits;
 pub mod cabac;
 pub mod deblock;
+#[cfg(test)]
+pub(crate) mod goldens;
 pub mod inter;
 pub mod intra;
 pub mod mvpred;
@@ -16,5 +18,3 @@ pub mod slice;
 #[rustfmt::skip]
 mod tables;
 
-#[cfg(test)]
-pub mod goldens;
