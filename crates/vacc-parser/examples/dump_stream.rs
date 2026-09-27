@@ -196,6 +196,21 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                 };
                 let l0: Vec<i32> = lists.l0.iter().map(|r| r.poc).collect();
                 let l1: Vec<i32> = lists.l1.iter().map(|r| r.poc).collect();
+                if std::env::var("DUMP_SLOTS").is_ok() {
+                    let slots: Vec<String> = dpb
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.state != 0)
+                        .map(|(i, s)| {
+                            format!(
+                                "s{}[fn={}poc={}m={}] ",
+                                i, s.frame_num, s.poc, s.marking
+                            )
+                        })
+                        .collect();
+                    eprintln!("SLOTS pic{pic}: {}", slots.join(""));
+                }
                 let mmco_s: Vec<String> = mmco.iter().map(|(o, v)| format!("{o}:{v}")).collect();
                 println!(
                     "PIC {pic}\n  fn={} poc={} slt={} pps={} idr={} poc_lsb={} nal_ref={} \
@@ -277,12 +292,15 @@ fn dump_h265(data: &[u8], max_frames: usize) {
                         .cloned()
                         .unwrap();
                     println!(
-                        "PPS id={} sps_id={} nr0={} nr1={} output_flag_present={}",
+                        "PPS id={} sps_id={} nr0={} nr1={} output_flag_present={} wpp={} tiles={} tqb={}",
                         pps.pps_pic_parameter_set_id,
                         pps.pps_seq_parameter_set_id,
                         pps.num_ref_idx_l0_default_active_minus1,
                         pps.num_ref_idx_l1_default_active_minus1,
                         u32::from(pps.output_flag_present_flag),
+                        u32::from(pps.entropy_coding_sync_enabled_flag),
+                        u32::from(pps.tiles_enabled_flag),
+                        u32::from(pps.transquant_bypass_enabled_flag),
                     );
                 }
                 if let Some(v) = vps {

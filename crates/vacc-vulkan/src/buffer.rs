@@ -219,6 +219,13 @@ impl BitstreamBuffer {
 
     pub fn write(&mut self, data: &[u8]) -> VideoResult<()> {
         if let Some(ptr) = self.mapped_ptr {
+            if data.len() as u64 > self.size {
+                return Err(VideoError::BufferAllocation(format!(
+                    "write of {} bytes exceeds buffer size {}",
+                    data.len(),
+                    self.size
+                )));
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
             }

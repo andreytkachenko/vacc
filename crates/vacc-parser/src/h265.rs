@@ -1300,6 +1300,57 @@ impl H265Parser {
                     pps.row_height_minus1[i as usize] = r.read_ue()? as u16;
                 }
             }
+
+            // H.265 spec 7.4.4 (tile grid): widths are in units of CTB rows/
+            // columns and the LAST tile row/column width is implicit:
+            // pic_width_in_ctbs_y - sum(explicit). Store it (minus 1, like the
+            // explicit entries) so every consumer sees a complete grid —
+            // FFmpeg fills it in ps.c (column_width[ntc-1] = ctb_width - sum)
+            // and passes all entries to VAPictureParameterBufferHEVC; a zeroed
+            // last entry makes iHD reject the picture with an internal error.
+            let sps_for_tiles = self.sps_cache.get(&pps.pps_seq_parameter_set_id);
+            if let Some(sps_t) = sps_for_tiles {
+                // Tile grid is in units of CTB (max coding block), not min CB:
+                // ctb_size = min_cb << log2_diff_max_min (FFmpeg ps.c ctb_width).
+                let ctb_size = 1u32
+                    << (sps_t.log2_min_luma_coding_block_size_minus3 as u32
+                        + 3
+                        + sps_t.log2_diff_max_min_luma_coding_block_size as u32);
+                let ctb_w = sps_t.pic_width_in_luma_samples as u32 / ctb_size;
+                let ctb_h = (sps_t.pic_height_in_luma_samples as u32 + ctb_size - 1) / ctb_size;
+                let ntc_total = pps.num_tile_columns_minus1 as usize + 1;
+                let ntr_total = pps.num_tile_rows_minus1 as usize + 1;
+                if pps.uniform_spacing_flag {
+                    // FFmpeg ps.c uniform spacing: even division with rounding
+                    for i in 0..ntc_total {
+                        let w = ((i as u32 + 1) * ctb_w) / ntc_total as u32
+                            - (i as u32 * ctb_w) / ntc_total as u32;
+                        pps.column_width_minus1[i] = w.saturating_sub(1) as u16;
+                    }
+                    for i in 0..ntr_total {
+                        let h = ((i as u32 + 1) * ctb_h) / ntr_total as u32
+                            - (i as u32 * ctb_h) / ntr_total as u32;
+                        pps.row_height_minus1[i] = h.saturating_sub(1) as u16;
+                    }
+                } else {
+                    // The last column/row is always implicit (also when it is
+                    // the only one): width = ctb_width - sum(explicit).
+                    let ntc_explicit = pps.num_tile_columns_minus1 as usize;
+                    let sum: u32 = pps.column_width_minus1[..ntc_explicit]
+                        .iter()
+                        .map(|&v| v as u32 + 1)
+                        .sum();
+                    pps.column_width_minus1[ntc_explicit] =
+                        (ctb_w.saturating_sub(sum).saturating_sub(1)) as u16;
+                    let ntr_explicit = pps.num_tile_rows_minus1 as usize;
+                    let sum: u32 = pps.row_height_minus1[..ntr_explicit]
+                        .iter()
+                        .map(|&v| v as u32 + 1)
+                        .sum();
+                    pps.row_height_minus1[ntr_explicit] =
+                        (ctb_h.saturating_sub(sum).saturating_sub(1)) as u16;
+                }
+            }
         }
 
         // pps_loop_filter_across_tiles_enabled_flag: present in the bitstream
@@ -3875,5 +3926,160 @@ mod tests {
         let poc = parse_poc(&mut parser, &payload);
         assert_eq!(poc, 5, "post-EOS CRA must have POC MSB 0");
         assert!(!parser.pending_eos, "pending_eos must be consumed");
+    }
+}
+
+#[cfg(test)]
+mod tmp_sps_dump {
+    use super::*;
+    #[test]
+    fn dump_bussiness_sps() {
+        use crate::BitstreamPacket;
+        for name in ["bussiness", "office", "street"] {
+            let path = format!("/home/atkachenko/scratch_demo/{name}.h265");
+            let data = std::fs::read(&path).unwrap();
+            let mut parser = H265Parser::new();
+            parser.init(&DetectedVideoFormat::new(
+                vacc_core::codec::VideoCodec::DecodeH265,
+            ))
+            .unwrap();
+            let packet = BitstreamPacket::new(data);
+            match parser.parse(&packet) {
+                Ok(ParseResult::ParameterSet { sps, .. }) => {
+                    if let Some(s) = sps {
+                        let s = s.downcast_ref::<vacc_core::picture::H265Sps>().unwrap();
+                        eprintln!(
+                            "DUMP {name}: profile={} level={} w={} h={} max_num_ref_frames={} mdb0={} reorder0={} nsets={} chroma={} log2mincb_m3={} log2diff_maxmin={}",
+                            s.profile_idc, s.level_idc,
+                            s.pic_width_in_luma_samples, s.pic_height_in_luma_samples,
+                            s.max_num_ref_frames,
+                            s.max_dec_pic_buffering_minus1[0], s.max_num_reorder_pics[0],
+                            s.num_short_term_ref_pic_sets,
+                            s.chroma_format_idc,
+                            s.log2_min_luma_coding_block_size_minus3,
+                            s.log2_diff_max_min_luma_coding_block_size
+                        );
+                    }
+                }
+                other => panic!("unexpected parse result for {name}: {other:?}"),
+            }
+        }
+        return;
+        let data = std::fs::read("/home/atkachenko/scratch_demo/bussiness.h265").unwrap();
+        let mut parser = H265Parser::new();
+        parser.init(&DetectedVideoFormat::new(
+            vacc_core::codec::VideoCodec::DecodeH265,
+        ))
+        .unwrap();
+        let packet = BitstreamPacket::new(data);
+        match parser.parse(&packet) {
+            Ok(ParseResult::ParameterSet { sps, .. }) => {
+                if let Some(s) = sps {
+                    let s = s.downcast_ref::<vacc_core::picture::H265Sps>().unwrap();
+                    eprintln!(
+                        "DUMP profile={} level={} chroma={} w={} h={} bitdepth_luma={} max_num_ref_frames={} mdb0={} reorder0={} nsets={}",
+                        s.profile_idc, s.level_idc, s.chroma_format_idc,
+                        s.pic_width_in_luma_samples, s.pic_height_in_luma_samples,
+                        8 + s.bit_depth_luma_minus8 as u32, s.max_num_ref_frames,
+                        s.max_dec_pic_buffering_minus1[0], s.max_num_reorder_pics[0],
+                        s.num_short_term_ref_pic_sets
+                    );
+                }
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tmp_office_diag {
+    use super::*;
+    #[test]
+    fn dump_office_slices() {
+        use crate::BitstreamPacket;
+        let data = std::fs::read("/home/atkachenko/scratch_demo/office.h265").unwrap();
+        let mut parser = H265Parser::new();
+        parser
+            .init(&DetectedVideoFormat::new(
+                vacc_core::codec::VideoCodec::DecodeH265,
+            ))
+            .unwrap();
+        let packet = BitstreamPacket::new(data);
+        let mut n = 0;
+        loop {
+            match parser.parse(&packet) {
+                Ok(ParseResult::Slice { slices, .. }) => {
+                    for s in &slices {
+                        if let Some(crate::SliceHeader::H265(i)) = &s.slice_header {
+                            eprintln!(
+                                "SLICE {n}: type={} poc_lsb={} curr_poc={} out_flag={} ref={} idr={} rap={} strps_sps={} idx={}",
+                                i.slice_type, i.pic_order_cnt_lsb, i.curr_pic_order_cnt_val,
+                                i.pic_output_flag, i.is_reference, i.is_idr, i.is_rap,
+                                i.short_term_ref_pic_set_sps_flag, i.short_term_ref_pic_set_idx
+                            );
+                        }
+                    }
+                    n += 1;
+                    if n >= 6 { break; }
+                }
+                Ok(ParseResult::ParameterSet { .. }) | Ok(ParseResult::Nothing) => continue,
+                Ok(ParseResult::EndOfStream) => break,
+                Err(e) => { eprintln!("parse err: {e}"); break; }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tmp_pps_dump {
+    use super::*;
+    #[test]
+    fn dump_pps() {
+        use crate::BitstreamPacket;
+        let data = std::fs::read("/home/atkachenko/scratch_demo/office.h265").unwrap();
+        let mut parser = H265Parser::new();
+        parser.init(&DetectedVideoFormat::new(
+            vacc_core::codec::VideoCodec::DecodeH265,
+        ))
+        .unwrap();
+        let packet = BitstreamPacket::new(data);
+        let mut n_slices = 0;
+        loop {
+            match parser.parse(&packet) {
+                Ok(ParseResult::ParameterSet { pps, .. }) => {
+                    if let Some(p) = pps {
+                        let p = p.downcast_ref::<vacc_core::picture::H265Pps>().unwrap();
+                        eprintln!(
+                            "PPS: id={} sps_id={} extra_bits={} dep_slice={} tiles={} esync={} outflag={} l0def={} l1def={} uniform={} ntc_minus1={} ntr_minus1={} col_w={:?} row_h={:?}",
+                            p.pps_pic_parameter_set_id, p.pps_seq_parameter_set_id,
+                            p.num_extra_slice_header_bits, p.dependent_slice_segments_enabled_flag,
+                            p.tiles_enabled_flag, p.entropy_coding_sync_enabled_flag,
+                            p.output_flag_present_flag, p.num_ref_idx_l0_default_active_minus1,
+                            p.num_ref_idx_l1_default_active_minus1, p.uniform_spacing_flag,
+                            p.num_tile_columns_minus1, p.num_tile_rows_minus1,
+                            &p.column_width_minus1[..(p.num_tile_columns_minus1 + 1) as usize],
+                            &p.row_height_minus1[..(p.num_tile_rows_minus1 + 1) as usize]
+                        );
+                    }
+                }
+                Ok(ParseResult::Slice { slices, .. }) => {
+                    for s in &slices {
+                        let crate::SliceHeader::H265(i) = &s.slice_header.as_ref().unwrap() else { unreachable!() };
+                        let nal_type = (s.nal_data[0] >> 1) & 0x3F;
+                        let fss = if s.nal_data.len() >= 3 { ((s.nal_data[2] >> 7) & 1) == 1 } else { false };
+                        eprintln!(
+                            "SLICE {} nal_type={} fss={} addr={} stype={} poc={} outflag={} idr={} rap={} hdr_bits={}",
+                            n_slices, nal_type, fss, i.slice_segment_address,
+                            i.slice_type, i.curr_pic_order_cnt_val, i.pic_output_flag,
+                            i.is_idr, i.is_rap, i.header_bit_size
+                        );
+                    }
+                    n_slices += slices.len();
+                    if n_slices >= 6 { break; }
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("parse err: {e}"),
+            }
+        }
     }
 }

@@ -13,7 +13,9 @@
 #[cfg(test)]
 pub(crate) use self::tests::golden_entries;
 
-use crate::hevc::types::{clip3, Mv, Plane, Tiles};
+use crate::hevc::coding_tree::CuInfo;
+use crate::hevc::picture::PuMotionInfo;
+use crate::hevc::types::{clip3, Mv, Plane, PredMode, Tiles};
 
 /// Table 8-12: beta' from Q (spec §8.7.2.5.3).
 const BETA_TABLE: [i32; 52] = [
@@ -52,25 +54,6 @@ pub struct DeblockSliceParams {
     pub tc_offset_div2: i32,
 }
 
-/// Per-min-CB (4x4) CU state used by the deblocking filter.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DeblockCu {
-    /// PredMode: 0 = inter, 1 = intra.
-    pub pred_mode: u8,
-    pub qp_y: i32,
-    pub is_pcm: bool,
-    pub transquant_bypass: bool,
-}
-
-/// Per-4x4 motion info (min-TB granularity).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MotionInfo {
-    /// mvL0 / mvL1 (1/4 pel).
-    pub mv: [Mv; 2],
-    pub ref_idx: [i8; 2],
-    pub pred_flag: [bool; 2],
-}
-
 /// Context for `apply_deblocking` — mirrors the DecodingContext fields the
 /// C++ kernel reads.
 pub struct DeblockCtx<'a> {
@@ -102,7 +85,7 @@ pub struct DeblockCtx<'a> {
     pub slice_idx: Option<&'a [u8]>,
     pub sh: &'a [DeblockSliceParams],
     // CU grid at min-CB granularity, raster order (C++ `cu_info`).
-    pub cu: &'a [DeblockCu],
+    pub cu: &'a [CuInfo],
     /// CU grid stride = PicWidthInMinCbsY (C++ `cu_info_stride`). Distinct from
     /// `grid_stride` when MinCbSize != MinTbSize.
     pub cu_stride: i32,
@@ -111,7 +94,7 @@ pub struct DeblockCtx<'a> {
     /// = picW / MinTbSizeY. The C++ motion_info_stride and filter_grid_stride.
     pub grid_stride: i32,
     // Motion + filter grids at 4x4 granularity (stride = grid_stride).
-    pub motion: &'a [MotionInfo],
+    pub motion: &'a [PuMotionInfo],
     /// 1 if TU has nonzero luma coefficients.
     pub cbf_luma: &'a [u8],
     /// log2 of TU size covering this 4x4 block.
@@ -126,7 +109,7 @@ pub struct DeblockCtx<'a> {
 
 impl<'a> DeblockCtx<'a> {
     /// CU info at a luma position (min-CB grid) — `DecodingContext::cu_at`.
-    fn cu_at(&self, x: i32, y: i32) -> &DeblockCu {
+    fn cu_at(&self, x: i32, y: i32) -> &CuInfo {
         assert!(x >= 0 && y >= 0);
         let idx = ((y >> self.min_cb_log2) * self.cu_stride + (x >> self.min_cb_log2)) as usize;
         &self.cu[idx]
@@ -146,7 +129,7 @@ impl<'a> DeblockCtx<'a> {
 
 /// Reference picture POC for list/index, or -999999 when unavailable —
 /// mirrors the `get_ref_poc` lambda in `derive_bs`.
-fn get_ref_poc(ctx: &DeblockCtx, mi: &MotionInfo, list: usize) -> i32 {
+fn get_ref_poc(ctx: &DeblockCtx, mi: &PuMotionInfo, list: usize) -> i32 {
     if !mi.pred_flag[list] || mi.ref_idx[list] < 0 {
         return -999_999;
     }
@@ -247,7 +230,7 @@ fn derive_bs(ctx: &DeblockCtx, x_p: i32, y_p: i32, x_q: i32, y_q: i32) -> i32 {
     let cu_q = ctx.cu_at(x_q, y_q);
 
     // Bs=2 if either side is intra (or PCM treated as intra)
-    if cu_p.pred_mode == 1 || cu_q.pred_mode == 1 {
+    if cu_p.pred_mode == PredMode::Intra || cu_q.pred_mode == PredMode::Intra {
         return 2;
     }
 
@@ -558,8 +541,8 @@ pub fn apply_deblocking(ctx: &DeblockCtx, planes: &mut [Plane]) {
                     let cu_q = ctx.cu_at(x_q, y_q);
                     let pcm_p = cu_p.is_pcm;
                     let pcm_q = cu_q.is_pcm;
-                    let bypass_p = cu_p.transquant_bypass;
-                    let bypass_q = cu_q.transquant_bypass;
+                    let bypass_p = cu_p.cu_transquant_bypass;
+                    let bypass_q = cu_q.cu_transquant_bypass;
 
                     // §8.7.2.5.3: slice parameters for the slice containing q0,0
                     let addr_q = (y_q >> ctx.ctb_log2) * ctx.ctbs_w + (x_q >> ctx.ctb_log2);
@@ -981,17 +964,18 @@ mod tests {
         let mut cu_rs = Vec::with_capacity(n_blocks as usize);
         for i in 0..n_blocks {
             let f = &cu_fields[(i * 4) as usize..(i * 4 + 4) as usize];
-            cu_rs.push(DeblockCu {
-                pred_mode: f[0] as u8,
+            cu_rs.push(CuInfo {
+                pred_mode: if f[0] == 1 { PredMode::Intra } else { PredMode::Inter },
                 qp_y: f[1],
                 is_pcm: f[2] != 0,
-                transquant_bypass: f[3] != 0,
+                cu_transquant_bypass: f[3] != 0,
+                ..CuInfo::default()
             });
         }
         let mut motion_rs = Vec::with_capacity(n_blocks as usize);
         for i in 0..n_blocks {
             let m = &motion[(i * 8) as usize..(i * 8 + 8) as usize];
-            motion_rs.push(MotionInfo {
+            motion_rs.push(PuMotionInfo {
                 mv: [Mv { x: m[0] as i16, y: m[1] as i16 }, Mv { x: m[2] as i16, y: m[3] as i16 }],
                 ref_idx: [m[4] as i8, m[5] as i8],
                 pred_flag: [m[6] != 0, m[7] != 0],
@@ -1157,8 +1141,8 @@ mod tests {
     fn no_edges_is_noop() {
         let mut plane = vec![7u16; 64 * 64];
         let n_blocks = 16 * 16;
-        let cu = vec![DeblockCu::default(); n_blocks];
-        let motion = vec![MotionInfo::default(); n_blocks];
+        let cu = vec![CuInfo::default(); n_blocks];
+        let motion = vec![PuMotionInfo::default(); n_blocks];
         let zeros = vec![0u8; n_blocks];
         let sh = [DeblockSliceParams::default()];
         let ctx = DeblockCtx {

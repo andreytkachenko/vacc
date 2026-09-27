@@ -31,7 +31,8 @@ use crate::{
         CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec, cudaVideoCreateFlags,
         cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
     },
-    picparams::{H265DpbState, build_cuvid_hevc_picparams, dump_cuvid_hevc_picparams},
+    picparams::{H265DpbState, build_cuvid_hevc_picparams},
+    window_end, MAX_PICTURES_PER_PASS, PassOutcome, WINDOW_LIMIT,
 };
 
 /// Number of decode surfaces / DPB slots (matches the C reference).
@@ -167,15 +168,6 @@ pub struct NvdecH265Decoder {
 
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
-
-    /// If set (via `NVDEC_DUMP_PARAMS`), dump the exact [`CUVIDPICPARAMS`]
-    /// submitted for each picture (DECODE order) to this path.
-    dump_params_path: Option<std::path::PathBuf>,
-    dump_params_count: u32,
-    /// If set (via `NVDEC_DUMP_DECODE_ORDER`), dump each decoded picture
-    /// (DECODE order) as NV12 to `{path}_{N}.yuv`.
-    dump_decode_order_path: Option<std::path::PathBuf>,
-    dump_decode_order_count: u32,
 }
 
 impl NvdecH265Decoder {
@@ -222,14 +214,6 @@ impl NvdecH265Decoder {
             uw_min: None,
             uw_max: None,
             pinned_cache: Mutex::new(None),
-            dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
-                .ok()
-                .map(std::path::PathBuf::from),
-            dump_params_count: 0,
-            dump_decode_order_path: std::env::var("NVDEC_DUMP_DECODE_ORDER")
-                .ok()
-                .map(std::path::PathBuf::from),
-            dump_decode_order_count: 0,
         };
 
         decoder.init_parser_format()?;
@@ -254,18 +238,66 @@ impl NvdecH265Decoder {
             .map_err(|e| NvdecError::DecodeFailed(format!("parser init: {}", e)))
     }
 
-    /// Parse pending data and decode any available frames.
-    fn parse_and_decode(&mut self) -> NvdecResult<()> {
-        if self.parsed_offset >= self.pending_data.len() {
-            return Ok(());
+    /// Parse pending data and decode up to [`MAX_PICTURES_PER_PASS`] pictures.
+    ///
+    /// Each pass works on a bounded window of the bitstream (cut at a NAL
+    /// boundary, see [`window_end`]) so constructing a decoder from a long
+    /// stream neither re-copies the whole bitstream per `decode` call nor
+    /// queues every frame up front. Returns [`PassOutcome::More`] while input
+    /// remains, [`PassOutcome::Exhausted`] once it is fully consumed. The
+    /// parser's SPS/PPS and POC state persists across passes; its NAL scan
+    /// cache is invalidated per window.
+    fn parse_and_decode(&mut self) -> NvdecResult<PassOutcome> {
+        let window_len = self.pending_data.len() - self.parsed_offset;
+        if window_len == 0 {
+            return Ok(PassOutcome::Exhausted);
         }
 
-        let remaining = &self.pending_data[self.parsed_offset..];
-        let packet = BitstreamPacket::new(remaining.to_vec());
+        let off = self.parsed_offset;
+        let mut cut = window_end(&self.pending_data, off, WINDOW_LIMIT);
 
-        // Per-picture decode status logging, off unless NVDEC_DEBUG_STATUS is set.
-        let debug_status = std::env::var("NVDEC_DEBUG_STATUS").is_ok();
+        // Keep multi-slice pictures intact across passes: if the NAL at the
+        // window boundary is a continuation slice segment
+        // (first_slice_segment_in_pic_flag == 0), extend the window over it.
+        // A split picture would decode its head slices in this pass and the
+        // tail slices would be re-parsed as a bogus one-slice picture in the
+        // next, emitting an extra duplicate frame.
+        let data = &self.pending_data;
+        loop {
+            let boundary = off + cut;
+            if boundary >= data.len() {
+                break;
+            }
+            let Some((p, cl)) = vacc_parser::nal::find_next_start_code(data, boundary) else {
+                break;
+            };
+            // The start code must begin at (or one zero before) the boundary;
+            // the NAL header then sits at p + cl.
+            if p < boundary.saturating_sub(1) {
+                break;
+            }
+            let hdr = p + cl;
+            if data.len() > hdr + 2
+                && ((data[hdr] >> 1) & 0x3F) < 32
+                && (data[hdr + 2] & 0x80) == 0
+            {
+                match vacc_parser::nal::find_next_start_code(data, hdr) {
+                    Some((q, qcl)) => cut = (q - off) + if qcl == 4 { 1 } else { 0 },
+                    None => cut = data.len() - off,
+                }
+                continue;
+            }
+            break;
+        }
 
+        let window = self.pending_data[off..off + cut].to_vec();
+
+        self.parser.invalidate_nal_cache();
+        let packet = BitstreamPacket::new(window);
+
+        let mut pictures = 0u32;
+        let mut capped = false;
+        let mut last_consumed = 0usize;
         loop {
             match self.parser.parse(&packet) {
                 Ok(ParseResult::ParameterSet { sps, .. }) => {
@@ -295,12 +327,6 @@ impl NvdecH265Decoder {
                             .div_ceil(ctb_size)
                             * ctb_size;
                         let resolution_changed = prev_w != coded_width || prev_h != coded_height;
-                        if std::env::var("NVDEC_DEBUG_STATUS").is_ok() {
-                            eprintln!(
-                                "[sps] new SPS {}x{} prev={}x{} resolution_changed={}",
-                                coded_width, coded_height, prev_w, prev_h, resolution_changed
-                            );
-                        }
                         if resolution_changed {
                             self.recreate_decoder(h265_sps)?;
                         } else {
@@ -323,19 +349,13 @@ impl NvdecH265Decoder {
                             .set_max_num_reorder_frames(h265_sps.max_num_reorder_pics[0] as u32);
                     }
                 }
-                Ok(ParseResult::Slice { slices, .. }) => {
+                Ok(ParseResult::Slice {
+                    slices,
+                    bytes_consumed,
+                    ..
+                }) => {
                     if slices.is_empty() {
                         break;
-                    }
-                    if debug_status {
-                        let ctx = self.dpb.lock().unwrap();
-                        let occ: Vec<i32> = ctx
-                            .dpb
-                            .slots()
-                            .iter()
-                            .map(|s| if s.valid { s.poc } else { -1 })
-                            .collect();
-                        eprintln!("[dpb-start] slots={:?}", occ);
                     }
 
                     let info = if let Some(vacc_parser::SliceHeader::H265(info)) =
@@ -420,22 +440,6 @@ impl NvdecH265Decoder {
                         info.num_bits_for_strps_in_slice as i32
                     };
 
-                    if debug_status {
-                        eprintln!(
-                            "[dbg] poc={} is_idr={} is_rap={} slice_type={} rps_sps_flag={} rps_idx={} before={:?} after={:?} lt={:?} num_bits={}",
-                            poc,
-                            info.is_idr,
-                            info.is_rap,
-                            info.slice_type,
-                            info.short_term_ref_pic_set_sps_flag,
-                            info.short_term_ref_pic_set_idx,
-                            before,
-                            after,
-                            lt,
-                            num_bits
-                        );
-                    }
-
                     // --- Choose the decode surface (CurrPicIdx) and build the
                     // CUVID DPB state (16-entry array, slot-indexed). ---
                     let (curr_pic_idx, dpb_state) = {
@@ -467,16 +471,6 @@ impl NvdecH265Decoder {
                         state.curr_pic_order_cnt_val = poc;
                         (curr_pic_idx, state)
                     };
-                    if debug_status {
-                        let ctx = self.dpb.lock().unwrap();
-                        let occ: Vec<i32> = ctx
-                            .dpb
-                            .slots()
-                            .iter()
-                            .map(|s| if s.valid { s.poc } else { -1 })
-                            .collect();
-                        eprintln!("[dpb] poc={} slots={:?}", poc, occ);
-                    }
 
                     // Build the bitstream: slice NALs only, each prefixed with a
                     // 3-byte Annex-B start code (00 00 01). HEVC does NOT prepend
@@ -519,37 +513,6 @@ impl NvdecH265Decoder {
                     let funcs = get_funcs()?;
                     let _ = cu_ctx_set_current();
 
-                    let dump_idx = self.dump_params_count;
-                    if let Some(dump_path) = &self.dump_params_path {
-                        dump_cuvid_hevc_picparams(dump_path, dump_idx, &picparams);
-                        self.dump_params_count += 1;
-                    }
-
-                    // DEBUG: dump the reference surfaces (as the decoder will see
-                    // them) BEFORE decoding, when NVDEC_DUMP_REFS is set.
-                    if std::env::var("NVDEC_DUMP_REFS").is_ok() {
-                        for (list, arr) in [
-                            ("l0", &dpb_state.st_curr_before),
-                            ("l1", &dpb_state.st_curr_after),
-                        ] {
-                            let n = if list == "l0" {
-                                dpb_state.num_poc_st_curr_before
-                            } else {
-                                dpb_state.num_poc_st_curr_after
-                            };
-                            for &slot_u8 in arr.iter().take(n as usize) {
-                                let slot = slot_u8 as usize;
-                                let surf = dpb_state.ref_pic_idx[slot];
-                                let ref_poc = dpb_state.pic_order_cnt_val[slot];
-                                let path = format!(
-                                    "/tmp/refdump_p{}_{}_s{}_poc{}.yuv",
-                                    dump_idx, list, surf, ref_poc
-                                );
-                                self.dump_surface_to(&path, surf);
-                            }
-                        }
-                    }
-
                     let procparams = crate::ffi::default_procparams();
                     let result =
                         unsafe { (funcs.decode_picture)(decoder_handle, &picparams, &procparams) };
@@ -562,59 +525,6 @@ impl NvdecH265Decoder {
 
                     let _ = cu_ctx_synchronize();
 
-                    if self.dump_decode_order_path.is_some() {
-                        self.dump_decode_order_frame(curr_pic_idx, self.dump_decode_order_count);
-                        self.dump_decode_order_count += 1;
-                    }
-
-                    // Poll decode status until completion.
-                    let mut decode_status = crate::ffi::CUVIDGETDECODESTATUS {
-                        decodeStatus: crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Invalid,
-                        reserved: [0; 31],
-                        pReserved: [std::ptr::null_mut(); 8],
-                    };
-                    let mut status_result: u32 = 0;
-                    for _ in 0..100 {
-                        status_result = unsafe {
-                            (funcs.get_decode_status)(
-                                decoder_handle,
-                                curr_pic_idx as std::os::raw::c_int,
-                                &mut decode_status,
-                            )
-                        };
-                        if decode_status.decodeStatus
-                            != crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress
-                        {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        let _ = cu_ctx_synchronize();
-                    }
-                    // DEBUG: log per-picture decode status, gated by NVDEC_DEBUG_STATUS.
-                    if debug_status {
-                        let st = decode_status.decodeStatus;
-                        let st_name = match st {
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Invalid => "Invalid",
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_InProgress => {
-                                "InProgress"
-                            }
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Success => "Success",
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error => "Error",
-                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error_Concealed => {
-                                "Error_Concealed"
-                            }
-                        };
-                        eprintln!(
-                            "[decode] pic={} surf={} poc={} status={} ({}) api_result={}",
-                            self.dump_params_count.saturating_sub(1),
-                            curr_pic_idx,
-                            poc,
-                            st as u32,
-                            st_name,
-                            status_result
-                        );
-                    }
-
                     // --- Commit the picture to the common DPB and bind its
                     // surface (protected until extracted). ---
                     let seq = self.seq_counter;
@@ -624,22 +534,55 @@ impl NvdecH265Decoder {
                         ctx.commit(slot, curr_pic_idx);
                     }
 
-                    // Track for display-order presentation.
-                    let unwrapped = self.unwrapped_poc(poc);
-                    self.uw_min = Some(self.uw_min.map_or(unwrapped, |m| m.min(unwrapped)));
-                    self.uw_max = Some(self.uw_max.map_or(unwrapped, |m| m.max(unwrapped)));
-                    self.reorder
-                        .insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
+                    // IRAP with NoRaslOutputFlag (IDR): every picture decoded
+                    // since the previous IRAP must be displayed before this
+                    // one (H.265 7.4.7.3.1). Drain the reorder queue first so
+                    // held-back higher-POC pictures are not delayed past the
+                    // IDR by guard 1.
+                    if info.is_idr {
+                        self.extract_ready_frames(true);
+                    }
 
-                    self.extract_ready_frames();
+                    if info.pic_output_flag {
+                        // Track for display-order presentation.
+                        let unwrapped = self.unwrapped_poc(poc);
+                        self.uw_min = Some(self.uw_min.map_or(unwrapped, |m| m.min(unwrapped)));
+                        self.uw_max = Some(self.uw_max.map_or(unwrapped, |m| m.max(unwrapped)));
+                        self.reorder
+                            .insert((unwrapped, seq), (curr_pic_idx, seq, unwrapped));
+                    } else {
+                        // Decode-only picture (pic_output_flag == 0): never
+                        // presented, so release its surface pending mark now;
+                        // the DPB still protects the surface while the picture
+                        // is a live reference.
+                        let mut ctx = self.dpb.lock().unwrap();
+                        ctx.mark_extracted(curr_pic_idx);
+                    }
+
+                    self.extract_ready_frames(false);
+
+                    // `bytes_consumed` is measured from the window start and is
+                    // start-code aligned: a safe resume point for the next pass.
+                    last_consumed = bytes_consumed;
+                    pictures += 1;
+                    if pictures >= MAX_PICTURES_PER_PASS {
+                        capped = true;
+                        break;
+                    }
                 }
                 Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => break,
                 Err(e) => return Err(NvdecError::DecodeFailed(format!("Parse error: {}", e))),
             }
         }
 
-        self.parsed_offset = self.pending_data.len();
-        Ok(())
+        // A pass stopped at the picture budget resumes right after its last
+        // slice; any other exit consumed the whole window.
+        self.parsed_offset += if capped { last_consumed } else { cut };
+        Ok(if self.parsed_offset < self.pending_data.len() {
+            PassOutcome::More
+        } else {
+            PassOutcome::Exhausted
+        })
     }
 
     /// Create the NVDEC decoder from SPS parameters.
@@ -893,11 +836,10 @@ impl NvdecH265Decoder {
     /// consecutively decoded frames to determine the stream's POC increment.
     /// A frame is only extracted when the gap from the last presented POC to
     /// the current minimum is less than the observed POC increment.
-    fn extract_ready_frames(&mut self) {
-        // TEMP DEBUG: skip extraction entirely.
-        if std::env::var("NVDEC_SKIP_EXTRACT").is_ok() {
-            return;
-        }
+    ///
+    /// `force` bypasses both hold guards (used to drain the queue before an
+    /// IRAP with NoRaslOutputFlag).
+    fn extract_ready_frames(&mut self, force: bool) {
         while let Some((&key, &(min_idx, min_seq, min_poc))) = self.reorder.iter().next() {
             let max_uw = match self.reorder.iter().next_back() {
                 Some((k, _)) => k.0,
@@ -912,12 +854,14 @@ impl NvdecH265Decoder {
                 (Some(lo), Some(hi)) => lo == hi,
                 _ => false,
             };
-            if self.presented_count > 0 && max_uw <= key.0 && !poc_flat {
+            if !force && self.presented_count > 0 && max_uw <= key.0 && !poc_flat {
                 break;
             }
             // Guard 2: don't extract if there's a gap larger than the POC increment
             // between the last presented POC and the current minimum.
-            if let Some(last) = self.last_presented_unwrapped {
+            if let Some(last) = self.last_presented_unwrapped
+                && !force
+            {
                 let gap = key.0.saturating_sub(last);
                 if gap > self.min_poc_gap && gap < self.poc_period / 2 {
                     break;
@@ -1283,298 +1227,9 @@ impl NvdecH265Decoder {
         })
     }
 
-    /// Dump a decoded picture (DECODE order) as raw planes (full coded size).
-    fn dump_decode_order_frame(&self, pic_index: i32, count: u32) {
-        let path = match &self.dump_decode_order_path {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        let decoder = {
-            let d = self.decoder.lock().unwrap();
-            if d.is_null() {
-                return;
-            }
-            *d
-        };
-        let info = {
-            let i = self.info.lock().unwrap();
-            if i.coded_size.width == 0 || i.coded_size.height == 0 {
-                return;
-            }
-            i.clone()
-        };
-        let coded_w = info.coded_size.width as usize;
-        let coded_h = info.coded_size.height as usize;
-        let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
-        let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
-            2
-        } else {
-            1
-        };
-        let row_bytes = coded_w * bps;
-        let y_size = row_bytes * coded_h;
-        let uv_plane_size = if is_mono {
-            0
-        } else if is_444 {
-            row_bytes * coded_h
-        } else {
-            row_bytes * (coded_h / 2)
-        };
-        let num_uv_planes = if is_mono {
-            0
-        } else if is_444 {
-            2
-        } else {
-            1
-        };
-        let total = y_size + uv_plane_size * num_uv_planes;
-
-        let funcs = match get_funcs() {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let _ = cu_ctx_set_current();
-
-        let mut dev_ptr: CUdeviceptr = 0;
-        let mut pitch: u32 = 0;
-        let proc_params = CUVIDPROCPARAMS {
-            progressive_frame: 1,
-            second_field: 0,
-            top_field_first: 1,
-            unpaired_field: 0,
-            reserved_flags: 0,
-            reserved_zero: 0,
-            raw_input_dptr: 0,
-            raw_input_pitch: 0,
-            raw_input_format: 0,
-            raw_output_dptr: 0,
-            raw_output_pitch: 0,
-            Reserved1: 0,
-            output_stream: std::ptr::null_mut(),
-            Reserved: [0; 46],
-            histogram_dptr: std::ptr::null_mut(),
-            Reserved2: [std::ptr::null_mut()],
-        };
-        let map_result = unsafe {
-            (funcs.map_video_frame64)(decoder, pic_index, &mut dev_ptr, &mut pitch, &proc_params)
-        };
-        if map_result != CUDA_SUCCESS {
-            return;
-        }
-        let host = cu_mem_host_alloc(total);
-        if let Ok(p) = host {
-            let copy_y = CUDA_MEMCPY2D {
-                srcXInBytes: 0,
-                srcY: 0,
-                srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                _reserved0: 0,
-                srcHost: std::ptr::null(),
-                srcDevice: dev_ptr,
-                srcArray: 0,
-                srcPitch: pitch as u64,
-                dstXInBytes: 0,
-                dstY: 0,
-                dstMemoryType: CU_MEMORYTYPE_HOST,
-                _reserved1: 0,
-                dstHost: p,
-                dstDevice: 0,
-                dstArray: 0,
-                dstPitch: row_bytes as u64,
-                WidthInBytes: row_bytes as u64,
-                Height: coded_h as u64,
-            };
-            let _ = unsafe { cu_memcpy_2d(&copy_y) };
-            if !is_mono {
-                for plane in 0..num_uv_planes {
-                    let src_y = if is_444 {
-                        (coded_h * (plane + 1)) as u64
-                    } else {
-                        coded_h as u64
-                    };
-                    let rows = if is_444 {
-                        coded_h as u64
-                    } else {
-                        (coded_h / 2) as u64
-                    };
-                    let copy_uv = CUDA_MEMCPY2D {
-                        srcXInBytes: 0,
-                        srcY: src_y,
-                        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                        _reserved0: 0,
-                        srcHost: std::ptr::null(),
-                        srcDevice: dev_ptr,
-                        srcArray: 0,
-                        srcPitch: pitch as u64,
-                        dstXInBytes: 0,
-                        dstY: 0,
-                        dstMemoryType: CU_MEMORYTYPE_HOST,
-                        _reserved1: 0,
-                        dstHost: unsafe {
-                            (p as *mut u8).add(y_size + plane * uv_plane_size)
-                                as *mut std::ffi::c_void
-                        },
-                        dstDevice: 0,
-                        dstArray: 0,
-                        dstPitch: row_bytes as u64,
-                        WidthInBytes: row_bytes as u64,
-                        Height: rows,
-                    };
-                    let _ = unsafe { cu_memcpy_2d(&copy_uv) };
-                }
-            }
-            let mut buf = vec![0u8; total];
-            unsafe {
-                std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total);
-            }
-            let file_path = format!("{}_{}.yuv", path.to_string_lossy(), count);
-            let _ = std::fs::write(&file_path, &buf);
-            let _ = unsafe { cu_mem_free_host(p) };
-        }
-        let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
-    }
-
     fn get_decoded_frame(&self) -> Option<DecodedFrame> {
         let mut pending = self.pending_frames.lock().unwrap();
         pending.pop_front()
-    }
-
-    /// DEBUG: map a decode surface and write its full coded NV12 content to a file.
-    fn dump_surface_to(&self, path: &str, surface_idx: i32) {
-        let decoder = {
-            let d = self.decoder.lock().unwrap();
-            if d.is_null() {
-                return;
-            }
-            *d
-        };
-        let info = {
-            let i = self.info.lock().unwrap();
-            if i.coded_size.width == 0 || i.coded_size.height == 0 {
-                return;
-            }
-            i.clone()
-        };
-        let w = info.coded_size.width as usize;
-        let h = info.coded_size.height as usize;
-        let is_mono = info.chroma_subsampling == ChromaSubsampling::Monochrome;
-        let is_444 = info.chroma_subsampling == ChromaSubsampling::_444;
-        let bps = if info.luma_bit_depth == ComponentBitDepth::Bit10 {
-            2
-        } else {
-            1
-        };
-        let row_bytes = w * bps;
-        let uv_plane_size = if is_mono {
-            0
-        } else if is_444 {
-            row_bytes * h
-        } else {
-            row_bytes * (h / 2)
-        };
-        let num_uv_planes = if is_mono {
-            0
-        } else if is_444 {
-            2
-        } else {
-            1
-        };
-        let total = row_bytes * h + uv_plane_size * num_uv_planes;
-        let funcs = match get_funcs() {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let _ = cu_ctx_set_current();
-        let mut dev_ptr: CUdeviceptr = 0;
-        let mut pitch: u32 = 0;
-        let proc_params = CUVIDPROCPARAMS {
-            progressive_frame: 1,
-            second_field: 0,
-            top_field_first: 1,
-            unpaired_field: 0,
-            reserved_flags: 0,
-            reserved_zero: 0,
-            raw_input_dptr: 0,
-            raw_input_pitch: 0,
-            raw_input_format: 0,
-            raw_output_dptr: 0,
-            raw_output_pitch: 0,
-            Reserved1: 0,
-            output_stream: std::ptr::null_mut(),
-            Reserved: [0; 46],
-            histogram_dptr: std::ptr::null_mut(),
-            Reserved2: [std::ptr::null_mut()],
-        };
-        if unsafe {
-            (funcs.map_video_frame64)(decoder, surface_idx, &mut dev_ptr, &mut pitch, &proc_params)
-        } != CUDA_SUCCESS
-        {
-            return;
-        }
-        let host = cu_mem_host_alloc(total);
-        if let Ok(p) = host {
-            let y_size = row_bytes * h;
-            let cy = CUDA_MEMCPY2D {
-                srcXInBytes: 0,
-                srcY: 0,
-                srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                _reserved0: 0,
-                srcHost: std::ptr::null(),
-                srcDevice: dev_ptr,
-                srcArray: 0,
-                srcPitch: pitch as u64,
-                dstXInBytes: 0,
-                dstY: 0,
-                dstMemoryType: CU_MEMORYTYPE_HOST,
-                _reserved1: 0,
-                dstHost: p,
-                dstDevice: 0,
-                dstArray: 0,
-                dstPitch: row_bytes as u64,
-                WidthInBytes: row_bytes as u64,
-                Height: h as u64,
-            };
-            let _ = unsafe { cu_memcpy_2d(&cy) };
-            if !is_mono {
-                for plane in 0..num_uv_planes {
-                    let src_y = if is_444 {
-                        (h * (plane + 1)) as u64
-                    } else {
-                        h as u64
-                    };
-                    let rows = if is_444 { h as u64 } else { (h / 2) as u64 };
-                    let cuv = CUDA_MEMCPY2D {
-                        srcXInBytes: 0,
-                        srcY: src_y,
-                        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-                        _reserved0: 0,
-                        srcHost: std::ptr::null(),
-                        srcDevice: dev_ptr,
-                        srcArray: 0,
-                        srcPitch: pitch as u64,
-                        dstXInBytes: 0,
-                        dstY: 0,
-                        dstMemoryType: CU_MEMORYTYPE_HOST,
-                        _reserved1: 0,
-                        dstHost: unsafe {
-                            (p as *mut u8).add(y_size + plane * uv_plane_size)
-                                as *mut std::ffi::c_void
-                        },
-                        dstDevice: 0,
-                        dstArray: 0,
-                        dstPitch: row_bytes as u64,
-                        WidthInBytes: row_bytes as u64,
-                        Height: rows,
-                    };
-                    let _ = unsafe { cu_memcpy_2d(&cuv) };
-                }
-            }
-            let mut buf = vec![0u8; total];
-            unsafe { std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), total) };
-            let _ = std::fs::write(path, &buf);
-            let _ = unsafe { cu_mem_free_host(p) };
-        }
-        let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
     }
 }
 
@@ -1608,12 +1263,19 @@ impl Decoder for NvdecH265Decoder {
     }
 
     fn decode(&mut self) -> NvdecResult<Option<DecodedFrame>> {
-        self.parse_and_decode()?;
-        Ok(self.get_decoded_frame())
+        loop {
+            if let Some(frame) = self.get_decoded_frame() {
+                return Ok(Some(frame));
+            }
+            match self.parse_and_decode()? {
+                PassOutcome::More => continue,
+                PassOutcome::Exhausted => return Ok(None),
+            }
+        }
     }
 
     fn flush(&mut self) -> NvdecResult<Vec<DecodedFrame>> {
-        self.parse_and_decode()?;
+        while !matches!(self.parse_and_decode()?, PassOutcome::Exhausted) {}
         let mut frames: Vec<DecodedFrame> = {
             let mut pending = self.pending_frames.lock().unwrap();
             pending.drain(..).collect()

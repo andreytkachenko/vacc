@@ -14,7 +14,7 @@
 //!   `max_num_reorder_pics` (SPS) or more pictures have been decoded after it
 //!   (spec 7.4.6 bounds the decode/display delay).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use vacc_core::codec::VideoCodec;
 use vacc_core::decoder::{Decoder, DecoderInfo};
@@ -98,6 +98,9 @@ pub struct SoftwareH265Decoder {
 
     // Display-order reorder state.
     reorder: BTreeMap<(i32, i32), BufferedFrame>, // (uw_poc, seq) -> frame
+    /// Frames flushed at a sequence boundary (IDR/BLA), held for presentation
+    /// ahead of any new-sequence picture.
+    pending: VecDeque<DecodedFrame>,
     poc_period: i32,
     poc_cycle: i32,
     prev_decoded_raw_poc: Option<i32>,
@@ -105,6 +108,11 @@ pub struct SoftwareH265Decoder {
     max_reorder: u32,
     seq_counter: i32,
     frame_index: u32,
+    /// Last picture emitted in display order, cached for error concealment:
+    /// invalid pictures (slice segments not covering the full tile grid) are
+    /// emitted as a repeat of this frame, matching what the Vulkan/NVDEC
+    /// drivers produce for such non-conformant pictures.
+    last_emitted_pic: Option<Picture>,
 }
 
 impl SoftwareH265Decoder {
@@ -266,6 +274,7 @@ impl SoftwareH265Decoder {
         // --- Map parameter sets + build per-segment slice inputs ---
         let sps = syntax_map::map_sps(&sps_h);
         let pps = syntax_map::map_pps(&pps_h, &sps);
+
         let has_chroma = sps.chroma_array_type != 0;
         let sps_scaling_enabled = sps_h.sps_scaling_list_data_present_flag;
         let sps_scaling = if sps_scaling_enabled {
@@ -303,21 +312,65 @@ impl SoftwareH265Decoder {
             return Err(Error::Parser("no slice segments parsed".to_string()));
         }
 
+        // --- Non-conformant picture concealment (spec 5.2.1) ---
+        // If the slice segments do not cover every tile, the picture is
+        // invalid. GPU decoders fail on such pictures and emit a repeat of
+        // the previous frame; match that behavior deterministically.
+        let valid = self.tile_coverage_complete(&pps, slices);
+        if !valid {
+            eprintln!(
+                "CONCEAL seq={} poc={}: slice segments do not cover the full tile grid; repeating previous frame",
+                self.seq_counter + 1,
+                first_info.curr_pic_order_cnt_val
+            );
+        }
+
         // --- Run the Rust reconstruction core ---
-        let pic = driver::decode_picture(
-            &sps,
-            &pps,
-            &slice_inputs,
-            &refs_l0,
-            &refs_l1,
-            &self.store,
-            first_info.curr_pic_order_cnt_val,
-            sps_scaling_enabled,
-            &sps_scaling,
-            pps_scaling_present,
-            &pps_scaling,
-        )
-        .map_err(|e| Error::Core { code: -1, msg: e })?;
+        let pic = if valid {
+            driver::decode_picture(
+                &sps,
+                &pps,
+                &slice_inputs,
+                &refs_l0,
+                &refs_l1,
+                &self.store,
+                first_info.curr_pic_order_cnt_val,
+                sps_scaling_enabled,
+                &sps_scaling,
+                pps_scaling_present,
+                &pps_scaling,
+            )
+            .map_err(|e| Error::Core { code: -1, msg: e })?
+        } else {
+            // Concealment: repeat the previous frame's pixels for both the
+            // output and the DPB reference entry. Motion info is cleared so
+            // no TMVP collocated data leaks from the repeated picture; this
+            // matches what the Vulkan/NVDEC drivers produce for such
+            // non-conformant pictures.
+            let mut p = match self.last_emitted_pic.clone() {
+                Some(prev) => prev,
+                None => {
+                    let mut z = Picture::default();
+                    z.allocate(
+                        sps.pic_width_in_luma_samples,
+                        sps.pic_height_in_luma_samples,
+                        if sps.chroma_array_type == 0 {
+                            crate::hevc::types::ChromaFormat::Monochrome
+                        } else {
+                            crate::hevc::types::ChromaFormat::Yuv420
+                        },
+                        sps.bit_depth_y,
+                        sps.bit_depth_c,
+                    );
+                    z
+                }
+            };
+            p.poc = first_info.curr_pic_order_cnt_val;
+            p.motion_info_buf.clear();
+            p.motion_info_stride = 0;
+            p.ref_poc = [vec![], vec![]];
+            p
+        };
 
         // --- Commit to the Rust DPB + store for future reference resolution ---
         let planes = self.picture_to_planes(&pic);
@@ -342,6 +395,35 @@ impl SoftwareH265Decoder {
         }
 
         Ok(())
+    }
+
+    /// True when the picture's independent slice segments cover every tile.
+    /// A slice segment starts and ends on tile boundaries and covers
+    /// `1 + num_entry_point_offsets` consecutive tiles in tile order
+    /// (spec 7.3.6.1). Non-tiled pictures always pass.
+    fn tile_coverage_complete(&self, pps: &crate::hevc::types::Pps, slices: &[SliceEntry]) -> bool {
+        if !pps.tiles_enabled_flag {
+            return true;
+        }
+        let num_tiles =
+            ((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1)) as usize;
+        let mut covered = vec![false; num_tiles];
+        for e in slices {
+            let Some(SliceHeader::H265(info)) = &e.slice_header else {
+                continue;
+            };
+            if info.dependent_slice_segment_flag {
+                continue;
+            }
+            let rs = info.slice_segment_address as usize;
+            let ts = pps.ctb_addr_rs_to_ts[rs] as usize;
+            let start_tile = pps.tile_id[ts] as usize;
+            let end = (start_tile + 1 + info.num_entry_point_offsets as usize).min(num_tiles);
+            for t in start_tile..end {
+                covered[t] = true;
+            }
+        }
+        covered.iter().all(|&c| c)
     }
 
     /// Convert a reconstructed `Picture` (u16 samples, tight strides) into the
@@ -465,6 +547,27 @@ impl SoftwareH265Decoder {
                     self.parse_offset = bytes_consumed;
                     self.ps_pending = false;
 
+                    // Sequence boundary (FF new_sequence()): an IDR/BLA starts
+                    // a new sequence. Pictures still held for reordering belong
+                    // to the previous sequence and must be presented before any
+                    // picture of the new one — or discarded when
+                    // no_output_of_prior_pics_flag is set (spec 7.4.6). Without
+                    // this, the new sequence's POC-0 unwraps below the previous
+                    // sequence's pending tail and display order is scrambled at
+                    // the boundary.
+                    let nal_type = slices_owned
+                        .first()
+                        .and_then(|s| s.nal_data.first())
+                        .map(|b| (b >> 1) & 0x3f)
+                        .unwrap_or(0);
+                    if nal_type == 19 || nal_type == 20 || (16..=18).contains(&nal_type) {
+                        self.drain_reorder_at_boundary(!info.no_output_of_prior_pics_flag);
+                        // POC restarts with the new sequence: reset the unwrap
+                        // tracker so the first picture maps to cycle 0.
+                        self.poc_cycle = 0;
+                        self.prev_decoded_raw_poc = None;
+                    }
+
                     self.decode_picture(&slices_owned, &info)?;
                     return Ok(true);
                 }
@@ -533,10 +636,16 @@ impl SoftwareH265Decoder {
 
         // The slot may have been recycled since decode; only mark displayed
         // if a live slot still holds this POC.
+        let mut emitted_slot: Option<usize> = None;
         if let Some(dpb) = self.dpb.as_mut()
             && let Some(i) = dpb.slots().iter().position(|s| s.valid && s.poc == bf.poc)
         {
             dpb.mark_displayed(i);
+            emitted_slot = Some(i);
+        }
+        // Cache for error concealment (frame-repeat on invalid pictures).
+        if let Some(i) = emitted_slot {
+            self.last_emitted_pic = self.store.get(i).cloned();
         }
 
         let frame_idx = self.frame_index;
@@ -585,6 +694,43 @@ impl SoftwareH265Decoder {
         })
     }
 
+    /// Present (or discard) every picture still held for reordering at a
+    /// sequence boundary, mirroring FF's new_sequence() flush. With `output`
+    /// false (no_output_of_prior_pics_flag set) the pictures are dropped
+    /// without being presented (spec 7.4.6); their DPB slots are released
+    /// either way.
+    fn drain_reorder_at_boundary(&mut self, output: bool) {
+        let keys: Vec<(i32, i32)> = self.reorder.keys().copied().collect();
+        for key in keys {
+            let poc = match self.reorder.get(&key) {
+                Some(bf) => bf.poc,
+                None => continue,
+            };
+            if output {
+                match self.build_frame(&key) {
+                    Ok(f) => self.pending.push_back(f),
+                    Err(e) => {
+                        log::error!("failed to build frame at sequence boundary: {e}");
+                        self.mark_displayed_by_poc(poc);
+                    }
+                }
+            } else {
+                self.reorder.remove(&key);
+                self.mark_displayed_by_poc(poc);
+            }
+        }
+    }
+
+    /// Release the DPB slot holding `poc` (if still live) so it can be
+    /// recycled, without presenting a frame.
+    fn mark_displayed_by_poc(&mut self, poc: i32) {
+        if let Some(dpb) = self.dpb.as_mut()
+            && let Some(i) = dpb.slots().iter().position(|s| s.valid && s.poc == poc)
+        {
+            dpb.mark_displayed(i);
+        }
+    }
+
     /// Emit the display-ready frame at the front of the reorder buffer, if
     /// any. A frame is ready once `max_reorder` or more pictures have been
     /// decoded after it (spec 7.4.6).
@@ -614,6 +760,7 @@ impl SoftwareH265Decoder {
             dpb.clear_display_pending();
         }
         self.reorder.clear();
+        self.pending.clear();
         self.prev_decoded_raw_poc = None;
         self.poc_cycle = 0;
         self.max_seq = 0;
@@ -663,6 +810,7 @@ impl Decoder for SoftwareH265Decoder {
             parse_offset: 0,
             ps_pending: false,
             reorder: BTreeMap::new(),
+            pending: VecDeque::new(),
             poc_period: 1,
             poc_cycle: 0,
             prev_decoded_raw_poc: None,
@@ -670,6 +818,7 @@ impl Decoder for SoftwareH265Decoder {
             max_reorder: 0,
             seq_counter: 0,
             frame_index: 0,
+            last_emitted_pic: None,
         })
     }
 
@@ -747,6 +896,11 @@ impl Decoder for SoftwareH265Decoder {
 
     fn decode(&mut self) -> Result<Option<DecodedFrame>> {
         loop {
+            // Frames flushed at a sequence boundary go out first, ahead of any
+            // new-sequence picture.
+            if let Some(f) = self.pending.pop_front() {
+                return Ok(Some(f));
+            }
             if let Some(frame) = self.emit_ready() {
                 return Ok(Some(frame));
             }
@@ -758,7 +912,7 @@ impl Decoder for SoftwareH265Decoder {
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        let mut out = Vec::new();
+        let mut out: Vec<DecodedFrame> = self.pending.drain(..).collect();
         // Drain the reorder buffer in display (POC) order.
         while let Some((&key, _)) = self.reorder.iter().next() {
             out.push(self.build_frame(&key)?);

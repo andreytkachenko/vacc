@@ -56,6 +56,7 @@ use crate::{
         CUVIDVP9PICPARAMS, CUdeviceptr, CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec,
         cudaVideoDeinterlaceMode, cudaVideoSurfaceFormat,
     },
+    MAX_PICTURES_PER_PASS, PassOutcome,
 };
 
 /// Common VP9 DPB manager shared by ALL backends (Vulkan / NVDEC / VAAPI).
@@ -155,13 +156,11 @@ pub fn build_cuvid_vp9_picparams(
     vp9.set_refresh_entropy_probs(pi.flags.refresh_frame_context as u32);
     vp9.reserved16Bits = 0;
 
-    // refFrameSignBias[i] = (ref_frame_sign_bias_mask >> (i + 1)) & 1, [3] = 0.
-    for i in 0..4 {
-        vp9.refFrameSignBias[i] = if i < 3 {
-            ((pi.ref_frame_sign_bias_mask >> (i + 1)) & 1) as c_uchar
-        } else {
-            0
-        };
+    // cuvid convention (FFmpeg nvdec_vp9.c): refFrameSignBias = [0, sb0, sb1, sb2],
+    // where the parser stores sb[i] at bit (i+1) of the mask.
+    vp9.refFrameSignBias[0] = 0;
+    for i in 0..3 {
+        vp9.refFrameSignBias[i + 1] = ((pi.ref_frame_sign_bias_mask >> (i + 1)) & 1) as c_uchar;
     }
 
     vp9.bitDepthMinus8Luma = cc.bit_depth.saturating_sub(8);
@@ -346,84 +345,6 @@ fn bit_depth_component(bit_depth: u8) -> ComponentBitDepth {
     }
 }
 
-/// Dump the exact [`CUVIDPICPARAMS`] submitted for one VP9 picture (DECODE
-/// order) to `path`, appending (truncating on the first picture). Mirrors the
-/// format of `dump_cuvid_hevc_picparams` loosely.
-fn dump_cuvid_vp9_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPARAMS) {
-    use std::io::Write;
-
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(pic_num == 0)
-        .append(pic_num != 0)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[NVDEC-DUMP] cannot open {}: {}", path.display(), e);
-            return;
-        }
-    };
-    let mut out = std::io::BufWriter::new(file);
-
-    let v = unsafe { &p.CodecSpecific.vp9 };
-
-    let mut s = String::new();
-    s.push_str(&format!("=== PIC {} (decode) ===\n", pic_num));
-    s.push_str(&format!(
-        "PicWidthInMbs={} FrameHeightInMbs={} CurrPicIdx={} nNumSlices={} nBitstreamDataLen={}\n",
-        p.PicWidthInMbs, p.FrameHeightInMbs, p.CurrPicIdx, p.nNumSlices, p.nBitstreamDataLen
-    ));
-    s.push_str(&format!(
-        "field_pic_flag={} bottom_field_flag={} second_field={} ref_pic_flag={} intra_pic_flag={}\n",
-        p.field_pic_flag, p.bottom_field_flag, p.second_field, p.ref_pic_flag, p.intra_pic_flag
-    ));
-    s.push_str(&format!(
-        "  [vp9] width={} height={} LastRefIdx={} GoldenRefIdx={} AltRefIdx={}\n",
-        v.width, v.height, v.LastRefIdx, v.GoldenRefIdx, v.AltRefIdx
-    ));
-    s.push_str(&format!(
-        "  [vp9] profile={} frameContextIdx={} frameType={} showFrame={} errorResilient={} frameParallelDecoding={}\n",
-        v.profile(), v.frame_context_idx(), v.frame_type(), v.show_frame(),
-        v.error_resilient(), v.frame_parallel_decoding()
-    ));
-    s.push_str(&format!(
-        "  [vp9] subSamplingX={} subSamplingY={} intraOnly={} allow_high_precision_mv={} refreshEntropyProbs={}\n",
-        v.sub_sampling_x(), v.sub_sampling_y(), v.intra_only(),
-        v.allow_high_precision_mv(), v.refresh_entropy_probs()
-    ));
-    s.push_str(&format!(
-        "  [vp9] bitDepthLuma={} bitDepthChroma={} loopFilterLevel={} loopFilterSharpness={} modeRefLfEnabled={}\n",
-        v.bitDepthMinus8Luma, v.bitDepthMinus8Chroma, v.loopFilterLevel,
-        v.loopFilterSharpness, v.modeRefLfEnabled
-    ));
-    s.push_str(&format!(
-        "  [vp9] log2_tile_columns={} log2_tile_rows={} segmentEnabled={} segmentMapUpdate={} segmentMapTemporalUpdate={} segmentFeatureMode={}\n",
-        v.log2_tile_columns, v.log2_tile_rows, v.segment_enabled(),
-        v.segment_map_update(), v.segment_map_temporal_update(), v.segment_feature_mode()
-    ));
-    s.push_str(&format!(
-        "  [vp9] qpYAc={} qpYDc={} qpChDc={} qpChAc={}\n",
-        v.qpYAc, v.qpYDc, v.qpChDc, v.qpChAc
-    ));
-    s.push_str(&format!(
-        "  [vp9] activeRefIdx=[{}, {}, {}] resetFrameContext={} mcomp_filter_type={}\n",
-        v.activeRefIdx[0],
-        v.activeRefIdx[1],
-        v.activeRefIdx[2],
-        v.resetFrameContext,
-        v.mcomp_filter_type
-    ));
-    s.push_str(&format!(
-        "  [vp9] frameTagSize={} offsetToDctParts={}\n",
-        v.frameTagSize, v.offsetToDctParts
-    ));
-
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.flush();
-}
-
 /// NVDEC VP9 decoder using vacc-parser.
 ///
 /// Not `Send`/`Sync`; use from a single thread. The CUDA context must be set
@@ -456,10 +377,6 @@ pub struct NvdecVp9Decoder {
     is_ivf: bool,
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
-    /// If set (via `NVDEC_DUMP_PARAMS`), dump the exact [`CUVIDPICPARAMS`]
-    /// submitted for each picture (DECODE order) to this path.
-    dump_params_path: Option<std::path::PathBuf>,
-    dump_params_count: u32,
     /// Per-decode slice-offset storage: `[0, bitstream_len, 0, ...]`.
     ///
     /// The NVDEC front end reads `nNumSlices + 1` entries from
@@ -510,10 +427,6 @@ impl NvdecVp9Decoder {
             parsed_offset: if is_ivf { IVF_HEADER_SIZE } else { 0 },
             is_ivf,
             pinned_cache: Mutex::new(None),
-            dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
-                .ok()
-                .map(std::path::PathBuf::from),
-            dump_params_count: 0,
             slice_offsets: [0; 64],
         };
 
@@ -538,12 +451,19 @@ impl NvdecVp9Decoder {
     }
 
     /// Parse pending data and decode any available frames.
-    fn parse_and_decode(&mut self) -> NvdecResult<()> {
+    /// Parse pending data and decode up to [`MAX_PICTURES_PER_PASS`] frames.
+    ///
+    /// Returns [`PassOutcome::More`] when the per-pass budget is hit with input
+    /// still left in the window, or [`PassOutcome::Exhausted`] once the whole
+    /// window has been consumed (a truncated trailing IVF packet also counts
+    /// as exhausted until more data is submitted).
+    fn parse_and_decode(&mut self) -> NvdecResult<PassOutcome> {
         if self.is_ivf {
+            let mut pictures = 0u32;
             loop {
                 // Need at least 12 bytes for the packet header (4 size + 8 pts).
                 if self.parsed_offset + 12 > self.pending_data.len() {
-                    break;
+                    return Ok(PassOutcome::Exhausted);
                 }
                 let size = u32::from_le_bytes(
                     self.pending_data[self.parsed_offset..self.parsed_offset + 4]
@@ -551,14 +471,22 @@ impl NvdecVp9Decoder {
                         .unwrap(),
                 ) as usize;
                 if size == 0 || self.parsed_offset + 12 + size > self.pending_data.len() {
-                    break;
+                    return Ok(PassOutcome::Exhausted);
                 }
                 let payload =
                     &self.pending_data[self.parsed_offset + 12..self.parsed_offset + 12 + size];
+                // A packet is the atomic unit of progress: process all of its
+                // frames before returning, so a budget stop never leaves
+                // `parsed_offset` pointing at an already-processed packet
+                // (the next pass would re-decode it and duplicate its frames).
                 for f in expand_superframes(payload) {
                     self.process_frame(&f.data, f.superframe_frame_offset)?;
+                    pictures += 1;
                 }
                 self.parsed_offset += 12 + size;
+                if pictures >= MAX_PICTURES_PER_PASS {
+                    return Ok(PassOutcome::More);
+                }
             }
         } else {
             // Raw single-frame: process the whole buffer once, then mark consumed.
@@ -568,7 +496,7 @@ impl NvdecVp9Decoder {
                 self.parsed_offset = self.pending_data.len();
             }
         }
-        Ok(())
+        Ok(PassOutcome::Exhausted)
     }
 
     /// Parse and decode one (superframe-expanded) VP9 frame.
@@ -621,11 +549,6 @@ impl NvdecVp9Decoder {
                 self.slice_offsets.as_ptr().cast::<c_uint>(),
             )
         };
-
-        if let Some(dump_path) = &self.dump_params_path {
-            dump_cuvid_vp9_picparams(dump_path, self.dump_params_count, &params);
-            self.dump_params_count += 1;
-        }
 
         let decoder_handle = {
             let d = self.decoder.lock().unwrap();
@@ -1213,12 +1136,19 @@ impl Decoder for NvdecVp9Decoder {
     }
 
     fn decode(&mut self) -> NvdecResult<Option<DecodedFrame>> {
-        self.parse_and_decode()?;
-        Ok(self.pending_frames.lock().unwrap().pop_front())
+        loop {
+            if let Some(frame) = self.pending_frames.lock().unwrap().pop_front() {
+                return Ok(Some(frame));
+            }
+            match self.parse_and_decode()? {
+                PassOutcome::More => continue,
+                PassOutcome::Exhausted => return Ok(None),
+            }
+        }
     }
 
     fn flush(&mut self) -> NvdecResult<Vec<DecodedFrame>> {
-        self.parse_and_decode()?;
+        while !matches!(self.parse_and_decode()?, PassOutcome::Exhausted) {}
         let mut pending = self.pending_frames.lock().unwrap();
         Ok(pending.drain(..).collect())
     }

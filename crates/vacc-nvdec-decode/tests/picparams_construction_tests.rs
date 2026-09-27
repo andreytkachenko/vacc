@@ -22,20 +22,11 @@ fn find_start_code(data: &[u8], start: usize) -> Option<(usize, usize)> {
     let remaining = &data[start..];
     let mut i = 0;
     while i + 2 < remaining.len() {
-        if i + 3 < remaining.len()
-            && remaining[i] == 0
-            && remaining[i + 1] == 0
-            && remaining[i + 2] == 0
-            && remaining[i + 3] == 1
-        {
-            if i == 0 || remaining[i - 1] != 0 {
-                return Some((start + i, 4));
+        if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1 {
+            // Longest match: a preceding zero makes this a 4-byte start code.
+            if i > 0 && remaining[i - 1] == 0 {
+                return Some((start + i - 1, 4));
             }
-        } else if remaining[i] == 0
-            && remaining[i + 1] == 0
-            && remaining[i + 2] == 1
-            && (i == 0 || remaining[i - 1] != 0)
-        {
             return Some((start + i, 3));
         }
         i += 1;

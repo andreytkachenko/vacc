@@ -696,10 +696,20 @@ impl H264Parser {
         // Skip NAL header byte (1 byte), enable EPB removal
         let mut r = BitReader::new(&data[1..], true);
         let header_start_pos = r.position();
+        let dbg = std::env::var("VACC_SW_DEBUG").is_ok();
+        let mut stages: Vec<String> = Vec::new();
+        macro_rules! dbgpos {
+            ($stage:expr) => {
+                if dbg {
+                    stages.push(format!("{}={}", $stage, r.position()));
+                }
+            };
+        }
 
         let first_mb_in_slice = r.read_ue()?;
         let slice_type = r.read_ue()? % 5;
         let pps_id = r.read_ue()?;
+        dbgpos!("after_pps_id");
 
         let pps = self
             .active_pps
@@ -718,6 +728,7 @@ impl H264Parser {
 
         let frame_num_bits = sps.log2_max_frame_num_minus4 as u32 + 4;
         let frame_num = r.read_bits(frame_num_bits as u8)?;
+        dbgpos!("after_frame_num");
 
         let mut slh = SliceHeader {
             first_mb_in_slice,
@@ -749,6 +760,7 @@ impl H264Parser {
             dec_ref_pic_marking: Vec::new(),
             no_output_of_prior_pics_flag: false,
             long_term_reference_flag: false,
+            adaptive_ref_pic_marking_mode_flag: false,
             header_bit_size: 0,
             luma_log2_weight_denom: 0,
             chroma_log2_weight_denom: 0,
@@ -787,6 +799,7 @@ impl H264Parser {
                 slh.delta_pic_order_cnt[0] = r.read_se()?; // delta_pic_order_cnt_bottom
             }
         }
+        dbgpos!("after_poc");
 
         // POC type 1: delta_pic_order_cnt
         if sps.pic_order_cnt_type == 1 && !sps.delta_pic_order_always_zero_flag {
@@ -801,6 +814,7 @@ impl H264Parser {
         if pps.redundant_pic_cnt_present_flag {
             slh.redundant_pic_cnt = r.read_ue()? as i32;
         }
+        dbgpos!("after_redundant");
 
         // Slice type classification (already mod 5: 0=P, 1=B, 2=I, 3=SP, 4=SI)
         let is_p = slice_type == 0;
@@ -828,6 +842,7 @@ impl H264Parser {
                 }
             }
         }
+        dbgpos!("after_ref_override");
 
         // Reference picture list modification (H.264 spec 7.3.6): L0 present when
         // slice_type != I && slice_type != SI (P/SP/B), L1 only for B slices.
@@ -836,6 +851,7 @@ impl H264Parser {
             slh.ref_pic_list_modification_l0 = mod_l0;
             slh.ref_pic_list_modification_l1 = mod_l1;
         }
+        dbgpos!("after_list_mod");
 
         // Pred weight table (H.264 spec 7.3.3.2): present when
         // (slice_type P|SP && weighted_pred_flag) ||
@@ -883,6 +899,7 @@ impl H264Parser {
             slh.chroma_weight_l1 = chroma_weight_l1;
             slh.chroma_offset_l1 = chroma_offset_l1;
         }
+        dbgpos!("after_pred_weight");
 
         // Decoded reference picture marking (H.264 spec 7.4.3): present when
         // nal_ref_idc > 0, AFTER pred_weight_table and BEFORE cabac_init_idc.
@@ -890,20 +907,24 @@ impl H264Parser {
         //       long_term_reference_flag u(1) (two fixed 1-bit fields)
         //   non-IDR reference: adaptive_ref_pic_marking_mode_flag u(1) + MMCO ops
         if nal_ref_idc > 0 {
-            let (marking, no_output, lt_ref) =
+            let (marking, no_output, lt_ref, adaptive_flag) =
                 Self::parse_dec_ref_pic_marking(&mut r, nal_unit_type == 5)?;
             slh.dec_ref_pic_marking = marking;
             slh.no_output_of_prior_pics_flag = no_output;
             slh.long_term_reference_flag = lt_ref;
+            slh.adaptive_ref_pic_marking_mode_flag = adaptive_flag;
         }
+        dbgpos!("after_mmco");
 
         // CABAC init IDC (not for I/SI slices)
         if pps.entropy_coding_mode_flag && !is_i && !is_si {
             slh.cabac_init_idc = r.read_ue()? as u8;
         }
+        dbgpos!("after_cabac_init");
 
         // Slice QP delta
         slh.slice_qp_delta = r.read_se()?;
+        dbgpos!("after_qp_delta");
 
         // SP/SI slice extras (H.264 spec 7.4.3)
         if is_sp {
@@ -929,6 +950,19 @@ impl H264Parser {
 
         // Calculate header bit size (bits consumed from slice header start)
         slh.header_bit_size = (r.position() - header_start_pos) as u16;
+        if dbg {
+            eprintln!(
+                "[SH-STAGES] fn={} poc={} st={} nal={} first_mb={} pps_id={} stages: {} end={}",
+                slh.frame_num,
+                slh.pic_order_cnt_lsb,
+                slice_type,
+                nal_unit_type,
+                first_mb_in_slice,
+                pps_id,
+                stages.join(" "),
+                slh.header_bit_size
+            );
+        }
 
         if std::env::var("DBG_H264").is_ok() {
             eprintln!(
@@ -1148,10 +1182,11 @@ impl H264Parser {
     fn parse_dec_ref_pic_marking(
         r: &mut BitReader,
         is_idr: bool,
-    ) -> ParserResult<(Vec<DecRefPicMarkingEntry>, bool, bool)> {
+    ) -> ParserResult<(Vec<DecRefPicMarkingEntry>, bool, bool, bool)> {
         let mut marking = Vec::new();
         let mut no_output_of_prior_pics_flag = false;
         let mut long_term_reference_flag = false;
+        let mut adaptive_ref_pic_marking_mode_flag = false;
 
         if is_idr {
             // IDR picture marking: two fixed 1-bit fields (H.264 spec 7.4.3):
@@ -1161,7 +1196,7 @@ impl H264Parser {
             long_term_reference_flag = r.read_bit()?;
         } else {
             // Non-IDR picture marking: first read adaptive_ref_pic_marking_mode_flag (H.264 spec 7.4.5)
-            let adaptive_ref_pic_marking_mode_flag = r.read_bit()?;
+            adaptive_ref_pic_marking_mode_flag = r.read_bit()?;
             if adaptive_ref_pic_marking_mode_flag {
                 // Adaptive memory management: read operations until memory_management_control_operation=0
                 loop {
@@ -1203,6 +1238,7 @@ impl H264Parser {
             marking,
             no_output_of_prior_pics_flag,
             long_term_reference_flag,
+            adaptive_ref_pic_marking_mode_flag,
         ))
     }
 
@@ -1572,6 +1608,11 @@ pub struct SliceHeader {
     pub ref_pic_list_modification_l1: Vec<RefPicListModificationEntry>,
     // Decoded reference picture marking (H.264 spec 7.4.5)
     pub dec_ref_pic_marking: Vec<DecRefPicMarkingEntry>,
+    /// adaptive_ref_pic_marking_mode_flag from the slice header (H.264 spec 7.4.5).
+    /// Only meaningful when nal_ref_idc > 0 and the slice is not IDR. When true,
+    /// memory management follows the MMCO ops in `dec_ref_pic_marking`; when false
+    /// (and the picture is a reference), sliding-window marking applies.
+    pub adaptive_ref_pic_marking_mode_flag: bool,
     pub no_output_of_prior_pics_flag: bool,
     pub long_term_reference_flag: bool,
     // Slice header size in bits (excluding NAL header)

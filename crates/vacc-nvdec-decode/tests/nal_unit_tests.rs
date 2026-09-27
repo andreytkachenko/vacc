@@ -235,6 +235,17 @@ fn test_start_code_4_byte_takes_precedence_over_3_byte() {
 }
 
 #[test]
+fn test_start_code_preceded_by_data_zero() {
+    // Previous NAL payload ends with 0x00; by longest-match the start code is
+    // 4 bytes starting at the leading zero (FFmpeg av_find_start_code behavior).
+    let data = vec![0xAA, 0x00, 0x00, 0x00, 0x01, 0x42];
+    let result = nal::find_next_start_code(&data, 0);
+    let (offset, len) = result.unwrap();
+    assert_eq!(offset, 1, "Start code should start at the leading zero");
+    assert_eq!(len, 4, "Should be detected as a 4-byte start code");
+}
+
+#[test]
 fn test_start_code_not_found_in_empty_data() {
     let data: Vec<u8> = vec![];
     let result = nal::find_next_start_code(&data, 0);

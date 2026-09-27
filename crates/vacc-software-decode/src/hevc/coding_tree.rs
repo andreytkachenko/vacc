@@ -870,6 +870,13 @@ fn decode_wpp_row(
     substream_byte_pos: &[usize],
     sync: &[RowSync],
 ) -> usize {
+    eprintln!(
+        "DBG wpp_row row={} start_row={} substreams={:?} tid={:?}",
+        row,
+        start_row,
+        substream_byte_pos,
+        std::thread::current().id()
+    );
     let sps = g.sps;
     let sh = g.sh;
     let num_cols = sps.pic_width_in_ctbs_y;
@@ -1012,6 +1019,19 @@ pub fn decode_slice_segment_data(
     let pps = ctx.pps;
     let sh = ctx.sh;
 
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "DBG slice_seg n={} slice_addr={} ep_offs={} tid={:?}",
+            n,
+            sh.slice_segment_address,
+            sh.num_entry_point_offsets,
+            std::thread::current().id()
+        );
+    }
+
     // §7.3.8.1: compute RBSP byte positions of WPP/tile substreams.
     // entry_point_offsets are in bytes of the coded slice data (including EP
     // bytes). Convert to RBSP positions (EP bytes removed).
@@ -1092,9 +1112,16 @@ pub fn decode_slice_segment_data(
         }
 
         if hevc_trace() {
+            let bs = ctx.cabac.bitstream();
             eprintln!(
-                "RUST CTU addr_rs={} pos=({}, {}) bits={}",
-                ctb_addr_in_rs, x_ctb, y_ctb, ctx.cabac.bitstream().bits_read()
+                "TRC rs={} ts={} tile={} pos=({}, {}) bits={}/{}",
+                ctb_addr_in_rs,
+                ctb_addr_in_ts,
+                pps.tile_id[ctb_addr_in_ts as usize],
+                x_ctb,
+                y_ctb,
+                bs.bits_read(),
+                bs.size() * 8
             );
         }
 
@@ -1119,7 +1146,7 @@ pub fn decode_slice_segment_data(
             if pps.tiles_enabled_flag
                 && pps.tile_id[ctb_addr_in_ts as usize] != pps.tile_id[(ctb_addr_in_ts - 1) as usize]
             {
-                ctx.cabac.decode_terminate(); // end_of_subset_one_bit
+                let _eossb = ctx.cabac.decode_terminate(); // end_of_subset_one_bit
                 ctx.cabac.bitstream().byte_alignment().ok();
                 ctx.cabac.init_decoder();
                 // §8.6.1: reset QpY_prev at first QG in a tile
@@ -1161,7 +1188,9 @@ pub fn decode_slice_segment_data(
         }
     }
 
-    (true, ctx.cabac.bitstream().bits_read())
+    let final_bits = ctx.cabac.bitstream().bits_read();
+
+    (true, final_bits)
 }
 
 /// Build a `WppShared` from the current context's references. Exclusive
@@ -1250,8 +1279,8 @@ fn decode_coding_quadtree(ctx: &mut DecodingContext, x0: i32, y0: i32, log2_cb_s
     }
 
     if hevc_trace() {
-        eprintln!("RUST QT ({},{}) {}x{} split={} bits={}", x0, y0, cb_size, cb_size,
-            split as i32, ctx.cabac.bitstream().bits_read());
+        eprintln!("RUST QT ({},{}) {}x{} split={} bits={} tid={:?}", x0, y0, cb_size, cb_size,
+            split as i32, ctx.cabac.bitstream().bits_read(), std::thread::current().id());
     }
 
     // QP group boundary — §8.6.1
@@ -1349,8 +1378,8 @@ fn decode_coding_unit(ctx: &mut DecodingContext, x0: i32, y0: i32, log2_cb_size:
         }
 
         if hevc_trace() {
-            eprintln!("RUST CU ({},{}) {}x{} pred={} part={} bits={}", x0, y0, cb_size, cb_size,
-                pred_mode as u8 as i32, part_mode as u8 as i32, ctx.cabac.bitstream().bits_read());
+            eprintln!("RUST CU ({},{}) {}x{} pred={} part={} bits={} tid={:?}", x0, y0, cb_size, cb_size,
+                pred_mode as u8 as i32, part_mode as u8 as i32, ctx.cabac.bitstream().bits_read(), std::thread::current().id());
         }
 
         // §6.4.2: store pred_mode and part_mode early so PU-level AMVP/merge

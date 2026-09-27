@@ -768,7 +768,12 @@ pub fn extract_all_access_units(
                                         _ => None,
                                     })
                                     .collect();
-                                let adaptive_ref_pic_marking_mode_flag = !mmco_commands.is_empty();
+                                // Real slice-header flag (H.264 spec 7.4.5): it can be 1
+                                // even when this slice carries no MMCO ops. Deriving it
+                                // from `!mmco_commands.is_empty()` would wrongly fall back
+                                // to sliding-window marking on such slices.
+                                let adaptive_ref_pic_marking_mode_flag =
+                                    slh.adaptive_ref_pic_marking_mode_flag;
                                 let no_output_of_prior_pics_flag = slh.no_output_of_prior_pics_flag;
 
                                 if in_frame && !current_au_data.is_empty() {
@@ -837,6 +842,13 @@ pub fn extract_all_access_units(
                     if let Some((_, nal_unit_type, _, nuh_temporal_id_plus1)) =
                         parse_h265_nal_header(nal_data)
                     {
+                        if std::env::var("VACC_DBG_AU").is_ok() {
+                            let raw_fss = nal_data.len() >= 3 && ((nal_data[2] >> 7) & 1) == 1;
+                            eprintln!(
+                                "[H265-AU-NAL] off={} nal={} irap={} raw_fss={}",
+                                start, nal_unit_type, is_irap, raw_fss
+                            );
+                        }
                         if let Some((
                             first_slice_in_pic,
                             poc_lsb,
@@ -946,6 +958,12 @@ pub fn extract_all_access_units(
                             is_new_frame = !in_frame
                                 || current_slice_offsets.is_empty()
                                 || first_slice_segment;
+                            if std::env::var("VACC_DBG_AU").is_ok() {
+                                eprintln!(
+                                    "[H265-AU-NAL] off={} nal={} parse=None raw_fss={} is_new={}",
+                                    start, nal_unit_type, first_slice_segment, is_new_frame
+                                );
+                            }
                         }
                     } else {
                         is_new_frame = !in_frame || current_slice_offsets.is_empty();
@@ -1424,7 +1442,10 @@ pub fn extract_vp9_frames(data: &[u8], max_frames: usize) -> Vec<Vp9Frame> {
 /// An AV1 frame extracted from the bitstream.
 #[derive(Debug, Clone)]
 pub struct Av1Frame {
-    /// The full IVF packet (bitstream) — the GPU decodes from this buffer.
+    /// The bitstream the GPU decodes from: the full IVF packet for whole
+    /// Frame OBUs (type 6), or a synthetic single-Frame-OBU buffer
+    /// `[0x32][leb128 size][payload]` for split frames (FrameHeader type 3 +
+    /// Tile type 4 OBUs reassembled into one Frame OBU at offset 0).
     pub data: Vec<u8>,
     /// Frame count (sequential, per Frame OBU).
     pub frame_count: u32,
@@ -1486,13 +1507,22 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
             );
         }
         for obu in n_obus {
+            // Split frames carry a synthetic Frame OBU buffer; the rest use
+            // offsets into the raw packet.
+            let (data, obu_start, payload_start, payload_size) = match &obu.obu_buffer {
+                Some((buf, off)) => {
+                    let off = *off as u32;
+                    (buf.clone(), 0u32, off, buf.len() as u32 - off)
+                }
+                None => (packet.clone(), obu.obu_start, obu.payload_start, obu.payload_size),
+            };
             frames.push(Av1Frame {
-                data: packet.clone(),
+                data,
                 frame_count,
                 frame_obu_payload: obu.payload,
-                payload_start: obu.payload_start,
-                payload_size: obu.payload_size,
-                obu_start: obu.obu_start,
+                payload_start,
+                payload_size,
+                obu_start,
                 temporal_id: obu.temporal_id,
                 spatial_id: obu.spatial_id,
             });
@@ -1511,15 +1541,21 @@ struct FrameObuInfo {
     /// The OBU payload (frame header + tile data for Frame OBUs; frame header
     /// only for FrameHeader OBUs).
     payload: Vec<u8>,
-    /// Offset of the OBU header byte within the packet.
+    /// Offset of the OBU header byte within the packet. Unused (0) when
+    /// `obu_buffer` is set.
     obu_start: u32,
-    /// Offset of the payload within the packet.
+    /// Offset of the payload within the packet. Unused (0) when `obu_buffer`
+    /// is set.
     payload_start: u32,
-    /// Size of the payload.
+    /// Size of the payload. Unused (0) when `obu_buffer` is set.
     payload_size: u32,
     /// OBU extension temporal_id / spatial_id (0 when no extension byte).
     temporal_id: u32,
     spatial_id: u32,
+    /// For split frames (FrameHeader OBU + Tile OBUs): the synthetic type-6
+    /// Frame OBU bytes `[0x32][leb128 size][payload]` and the payload offset
+    /// within it. None for whole Frame OBUs.
+    obu_buffer: Option<(Vec<u8>, usize)>,
 }
 
 /// Extract all Frame OBUs (type 6) and show_existing_frame FrameHeader OBUs
@@ -1531,6 +1567,11 @@ struct FrameObuInfo {
 /// of issuing a GPU decode. Redundant frame headers (type 3 with
 /// show_existing_frame = 0) are skipped: the corresponding Frame OBU is
 /// decoded instead (C++ behavior).
+///
+/// Split frames — a type-3 FrameHeader OBU (show_existing_frame = 0) followed
+/// by one or more type-4 Tile OBUs — are reassembled into a single synthetic
+/// Frame OBU: the GPU bitstream path expects one Frame OBU at offset 0 of the
+/// submitted range, with tile offsets relative to its header byte.
 fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
     let mut obus = Vec::new();
     let mut pos = 0;
@@ -1562,6 +1603,12 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                 && size > 0
                 && size_pos < packet.len()
                 && (packet[size_pos] & 0x80) != 0;
+            // Split frame: FrameHeader OBU with show_existing_frame = 0.
+            // Tile data follows in separate Tile OBUs.
+            let is_split_frame_header = obu_type == 3
+                && size > 0
+                && size_pos < packet.len()
+                && (packet[size_pos] & 0x80) == 0;
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
@@ -1579,7 +1626,66 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
                     payload_size: (payload_end - payload_start) as u32,
                     temporal_id,
                     spatial_id,
+                    obu_buffer: None,
                 });
+            } else if is_split_frame_header {
+                // Split frame: reassemble the Frame OBU payload (frame header
+                // + tile data) from the FrameHeader and following Tile OBUs,
+                // then wrap it in a synthetic type-6 Frame OBU.
+                let fh_end = (size_pos + size).min(packet.len());
+                let mut payload: Vec<u8> = packet[size_pos..fh_end].to_vec();
+                let mut p = fh_end;
+                let mut tiles = 0usize;
+                while p < packet.len().saturating_sub(1) {
+                    let t_first = packet[p];
+                    let t_type = (t_first >> 3) & 0x0F;
+                    let t_ext = (t_first >> 2) & 1;
+                    let t_header_size = 1 + t_ext as usize;
+                    if ((t_first >> 1) & 1) == 0 || p + t_header_size >= packet.len() {
+                        break;
+                    }
+                    let mut t_size: usize = 0;
+                    let mut shift = 0;
+                    let mut t_size_pos = p + t_header_size;
+                    loop {
+                        if t_size_pos >= packet.len() {
+                            break;
+                        }
+                        let b = packet[t_size_pos];
+                        t_size |= ((b & 0x7F) as usize) << shift;
+                        shift += 7;
+                        t_size_pos += 1;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    if t_type != 4 {
+                        break;
+                    }
+                    let t_end = (t_size_pos + t_size).min(packet.len());
+                    payload.extend_from_slice(&packet[t_size_pos..t_end]);
+                    tiles += 1;
+                    p = t_end;
+                }
+                if tiles > 0 {
+                    // OBU extension byte: [temporal_id(3), spatial_id(5)].
+                    let (temporal_id, spatial_id) = if ext == 1 {
+                        let e = packet[pos + 1];
+                        (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32)
+                    } else {
+                        (0, 0)
+                    };
+                    let (obu_buf, payload_off) = build_synthetic_frame_obu(&payload);
+                    obus.push(FrameObuInfo {
+                        payload,
+                        obu_start: 0,
+                        payload_start: 0,
+                        payload_size: 0,
+                        temporal_id,
+                        spatial_id,
+                        obu_buffer: Some((obu_buf, payload_off)),
+                    });
+                }
             }
             let next = size_pos + size;
             pos = if next > pos { next } else { size_pos + 1 };
@@ -1588,4 +1694,35 @@ fn extract_frame_obus_from_packet(packet: &[u8]) -> Vec<FrameObuInfo> {
         }
     }
     obus
+}
+
+/// Encode `value` as an EB128 (LEB128) size field.
+fn encode_leb128(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Build a synthetic Frame OBU (type 6) wrapping `payload` (frame header +
+/// tile data). Returns the OBU bytes and the payload offset within them.
+///
+/// The first byte is `0x32`: forbidden bit 0, obu_type=6 (bits 6-3), no
+/// extension, size field present — matching this bitstream's OBU header
+/// layout (forbidden:1, type:4, ext:1, has_size:1, reserved:1).
+fn build_synthetic_frame_obu(payload: &[u8]) -> (Vec<u8>, usize) {
+    let mut obu = vec![0x32];
+    let leb = encode_leb128(payload.len() as u64);
+    obu.extend_from_slice(&leb);
+    obu.extend_from_slice(payload);
+    (obu, 1 + leb.len())
 }

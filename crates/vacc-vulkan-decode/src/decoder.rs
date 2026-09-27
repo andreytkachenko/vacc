@@ -27,6 +27,18 @@ impl VulkanDecoder {
         self.inner.decode_all(max_frames).map_err(Error::Vulkan)
     }
 
+    /// Stream frames in display order via `emit(index, frame)`.
+    ///
+    /// Memory stays flat on long streams (bounded B-frame reorder buffer);
+    /// see [`vacc_vulkan::VideoDecoder::decode_stream`]. Returns the number
+    /// of emitted frames.
+    pub fn decode_stream<F>(&mut self, max_frames: usize, emit: F) -> Result<usize>
+    where
+        F: FnMut(usize, vacc_vulkan::DecodedFrame) -> bool,
+    {
+        self.inner.decode_stream(max_frames, emit).map_err(Error::Vulkan)
+    }
+
     /// Reorder frames from decoding order to presentation order (by POC).
     pub fn reorder_to_presentation(
         frames: Vec<vacc_vulkan::DecodedFrame>,

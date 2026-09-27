@@ -107,7 +107,7 @@ impl NvdecDpbManager {
             // Apply sliding window: evict oldest short-term references
             // until we have room for the new one.
             while self.count_references() >= self.max_dpb_size {
-                self.evict_oldest_short_term();
+                self.evict_oldest_short_term(frame_num);
             }
         }
 
@@ -505,22 +505,52 @@ impl NvdecDpbManager {
             .count()
     }
 
-    /// Evict the oldest short-term reference frame (by POC).
+    /// Evict the oldest short-term reference frame by picNum (FrameNumWrap).
+    ///
+    /// Spec 8.2.5.3 evicts the short-term ref with the SMALLEST picNum, not
+    /// the smallest POC: with B-frame reordering, POC order and FrameNum order
+    /// diverge, and POC-based eviction drops refs that later slices still
+    /// reference (verified against FFmpeg's sliding-window MMCOs on
+    /// street.h264, where POC-order eviction corrupted 292 frames).
+    ///
+    /// FrameNumWrap = FrameNum, or FrameNum - MaxFrameNum when the ref's
+    /// FrameNum is greater than the current picture's FrameNum (C++
+    /// picture_numbers, eq. 8-28): refs from an earlier wraparound generation
+    /// sort older.
     ///
     /// Long-term references are never evicted by sliding window.
-    fn evict_oldest_short_term(&mut self) {
+    fn evict_oldest_short_term(&mut self, cur_frame_num: u32) {
         let mut oldest_idx = None;
-        let mut oldest_poc = i32::MAX;
+        let mut oldest_wrap = i32::MAX;
 
         for (i, entry) in self.entries.iter().enumerate() {
-            if entry.is_valid
-                && entry.is_reference
-                && !entry.is_long_term
-                && entry.pic_order_cnt < oldest_poc
-            {
-                oldest_poc = entry.pic_order_cnt;
-                oldest_idx = Some(i);
+            if entry.is_valid && entry.is_reference && !entry.is_long_term {
+                let wrap = if entry.frame_num > cur_frame_num {
+                    entry.frame_num as i32 - self.max_frame_num as i32
+                } else {
+                    entry.frame_num as i32
+                };
+                if wrap < oldest_wrap {
+                    oldest_wrap = wrap;
+                    oldest_idx = Some(i);
+                }
             }
+        }
+
+        if std::env::var("NVDEC_DEBUG_DPB").is_ok() {
+            let cands: Vec<String> = self
+                .entries
+                .iter()
+                .filter(|e| e.is_valid && e.is_reference && !e.is_long_term)
+                .map(|e| format!("fn={} poc={}", e.frame_num, e.pic_order_cnt))
+                .collect();
+            eprintln!(
+                "[DPB-EVICT] cur_fn={} candidates=[{}] evict={:?} wrap={}",
+                cur_frame_num,
+                cands.join(", "),
+                oldest_idx.map(|i| (self.entries[i].frame_num, self.entries[i].pic_order_cnt)),
+                oldest_wrap
+            );
         }
 
         if let Some(idx) = oldest_idx {
@@ -561,6 +591,7 @@ mod tests {
             ref_pic_list_modification_l0: Vec::new(),
             ref_pic_list_modification_l1: Vec::new(),
             dec_ref_pic_marking: mmcos,
+            adaptive_ref_pic_marking_mode_flag: false,
             no_output_of_prior_pics_flag: false,
             long_term_reference_flag: false,
             sp_for_switch_flag: false,
@@ -831,6 +862,51 @@ mod tests {
         assert_eq!(cuvid[2].not_existing, 0);
         assert_eq!(cuvid[3].not_existing, 0);
         assert_eq!(cuvid[3].PicIdx, -1);
+    }
+
+    #[test]
+    fn test_sliding_window_evicts_by_frame_num_not_poc() {
+        // street.h264 scenario (max_num_ref_frames=4, x264 B-frame reordering):
+        // POC order diverges from FrameNum order — fn6 has a LOWER poc than
+        // fn5. Spec 8.2.5.3 must evict fn5 (smallest picNum), not fn6
+        // (smallest POC), because later slices still reference fn6.
+        let mut dpb = NvdecDpbManager::new(1);
+        dpb.set_max_dpb_size(4);
+
+        dpb.add_frame(5, 20, true);
+        dpb.add_frame(6, 16, true); // lower POC than fn5, newer FrameNum
+        dpb.add_frame(7, 24, true);
+        dpb.add_frame(8, 26, true);
+        assert_eq!(dpb.count_references(), 4);
+
+        // DPB full: adding fn9 must evict fn5, keep fn6.
+        dpb.add_frame(9, 30, true);
+        let fns: Vec<u32> = dpb.valid_entries().map(|e| e.frame_num).collect();
+        assert_eq!(dpb.count_references(), 4);
+        assert!(fns.contains(&9), "new frame must be present: {:?}", fns);
+        assert!(fns.contains(&6), "fn6 (smallest POC) must survive: {:?}", fns);
+        assert!(!fns.contains(&5), "fn5 (smallest FrameNum) must be evicted: {:?}", fns);
+    }
+
+    #[test]
+    fn test_sliding_window_eviction_wraparound() {
+        // MaxFrameNum=16, current fn=2 (third generation). A ref from the
+        // first generation (raw fn=10 > cur) must sort older than any ref of
+        // the current generation via FrameNumWrap = 10 - 16 = -6.
+        let mut dpb = NvdecDpbManager::new(1);
+        dpb.set_max_frame_num(16);
+        dpb.set_max_dpb_size(3);
+
+        dpb.add_frame(10, 20, true); // previous generation (raw fn > cur)
+        dpb.add_frame(14, 24, true); // previous generation
+        dpb.add_frame(0, 26, true); // current generation
+
+        // Adding fn=2 (cur): evict min FrameNumWrap = fn10 (-6).
+        dpb.add_frame(2, 28, true);
+        let fns: Vec<u32> = dpb.valid_entries().map(|e| e.frame_num).collect();
+        assert!(!fns.contains(&10), "fn10 (oldest wrap) must be evicted: {:?}", fns);
+        assert!(fns.contains(&14), "fn14 must survive: {:?}", fns);
+        assert!(fns.contains(&0), "fn0 must survive: {:?}", fns);
     }
 
     #[test]

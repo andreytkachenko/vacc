@@ -21,6 +21,10 @@ pub struct BitReader<'a> {
     prev_two_bytes: u16,
     /// Whether to apply emulation-prevention byte removal.
     remove_epb: bool,
+    /// Number of emulation-prevention bytes removed so far. `pos` counts RAW
+    /// bytes (an EPB skip advances it by 2 for one RBSP byte), so bit
+    /// positions in RBSP space must subtract 8 per removal.
+    epb_removed: usize,
 }
 
 impl<'a> BitReader<'a> {
@@ -33,6 +37,7 @@ impl<'a> BitReader<'a> {
             bits_left: 0,
             prev_two_bytes: 0xFFFF,
             remove_epb,
+            epb_removed: 0,
         }
     }
 
@@ -306,14 +311,19 @@ impl<'a> BitReader<'a> {
     }
 
     /// Get current bit position in the stream (number of bits consumed).
+    /// Current read position in RBSP bits (emulation-prevention bytes
+    /// excluded). Callers that consume the stream the same way (e.g. the
+    /// SW decoder's CAVLC reader, which removes EPBs inline) must use this
+    /// space; raw-byte offsets would drift by 8 per EPB byte.
     pub fn position(&self) -> u64 {
-        if self.bits_left == 8 {
+        let raw = if self.bits_left == 8 {
             // Haven't consumed any bits from the loaded byte
             (self.pos as u64 - 1) * 8
         } else {
             // Consumed some bits from the loaded byte (or all of it)
             (self.pos as u64) * 8 - (self.bits_left as u64)
-        }
+        };
+        raw.saturating_sub((self.epb_removed as u64) * 8)
     }
 
     /// Check if there is more data to read.
@@ -384,6 +394,7 @@ impl<'a> BitReader<'a> {
             }
             let actual_byte = self.data[self.pos];
             self.pos += 1;
+            self.epb_removed += 1;
             // Update prev_two_bytes: track raw stream bytes (EPB byte + actual byte)
             // to avoid false EPB detection after removal
             self.prev_two_bytes = (0x03u16 << 8) | (actual_byte as u16);

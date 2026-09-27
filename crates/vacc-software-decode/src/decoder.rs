@@ -128,13 +128,18 @@ pub struct SwH264Decoder {
     // Input buffering.
     pending_data: Vec<u8>,
     parse_offset: usize,
+    /// Stable packet holding the whole stream up front (set by [`Self::new`]).
+    /// While present, the parser consumes it cursor-by-cursor without a
+    /// re-scan/re-copy per frame (rebuilding a packet from `pending_data`
+    /// every frame is O(n^2) on long files). Cleared on exhaustion or when
+    /// [`Self::feed`] appends new data.
+    stable_packet: Option<BitstreamPacket>,
 
     // Output reordering (B frames).
     frame_count: u32,
     gop_count: i64,
-    reorder_watermark: i64,
     pending_key: i64,
-    pending_frames: VecDeque<(i64, DecodedFrame)>,
+    pending_frames: VecDeque<(i64, DecodedFrame)>, 
 
     /// Per-slice macroblock parse-record capture, armed via
     /// [`SwH264Decoder::arm_mb_dump`] (test-only).
@@ -225,11 +230,14 @@ impl SwH264Decoder {
             slot_planes: Vec::new(),
             slot_mbs: Vec::new(),
             mbs_per_frame: 0,
-            pending_data: data,
+            // The whole stream is available up front: move it into a stable
+            // packet (no extra copy) so the parser's NAL cache survives
+            // across frames; `pending_data` stays empty until feed() lands.
+            pending_data: Vec::new(),
             parse_offset: 0,
+            stable_packet: Some(BitstreamPacket::new(data)),
             frame_count: 0,
             gop_count: 0,
-            reorder_watermark: i64::MIN,
             pending_key: 0,
             pending_frames: VecDeque::new(),
             mb_dump: RefCell::default(),
@@ -380,39 +388,83 @@ impl SwH264Decoder {
         Ok(())
     }
 
-    /// Decode the next picture from `pending_data`, or None when no complete
+    /// Apply a parsed parameter-set result (SPS/PPS bookkeeping).
+    fn apply_parameter_set(
+        &mut self,
+        sps: Option<vacc_core::picture::BoxedPictureParametersSet>,
+        pps: Option<vacc_core::picture::BoxedPictureParametersSet>,
+    ) -> Result<(), Error> {
+        if let Some(b) = sps {
+            let new_sps = b
+                .downcast_ref::<H264Sps>()
+                .ok_or_else(|| Error::Parser("bad SPS type".into()))?
+                .clone();
+            let format_changed = self
+                .sps
+                .as_ref()
+                .map(|s| !same_format(s, &new_sps))
+                .unwrap_or(true);
+            self.sps = Some(new_sps.clone());
+            if format_changed {
+                self.init_sequence(&new_sps)?;
+            }
+        }
+        if let Some(b) = pps {
+            let new_pps = b
+                .downcast_ref::<H264Pps>()
+                .ok_or_else(|| Error::Parser("bad PPS type".into()))?
+                .clone();
+            self.pps = Some(new_pps);
+        }
+        Ok(())
+    }
+
+    /// Decode the next picture from the input, or None when no complete
     /// picture is available yet.
     fn decode_one(&mut self) -> Result<Option<DecodedFrame>, Error> {
+        if let Some(packet) = self.stable_packet.take() {
+            // Stable-packet path: the parser's NAL cache spans the whole
+            // payload, so successive parse() calls advance the internal
+            // cursor with no re-scan and no per-frame copy.
+            let mut pkt = packet;
+            loop {
+                match self.parser.parse(&pkt) {
+                    Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
+                        self.apply_parameter_set(sps, pps)?;
+                        continue;
+                    }
+                    Ok(ParseResult::Slice { slices, bytes_consumed }) => {
+                        if slices.is_empty() {
+                            self.stable_packet = Some(pkt);
+                            return Ok(None);
+                        }
+                        // Measured from the payload start (= stream start here).
+                        self.parse_offset += bytes_consumed;
+                        let r = self.decode_h264_frame(&slices);
+                        self.stable_packet = Some(pkt);
+                        return r;
+                    }
+                    Ok(ParseResult::Nothing) | Ok(ParseResult::EndOfStream) => {
+                        // Stream exhausted; the packet is consumed for good.
+                        self.parse_offset = pkt.payload.len();
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(Error::Parser(e.to_string())),
+                }
+            }
+        }
+
+        // Incremental path (after feed()): rebuild a packet from the
+        // unconsumed tail.
         loop {
             if self.parse_offset >= self.pending_data.len() {
                 return Ok(None);
             }
-              let remaining = &self.pending_data[self.parse_offset..];
-              let packet = BitstreamPacket::new(remaining.to_vec());
-              match self.parser.parse(&packet) {
+            let remaining = &self.pending_data[self.parse_offset..];
+            let packet = BitstreamPacket::new(remaining.to_vec());
+            match self.parser.parse(&packet) {
                 Ok(ParseResult::ParameterSet { sps, pps, .. }) => {
-                    if let Some(b) = sps {
-                        let new_sps = b
-                            .downcast_ref::<H264Sps>()
-                            .ok_or_else(|| Error::Parser("bad SPS type".into()))?
-                            .clone();
-                        let format_changed = self
-                            .sps
-                            .as_ref()
-                            .map(|s| !same_format(s, &new_sps))
-                            .unwrap_or(true);
-                        self.sps = Some(new_sps.clone());
-                        if format_changed {
-                            self.init_sequence(&new_sps)?;
-                        }
-                    }
-                    if let Some(b) = pps {
-                        let new_pps = b
-                            .downcast_ref::<H264Pps>()
-                            .ok_or_else(|| Error::Parser("bad PPS type".into()))?
-                            .clone();
-                        self.pps = Some(new_pps);
-                    }
+                    self.apply_parameter_set(sps, pps)?;
                     continue;
                 }
                 Ok(ParseResult::Slice {
@@ -582,7 +634,6 @@ impl SwH264Decoder {
         if is_idr && self.frame_count > 0 {
             self.gop_count += 1;
         }
-        self.reorder_watermark = self.reorder_watermark.max(self.gop_count);
         self.pending_key = self.gop_count * 1_000_000 + poc as i64;
 
         let mut frame = DecodedFrame::new(
@@ -905,8 +956,26 @@ impl SwH264Decoder {
         ctx.mb_dump_cap = rec_buf.as_ref().map_or(0, Vec::len);
 
         if ctx.is_cabac {
+            // TEMP DEBUG (BBB-360 errno 114): identify the failing slice.
+            if std::env::var("VACC_SW_DEBUG").is_ok() {
+                eprintln!(
+                    "[SW-DBG] cabac.start: frame_num={} poc_lsb={} st={} nal_type={} first_mb={} cabac_init_idc={} header_bits={} nal_len={}",
+                    h.frame_num,
+                    h.pic_order_cnt_lsb,
+                    h.slice_type,
+                    h.nal_unit_type,
+                    h.first_mb_in_slice,
+                    h.cabac_init_idc,
+                    h.header_bit_size,
+                    entry.nal_data.len()
+                );
+            }
             // cabac_alignment_one_bit: a good probability to catch random errors.
             if ctx.cabac.start(&mut ctx.bits) {
+                eprintln!(
+                    "[SW-DBG] CABAC alignment FAILED: frame_num={} poc_lsb={} st={} first_mb={}",
+                    h.frame_num, h.pic_order_cnt_lsb, h.slice_type, h.first_mb_in_slice
+                );
                 return Err(Error::SliceDecode(114)); // EBADMSG, as the C core
             }
             ctx.cabac.init(qp_y as u8, cabac_init_idc as usize);
@@ -1045,6 +1114,11 @@ impl SwH264Decoder {
             buffer: out,
         }
     }
+
+    /// True once every input byte has been parsed (stream end).
+    fn input_exhausted(&self) -> bool {
+        self.stable_packet.is_none() && self.parse_offset >= self.pending_data.len()
+    }
 }
 
 /// True when two SPSes describe a different frame format (requiring DPB /
@@ -1113,7 +1187,10 @@ impl Decoder for SwH264Decoder {
         // new data, and force a NAL-cache rebuild: the payload length alone is
         // not a reliable change detector (two consecutive access units may have
         // the same byte length).
-        if self.parse_offset >= self.pending_data.len() {
+        if let Some(pkt) = self.stable_packet.take() {
+            // The stable packet still owns the unconsumed tail of the stream.
+            self.pending_data = pkt.payload[self.parse_offset..].to_vec();
+        } else if self.parse_offset >= self.pending_data.len() {
             self.pending_data.clear();
         } else {
             self.pending_data.drain(..self.parse_offset);
@@ -1126,16 +1203,20 @@ impl Decoder for SwH264Decoder {
 
     fn decode(&mut self) -> Result<Option<DecodedFrame>, Self::Error> {
         loop {
-            // Emit the front of the reorder buffer once it is in display order:
-            // a frame's GOP is complete only after a newer GOP has been decoded.
+            // Emit the front of the reorder buffer once it is in display order.
+            // A frame is released only after a picture with a strictly greater
+            // (gop, poc) key has been decoded: a higher-POC picture merely
+            // sitting in the buffer proves nothing, because hierarchical
+            // B-frames can still decode lower-POC pictures later (same
+            // conservative rule as the NVDEC backend). Holding until the next
+            // IDR would be correct but unbounded — on long-GOP 4K content it
+            // accumulates whole GOPs of pixel buffers and OOMs.
             if let Some(&(front_key, _)) = self.pending_frames.front() {
-                let exhausted = self.parse_offset >= self.pending_data.len();
-                let front_gop = front_key / 1_000_000;
-                if exhausted || front_gop < self.reorder_watermark {
+                if self.input_exhausted() || front_key < self.pending_key {
                     return Ok(Some(self.pending_frames.pop_front().unwrap().1));
                 }
             }
-            if self.parse_offset >= self.pending_data.len() {
+            if self.input_exhausted() {
                 return Ok(None);
             }
             let offset_before = self.parse_offset;
@@ -1179,9 +1260,9 @@ impl Decoder for SwH264Decoder {
         self.remaining_mbs = 0;
         self.pending_data.clear();
         self.parse_offset = 0;
+        self.stable_packet = None;
         self.frame_count = 0;
         self.gop_count = 0;
-        self.reorder_watermark = i64::MIN;
         self.pending_frames.clear();
         Ok(())
     }

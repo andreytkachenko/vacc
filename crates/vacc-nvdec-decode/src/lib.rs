@@ -175,6 +175,66 @@ pub use error::{NvdecError, NvdecResult};
 pub use h265::NvdecH265Decoder;
 pub use vp9::{NvdecVp9Decoder, Vp9DpbState, build_cuvid_vp9_picparams};
 
+/// Outcome of one bounded internal parse/decode pass.
+///
+/// Every decoder caps each pass at [`MAX_PICTURES_PER_PASS`] pictures so that
+/// constructing a decoder from a long bitstream does not queue (and hold in
+/// host memory) every frame of the stream up front; `decode`/`flush` resume
+/// where the previous pass stopped.
+pub const MAX_PICTURES_PER_PASS: u32 = 16;
+
+pub enum PassOutcome {
+    /// The per-pass picture budget was hit while input remained in the
+    /// current window. Call `decode` (or `flush`) again to continue.
+    More,
+    /// The current input window is fully consumed; no further pictures will be
+    /// produced from it until new data is submitted.
+    Exhausted,
+}
+
+/// Per-pass parse window size. Large enough to hold several pictures of any
+/// realistic resolution; a single NAL longer than this (or with no start code
+/// within it) simply extends the window to its true terminator.
+pub const WINDOW_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Length of a parse window starting at `off` whose NAL units are all complete
+/// under the parsers' extraction convention (a NAL followed by a 4-byte start
+/// code includes that code's first zero byte in its RBSP). Cuts at the last
+/// start code within `limit`; if the window holds no start code at all, extends
+/// to the covering NAL's true terminator (or the stream end). The cut point is
+/// always a position from which the next window re-anchors on a clean start
+/// code, so per-window extraction matches whole-stream extraction byte for
+/// byte.
+pub(crate) fn window_end(data: &[u8], off: usize, limit: usize) -> usize {
+    let total = data.len();
+    let end = (off + limit).min(total);
+
+    // Last start code in (off, end].
+    let mut last: Option<(usize, usize)> = None;
+    let mut pos = off;
+    while pos < end {
+        match vacc_parser::nal::find_next_start_code(data, pos) {
+            Some((p, cl)) => {
+                if p > off && p <= end {
+                    last = Some((p, cl));
+                }
+                pos = p + cl;
+            }
+            None => break,
+        }
+    }
+
+    match last {
+        Some((p, cl)) => (p - off) + if cl == 4 { 1 } else { 0 },
+        // No start code in (off, end]: the NAL covering [off..] runs past the
+        // limit; extend to its terminator (or the stream end).
+        None => match vacc_parser::nal::find_next_start_code(data, end) {
+            Some((q, cl)) if q < total => (q - off) + if cl == 4 { 1 } else { 0 },
+            _ => total - off,
+        },
+    }
+}
+
 /// Convenience type alias for the H.264 decoder.
 ///
 /// Shorthand for [`NvdecH264Decoder`]. Use this when you only need H.264

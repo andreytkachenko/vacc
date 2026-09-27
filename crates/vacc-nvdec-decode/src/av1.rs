@@ -51,6 +51,7 @@ use crate::{
         CUvideodecoder, cudaVideoChromaFormat, cudaVideoCodec, cudaVideoDeinterlaceMode,
         cudaVideoSurfaceFormat,
     },
+    MAX_PICTURES_PER_PASS, PassOutcome,
 };
 
 /// Number of decode surfaces / DPB slots (matches the cuvid parser baseline).
@@ -129,6 +130,11 @@ fn find_sps_obu(packet: &[u8]) -> Option<Vec<u8>> {
 /// of issuing a GPU decode. Redundant frame headers (type 3 with
 /// `show_existing_frame = 0`) are skipped: the corresponding Frame OBU is
 /// decoded instead (C++ behavior).
+///
+/// Split frames — a type-3 FrameHeader OBU (show_existing_frame = 0) followed
+/// by one or more type-4 Tile OBUs — are reassembled into a single payload
+/// (frame header + tile data), which the decode path treats like a whole
+/// Frame OBU payload.
 fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
     let mut obus = Vec::new();
     let mut pos = 0;
@@ -159,6 +165,12 @@ fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
                 && size > 0
                 && size_pos < packet.len()
                 && (packet[size_pos] & 0x80) != 0;
+            // Split frame: FrameHeader OBU with show_existing_frame = 0.
+            // Tile data follows in separate Tile OBUs.
+            let is_split_frame_header = obu_type == 3
+                && size > 0
+                && size_pos < packet.len()
+                && (packet[size_pos] & 0x80) == 0;
             if is_frame || is_show_existing {
                 let payload_start = size_pos;
                 let payload_end = (payload_start + size).min(packet.len());
@@ -174,6 +186,58 @@ fn extract_frame_obus(packet: &[u8]) -> Vec<Av1FrameObu> {
                     temporal_id,
                     spatial_id,
                 });
+            } else if is_split_frame_header {
+                // Split frame: reassemble the Frame OBU payload (frame header
+                // + tile data) from the FrameHeader and following Tile OBUs.
+                let fh_end = (size_pos + size).min(packet.len());
+                let mut payload: Vec<u8> = packet[size_pos..fh_end].to_vec();
+                let mut p = fh_end;
+                let mut tiles = 0usize;
+                while p < packet.len().saturating_sub(1) {
+                    let t_first = packet[p];
+                    let t_type = (t_first >> 3) & 0x0F;
+                    let t_ext = (t_first >> 2) & 1;
+                    let t_header_size = 1 + t_ext as usize;
+                    if ((t_first >> 1) & 1) == 0 || p + t_header_size >= packet.len() {
+                        break;
+                    }
+                    let mut t_size: usize = 0;
+                    let mut shift = 0;
+                    let mut t_size_pos = p + t_header_size;
+                    loop {
+                        if t_size_pos >= packet.len() {
+                            break;
+                        }
+                        let b = packet[t_size_pos];
+                        t_size |= ((b & 0x7F) as usize) << shift;
+                        shift += 7;
+                        t_size_pos += 1;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    if t_type != 4 {
+                        break;
+                    }
+                    let t_end = (t_size_pos + t_size).min(packet.len());
+                    payload.extend_from_slice(&packet[t_size_pos..t_end]);
+                    tiles += 1;
+                    p = t_end;
+                }
+                if tiles > 0 {
+                    // OBU extension byte: [temporal_id(3), spatial_id(5)].
+                    let (temporal_id, spatial_id) = if ext == 1 {
+                        let e = packet[pos + 1];
+                        (((e >> 5) & 0x7) as u32, (e & 0x1f) as u32)
+                    } else {
+                        (0, 0)
+                    };
+                    obus.push(Av1FrameObu {
+                        payload,
+                        temporal_id,
+                        spatial_id,
+                    });
+                }
             }
             let next = size_pos + size;
             pos = if next > pos { next } else { size_pos + 1 };
@@ -607,10 +671,6 @@ pub struct NvdecAv1Decoder {
     /// `cuvidDecodeStatus_Error` and pixels come out wrong toward the end of
     /// the scan).
     slice_offsets: [u32; 64],
-    /// If set (via `NVDEC_DUMP_PARAMS`), dump the exact [`CUVIDPICPARAMS`]
-    /// submitted for each picture (DECODE order) to this path.
-    dump_params_path: Option<std::path::PathBuf>,
-    dump_params_count: u32,
     /// IVF timebase (rate_num, rate_den); converts packet pts to the 90 kHz
     /// clock NVDEC expects in `CUVIDPICPARAMS.Reserved[0]`.
     ivf_timebase: (u32, u32),
@@ -670,10 +730,6 @@ impl NvdecAv1Decoder {
             pinned_cache: Mutex::new(None),
             bitstream_ring: Mutex::new((Vec::new(), 0)),
             slice_offsets: [0; 64],
-            dump_params_path: std::env::var("NVDEC_DUMP_PARAMS")
-                .ok()
-                .map(std::path::PathBuf::from),
-            dump_params_count: 0,
         };
 
         decoder.init_parser_format()?;
@@ -698,12 +754,19 @@ impl NvdecAv1Decoder {
     }
 
     /// Parse pending data and decode any available frames.
-    fn parse_and_decode(&mut self) -> NvdecResult<()> {
+    /// Parse pending data and decode up to [`MAX_PICTURES_PER_PASS`] frames.
+    ///
+    /// Returns [`PassOutcome::More`] when the per-pass budget is hit with input
+    /// still left in the window, or [`PassOutcome::Exhausted`] once the whole
+    /// window has been consumed (a truncated trailing IVF packet also counts
+    /// as exhausted until more data is submitted).
+    fn parse_and_decode(&mut self) -> NvdecResult<PassOutcome> {
         if self.is_ivf {
+            let mut pictures = 0u32;
             loop {
                 // Need at least 12 bytes for the packet header (4 size + 8 pts).
                 if self.parsed_offset + 12 > self.pending_data.len() {
-                    break;
+                    return Ok(PassOutcome::Exhausted);
                 }
                 let size = u32::from_le_bytes(
                     self.pending_data[self.parsed_offset..self.parsed_offset + 4]
@@ -711,7 +774,7 @@ impl NvdecAv1Decoder {
                         .unwrap(),
                 ) as usize;
                 if size == 0 || self.parsed_offset + 12 + size > self.pending_data.len() {
-                    break;
+                    return Ok(PassOutcome::Exhausted);
                 }
                 let pts = u64::from_le_bytes(
                     self.pending_data[self.parsed_offset + 4..self.parsed_offset + 12]
@@ -752,10 +815,18 @@ impl NvdecAv1Decoder {
                         }
                     }
                 }
+                // A packet is the atomic unit of progress: process all of its
+                // frame OBUs before returning, so a budget stop never leaves
+                // `parsed_offset` pointing at an already-processed packet
+                // (the next pass would re-decode it and duplicate its frames).
                 for obu in extract_frame_obus(payload) {
                     self.process_frame(&obu.payload, obu.temporal_id, obu.spatial_id, pts)?;
+                    pictures += 1;
                 }
                 self.parsed_offset += 12 + size;
+                if pictures >= MAX_PICTURES_PER_PASS {
+                    return Ok(PassOutcome::More);
+                }
             }
         } else {
             // Raw single-frame: process the whole buffer once, then mark consumed.
@@ -765,7 +836,7 @@ impl NvdecAv1Decoder {
                 self.parsed_offset = self.pending_data.len();
             }
         }
-        Ok(())
+        Ok(PassOutcome::Exhausted)
     }
 
     /// Stage `src` into the cached pinned (page-locked) host buffer and return
@@ -882,11 +953,6 @@ impl NvdecAv1Decoder {
             ts_90k,
             self.slice_offsets.as_ptr().cast::<c_uint>(),
         );
-
-        if let Some(dump_path) = &self.dump_params_path {
-            dump_cuvid_av1_picparams(dump_path, self.dump_params_count, &params);
-            self.dump_params_count += 1;
-        }
 
         let decoder_handle = {
             let d = self.decoder.lock().unwrap();
@@ -1473,12 +1539,19 @@ impl Decoder for NvdecAv1Decoder {
     }
 
     fn decode(&mut self) -> NvdecResult<Option<DecodedFrame>> {
-        self.parse_and_decode()?;
-        Ok(self.pending_frames.lock().unwrap().pop_front())
+        loop {
+            if let Some(frame) = self.pending_frames.lock().unwrap().pop_front() {
+                return Ok(Some(frame));
+            }
+            match self.parse_and_decode()? {
+                PassOutcome::More => continue,
+                PassOutcome::Exhausted => return Ok(None),
+            }
+        }
     }
 
     fn flush(&mut self) -> NvdecResult<Vec<DecodedFrame>> {
-        self.parse_and_decode()?;
+        while !matches!(self.parse_and_decode()?, PassOutcome::Exhausted) {}
         let mut pending = self.pending_frames.lock().unwrap();
         Ok(pending.drain(..).collect())
     }
@@ -1566,232 +1639,4 @@ fn bit_depth_component(bit_depth: u8) -> ComponentBitDepth {
     }
 }
 
-/// Dump the key fields of a [`CUVIDPICPARAMS`] (AV1) for debugging.
-fn dump_cuvid_av1_picparams(path: &std::path::Path, pic_num: u32, p: &CUVIDPICPARAMS) {
-    use std::io::Write;
-    let av1 = unsafe { &p.CodecSpecific.av1 };
-    let mut f = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let _ = writeln!(f, "=== DECODE {} ===", pic_num);
-    let _ = writeln!(f, "PicWidthInMbs = {}", p.PicWidthInMbs);
-    let _ = writeln!(f, "FrameHeightInMbs = {}", p.FrameHeightInMbs);
-    let _ = writeln!(f, "CurrPicIdx = {}", p.CurrPicIdx);
-    let _ = writeln!(f, "nBitstreamDataLen = {}", p.nBitstreamDataLen);
-    let _ = writeln!(f, "nNumSlices = {}", p.nNumSlices);
-    let _ = writeln!(f, "field_pic_flag = {}", p.field_pic_flag);
-    let _ = writeln!(f, "bottom_field_flag = {}", p.bottom_field_flag);
-    let _ = writeln!(f, "second_field = {}", p.second_field);
-    let _ = writeln!(
-        f,
-        "Reserved = [{}]",
-        p.Reserved
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    // First/last 32 bytes of the actual bitstream passed to cuvidDecodePicture
-    // (it lives in the pinned host buffer, so read it directly).
-    let total = p.nBitstreamDataLen as usize;
-    let bs = unsafe { std::slice::from_raw_parts(p.pBitstreamData, total) };
-    let first_len = total.min(32);
-    let _ = writeln!(
-        f,
-        "BITSTREAM[0..{}) = {}",
-        first_len,
-        bs[..first_len]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    );
-    let last_start = total.saturating_sub(32);
-    let _ = writeln!(
-        f,
-        "BITSTREAM[{}..{}] = {}",
-        last_start,
-        total,
-        bs[last_start..]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    );
-    let _ = writeln!(f, "ref_pic_flag = {}", p.ref_pic_flag);
-    let _ = writeln!(f, "intra_pic_flag = {}", p.intra_pic_flag);
-    let _ = writeln!(f, "width = {}", av1.width);
-    let _ = writeln!(f, "height = {}", av1.height);
-    let _ = writeln!(f, "frame_offset = {}", av1.frame_offset);
-    let _ = writeln!(f, "decodePicIdx = {}", av1.decodePicIdx);
-    let _ = writeln!(
-        f,
-        "profile = {} use_128x128 = {} subsampling = {}/{} mono = {} bit_depth_minus8 = {}",
-        av1.profile(),
-        av1.use_128x128_superblock(),
-        av1.subsampling_x(),
-        av1.subsampling_y(),
-        av1.mono_chrome(),
-        av1.bit_depth_minus8()
-    );
-    let _ = writeln!(
-        f,
-        "enable_order_hint = {} order_hint_bits_minus1 = {} enable_cdef = {} enable_restoration = {} enable_superres = {} enable_fgs = {}",
-        av1.enable_order_hint(),
-        av1.order_hint_bits_minus1(),
-        av1.enable_cdef(),
-        av1.enable_restoration(),
-        av1.enable_superres(),
-        av1.enable_fgs()
-    );
-    let _ = writeln!(
-        f,
-        "frame_type = {} show_frame = {} disable_cdf_update = {} allow_sct = {} force_integer_mv = {} coded_denom = {}",
-        av1.frame_type(),
-        av1.show_frame(),
-        av1.disable_cdf_update(),
-        av1.allow_screen_content_tools(),
-        av1.force_integer_mv(),
-        av1.coded_denom()
-    );
-    let _ = writeln!(
-        f,
-        "interp_filter = {} switchable_motion_mode = {} use_ref_frame_mvs = {} tx_mode = {} reference_mode = {} reduced_tx_set = {} skip_mode = {}",
-        av1.interp_filter(),
-        av1.switchable_motion_mode(),
-        av1.use_ref_frame_mvs(),
-        av1.tx_mode(),
-        av1.reference_mode(),
-        av1.reduced_tx_set(),
-        av1.skip_mode()
-    );
-    let _ = writeln!(
-        f,
-        "delta_q_present = {} delta_q_res = {} using_qmatrix = {} coded_lossless = {} use_superres = {}",
-        av1.delta_q_present(),
-        av1.delta_q_res(),
-        av1.using_qmatrix(),
-        av1.coded_lossless(),
-        av1.use_superres()
-    );
-    let _ = writeln!(
-        f,
-        "num_tile_cols = {} num_tile_rows = {} context_update_tile_id = {}",
-        av1.num_tile_cols(),
-        av1.num_tile_rows(),
-        av1.context_update_tile_id()
-    );
-    let _ = writeln!(
-        f,
-        "tile_widths = [{}]",
-        av1.tile_widths
-            .iter()
-            .take(16)
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let _ = writeln!(
-        f,
-        "tile_heights = [{}]",
-        av1.tile_heights
-            .iter()
-            .take(16)
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let _ = writeln!(
-        f,
-        "cdef_damping_minus_3 = {} cdef_bits = {}",
-        av1.cdef_damping_minus_3(),
-        av1.cdef_bits()
-    );
-    let _ = writeln!(
-        f,
-        "base_qindex = {} qp_y_dc = {} qp_u_dc = {} qp_v_dc = {} qp_u_ac = {} qp_v_ac = {}",
-        av1.base_qindex,
-        av1.qp_y_dc_delta_q,
-        av1.qp_u_dc_delta_q,
-        av1.qp_v_dc_delta_q,
-        av1.qp_u_ac_delta_q,
-        av1.qp_v_ac_delta_q
-    );
-    let _ = writeln!(
-        f,
-        "segmentation: enabled={} update_map={} update_data={} temporal_update={}",
-        av1.segmentation_enabled(),
-        av1.segmentation_update_map(),
-        av1.segmentation_update_data(),
-        av1.segmentation_temporal_update()
-    );
-    let _ = writeln!(
-        f,
-        "loop_filter: level=[{},{}] level_u={} level_v={} sharpness={} delta_enabled={} delta_update={} delta_lf_present={} delta_lf_res={} delta_lf_multi={}",
-        av1.loop_filter_level[0],
-        av1.loop_filter_level[1],
-        av1.loop_filter_level_u,
-        av1.loop_filter_level_v,
-        av1.loop_filter_sharpness,
-        av1.loop_filter_delta_enabled(),
-        av1.loop_filter_delta_update(),
-        av1.delta_lf_present(),
-        av1.delta_lf_res(),
-        av1.delta_lf_multi()
-    );
-    let _ = writeln!(
-        f,
-        "loop_filter_ref_deltas = [{}]",
-        av1.loop_filter_ref_deltas
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let _ = writeln!(f, "primary_ref_frame = {}", av1.primary_ref_frame);
-    let _ = writeln!(
-        f,
-        "ref_frame_map = [{}]",
-        av1.ref_frame_map
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let _ = writeln!(
-        f,
-        "ref_frame = [{}]",
-        (0..7)
-            .map(|r| format!(
-                "({}x{} idx={})",
-                av1.ref_frame[r].width, av1.ref_frame[r].height, av1.ref_frame[r].index
-            ))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    // Full raw byte dump of the CUVIDAV1PICPARAMS for byte-exact diffing.
-    let raw = unsafe {
-        std::slice::from_raw_parts(
-            av1 as *const crate::ffi::CUVIDAV1PICPARAMS as *const u8,
-            std::mem::size_of::<crate::ffi::CUVIDAV1PICPARAMS>(),
-        )
-    };
-    let _ = writeln!(
-        f,
-        "RAW = {}",
-        raw.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-    );
-    // Full bitstream MD5 for content verification (matches the cuvid baseline tool).
-    let bs_len = p.nBitstreamDataLen as usize;
-    if bs_len > 0 && !p.pBitstreamData.is_null() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let full = unsafe { std::slice::from_raw_parts(p.pBitstreamData, bs_len) };
-        let mut h = DefaultHasher::new();
-        full.hash(&mut h);
-        let _ = writeln!(f, "BITSTREAM_MD5_LEN = {} {}", bs_len, h.finish());
-    }
-}
+

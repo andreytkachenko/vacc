@@ -9,9 +9,9 @@
 //!   final RefPicList0/RefPicList1 POC lists (truncation, padding, and
 //!   ref_pic_lists_modification). Verified against FFmpeg
 //!   (`ff_hevc_slice_rpl` / `decode_lt_rps`) and bit-level encoder output.
-//! - [`H265Dpb`] — DPB slot state machine: NoRaslOutput reset, per-access-unit
-//!   reference marking (used + future-use RPS entries), eviction of
-//!   unreferenced pictures, slot allocation, and display-order bumping.
+//! - [`H265Dpb`] — DPB slot state machine: per-access-unit reference marking
+//!   (used + future-use RPS entries), eviction of unmarked pictures, slot
+//!   allocation, and display-order bumping.
 //!
 //! List construction order (verified against FFmpeg and the NVIDIA cuvid
 //! ground-truth dump for B slices):
@@ -370,9 +370,9 @@ struct H265CurPic {
 /// POC-based HEVC decoded picture buffer (common to all backends).
 ///
 /// Mirrors [`crate::h264_dpb::H264Dpb`] usage:
-/// 1. `picture_start(sps, info, is_ref)` — stage the picture, apply the
-///    NoRaslOutput reset, mark referenced slots (used + future-use RPS
-///    entries), evict unreferenced non-output pictures, and reserve a slot.
+/// 1. `picture_start(sps, info, is_ref)` — stage the picture, mark referenced
+///    slots (used + future-use RPS entries), evict unmarked non-output
+///    pictures, and reserve a slot.
 /// 2. `build_ref_lists()` — match the resolved L0/L1 lists against slots.
 /// 3. decode into the reserved slot.
 /// 4. `commit_current(slot)` — store the picture and run display logic.
@@ -397,23 +397,27 @@ impl H265Dpb {
 
     /// Stage the current picture and return the slot it will be stored into.
     ///
-    /// Applies, in order (mirrors the C++ core's `alloc_picture` +
-    /// `evict_unused`, which never remove reference pictures):
+    /// Applies, in order (mirrors FFmpeg's `ff_hevc_frame_rps` mark/unref
+    /// cycle in libavcodec/hevc/refs.c):
     /// - marking: every RPS entry of the current picture (used OR future-use)
     ///   marks its DPB slot as referenced by the current access unit;
-    /// - eviction: non-reference pictures that are not referenced and not
-    ///   pending output are freed. Reference pictures persist across IRAPs
-    ///   (`no_output_of_prior_pics_flag` is parsed by the C++ core but has no
-    ///   effect on DPB eviction);
+    /// - eviction: pictures that are neither marked by the current RPS nor
+    ///   pending output are freed — reference pictures included. This is what
+    ///   bounds the DPB to `MaxDecPicBuffering`: x265 pyramid anchors die as
+    ///   soon as the reference window moves past them, and pre-IRAP references
+    ///   die at the first following slice (their POCs never reappear in a
+    ///   post-IRAP RPS). References still pending output stay until displayed;
     /// - allocation: the first empty slot is reserved for the current picture,
-    ///   growing the pool when all slots are occupied.
+    ///   growing the pool only when no slot can be freed (non-conforming
+    ///   streams).
     pub fn picture_start(&mut self, sps: &H265Sps, info: &SliceHeaderInfo, is_ref: bool) -> usize {
         let resolved = resolve_refs(sps, info);
         let cur_poc = info.curr_pic_order_cnt_val;
 
         // 1. Clear reference marks from the previous access unit (FFmpeg
         //    mark_ref(0) on all frames). Marks are per-AU: a picture stays in
-        //    the DPB across IRAPs as long as it is a reference (step 3).
+        //    the DPB only while the current RPS marks it or output is pending
+        //    (step 3).
         for s in &mut self.slots {
             s.referenced_by_curr = false;
             s.is_long_term = false;
@@ -466,20 +470,28 @@ impl H265Dpb {
             }
         }
 
-        // 3. Evict: non-reference pictures that are no longer pending output.
-        //    Reference pictures (RefPicFlag=1) are kept until the next IRAP /
-        //    long-term operation — a reference not used by the *current* pic may
-        //    still be used by a later one, so it must not be freed (mirrors the
-        //    C++ `DPB::evict_unused`, which never removes references).
+        // 3. Evict: pictures no longer needed. A picture stays alive while it
+        //    is marked by the current access unit's RPS (used or future-use
+        //    entry) or still pending output — exactly FFmpeg's per-slice
+        //    mark/unref cycle: clear all marks, re-mark the current RPS
+        //    entries, release everything left unmarked and not awaiting
+        //    output. Reference pictures are included: keeping them alive
+        //    forever (the old C++-mirroring rule) grows the DPB without bound
+        //    on pyramid streams and overflows the backends' fixed surface
+        //    pools. Encoders keep a reference marked in every RPS until the
+        //    last picture that needs it, so freeing unmarked references is
+        //    safe for conforming streams (FFmpeg degrades to a gray
+        //    placeholder only if a stream violates this).
         for s in &mut self.slots {
-            if s.valid && !s.is_ref && !s.referenced_by_curr && !s.needed_for_output {
+            if s.valid && !s.referenced_by_curr && !s.needed_for_output {
                 *s = H265DpbSlot::empty();
             }
         }
 
-        // 4. Reserve the first empty slot for the current picture, growing the
-        //    pool when it is exhausted (the C++ DPB is an unbounded vector of
-        //    pictures; short-term references accumulate until the next IRAP).
+        // 4. Reserve the first empty slot for the current picture. With the
+        //    FFmpeg-style eviction above, conforming streams never exhaust the
+        //    pool (it is sized >= MaxDecPicBuffering + MaxNumReorderPics);
+        //    growing is only a fallback for non-conforming streams.
         let slot = match self.slots.iter().position(|s| !s.valid) {
             Some(i) => i,
             None => {
@@ -972,10 +984,12 @@ mod tests {
         assert!(r.l1.is_empty());
     }
 
-    /// DPB lifecycle: IDR -> P -> B pyramid; verify marking, keep-alive of
-    /// unused RPS entries, and reference persistence across an IRAP (the C++
-    /// core never evicts references; `no_output_of_prior_pics_flag` has no
-    /// effect on DPB eviction).
+    /// DPB lifecycle: IDR -> P -> B pyramid; verify marking and keep-alive of
+    /// unused RPS entries (FOLL lists). With `max_num_reorder_frames = 0`
+    /// every picture is output at its own commit, so by the CRA none of the
+    /// prior references is pending output — the FFmpeg mark/unref cycle frees
+    /// them all there (a real reorder window would keep the still-pending
+    /// ones alive across the IRAP).
     #[test]
     fn dpb_lifecycle() {
         let sps = sps_with(4);
@@ -1051,10 +1065,9 @@ mod tests {
         let refs = dpb.get_references();
         assert!(refs.iter().any(|&i| dpb.slot_poc(i) == Some(0)));
 
-        // PIC 3: CRA with no_output_of_prior_pics=1. The C++ core parses the
-        // flag but never uses it for DPB eviction, and `evict_unused` never
-        // removes reference pictures — so every prior reference survives the
-        // IRAP (mirrored here).
+        // PIC 3: CRA with no_output_of_prior_pics=1. Empty RPS -> nothing is
+        // marked; all prior references are already output (reorder = 0) ->
+        // all freed, leaving only the CRA itself.
         let mut info = SliceHeaderInfo::new();
         info.slice_type = 0; // I
         info.is_rap = true;
@@ -1073,9 +1086,9 @@ mod tests {
             .into_iter()
             .filter_map(|i| dpb.slot_poc(i))
             .collect();
-        // All prior references persist across the IRAP (C++ `evict_unused`
-        // never removes references).
-        assert_eq!(live_refs, vec![0, 1, 3, 8]);
+        // Only the CRA survives: unmarked + output references are freed
+        // (FFmpeg ff_hevc_frame_rps semantics).
+        assert_eq!(live_refs, vec![8]);
     }
 
     /// Eviction semantics (mirrors C++ `DPB::evict_unused`): a non-reference
@@ -1127,17 +1140,16 @@ mod tests {
         let slot = dpb.picture_start(&sps, &mk_p(3), true);
         dpb.commit_current(slot);
 
-        // POC 4 (ref) references only POC 3: POC 2 is now unreferenced, not
-        // pending output (bumped at its commit), and not a reference ->
-        // evicted. References POC 0/1 persist although unused by the current
-        // picture.
+        // POC 4 (ref) references only POC 3. With reorder = 0 every picture
+        // is output at its own commit, so each picture_start frees the
+        // references that dropped out of the current RPS: POC 0 at POC 3's
+        // start, POC 1 at POC 4's start (FFmpeg mark/unref semantics). Only
+        // the current picture's reference (POC 3) and POC 4 itself remain.
         let slot = dpb.picture_start(&sps, &mk_p(4), true);
         dpb.commit_current(slot);
 
-        let pocs: Vec<i32> = (0..8).filter_map(|i| dpb.slot_poc(i)).collect();
-        assert!(!pocs.contains(&2), "POC 2 should be evicted: {pocs:?}");
-        for keep in [0, 1, 3, 4] {
-            assert!(pocs.contains(&keep), "POC {keep} missing: {pocs:?}");
-        }
+        let mut pocs: Vec<i32> = (0..8).filter_map(|i| dpb.slot_poc(i)).collect();
+        pocs.sort();
+        assert_eq!(pocs, vec![3, 4], "expected only POCs 3 and 4: {pocs:?}");
     }
 }

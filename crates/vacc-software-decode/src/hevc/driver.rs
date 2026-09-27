@@ -9,7 +9,7 @@ use crate::hevc::bitreader::{BitstreamReader, extract_rbsp_with_epb};
 use crate::hevc::cabac::{CabacContext, CabacEngine};
 use crate::hevc::cabac_tables::NUM_CABAC_CONTEXTS;
 use crate::hevc::coding_tree::{CuInfo, DecodingContext, SaoParams, decode_slice_segment_data};
-use crate::hevc::deblocking::{DeblockCtx, DeblockCu, DeblockSliceParams, MotionInfo, apply_deblocking};
+use crate::hevc::deblocking::{DeblockCtx, DeblockSliceParams, apply_deblocking};
 use crate::hevc::inter_prediction::{DpbView, PlaneView, RefPic};
 use crate::hevc::picture::{Picture, PuMotionInfo};
 use crate::hevc::sao::{CuGrid, SaoCtx, apply_sao};
@@ -231,6 +231,12 @@ pub fn decode_picture(
     let mut wpp_saved = [CabacContext::default(); NUM_CABAC_CONTEXTS];
     let mut wpp_avail = false;
 
+    eprintln!(
+        "DBG decode_picture poc={} nslices={} slice_addrs={:?}",
+        cur_poc,
+        slices.len(),
+        slices.iter().map(|s| s.sh.slice_segment_address).collect::<Vec<_>>()
+    );
     for (s, seg) in slices.iter().enumerate() {
         let sh = &seg.sh;
         // C++ NalParser extracts RBSP from the NAL payload (after the 2-byte
@@ -305,34 +311,8 @@ pub fn decode_picture(
         wpp_avail = wpp_out.1;
     }
 
-    // Deblocking/SAO motion grid (built before `motion` is moved into the
-    // picture for TMVP storage).
-    let motion_db: Vec<MotionInfo> = motion
-        .iter()
-        .map(|m| MotionInfo {
-            mv: m.mv,
-            ref_idx: m.ref_idx,
-            pred_flag: m.pred_flag,
-        })
-        .collect();
-
-    // Motion info + ref POC snapshots for TMVP (C++ decoder.cpp after the
-    // slice loop). Missing references store POC 0, mirroring the C++ DPB.
-    pic.motion_info_buf = std::mem::take(&mut motion);
-    pic.motion_info_stride = grid_w;
-    pic.ref_poc[0] = refs_l0.iter().map(|e| if e.slot >= 0 { e.poc } else { 0 }).collect();
-    pic.ref_poc[1] = refs_l1.iter().map(|e| if e.slot >= 0 { e.poc } else { 0 }).collect();
-
     // §8.7: in-loop filters — deblocking then SAO, once after all slices.
-    let cu_db: Vec<DeblockCu> = cu
-        .iter()
-        .map(|c| DeblockCu {
-            pred_mode: c.pred_mode as u8,
-            qp_y: c.qp_y,
-            is_pcm: c.is_pcm,
-            transquant_bypass: c.cu_transquant_bypass,
-        })
-        .collect();
+    // (Runs before `motion` is moved into the picture: DeblockCtx borrows it.)
     let is_pcm_db: Vec<u8> = cu.iter().map(|c| c.is_pcm as u8).collect();
     let bypass_db: Vec<u8> = cu.iter().map(|c| c.cu_transquant_bypass as u8).collect();
     let across_slices: Vec<bool> = slices.iter().map(|s| s.deblock.across_slices_enabled).collect();
@@ -384,11 +364,11 @@ pub fn decode_picture(
         pps_cr_qp_offset: pps.pps_cr_qp_offset,
         slice_idx: Some(&slice_idx),
         sh: &sh_params,
-        cu: &cu_db,
+        cu: &cu,
         cu_stride: min_cb_w,
         min_cb_log2: sps.min_cb_log2_size_y,
         grid_stride: grid_w,
-        motion: &motion_db,
+        motion: &motion,
         cbf_luma: &cbf,
         log2_tu_size: &log2_tu,
         edge_v: &edge_v,
@@ -426,6 +406,13 @@ pub fn decode_picture(
         },
     };
     apply_sao(&sao_ctx, &mut planes);
+
+    // Motion info + ref POC snapshots for TMVP (C++ decoder.cpp after the
+    // slice loop). Missing references store POC 0, mirroring the C++ DPB.
+    pic.motion_info_buf = std::mem::take(&mut motion);
+    pic.motion_info_stride = grid_w;
+    pic.ref_poc[0] = refs_l0.iter().map(|e| if e.slot >= 0 { e.poc } else { 0 }).collect();
+    pic.ref_poc[1] = refs_l1.iter().map(|e| if e.slot >= 0 { e.poc } else { 0 }).collect();
 
     Ok(pic)
 }

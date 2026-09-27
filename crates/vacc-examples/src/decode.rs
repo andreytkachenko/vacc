@@ -437,20 +437,21 @@ fn fmt_ms(v: f64) -> String {
     }
 }
 
-/// One decoded display frame, regardless of backend.
-enum Frame {
-    Core(CoreFrame),
+/// One decoded display frame, regardless of backend (borrowed — frames are
+/// streamed and dropped after hashing).
+enum FrameRef<'a> {
+    Core(&'a CoreFrame),
     #[cfg(feature = "vulkan")]
-    Vk(vacc_vulkan::DecodedFrame),
+    Vk(&'a vacc_vulkan::DecodedFrame),
 }
 
-impl Frame {
+impl<'a> FrameRef<'a> {
     /// Display size (width, height).
     fn size(&self) -> (u32, u32) {
         match self {
-            Frame::Core(f) => (f.width, f.height),
+            FrameRef::Core(f) => (f.width, f.height),
             #[cfg(feature = "vulkan")]
-            Frame::Vk(f) => (f.display_width, f.display_height),
+            FrameRef::Vk(f) => (f.display_width, f.display_height),
         }
     }
 
@@ -458,9 +459,9 @@ impl Frame {
     /// cropped to the display size), or None for skipped/empty frames.
     fn canonical_pixels(&self) -> Option<Vec<u8>> {
         match self {
-            Frame::Core(f) => f.pixel_data.as_ref().map(canonical_core),
+            FrameRef::Core(f) => f.pixel_data.as_ref().map(canonical_core),
             #[cfg(feature = "vulkan")]
-            Frame::Vk(f) => Some(canonical_vk(f)),
+            FrameRef::Vk(f) => Some(canonical_vk(f)),
         }
     }
 }
@@ -638,14 +639,22 @@ fn canonical_vk(frame: &vacc_vulkan::DecodedFrame) -> Vec<u8> {
     out
 }
 
-/// Drain a core-trait decoder (VAAPI / NVDEC) into display-order frames.
-fn decode_all_core<D: Decoder>(decoder: &mut D, max_frames: usize) -> Vec<CoreFrame> {
-    let mut frames = Vec::new();
+/// Stream a core-trait decoder (SW / VAAPI / NVDEC), passing each display
+/// frame to `process` as soon as it is released from B-frame reordering.
+/// Frames are hashed and dropped one at a time, so memory stays flat on long
+/// streams. Returns the number of frames processed.
+fn decode_stream_core<D: Decoder>(
+    decoder: &mut D,
+    max_frames: usize,
+    mut process: impl FnMut(usize, &CoreFrame) -> bool,
+) -> usize {
+    let mut n = 0;
     loop {
         match decoder.decode() {
             Ok(Some(frame)) => {
-                frames.push(frame);
-                if frames.len() >= max_frames {
+                let keep = process(n, &frame);
+                n += 1;
+                if !keep || n >= max_frames {
                     break;
                 }
             }
@@ -657,16 +666,92 @@ fn decode_all_core<D: Decoder>(decoder: &mut D, max_frames: usize) -> Vec<CoreFr
         }
     }
     // Drain frames still held back by B-frame reordering.
-    if frames.len() < max_frames {
+    if n < max_frames {
         match decoder.flush() {
-            Ok(mut pending) => {
-                frames.append(&mut pending);
-                frames.truncate(max_frames);
+            Ok(pending) => {
+                for frame in pending.iter().take(max_frames - n) {
+                    let keep = process(n, frame);
+                    n += 1;
+                    if !keep {
+                        break;
+                    }
+                }
             }
             Err(e) => eprintln!("flush error: {}", e),
         }
     }
-    frames
+    n
+}
+
+/// Per-frame output sink: prints one line per display frame (hashing the
+/// pixels on the fly) and optionally dumps raw .yuv files. Frames are
+/// processed one at a time so memory stays flat on long streams.
+struct FrameSink<'a> {
+    input: &'a str,
+    ivf: Option<&'a Ivf>,
+    pts_table: &'a [u64],
+    out_dir: Option<&'a std::path::Path>,
+    max_frames: usize,
+    emitted: usize,
+    pts_warned: bool,
+}
+
+impl<'a> FrameSink<'a> {
+    /// Process one frame in display order. Returns false once `max_frames`
+    /// frames have been emitted (caller should stop).
+    fn emit(&mut self, frame: &FrameRef) -> bool {
+        let i = self.emitted;
+        let (w, h) = frame.size();
+        let pts_ms: f64 = match self.ivf {
+            Some(ivf) => match self.pts_table.get(i) {
+                Some(&ticks) => ticks as f64 * ivf.tb_num as f64 * 1000.0 / ivf.tb_den as f64,
+                None => {
+                    if !self.pts_warned {
+                        eprintln!(
+                            "warning: decoded frame {} but only {} container display pts; remaining pts set to -1",
+                            i + 1,
+                            self.pts_table.len()
+                        );
+                        self.pts_warned = true;
+                    }
+                    -1.0
+                }
+            },
+            None => i as f64 * 1000.0 / 30.0, // synthetic: frame index on assumed 30 fps
+        };
+
+        match frame.canonical_pixels() {
+            Some(pixels) => {
+                if let Some(dir) = &self.out_dir {
+                    let stem = std::path::Path::new(self.input)
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy();
+                    let path = dir.join(format!("{}__frame_{}.yuv", stem, i));
+                    std::fs::write(&path, &pixels).unwrap_or_else(|e| {
+                        die(&format!("cannot write {}: {}", path.display(), e))
+                    });
+                }
+                println!(
+                    "frame {}: pts={}ms size={}x{} hash={:016x}",
+                    i,
+                    fmt_ms(pts_ms),
+                    w,
+                    h,
+                    fnv1a64(&pixels)
+                );
+            }
+            None => println!(
+                "frame {}: pts={}ms size={}x{} hash=- (no pixel data)",
+                i,
+                fmt_ms(pts_ms),
+                w,
+                h
+            ),
+        }
+        self.emitted += 1;
+        self.emitted < self.max_frames
+    }
 }
 
 fn main() {
@@ -717,139 +802,88 @@ fn main() {
     }
 
     let start = Instant::now();
-    let frames: Vec<Frame> = match args.backend {
+    let mut sink = FrameSink {
+        input: &args.input,
+        ivf: ivf.as_ref(),
+        pts_table: &pts_table,
+        out_dir: out_dir.as_deref(),
+        max_frames: args.max_frames,
+        emitted: 0,
+        pts_warned: false,
+    };
+
+    match args.backend {
         #[cfg(feature = "vulkan")]
         Backend::Vulkan => {
             let mut decoder = vacc_vulkan_decode::VulkanDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vulkan decoder init: {}", e)));
-            let frames = decoder
-                .decode_all(args.max_frames)
+            decoder
+                .decode_stream(args.max_frames, |_, f| sink.emit(&FrameRef::Vk(&f)))
                 .unwrap_or_else(|e| die(&format!("vulkan decode: {}", e)));
-            vacc_vulkan_decode::VulkanDecoder::reorder_to_presentation(frames)
-                .into_iter()
-                .map(Frame::Vk)
-                .collect()
         }
         #[cfg(feature = "vaapi")]
         Backend::Vaapi => {
             let mut decoder = vacc_vaapi_decode::VaapiDecoder::new(data)
                 .unwrap_or_else(|e| die(&format!("vaapi decoder init: {}", e)));
-            decode_all_core(&mut decoder, args.max_frames)
-                .into_iter()
-                .map(Frame::Core)
-                .collect()
+            decode_stream_core(&mut decoder, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
         }
         #[cfg(feature = "nvdec")]
         Backend::Nvdec => {
-            let frames = match codec {
+            match codec {
                 Codec::H264 => {
                     let mut d = vacc_nvdec_decode::NvdecH264Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
                 Codec::H265 => {
                     let mut d = vacc_nvdec_decode::NvdecH265Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
                 Codec::Vp9 => {
                     let mut d = vacc_nvdec_decode::NvdecVp9Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
                 Codec::Av1 => {
                     let mut d = vacc_nvdec_decode::NvdecAv1Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("nvdec init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
-            };
-            frames.into_iter().map(Frame::Core).collect()
+            }
         }
         #[cfg(any(feature = "edge264", feature = "hevcjs"))]
         Backend::Sw => {
-            let frames = match codec {
+            match codec {
                 #[cfg(feature = "edge264")]
                 Codec::H264 => {
                     let mut d = vacc_software_decode::SwH264Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("sw decoder init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
                 #[cfg(feature = "hevcjs")]
                 Codec::H265 => {
                     let mut d = vacc_software_decode::SoftwareH265Decoder::new(data)
                         .unwrap_or_else(|e| die(&format!("sw decoder init: {}", e)));
-                    decode_all_core(&mut d, args.max_frames)
+                    decode_stream_core(&mut d, args.max_frames, |_, f| sink.emit(&FrameRef::Core(f)));
                 }
                 other => die(&format!(
                     "sw backend does not support {} in this build",
                     other.name()
                 )),
-            };
-            frames.into_iter().map(Frame::Core).collect()
+            }
         }
     };
 
-    if frames.is_empty() {
+    if sink.emitted == 0 {
         die("no frames decoded");
-    }
-
-    let mut pts_warned = false;
-    for (i, frame) in frames.iter().enumerate() {
-        let (w, h) = frame.size();
-        let pts_ms: f64 = match &ivf {
-            Some(ivf) => match pts_table.get(i) {
-                Some(&ticks) => ticks as f64 * ivf.tb_num as f64 * 1000.0 / ivf.tb_den as f64,
-                None => {
-                    if !pts_warned {
-                        eprintln!(
-                            "warning: {} decoded frames but only {} container display pts; remaining pts set to -1",
-                            frames.len(),
-                            pts_table.len()
-                        );
-                        pts_warned = true;
-                    }
-                    -1.0
-                }
-            },
-            None => i as f64 * 1000.0 / 30.0, // synthetic: frame index on assumed 30 fps
-        };
-
-        match frame.canonical_pixels() {
-            Some(pixels) => {
-                if let Some(dir) = &out_dir {
-                    let stem = std::path::Path::new(&args.input)
-                        .file_stem()
-                        .unwrap()
-                        .to_string_lossy();
-                    let path = dir.join(format!("{}__frame_{}.yuv", stem, i));
-                    std::fs::write(&path, &pixels).unwrap_or_else(|e| {
-                        die(&format!("cannot write {}: {}", path.display(), e))
-                    });
-                }
-                println!(
-                    "frame {}: pts={}ms size={}x{} hash={:016x}",
-                    i,
-                    fmt_ms(pts_ms),
-                    w,
-                    h,
-                    fnv1a64(&pixels)
-                );
-            }
-            None => println!(
-                "frame {}: pts={}ms size={}x{} hash=- (no pixel data)",
-                i,
-                fmt_ms(pts_ms),
-                w,
-                h
-            ),
-        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
     println!(
         "decoded {} frames in {:.2}s ({:.1} fps)",
-        frames.len(),
+        sink.emitted,
         elapsed,
-        frames.len() as f64 / elapsed.max(1e-9)
+        sink.emitted as f64 / elapsed.max(1e-9)
     );
 }

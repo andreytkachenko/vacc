@@ -163,7 +163,7 @@ pub struct FrameSyncInfo {
 }
 
 /// A single plane of pixel data (Y, U, or V).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PixelPlane {
     /// Pointer to plane data.
     pub data: *const u8,
@@ -176,7 +176,7 @@ pub struct PixelPlane {
 }
 
 /// Planar pixel data for a decoded frame.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PixelData {
     /// Format string (e.g., "NV12", "YV12", "I420").
     pub format: String,
@@ -188,4 +188,33 @@ pub struct PixelData {
     pub v: Option<PixelPlane>,
     /// Owned buffer backing the planes.
     pub buffer: Vec<u8>,
+}
+
+impl Clone for PixelData {
+    fn clone(&self) -> Self {
+        // Plane pointers are offsets into `buffer`; rebase them onto the
+        // cloned buffer so the clone is self-contained. A derived clone would
+        // leave them pointing at the original buffer (dangling once the
+        // original drops).
+        let buffer = self.buffer.clone();
+        let base = self.buffer.as_ptr() as usize;
+        let len = self.buffer.len();
+        let rebased = |p: &PixelPlane| -> PixelPlane {
+            let addr = p.data as usize;
+            if addr >= base && addr < base + len {
+                let mut q = *p;
+                q.data = unsafe { buffer.as_ptr().add(addr - base) };
+                q
+            } else {
+                *p
+            }
+        };
+        PixelData {
+            format: self.format.clone(),
+            y: rebased(&self.y),
+            u: rebased(&self.u),
+            v: self.v.as_ref().map(rebased),
+            buffer,
+        }
+    }
 }

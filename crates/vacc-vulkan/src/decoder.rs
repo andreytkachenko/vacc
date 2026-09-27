@@ -162,9 +162,18 @@ impl VideoDecoder {
                         width: parsed.coded_width,
                         height: parsed.coded_height,
                     };
-                    let session_dpb_slots = parsed.max_dpb_slots.min(4) + 1;
+                    // H.264 DPB must hold every short-term reference simultaneously:
+                    // max_num_ref_frames from the SPS plus the current picture.
+                    // Encoders with B-frame pyramids (x264 bframes/b_pyramid) keep
+                    // many references alive; capping this at 4 corrupts streams that
+                    // need more (slot-0 overwrite once the pool saturates).
+                    let h264_dpb_slots = match &parsed.sps {
+                        Some(H264OrH265Sps::H264(s)) => s.max_num_ref_frames.clamp(4, 16),
+                        _ => 8,
+                    };
+                    let session_dpb_slots = h264_dpb_slots + 1;
                     let codec = VideoCodec::DecodeH264;
-                    let dpb_slots = parsed.max_dpb_slots.min(4);
+                    let dpb_slots = h264_dpb_slots;
                     (
                         parsed,
                         codec,
@@ -311,7 +320,19 @@ impl VideoDecoder {
         )?;
         eprintln!("[Decoder] Video session created successfully");
 
-        let max_frame_size = extract_max_frame_size(&data, decoded_codec, max_frames);
+        // H.264/H.265: the bitstream buffer only ever receives ONE access unit
+        // at a time (see decode_stream_h26x), so size it for the largest AU —
+        // not the whole file. A whole-file device-local/host-visible allocation
+        // fails on streams larger than the GPU's BAR1 window (e.g. 2 GB files).
+        let max_frame_size = match decoded_codec {
+            AccessUnitCodec::H264 | AccessUnitCodec::H265 => extract_max_au_size(
+                &data,
+                decoded_codec,
+                max_frames.saturating_add(32),
+                &parsed,
+            ),
+            _ => extract_max_frame_size(&data, decoded_codec, max_frames),
+        };
         // The driver may read srcBufferRange rounded up to
         // minBitstreamBufferSizeAlignment, so the allocation must cover the
         // aligned size of the largest access unit (VUID-07139).
@@ -330,7 +351,11 @@ impl VideoDecoder {
             parsed.chroma_bit_depth,
             decode_queue_family,
         )?;
-        eprintln!("[Decoder] Bitstream buffer created");
+        eprintln!(
+            "[Decoder] Bitstream buffer created (size={} bytes, max_au={})",
+            bs_buffer.size(),
+            max_frame_size
+        );
 
         let command_pool = create_command_pool(&vulkan.device, decode_queue_family)?;
         eprintln!("[Decoder] Command pool created");
@@ -522,10 +547,31 @@ impl VideoDecoder {
     /// VP9/AV1: returns frames in decoding order (use
     /// `reorder_to_presentation` if the stream reorders).
     pub fn decode_all(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
+        let mut frames = Vec::new();
+        self.decode_stream(max_frames, |_, frame| {
+            frames.push(frame);
+            true
+        })?;
+        Ok(frames)
+    }
+
+    /// Decode and stream frames in display order via `emit(index, frame)`.
+    ///
+    /// Unlike [`decode_all`], each frame is released one by one as soon as it
+    /// is safe to display (bounded B-frame reorder buffer), so memory stays
+    /// flat on long streams instead of growing with the stream length.
+    /// Returns the number of emitted frames; stops when `max_frames` is
+    /// reached, the stream is exhausted, or `emit` returns false.
+    pub fn decode_stream<F>(&mut self, max_frames: usize, emit: F) -> VideoResult<usize>
+    where
+        F: FnMut(usize, DecodedFrame) -> bool,
+    {
         match self.decoded_codec {
-            AccessUnitCodec::H264 | AccessUnitCodec::H265 => self.decode_all_h26x(max_frames),
-            AccessUnitCodec::Vp9 => self.decode_all_vp9(max_frames),
-            AccessUnitCodec::Av1 => self.decode_all_av1(max_frames),
+            AccessUnitCodec::H264 | AccessUnitCodec::H265 => {
+                self.decode_stream_h26x(max_frames, emit)
+            }
+            AccessUnitCodec::Vp9 => self.decode_stream_vp9(max_frames, emit),
+            AccessUnitCodec::Av1 => self.decode_stream_av1(max_frames, emit),
         }
     }
 
@@ -557,7 +603,43 @@ impl VideoDecoder {
         result
     }
 
-    fn decode_all_h26x(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
+    /// Ensure the bitstream buffer can hold an access unit of `needed_bytes`.
+    ///
+    /// `VideoDecoder::new` sizes the buffer from the construction-time frame
+    /// budget, but `decode_stream` may be called with a much larger budget
+    /// (e.g. the wrapper constructs with 64 and streams the whole file). An
+    /// oversized AU write is an out-of-bounds memcpy, so grow the buffer here
+    /// where the actual access units are known.
+    fn ensure_bs_buffer_capacity(&mut self, needed_bytes: usize) -> VideoResult<()> {
+        let align = self.bs_buffer_size_alignment.max(1) as u64;
+        let needed = ((needed_bytes as u64 + align - 1) & !(align - 1)).max(align);
+        if needed <= self.bs_buffer.size() {
+            return Ok(());
+        }
+        let bs_buffer = create_bitstream_buffer_with_profile(
+            &self.vulkan.device,
+            &self.vulkan.memory_properties,
+            needed,
+            self.codec,
+            self.parsed.profile_idc,
+            self.parsed.chroma_subsampling,
+            self.parsed.luma_bit_depth,
+            self.parsed.chroma_bit_depth,
+            self.decode_queue_family,
+        )?;
+        eprintln!(
+            "[Decoder] Bitstream buffer grown {} -> {} bytes",
+            self.bs_buffer.size(),
+            bs_buffer.size()
+        );
+        self.bs_buffer = bs_buffer;
+        Ok(())
+    }
+
+    fn decode_stream_h26x<F>(&mut self, max_frames: usize, mut emit: F) -> VideoResult<usize>
+    where
+        F: FnMut(usize, DecodedFrame) -> bool,
+    {
         // B-frames are decoded AFTER their future reference P-frame, so
         // decoding exactly `max_frames` access units can leave the last
         // in-window display frame undecoded while emitting an out-of-window
@@ -585,6 +667,18 @@ impl VideoDecoder {
         }
 
         let items: Vec<_> = items.into_iter().take(au_budget * 2).collect();
+
+        // The buffer was sized from the construction-time budget; make sure it
+        // can hold the largest access unit we are actually about to write.
+        let max_au = items
+            .iter()
+            .filter_map(|i| match i {
+                ExtractedItem::AccessUnit(au) => Some(au.data.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        self.ensure_bs_buffer_capacity(max_au)?;
 
         // H.265: common parser + common DPB — the single source of truth for
         // POC, reference lists and DPB slot allocation/liveness (shared with
@@ -622,7 +716,15 @@ impl VideoDecoder {
             ));
         }
 
-        let mut frames: Vec<DecodedFrame> = Vec::new();
+        // B-frame reorder buffer, kept sorted by display key (gop, poc).
+        // A frame is emitted once a picture with a strictly greater key has
+        // been decoded (same conservative rule as the SW/VAAPI/NVDEC
+        // backends), so the buffer is bounded by the GOP reorder depth —
+        // never the whole stream.
+        let mut pending: Vec<((u32, i32), DecodedFrame)> = Vec::new();
+        let mut emitted = 0usize;
+        let mut stopped = false;
+        let mut gop_count: u32 = 0;
         let mut is_first_frame = true;
         let mut access_unit_count = 0;
 
@@ -631,6 +733,15 @@ impl VideoDecoder {
         // RESULT_STATUS_ONLY query per frame, pool created with the session's
         // video profile in the pNext chain (VUID-vkCmdDecodeVideoKHR-queryPool-08368).
         let mut query_pool = vk::QueryPool::null();
+        // One RESULT_STATUS_ONLY query per decoded access unit (index = AU
+        // index), so the pool must cover every AU actually present in the
+        // stream — size it from the extracted items, not from `max_frames`
+        // (which may be unbounded) and never cap it below that.
+        let au_total = items
+            .iter()
+            .filter(|i| matches!(i, ExtractedItem::AccessUnit(_)))
+            .count();
+        let query_count = (au_total.max(1) as u32 + 3) & !3u32;
         match self.codec {
             VideoCodec::DecodeH265 => {
                 let h265_profile = vk::VideoDecodeH265ProfileInfoKHR {
@@ -656,9 +767,8 @@ impl VideoDecoder {
                             flags: vk::QueryPoolCreateFlags::empty(),
                             query_type: vk::QueryType::RESULT_STATUS_ONLY_KHR,
                             // One query per decoded AU (index = au count - 1);
-                            // size the pool for the full AU budget (including
-                            // the reorder margin) and round up for safety.
-                            query_count: ((au_budget as u32) + 3) & !3u32,
+                            // sized for every AU in the stream (see above).
+                            query_count,
                             pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
                             _marker: Default::default(),
                         },
@@ -694,7 +804,7 @@ impl VideoDecoder {
                             // One query per decoded AU (index = au count - 1);
                             // size the pool for the full AU budget (including
                             // the reorder margin) and round up for safety.
-                            query_count: ((au_budget as u32) + 3) & !3u32,
+                            query_count,
                             pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
                             _marker: Default::default(),
                         },
@@ -713,7 +823,7 @@ impl VideoDecoder {
                     self.handle_inband_parameter_set(ps)?;
                 }
                 ExtractedItem::AccessUnit(au) => {
-                    if access_unit_count >= au_budget {
+                    if stopped || emitted >= max_frames || access_unit_count >= au_budget {
                         break;
                     }
                     access_unit_count += 1;
@@ -919,10 +1029,25 @@ impl VideoDecoder {
                         dpb.commit_current(output_slot as usize);
                         self.sync_h265_dpb_entries(dpb);
                     } else if au.is_reference {
-                        // Always update DPB entry for reference frames, regardless of MMCO flag.
-                        // When adaptive_ref_pic_marking_mode_flag is true, MMCO commands are present
-                        // in the bitstream and take precedence over sliding window.
-                        // When false, sliding window handles cleanup.
+                        // H.264 8.2.5.4: reference picture marking applies to every
+                        // slice with nal_ref_idc > 0 (== is_reference here), and the
+                        // marking process runs BEFORE the current picture is added to
+                        // the DPB — so MMCO-5 (unmark all) cannot wipe the picture we
+                        // are about to store. Adaptive mode with no ops in this slice
+                        // leaves marking unchanged (the encoder manages it via MMCO);
+                        // only non-adaptive mode uses the sliding window.
+                        if au.adaptive_ref_pic_marking_mode_flag {
+                            if !au.mmco_commands.is_empty() {
+                                self.dpb_manager.apply_mmco(
+                                    au.frame_num,
+                                    output_slot,
+                                    &au.mmco_commands,
+                                );
+                            }
+                        } else {
+                            self.dpb_manager.apply_sliding_window(au.frame_num);
+                        }
+
                         self.dpb_manager.entries[output_slot as usize] = DpbEntry {
                             frame_num: au.frame_num,
                             pic_order_cnt: au.pic_order_cnt,
@@ -933,19 +1058,6 @@ impl VideoDecoder {
                             current_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
                             last_access: LastAccessType::DecodeWrite,
                         };
-
-                        // Apply reference picture marking AFTER updating the current frame's DPB entry.
-                        // When adaptive_ref_pic_marking_mode_flag is true, use MMCO commands.
-                        // When false, use sliding window.
-                        if au.adaptive_ref_pic_marking_mode_flag && !au.mmco_commands.is_empty() {
-                            self.dpb_manager.apply_mmco(
-                                au.frame_num,
-                                output_slot,
-                                &au.mmco_commands,
-                            );
-                        } else {
-                            self.dpb_manager.apply_sliding_window(au.frame_num);
-                        }
                     }
 
                     let pixels = super::readback::readback_decoded_image(
@@ -968,13 +1080,24 @@ impl VideoDecoder {
                     self.dpb_manager
                         .set_slot_last_access(output_slot, LastAccessType::TransferRead);
 
-                    frames.push(DecodedFrame {
-                        // H.265: POC from the common parser (source of truth for
-                        // presentation reordering); H.264: access-unit POC.
-                        poc: h265_ctx
-                            .as_ref()
-                            .map(|c| c.info.curr_pic_order_cnt_val)
-                            .unwrap_or(au.pic_order_cnt[0]),
+                    // H.265: POC from the common parser (source of truth for
+                    // presentation reordering); H.264: access-unit POC.
+                    let poc = h265_ctx
+                        .as_ref()
+                        .map(|c| c.info.curr_pic_order_cnt_val)
+                        .unwrap_or(au.pic_order_cnt[0]);
+                    // POC resets at each IDR, so combine with the GOP index to
+                    // keep the display key monotonic across the stream.
+                    if au.is_idr && access_unit_count > 1 {
+                        gop_count += 1;
+                    }
+                    let key = (gop_count, poc);
+                    let pos = pending
+                        .iter()
+                        .position(|(k, _)| *k > key)
+                        .unwrap_or(pending.len());
+                    pending.insert(pos, (key, DecodedFrame {
+                        poc,
                         frame_num: au.frame_num,
                         is_idr: au.is_idr,
                         is_reference: au.is_reference,
@@ -985,7 +1108,26 @@ impl VideoDecoder {
                         display_height: self.parsed.display_height,
                         crop_left: self.parsed.crop_left,
                         crop_top: self.parsed.crop_top,
-                    });
+                    }));
+
+                    // Release every frame whose display key is strictly below
+                    // the just-decoded picture's key. A higher-POC picture
+                    // merely sitting in the buffer proves nothing: hierarchical
+                    // B-frames can still decode lower-POC pictures later.
+                    while emitted < max_frames {
+                        match pending.first().map(|(k, _)| *k) {
+                            Some(front) if front < key => {
+                                let (_, frame) = pending.remove(0);
+                                let keep = emit(emitted, frame);
+                                emitted += 1;
+                                if !keep {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
         }
@@ -996,10 +1138,16 @@ impl VideoDecoder {
             }
         }
 
-        // Present in display order and drop the out-of-window margin frames.
-        let mut frames = Self::reorder_to_presentation(frames);
-        frames.truncate(max_frames);
-        Ok(frames)
+        // Input exhausted: release whatever reordering still holds back.
+        // `pending` is already sorted by display key.
+        while !stopped && emitted < max_frames && !pending.is_empty() {
+            let (_, frame) = pending.remove(0);
+            if !emit(emitted, frame) {
+                stopped = true;
+            }
+            emitted += 1;
+        }
+        Ok(emitted)
     }
     /// Updates cached parameter sets and calls vkUpdateVideoSessionParametersKHR.
     fn handle_inband_parameter_set(&mut self, ps: &InBandParameterSet) -> VideoResult<()> {
@@ -1066,7 +1214,10 @@ impl VideoDecoder {
         Ok(())
     }
 
-    fn decode_all_vp9(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
+    fn decode_stream_vp9<F>(&mut self, max_frames: usize, mut emit: F) -> VideoResult<usize>
+    where
+        F: FnMut(usize, DecodedFrame) -> bool,
+    {
         // Extract a generous multiple of AUs: VP9 has hidden reference-only
         // frames (show_frame=0) that are decoded but produce no display output,
         // so `max_frames` AUs can yield fewer than `max_frames` display frames.
@@ -1076,6 +1227,9 @@ impl VideoDecoder {
         if frames.is_empty() {
             return Err(VideoError::DecoderInit("No VP9 frames found".to_string()));
         }
+
+        let max_frame = frames.iter().map(|f| f.data.len()).max().unwrap_or(0);
+        self.ensure_bs_buffer_capacity(max_frame)?;
 
         let mut vp9_decoder =
             Vp9Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
@@ -1087,7 +1241,7 @@ impl VideoDecoder {
         let mut vp9_dpb = vacc_parser::vp9_dpb::Vp9Dpb::new(self.dpb_images.len() as u32);
         let output_format = decode_output_format(self.parsed.luma_bit_depth);
 
-        let mut decoded_frames = Vec::new();
+        let mut emitted = 0usize;
         let mut is_first_frame = true;
         let mut frame_count: u32 = 0;
 
@@ -1098,7 +1252,7 @@ impl VideoDecoder {
             // Stop once we have the requested number of DISPLAY frames. Hidden
             // reference-only AUs are still decoded (they feed later references)
             // but do not count toward this total.
-            if decoded_frames.len() >= max_frames {
+            if emitted >= max_frames {
                 break;
             }
             // Parse frame header
@@ -1138,7 +1292,7 @@ impl VideoDecoder {
                         vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
                         output_format,
                     )?;
-                    decoded_frames.push(DecodedFrame {
+                    let frame = DecodedFrame {
                         poc: frame_count as i32,
                         frame_num: frame_count,
                         is_idr: false,
@@ -1150,7 +1304,11 @@ impl VideoDecoder {
                         display_height: self.parsed.display_height,
                         crop_left: self.parsed.crop_left,
                         crop_top: self.parsed.crop_top,
-                    });
+                    };
+                    if !emit(emitted, frame) {
+                        return Ok(emitted);
+                    }
+                    emitted += 1;
                     frame_count += 1;
                 }
                 continue;
@@ -1334,7 +1492,7 @@ impl VideoDecoder {
                 self.dpb_manager
                     .set_slot_layout(output_slot_u, vk::ImageLayout::VIDEO_DECODE_DPB_KHR);
 
-                decoded_frames.push(DecodedFrame {
+                let frame = DecodedFrame {
                     poc: frame_count as i32,
                     frame_num: frame_count,
                     is_idr: is_key_frame,
@@ -1346,7 +1504,11 @@ impl VideoDecoder {
                     display_height: self.parsed.display_height,
                     crop_left: self.parsed.crop_left,
                     crop_top: self.parsed.crop_top,
-                });
+                };
+                if !emit(emitted, frame) {
+                    return Ok(emitted);
+                }
+                emitted += 1;
             } else {
                 // Decoded for references only; keep the DPB layout.
                 self.dpb_manager
@@ -1356,16 +1518,21 @@ impl VideoDecoder {
             frame_count += 1;
         }
 
-        decoded_frames.truncate(max_frames);
-        Ok(decoded_frames)
+        Ok(emitted)
     }
 
-    fn decode_all_av1(&mut self, max_frames: usize) -> VideoResult<Vec<DecodedFrame>> {
+    fn decode_stream_av1<F>(&mut self, max_frames: usize, mut emit: F) -> VideoResult<usize>
+    where
+        F: FnMut(usize, DecodedFrame) -> bool,
+    {
         let frames = super::access_unit::extract_av1_frames(&self.bitstream_data, max_frames);
 
         if frames.is_empty() {
             return Err(VideoError::DecoderInit("No AV1 frames found".to_string()));
         }
+
+        let max_frame = frames.iter().map(|f| f.data.len()).max().unwrap_or(0);
+        self.ensure_bs_buffer_capacity(max_frame)?;
 
         let mut av1_decoder =
             Av1Decoder::new(self.vulkan.device.clone(), self.vulkan.instance.clone());
@@ -1387,9 +1554,10 @@ impl VideoDecoder {
             .as_ref()
             .ok_or_else(|| VideoError::DecoderInit("AV1 SPS not available".to_string()))?;
 
-        let mut decoded_frames = Vec::new();
         let mut is_first_frame = true;
         let mut frame_count: u32 = 0;
+        // display_count doubles as the emit index (VP9/AV1 display frames come
+        // out in decode order, so no reorder buffer is needed).
         let mut display_count: usize = 0;
 
         eprintln!(
@@ -1513,7 +1681,7 @@ impl VideoDecoder {
                     // FIX (iteration 4): POC must identify the DISPLAY position so
                     // reorder_to_presentation yields display order. display_count is
                     // the display index captured BEFORE incrementing below.
-                    decoded_frames.push(DecodedFrame {
+                    let frame = DecodedFrame {
                         poc: display_count as i32,
                         frame_num: frame_count,
                         is_idr: false,
@@ -1525,7 +1693,10 @@ impl VideoDecoder {
                         display_height: self.parsed.display_height,
                         crop_left: self.parsed.crop_left,
                         crop_top: self.parsed.crop_top,
-                    });
+                    };
+                    if !emit(display_count, frame) {
+                        return Ok(display_count);
+                    }
                     display_count += 1;
                     if display_count >= max_frames {
                         break;
@@ -2805,7 +2976,7 @@ impl VideoDecoder {
             // FIX (iteration 4): POC must identify the DISPLAY position so
             // reorder_to_presentation yields display order. display_count is the
             // display index captured BEFORE incrementing below.
-            decoded_frames.push(DecodedFrame {
+            let frame = DecodedFrame {
                 poc: display_count as i32,
                 frame_num: frame_count,
                 is_idr: is_key_frame,
@@ -2817,7 +2988,10 @@ impl VideoDecoder {
                 display_height: self.parsed.display_height,
                 crop_left: self.parsed.crop_left,
                 crop_top: self.parsed.crop_top,
-            });
+            };
+            if !emit(display_count, frame) {
+                return Ok(display_count);
+            }
 
             frame_count += 1;
             display_count += 1;
@@ -2826,7 +3000,7 @@ impl VideoDecoder {
             }
         }
 
-        Ok(decoded_frames)
+        Ok(display_count)
     }
 
     fn bitstream_data(&self) -> &[u8] {
@@ -4246,7 +4420,6 @@ fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::Vi
     }
 }
 
-#[allow(dead_code)]
 fn extract_max_au_size(
     data: &[u8],
     codec: AccessUnitCodec,
@@ -4261,17 +4434,20 @@ fn extract_max_au_size(
         parsed.pps.as_ref(),
     );
 
-    items
-        .iter()
-        .filter_map(|item| {
-            if let ExtractedItem::AccessUnit(au) = item {
-                Some(au.data.len())
-            } else {
-                None
-            }
-        })
-        .max()
-        .unwrap_or(0)
+    let mut max: Option<usize> = None;
+    let mut count = 0usize;
+    for item in &items {
+        if let ExtractedItem::AccessUnit(au) = item {
+            count += 1;
+            max = Some(max.map(|m| m.max(au.data.len())).unwrap_or(au.data.len()));
+        }
+    }
+    eprintln!(
+        "[Decoder] extract_max_au_size: {} AUs, max={} bytes",
+        count,
+        max.unwrap_or(0)
+    );
+    max.unwrap_or(0)
 }
 
 fn extract_max_frame_size(data: &[u8], codec: AccessUnitCodec, max_frames: usize) -> usize {

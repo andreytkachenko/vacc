@@ -595,3 +595,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pic971_repro {
+    use super::*;
+    // Repro of street.h264 PIC 971 (fn=9, poc=32, P slice, nr0=3):
+    // slots before commit: s0[fn6/poc16], s1[fn7/poc24], s2[fn8/poc26], s3[fn5/poc20]
+    // rplm0 = [(0,0,0), (0,0,15), (0,0,0), (0,0,1)]  (all idc=0, per bitstream)
+    // dump_stream output: L0 [26 26 24 20]
+    #[test]
+    fn pic971() {
+        let slots = vec![
+            DpbRefState { frame_num: 6, frame_num_wrap: 6, poc: 16, marking: MARKING_SHORT, long_term_frame_idx: 0 },
+            DpbRefState { frame_num: 7, frame_num_wrap: 7, poc: 24, marking: MARKING_SHORT, long_term_frame_idx: 0 },
+            DpbRefState { frame_num: 8, frame_num_wrap: 8, poc: 26, marking: MARKING_SHORT, long_term_frame_idx: 0 },
+            DpbRefState { frame_num: 5, frame_num_wrap: 5, poc: 20, marking: MARKING_SHORT, long_term_frame_idx: 0 },
+        ];
+        let mods = vec![
+            RefPicListModificationEntry { op: 0, index: 0, length: 0, difference: 0 },
+            RefPicListModificationEntry { op: 0, index: 0, length: 0, difference: 15 },
+            RefPicListModificationEntry { op: 0, index: 0, length: 0, difference: 0 },
+            RefPicListModificationEntry { op: 0, index: 0, length: 0, difference: 1 },
+        ];
+        let lists = build_ref_pic_lists(&slots, 0, 3, 0, &mods, &[], 9, 32, 16);
+        let l0: Vec<i32> = lists.l0.iter().map(|r| r.poc).collect();
+        eprintln!("L0 = {l0:?} (dump says [26, 26, 24, 20])");
+        assert_eq!(l0, vec![26, 26, 24, 20]);
+    }
+}

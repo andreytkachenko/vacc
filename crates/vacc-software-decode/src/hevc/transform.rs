@@ -559,11 +559,21 @@ pub fn perform_transform_inverse(
     let tr_size = 1usize << log2_trafo_size;
 
     if transform_skip {
-        // Transform skip: shift = 15 - BitDepth
-        let shift = (15 - bit_depth as i32).max(0);
-        let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-        for i in 0..tr_size * tr_size {
-            residual[i] = ((scaled[i] as i32 + add) >> shift) as i16;
+        // Transform skip: dequant shift = 15 - BitDepth - log2_size
+        // (matches FFmpeg hevcdsp.dequant; negative shift => left shift,
+        // reachable only at bit depths >= 12 for 16x16/32x32 blocks).
+        let shift = 15 - bit_depth as i32 - log2_trafo_size as i32;
+        if shift > 0 {
+            let add = 1 << (shift - 1);
+            for i in 0..tr_size * tr_size {
+                residual[i] = ((scaled[i] as i32 + add) >> shift) as i16;
+            }
+        } else if shift < 0 {
+            for i in 0..tr_size * tr_size {
+                residual[i] = ((scaled[i] as i32) << -shift) as i16;
+            }
+        } else {
+            residual.copy_from_slice(scaled);
         }
         return;
     }

@@ -336,12 +336,13 @@ pub const EMULATION_PREVENTION_BYTE: u8 = 0x03;
 /// Find the next start code in a byte stream.
 ///
 /// Returns the offset of the start code and its length (3 or 4 bytes).
-/// Checks for 4-byte start code (0x00 0x00 0x00 0x01) before 3-byte (0x00 0x00 0x01).
 ///
-/// IMPORTANT: This function only finds start codes that are NOT preceded by 0x00.
-/// This prevents matching 0x00 0x00 0x01 sequences that appear inside RBSP data
-/// (which should only match 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01 at the
-/// beginning of a NAL unit, not inside RBSP data).
+/// Uses longest-match semantics: a `0x00 0x00 0x01` sequence preceded by an
+/// additional `0x00` is a 4-byte start code, and the returned offset points
+/// at that leading zero. Emulation prevention guarantees these byte
+/// sequences never occur inside RBSP data, so every occurrence in an Annex B
+/// stream is a genuine NAL boundary — even when the previous NAL's payload
+/// ends with a zero byte.
 pub fn find_next_start_code(data: &[u8], start: usize) -> Option<(usize, usize)> {
     if start >= data.len() {
         return None;
@@ -350,25 +351,11 @@ pub fn find_next_start_code(data: &[u8], start: usize) -> Option<(usize, usize)>
     let remaining = &data[start..];
     let mut i = 0;
     while i + 2 < remaining.len() {
-        // Check for 4-byte start code first: 0x00 0x00 0x00 0x01
-        // Must NOT be preceded by 0x00 (to avoid matching inside RBSP data)
-        if i + 3 < remaining.len()
-            && remaining[i] == 0
-            && remaining[i + 1] == 0
-            && remaining[i + 2] == 0
-            && remaining[i + 3] == 1
-        {
-            if i == 0 || remaining[i - 1] != 0 {
-                return Some((start + i, 4));
+        if remaining[i] == 0 && remaining[i + 1] == 0 && remaining[i + 2] == 1 {
+            // Longest match: a preceding zero makes this a 4-byte start code.
+            if i > 0 && remaining[i - 1] == 0 {
+                return Some((start + i - 1, 4));
             }
-        }
-        // Check for 3-byte start code: 0x00 0x00 0x01
-        // Must NOT be preceded by 0x00 (to avoid matching inside RBSP data)
-        else if remaining[i] == 0
-            && remaining[i + 1] == 0
-            && remaining[i + 2] == 1
-            && (i == 0 || remaining[i - 1] != 0)
-        {
             return Some((start + i, 3));
         }
         i += 1;
