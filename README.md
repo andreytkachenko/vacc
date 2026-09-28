@@ -11,6 +11,10 @@ Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see th
 [Decode Support Matrix](#decode-support-matrix) for what each GPU/driver actually decodes
 byte-exact (verified against FFmpeg, 300 frames per sample).
 
+An optional **post-decode image pipeline** can scale frames and convert Y'CbCr to packed
+RGB in one pass, on the fastest available backend: NVIDIA NPP, Vulkan compute (any GPU),
+or a pure-Rust SIMD fallback — see [Image Pipeline](#image-pipeline-scale--rgb-conversion).
+
 ## Quick Start
 
 ```rust
@@ -29,6 +33,16 @@ for frame in decoder.decode_all(usize::MAX).unwrap() {
 // Or pick the fallback order yourself:
 let config = DecoderConfig::new([Backend::Nvdec, Backend::Software]);
 let decoder = VaccDecoder::new(&std::fs::read("video.h265").unwrap(), &config).unwrap();
+
+// Optional post-decode image pipeline: scale to 1280x720 and emit packed RGB24.
+// GPU-accelerated when available (NPP / Vulkan compute); frame.rgb_pixels carries the result.
+use vacc::{Filter, ImageConfig, RgbChannels, Scale};
+let config = DecoderConfig::default().with_image(ImageConfig {
+    scale: Some(Scale::new(1280, 720, Filter::Bilinear)),
+    rgb: Some(RgbChannels::Rgb24),
+    ..Default::default()
+});
+let decoder = VaccDecoder::new(&data, &config).unwrap();
 ```
 
 Each backend is an optional cargo feature (`vulkan`, `nvdec`, `vaapi`, `sw`, all on by
@@ -47,7 +61,8 @@ vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
 │                        vacc (workspace)                            │
 │                                                                    │
 │   vacc               unified decoder: VaccDecoder + fallback       │
-│                        chain vulkan → nvdec → vaapi → sw           │
+│                        chain vulkan → nvdec → vaapi → sw, plus     │
+│                        optional post-decode image pipeline         │
 │                                                                    │
 │   vacc-core          shared types, traits, errors                  │
 │   vacc-parser        bitstream parsing (H.264/HEVC/VP9/AV1),       │
@@ -64,6 +79,11 @@ vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
 │     vacc-software-decode CPU H.264 (edge264 port) +                │
 │                          CPU H.265 (hevc.js port), pure Rust       │
 │                                                                    │
+│   Image pipeline (post-decode scale / Y'CbCr→RGB):                 │
+│     vacc-image           pure-Rust SIMD reference pipeline         │
+│     vacc-npp             NVIDIA NPP GPU backend                    │
+│     vacc-vkimage         Vulkan compute backend (any GPU)          │
+│                                                                    │
 │   vacc-examples: decode  unified CLI: -b <backend> -i <file>       │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -75,18 +95,21 @@ The unified decoder:
 - `VaccDecoder` / `new_auto()` — one API over all backends; default fallback chain
   `vulkan → nvdec → vaapi → software`
 - `DecoderConfig` — custom fallback order (`new([Backend…])`, `only(…)`, `default_order()`)
+  and the optional post-decode image pipeline (`with_image(ImageConfig)`)
 - `detect_codec()` — H.264/H.265/VP9/AV1 bitstream detection
 - Per-backend features (`vulkan`, `nvdec`, `vaapi`, `sw`); if every configured backend
   fails, the returned error lists each per-backend failure so callers can report *why*
 - PTS normalization: frames carry monotonic presentation timestamps (synthetic 1/30 s
   steps when a backend's PTS is invalid or goes backwards under B-frame reordering)
+- Optional post-decode image pipeline — see [Image Pipeline](#image-pipeline-scale--rgb-conversion)
 
 ### `vacc-core`
 Core types and traits shared across all crates:
 - `VideoCodec` - H.264, H.265, AV1, VP9 identification
 - `VideoFormat` - Chroma subsampling, bit depth, profile info
 - `PictureParametersSet` - SPS/PPS/VPS abstraction
-- `DecodedFrame` - Output frame representation
+- `DecodedFrame` - Output frame representation (`rgb_pixels: Option<RgbFrame>` carries the
+  image-pipeline RGB output when conversion was requested)
 - `VideoError` / `VideoResult` - Error handling
 
 ### `vacc-parser`
@@ -132,6 +155,53 @@ The CPU backends — see [Software (CPU) Backends](#software-cpu-backends--b-sw)
 ### `vacc-examples`
 - `decode` — unified CLI: `-b <vulkan|nvdec|vaapi|sw> -i <file> [-n frames] [-o outdir]`;
   prints pts/size/pixel-hash per frame (the hash is what the verification matrix compares)
+
+### `vacc-image`
+The pure-Rust image pipeline used as the reference implementation and last-resort fallback:
+- Y'CbCr → RGB conversion in Q14 fixed point (BT.601/BT.709 × limited/full range tables,
+  monochrome-safe), SSE4.1/AVX2 kernels
+- Resize: box, bilinear, bicubic (Mitchell) with spec-correct tap tables, including the
+  integer-ratio downscale degenerate case; AVX2/SSE4.1 H/V passes
+- Affine warp (rotation/translation/scale/shear) via inverse mapping
+- `process(img, cfg, Kernel)` — the entry point the GPU backends are validated against
+
+### `vacc-npp`
+NVIDIA NPP GPU backend for the image pipeline (loaded dynamically with `libloading`, same
+pattern as NVDEC): Y'CbCr → RGB conversion and resize on the CUDA device. Selected
+automatically on NVIDIA hosts; unsupported combinations fall back with a warning.
+
+### `vacc-vkimage`
+Vulkan compute backend for the image pipeline — works on **any** GPU (discrete or
+integrated, no vendor SDK needed):
+- WGSL shaders (`yuv2rgb`, bilinear `resize_yuv`) compiled to SPIR-V at build time via naga
+- One host-visible arena buffer per device; an 8-slot command-buffer ring + fence per pass
+- Same Q14 conversion math as the reference pipeline, validated against it with drift
+  tolerances (≤1 LSB conversion, ≤4 LSB resize) in `cargo test -p vacc-vkimage`
+
+## Image Pipeline (scale + RGB conversion)
+
+`DecoderConfig::with_image(ImageConfig)` enables a post-decode pipeline applied to every
+emitted frame. `ImageConfig` fields:
+
+- `scale: Option<Scale>` — `Scale::new(width, height, filter)`, filter is `Box`,
+  `Bilinear` or `Bicubic`
+- `rgb: Option<RgbChannels>` — `Rgb24` (3 bytes/px) or `Rgba32` (4 bytes/px, alpha 0xFF)
+- `affine: Option<Affine>` — 2×3 warp matrix (software path only; GPU paths skip it)
+- `spec: ColorSpec` — matrix (`Bt601`/`Bt709`) and range (`Limited`/`Full`);
+  `ColorSpec::auto(height)` picks a sensible default (BT.709 limited at ≥720 lines)
+
+Behavior:
+- **Scale only**: the frame's YUV `pixel_data` is replaced by the resized YUV — 8-bit
+  semi-planar (NV12) sources stay NV12; 10-bit sources are down-cast to 8-bit first and come
+  out planar I420 (matching the reference pipeline).
+- **RGB only**: original YUV is kept in `pixel_data`; packed RGB lands in
+  `DecodedFrame.rgb_pixels`.
+- **Scale + RGB**: the frame carries only the resized RGB in `rgb_pixels`.
+- Backend dispatch per frame: **NPP** on NVIDIA hosts → **Vulkan compute** (any GPU) →
+  **pure-Rust SIMD**. A GPU path that can't handle a combination (e.g. affine warp, or an
+  unsupported format) falls through to the next backend with a one-shot warning.
+- No-op by default: without `with_image`, frames are emitted exactly as the decode backend
+  produces them.
 
 ## Software (CPU) Backends (`-b sw`)
 
@@ -325,6 +395,25 @@ produce hash-identical per-frame output across every applicable backend (2026-09
 # sw = CPU, pure Rust: H.264 (edge264 port) / H.265 (hevc.js port), codec auto-detected
 ```
 
+The root package also ships a `unified` example with the full fallback chain and the image
+pipeline:
+
+```bash
+cargo run -p vacc --example unified -- -i <file> [options]
+
+  -o, --order    <csv>    backend order, e.g. "nvdec,software"
+                          (default: vulkan,nvdec,vaapi,software)
+  -n, --max      <num>    stop after this many frames (default: all)
+  -w, --width    <px>     resize output width (with -H)
+  -H, --height   <px>     resize output height (with -w)
+  -f, --filter   <name>   resize filter: box | bilinear | bicubic (default: bilinear)
+      --rgb24          convert frames to packed RGB24
+      --rgb32          convert frames to packed RGBA32
+  -O, --out      <file>   write the first decoded frame as PPM (needs --rgb24/--rgb32)
+```
+Per-frame lines hash whatever the frame carries after the image pipeline ran (`rgb` when
+`--rgb24`/`--rgb32` is active, `yuv` otherwise).
+
 ## Vulkan Extensions Required
 
 - `VK_KHR_video_decode_queue` - Video decode queue family
@@ -341,8 +430,9 @@ produce hash-identical per-frame output across every applicable backend (2026-09
 - **thiserror** - Error handling
 - **log** / **tracing** - Logging
 - **rayon** - Software-decoder threading (WPP CTU rows)
-- **libloading** - Dynamic `libnvcuvid.so` loading (NVDEC)
+- **libloading** - Dynamic `libnvcuvid.so` (NVDEC) and NPP library loading
 - **cros-libva** - VAAPI bindings (git dependency)
+- **naga** - Build-time WGSL → SPIR-V compilation for the `vacc-vkimage` shaders
 
 ## Building
 
