@@ -9,8 +9,8 @@
 //!   -n, --max      <num>    stop after this many frames (default: all)
 //!   -w, --width    <px>     resize output width (with -H)
 //!   -H, --height   <px>     resize output height (with -w)
-//!   -f, --filter   <name>   resize filter: box | bilinear | bicubic
-//!                           (default: bilinear)
+//!   -f, --filter   <name>   resampling interpolation:
+//!                           nearest | box | bilinear | bicubic (default: bilinear)
 //!       --rgb24          convert frames to packed RGB24
 //!       --rgb32          convert frames to packed RGBA32
 //!   -O, --out      <file>   write the first decoded frame as PPM (needs --rgb24/--rgb32)
@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use vacc_core::decoder::Decoder;
 use vacc_core::frame::RgbFrame;
-use vacc::{Backend, DecodedFrame, DecoderConfig, Filter, ImageConfig, RgbChannels, Scale, VaccDecoder};
+use vacc::{Backend, DecodedFrame, DecoderConfig, ImageConfig, Interpolation, RgbChannels, Scale, VaccDecoder};
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -73,7 +73,7 @@ struct Args {
     max_frames: usize,
     width: Option<u32>,
     height: Option<u32>,
-    filter: Filter,
+    filter: Interpolation,
     rgb: Option<RgbChannels>,
     out: Option<String>,
 }
@@ -84,7 +84,7 @@ fn parse_args() -> Args {
     let mut max_frames = usize::MAX;
     let mut width = None;
     let mut height = None;
-    let mut filter = Filter::Bilinear;
+    let mut filter = Interpolation::Bilinear;
     let mut rgb = None;
     let mut out = None;
     let mut args = std::env::args().skip(1);
@@ -101,10 +101,11 @@ fn parse_args() -> Args {
             "-f" | "--filter" => {
                 let name = args.next().unwrap_or_else(|| die("-f needs a value"));
                 filter = match name.as_str() {
-                    "box" => Filter::Box,
-                    "bilinear" => Filter::Bilinear,
-                    "bicubic" => Filter::Bicubic,
-                    other => die(&format!("unknown filter '{other}' (box|bilinear|bicubic)")),
+                    "nearest" => Interpolation::Nearest,
+                    "box" => Interpolation::Box,
+                    "bilinear" => Interpolation::Bilinear,
+                    "bicubic" => Interpolation::Bicubic,
+                    other => die(&format!("unknown filter '{other}' (nearest|box|bilinear|bicubic)")),
                 }
             }
             "--rgb24" => rgb = Some(RgbChannels::Rgb24),

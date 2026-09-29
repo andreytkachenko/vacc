@@ -80,12 +80,15 @@ impl ColorSpec {
     }
 }
 
-/// `Filter` selection for the resize kernels.
+/// Interpolation for resampling image operations (resize and affine warp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Filter {
+pub enum Interpolation {
+    /// Nearest neighbor: no interpolation, the closest source sample wins.
+    Nearest,
     /// Box filter (downscale averages, or nearest neighbor for single taps).
+    /// Resize-only; area coverage is undefined under a general affine map.
     Box,
-    /// Bilinear.
+    /// Bilinear: 2x2 taps with linear weights.
     #[default]
     Bilinear,
     /// Cubic convolution (Mitchell-style, B=0.5 C=0.5) with
@@ -93,24 +96,56 @@ pub enum Filter {
     Bicubic,
 }
 
-/// A resize request (target size + filter).
+impl Interpolation {
+    /// Whether the method is valid for affine warp. [`Interpolation::Box`]
+    /// has no defined behavior under a rotated/sheared grid, so it is
+    /// resize-only.
+    pub const fn supports_warp(self) -> bool {
+        !matches!(self, Interpolation::Box)
+    }
+}
+
+/// A resize request (target size + interpolation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scale {
     /// Target width in pixels.
     pub width: u32,
     /// Target height in pixels.
     pub height: u32,
-    /// Resampling filter.
-    pub filter: Filter,
+    /// Resampling interpolation.
+    pub filter: Interpolation,
 }
 
 impl Scale {
-    pub const fn new(width: u32, height: u32, filter: Filter) -> Self {
+    pub const fn new(width: u32, height: u32, filter: Interpolation) -> Self {
         Self {
             width,
             height,
             filter,
         }
+    }
+}
+
+/// An affine warp request (transform + interpolation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Warp {
+    /// 2x3 forward transform (`dst = M * src`).
+    pub transform: crate::warp::Affine,
+    /// Interpolation used for the inverse mapping.
+    pub interpolation: Interpolation,
+}
+
+impl Warp {
+    pub const fn new(transform: crate::warp::Affine, interpolation: Interpolation) -> Self {
+        Self {
+            transform,
+            interpolation,
+        }
+    }
+
+    /// Bilinear warp (the common case).
+    pub const fn bilinear(transform: crate::warp::Affine) -> Self {
+        Self::new(transform, Interpolation::Bilinear)
     }
 }
 
@@ -121,7 +156,8 @@ impl Scale {
 ///    frame is first converted to 8-bit limits (10/12 -> 8 downcast).
 /// 2. If `scale` is set, the frame (Y'CbCr or RGB) is resized to
 ///    `scale.width x scale.height` with `scale.filter`.
-/// 3. If `affine` is set, the frame is warped using the given transformation.
+/// 3. If `affine` is set, the frame is warped using the given transformation
+///    and interpolation.
 /// 4. If `rgb` is set, the frame is converted to packed RGB(R)(A) using
 ///    `spec` (Y'CbCr only; an already-converted frame is passed through).
 ///
@@ -136,7 +172,7 @@ pub struct ImageConfig {
     /// Resize request. `None` keeps the decoded size.
     pub scale: Option<Scale>,
     /// Affine warp request. `None` keeps the original geometry.
-    pub affine: Option<crate::warp::Affine>,
+    pub affine: Option<Warp>,
     /// Color conversion parameters (used when converting to RGB).
     pub spec: ColorSpec,
 }

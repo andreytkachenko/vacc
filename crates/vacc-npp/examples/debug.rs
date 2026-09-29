@@ -1,5 +1,5 @@
 //! Smoke test: run the NPP pipeline on a small frame and print samples.
-use vacc_image::{i420_size, ColorSpec, Filter, RgbChannels, Scale, YuvImage};
+use vacc_image::{i420_size, ColorSpec, Interpolation, RgbChannels, Scale, YuvImage};
 use vacc_npp::Npp;
 
 fn main() {
@@ -37,7 +37,7 @@ fn main() {
 
     // Resize 8x8 -> 4x4 (I420 out).
     let mut small = vec![0u8; i420_size(4, 4)];
-    npp.resize_yuv(&img, Scale::new(4, 4, Filter::Bilinear), &mut small)
+    npp.resize_yuv(&img, Scale::new(4, 4, Interpolation::Bilinear), &mut small)
         .expect("resize_yuv");
     println!("resize 8x8 -> 4x4 luma:");
     for py in 0..4 {

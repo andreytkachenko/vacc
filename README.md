@@ -36,9 +36,9 @@ let decoder = VaccDecoder::new(&std::fs::read("video.h265").unwrap(), &config).u
 
 // Optional post-decode image pipeline: scale to 1280x720 and emit packed RGB24.
 // GPU-accelerated when available (NPP / Vulkan compute); frame.rgb_pixels carries the result.
-use vacc::{Filter, ImageConfig, RgbChannels, Scale};
+use vacc::{ImageConfig, Interpolation, RgbChannels, Scale};
 let config = DecoderConfig::default().with_image(ImageConfig {
-    scale: Some(Scale::new(1280, 720, Filter::Bilinear)),
+    scale: Some(Scale::new(1280, 720, Interpolation::Bilinear)),
     rgb: Some(RgbChannels::Rgb24),
     ..Default::default()
 });
@@ -160,9 +160,10 @@ The CPU backends — see [Software (CPU) Backends](#software-cpu-backends--b-sw)
 The pure-Rust image pipeline used as the reference implementation and last-resort fallback:
 - Y'CbCr → RGB conversion in Q14 fixed point (BT.601/BT.709 × limited/full range tables,
   monochrome-safe), SSE4.1/AVX2 kernels
-- Resize: box, bilinear, bicubic (Mitchell) with spec-correct tap tables, including the
-  integer-ratio downscale degenerate case; AVX2/SSE4.1 H/V passes
-- Affine warp (rotation/translation/scale/shear) via inverse mapping
+- Resize: nearest, box, bilinear, bicubic (Mitchell) with spec-correct tap tables,
+  including the integer-ratio downscale degenerate case; AVX2/SSE4.1 H/V passes
+- Affine warp (rotation/translation/scale/shear) via inverse mapping with
+  nearest / bilinear / bicubic interpolation (box is resize-only)
 - `process(img, cfg, Kernel)` — the entry point the GPU backends are validated against
 
 ### `vacc-npp`
@@ -173,7 +174,8 @@ automatically on NVIDIA hosts; unsupported combinations fall back with a warning
 ### `vacc-vkimage`
 Vulkan compute backend for the image pipeline — works on **any** GPU (discrete or
 integrated, no vendor SDK needed):
-- WGSL shaders (`yuv2rgb`, bilinear `resize_yuv`) compiled to SPIR-V at build time via naga
+- WGSL shaders (`yuv2rgb`, bilinear `resize_yuv`, inverse-mapping `warp_rgb` over
+  RGBA32) compiled to SPIR-V at build time via naga
 - One host-visible arena buffer per device; an 8-slot command-buffer ring + fence per pass
 - Same Q14 conversion math as the reference pipeline, validated against it with drift
   tolerances (≤1 LSB conversion, ≤4 LSB resize) in `cargo test -p vacc-vkimage`
@@ -183,10 +185,11 @@ integrated, no vendor SDK needed):
 `DecoderConfig::with_image(ImageConfig)` enables a post-decode pipeline applied to every
 emitted frame. `ImageConfig` fields:
 
-- `scale: Option<Scale>` — `Scale::new(width, height, filter)`, filter is `Box`,
-  `Bilinear` or `Bicubic`
+- `scale: Option<Scale>` — `Scale::new(width, height, interpolation)`, interpolation is
+  `Nearest`, `Box`, `Bilinear` or `Bicubic`
 - `rgb: Option<RgbChannels>` — `Rgb24` (3 bytes/px) or `Rgba32` (4 bytes/px, alpha 0xFF)
-- `affine: Option<Affine>` — 2×3 warp matrix (software path only; GPU paths skip it)
+- `affine: Option<Warp>` — `Warp::new(transform, interpolation)`: 2×3 warp matrix plus
+  the inverse-mapping interpolation (`Nearest`/`Bilinear`/`Bicubic`; requires RGB output)
 - `spec: ColorSpec` — matrix (`Bt601`/`Bt709`) and range (`Limited`/`Full`);
   `ColorSpec::auto(height)` picks a sensible default (BT.709 limited at ≥720 lines)
 
@@ -197,9 +200,11 @@ Behavior:
 - **RGB only**: original YUV is kept in `pixel_data`; packed RGB lands in
   `DecodedFrame.rgb_pixels`.
 - **Scale + RGB**: the frame carries only the resized RGB in `rgb_pixels`.
+- **Warp** (with or without scale): the frame is converted to RGBA32 first, then warped;
+  the result lands in `rgb_pixels` (alpha dropped when `Rgb24` was requested).
 - Backend dispatch per frame: **NPP** on NVIDIA hosts → **Vulkan compute** (any GPU) →
-  **pure-Rust SIMD**. A GPU path that can't handle a combination (e.g. affine warp, or an
-  unsupported format) falls through to the next backend with a one-shot warning.
+  **pure-Rust SIMD**. A GPU path that can't handle a combination (e.g. box interpolation,
+  or an unsupported format) falls through to the next backend with a one-shot warning.
 - No-op by default: without `with_image`, frames are emitted exactly as the decode backend
   produces them.
 

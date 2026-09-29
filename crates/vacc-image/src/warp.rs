@@ -15,6 +15,7 @@
 use crate::conv::{Kernel, parallel_rows, simd_features};
 use crate::error::{ImageError, ImageResult};
 use crate::pixel::RgbImage;
+use crate::spec::Interpolation;
 
 pub(crate) mod avx2;
 
@@ -157,14 +158,22 @@ fn round_clamp(v: f32) -> u8 {
 /// Warp an RGB image using the given affine transformation.
 ///
 /// `dst` must be large enough to hold `width * height * channels` bytes.
-/// Pixels that map outside the source are filled with `border_value`.
+/// Pixels that map outside the source are filled with black; 4-channel
+/// output always carries alpha 0xFF. [`Interpolation::Box`] is rejected:
+/// area coverage is undefined under a general affine map.
 pub fn warp_rgb(
     src: &RgbImage,
     transform: Affine,
+    interpolation: Interpolation,
     width: usize,
     height: usize,
     dst: &mut [u8],
 ) -> ImageResult<()> {
+    if !interpolation.supports_warp() {
+        return Err(ImageError::Unsupported(
+            "box interpolation is not supported for affine warp".into(),
+        ));
+    }
     if width == 0 || height == 0 {
         return Err(ImageError::InvalidDimensions("output size must be non-zero".into()));
     }
@@ -191,35 +200,59 @@ pub fn warp_rgb(
         rest = b;
     }
 
+    // `Kernel::Avx2` is only ever reported on x86_64 (see `simd_features`),
+    // so the guard below falls through to the scalar path elsewhere.
     let simd = pick_kernel(Kernel::Auto);
     let cl = |a: usize, rows: &mut [&mut [u8]]| {
         for (i, row) in rows.iter_mut().enumerate() {
             let oy = a + i;
-            #[cfg(target_arch = "x86_64")]
-            if matches!(simd, Some(Kernel::Avx2)) && ch == 4 {
-                unsafe {
-                    avx2::warp_rgba_row(
-                        src.pixels_ptr(),
-                        src.pitch,
-                        src.width,
-                        src.height,
-                        inv,
-                        oy,
-                        row,
-                    );
+            match interpolation {
+                Interpolation::Bilinear if ch == 4 && matches!(simd, Some(Kernel::Avx2)) => {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        avx2::warp_rgba_row(
+                            src.pixels_ptr(),
+                            src.pitch,
+                            src.width,
+                            src.height,
+                            inv,
+                            oy,
+                            row,
+                        );
+                    }
                 }
-                continue;
+                Interpolation::Bilinear => scalar_warp_row(
+                    src.pixels_ptr(),
+                    src.pitch,
+                    src.width,
+                    src.height,
+                    ch,
+                    inv,
+                    oy,
+                    row,
+                ),
+                Interpolation::Nearest => scalar_warp_row_nearest(
+                    src.pixels_ptr(),
+                    src.pitch,
+                    src.width,
+                    src.height,
+                    ch,
+                    inv,
+                    oy,
+                    row,
+                ),
+                Interpolation::Bicubic => scalar_warp_row_bicubic(
+                    src.pixels_ptr(),
+                    src.pitch,
+                    src.width,
+                    src.height,
+                    ch,
+                    inv,
+                    oy,
+                    row,
+                ),
+                Interpolation::Box => unreachable!("rejected above"),
             }
-            scalar_warp_row(
-                src.pixels_ptr(),
-                src.pitch,
-                src.width,
-                src.height,
-                ch,
-                inv,
-                oy,
-                row,
-            );
         }
     };
     parallel_rows(&mut bands, &cl);
@@ -243,6 +276,33 @@ fn pick_kernel(kernel: Kernel) -> Option<Kernel> {
         Kernel::Avx2 => simd.avx2.then_some(Kernel::Avx2),
         Kernel::Scalar => None,
     }
+}
+
+/// Load one source pixel as RGBA floats; out-of-bounds reads are zero
+/// (alpha 0). For 3-channel sources alpha is synthesized as 255.
+#[inline]
+fn sample_pixel(
+    src_pixels: *const u8,
+    src_pitch: usize,
+    src_width: usize,
+    src_height: usize,
+    ch: usize,
+    x: i32,
+    y: i32,
+) -> [f32; 4] {
+    if x < 0 || y < 0 || x >= src_width as i32 || y >= src_height as i32 {
+        return [0.0; 4];
+    }
+    let row = unsafe { src_pixels.add(y as usize * src_pitch) };
+    let px = unsafe { row.add(x as usize * ch) };
+    let mut vals = [0.0f32; 4];
+    for c in 0..ch {
+        vals[c] = unsafe { *px.add(c) } as f32;
+    }
+    if ch == 3 {
+        vals[3] = 255.0;
+    }
+    vals
 }
 
 /// Scalar implementation: one output row via inverse mapping + bilinear interpolation.
@@ -270,28 +330,12 @@ fn scalar_warp_row(
         let fx = sx - x0 as f32;
         let fy = sy - y0 as f32;
 
-        let get_pixel = |x: i32, y: i32| -> [f32; 4] {
-            if x < 0 || y < 0 || x >= src_width as i32 || y >= src_height as i32 {
-                return [0.0; 4];
-            }
-            let row = unsafe { src_pixels.add(y as usize * src_pitch) };
-            let px = unsafe { row.add(x as usize * ch) };
-            let mut vals = [0.0f32; 4];
-            for c in 0..ch {
-                vals[c] = unsafe { *px.add(c) } as f32;
-            }
-            if ch == 3 {
-                vals[3] = 255.0;
-            }
-            vals
-        };
+        let p00 = sample_pixel(src_pixels, src_pitch, src_width, src_height, ch, x0, y0);
+        let p10 = sample_pixel(src_pixels, src_pitch, src_width, src_height, ch, x1, y0);
+        let p01 = sample_pixel(src_pixels, src_pitch, src_width, src_height, ch, x0, y1);
+        let p11 = sample_pixel(src_pixels, src_pitch, src_width, src_height, ch, x1, y1);
 
-        let p00 = get_pixel(x0, y0);
-        let p10 = get_pixel(x1, y0);
-        let p01 = get_pixel(x0, y1);
-        let p11 = get_pixel(x1, y1);
-
-        let mut result = [0.0f32; 4];
+        let mut result = [0.0; 4];
         for c in 0..ch {
             let top = p00[c] * (1.0 - fx) + p10[c] * fx;
             let bot = p01[c] * (1.0 - fx) + p11[c] * fx;
@@ -299,6 +343,99 @@ fn scalar_warp_row(
         }
         if ch == 3 {
             result[3] = 255.0;
+        }
+
+        let dst_px = &mut dst_row[ox * ch..ox * ch + ch];
+        for c in 0..ch {
+            dst_px[c] = round_clamp(result[c]);
+        }
+        if ch == 4 {
+            dst_row[ox * 4 + 3] = 255;
+        }
+    }
+}
+
+/// Scalar implementation: one output row via inverse mapping + nearest
+/// neighbor (the floor of the source position).
+fn scalar_warp_row_nearest(
+    src_pixels: *const u8,
+    src_pitch: usize,
+    src_width: usize,
+    src_height: usize,
+    ch: usize,
+    inv: Affine,
+    oy: usize,
+    dst_row: &mut [u8],
+) {
+    let dst_width = dst_row.len() / ch;
+    for ox in 0..dst_width {
+        let sx = inv.m00 * ox as f32 + inv.m01 * oy as f32 + inv.m02;
+        let sy = inv.m10 * ox as f32 + inv.m11 * oy as f32 + inv.m12;
+        let p = sample_pixel(
+            src_pixels, src_pitch, src_width, src_height, ch,
+            sx.floor() as i32,
+            sy.floor() as i32,
+        );
+        let dst_px = &mut dst_row[ox * ch..ox * ch + ch];
+        for c in 0..ch {
+            dst_px[c] = round_clamp(p[c]);
+        }
+        if ch == 4 {
+            dst_row[ox * 4 + 3] = 255;
+        }
+    }
+}
+
+/// Mitchell-Netravali cubic (B = C = 0.5) at distance `d >= 0`, f32 variant
+/// (mirrors `resize::mitchell`).
+#[inline]
+fn mitchell(d: f32) -> f32 {
+    if d < 1.0 {
+        (4.5 * d * d * d - 9.0 * d * d + 5.0) / 6.0
+    } else if d < 2.0 {
+        (-3.5 * d * d * d + 18.0 * d * d - 30.0 * d + 16.0) / 6.0
+    } else {
+        0.0
+    }
+}
+
+/// Scalar implementation: one output row via inverse mapping + separable
+/// 4x4 cubic convolution (Mitchell, B = C = 0.5). Out-of-bounds taps
+/// contribute zero, so edges fade to black like the bilinear path.
+fn scalar_warp_row_bicubic(
+    src_pixels: *const u8,
+    src_pitch: usize,
+    src_width: usize,
+    src_height: usize,
+    ch: usize,
+    inv: Affine,
+    oy: usize,
+    dst_row: &mut [u8],
+) {
+    let dst_width = dst_row.len() / ch;
+    for ox in 0..dst_width {
+        let sx = inv.m00 * ox as f32 + inv.m01 * oy as f32 + inv.m02;
+        let sy = inv.m10 * ox as f32 + inv.m11 * oy as f32 + inv.m12;
+        let x0 = sx.floor() as i32;
+        let y0 = sy.floor() as i32;
+
+        let mut result = [0.0f32; 4];
+        for kx in -1i32..=2 {
+            let wx = mitchell((sx - (x0 + kx) as f32).abs());
+            if wx == 0.0 {
+                continue;
+            }
+            for ky in -1i32..=2 {
+                let wy = mitchell((sy - (y0 + ky) as f32).abs());
+                if wy == 0.0 {
+                    continue;
+                }
+                let p = sample_pixel(src_pixels, src_pitch, src_width, src_height, ch, x0 + kx, y0 + ky);
+                let w = wx * wy;
+                for c in 0..ch {
+                    result[c] += p[c] * w;
+                }
+            }
         }
 
         let dst_px = &mut dst_row[ox * ch..ox * ch + ch];
@@ -334,9 +471,64 @@ mod tests {
     fn identity_warp_is_exact() {
         let (_, img) = make_test_image(100, 60);
         let mut out = vec![0u8; 100 * 60 * 3];
-        warp_rgb(&img, Affine::identity(), 100, 60, &mut out).unwrap();
         // Identity should reproduce the source (within interpolation tolerance).
+        warp_rgb(&img, Affine::identity(), Interpolation::Bilinear, 100, 60, &mut out).unwrap();
         assert_eq!(out.len(), img.pixels().len());
+    }
+
+    #[test]
+    fn nearest_identity_is_exact() {
+        let (buf, img) = make_test_image(100, 60);
+        let mut out = vec![0u8; 100 * 60 * 3];
+        warp_rgb(&img, Affine::identity(), Interpolation::Nearest, 100, 60, &mut out).unwrap();
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn nearest_integer_translate_is_exact() {
+        let (buf, img) = make_test_image(100, 60);
+        let mut out = vec![0u8; 100 * 60 * 3];
+        warp_rgb(&img, Affine::translate(10.0, 0.0), Interpolation::Nearest, 100, 60, &mut out)
+            .unwrap();
+        // Nearest + integer shift: each output pixel is the exact source
+        // pixel shifted by 10 (left strip black).
+        for y in 0..60 {
+            assert!(out[y * 300..y * 300 + 30].iter().all(|&v| v == 0));
+            for x in 10..100 {
+                let s = &buf[(y * 100 + (x - 10)) * 3..(y * 100 + (x - 10)) * 3 + 3];
+                assert_eq!(&out[(y * 100 + x) * 3..(y * 100 + x) * 3 + 3], s);
+            }
+        }
+    }
+
+    #[test]
+    fn bicubic_identity_stays_close_to_source() {
+        let (buf, img) = make_test_image(100, 60);
+        let mut out = vec![0u8; 100 * 60 * 3];
+        warp_rgb(&img, Affine::identity(), Interpolation::Bicubic, 100, 60, &mut out).unwrap();
+        // Interior pixels of a smooth gradient stay within +-2 of the source;
+        // edge rows fade slightly toward black (OOB taps are zero).
+        for y in 1..59 {
+            for x in 1..99 {
+                let p = (y * 100 + x) * 3;
+                for c in 0..3 {
+                    assert!(
+                        (out[p + c] as i32 - buf[p + c] as i32).abs() <= 2,
+                        "drift at ({x}, {y}) ch {c}: {} vs {}",
+                        out[p + c],
+                        buf[p + c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_interpolation_rejected() {
+        let (_, img) = make_test_image(16, 8);
+        let mut out = vec![0u8; 16 * 8 * 3];
+        let res = warp_rgb(&img, Affine::identity(), Interpolation::Box, 16, 8, &mut out);
+        assert!(matches!(res, Err(ImageError::Unsupported(_))));
     }
 
     #[test]
@@ -344,7 +536,8 @@ mod tests {
         let (_, img) = make_test_image(100, 60);
         let mut out = vec![0u8; 100 * 60 * 3];
         // Translate right by 10 pixels.
-        warp_rgb(&img, Affine::translate(10.0, 0.0), 100, 60, &mut out).unwrap();
+        warp_rgb(&img, Affine::translate(10.0, 0.0), Interpolation::Bilinear, 100, 60, &mut out)
+            .unwrap();
         // The left edge should now be black (mapped outside source).
         assert_eq!(out[0], 0);
         // The right edge should have the original left-edge color.
@@ -358,7 +551,7 @@ mod tests {
         let (_, img) = make_test_image(100, 100);
         let center = Affine::rotate_around(std::f32::consts::PI / 4.0, 50.0, 50.0);
         let mut out = vec![0u8; 100 * 100 * 3];
-        warp_rgb(&img, center, 100, 100, &mut out).unwrap();
+        warp_rgb(&img, center, Interpolation::Bilinear, 100, 100, &mut out).unwrap();
         // Just check it doesn't crash and produces non-uniform output.
         assert!(out.iter().any(|&v| v > 0));
     }
@@ -368,7 +561,7 @@ mod tests {
         let (_, img) = make_test_image(50, 50);
         let scale = Affine::scale(2.0);
         let mut out = vec![0u8; 100 * 100 * 3];
-        warp_rgb(&img, scale, 100, 100, &mut out).unwrap();
+        warp_rgb(&img, scale, Interpolation::Bilinear, 100, 100, &mut out).unwrap();
         // Upscaled image should be non-zero in the top-left quadrant.
         let center_val = out[50 * 100 * 3 + 50 * 3];
         assert!(center_val > 0);
@@ -379,7 +572,7 @@ mod tests {
         let (_, img) = make_test_image(100, 100);
         let scale = Affine::scale(0.5);
         let mut out = vec![0u8; 50 * 50 * 3];
-        warp_rgb(&img, scale, 50, 50, &mut out).unwrap();
+        warp_rgb(&img, scale, Interpolation::Bilinear, 50, 50, &mut out).unwrap();
         // Downscaled image should preserve the gradient direction.
         let top_left = out[0];
         let bottom_right = out[(49 * 50 + 49) * 3];
@@ -395,7 +588,7 @@ mod tests {
             m10: 0.0, m11: 1.0, m12: 0.0,
         };
         let mut out = vec![0u8; 100 * 50 * 3];
-        warp_rgb(&img, shear, 100, 50, &mut out).unwrap();
+        warp_rgb(&img, shear, Interpolation::Bilinear, 100, 50, &mut out).unwrap();
         // Sheared image should be non-uniform.
         assert!(out.iter().any(|&v| v > 0));
     }
@@ -407,7 +600,7 @@ mod tests {
         let rotate = Affine::rotate_around(std::f32::consts::PI / 6.0, 50.0, 50.0);
         let combined = translate * rotate;
         let mut out = vec![0u8; 100 * 100 * 3];
-        warp_rgb(&img, combined, 100, 100, &mut out).unwrap();
+        warp_rgb(&img, combined, Interpolation::Bilinear, 100, 100, &mut out).unwrap();
         assert!(out.iter().any(|&v| v > 0));
     }
 
@@ -482,7 +675,7 @@ mod tests {
         let (_, img) = make_test_image(4, 4);
         let scale = Affine::scale(2.0);
         let mut out = vec![0u8; 8 * 8 * 3];
-        warp_rgb(&img, scale, 8, 8, &mut out).unwrap();
+        warp_rgb(&img, scale, Interpolation::Bilinear, 8, 8, &mut out).unwrap();
         assert!(out.iter().any(|&v| v > 0));
     }
 
@@ -490,7 +683,7 @@ mod tests {
     fn output_size_validation() {
         let (_, img) = make_test_image(100, 60);
         let mut too_small = vec![0u8; 1000];
-        let result = warp_rgb(&img, Affine::identity(), 100, 60, &mut too_small);
+        let result = warp_rgb(&img, Affine::identity(), Interpolation::Bilinear, 100, 60, &mut too_small);
         assert!(result.is_err());
     }
 

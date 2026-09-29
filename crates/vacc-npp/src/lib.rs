@@ -25,10 +25,16 @@
 //! returning results to the host.
 //!
 //! Differences from the software pipeline (expected, tested with tolerance):
-//! - `Filter::Box` maps to NPP linear interpolation (NPP has no area-average
-//!   filter), so downscaled Box results are not identical.
+//! - `Interpolation::Box` maps to NPP linear interpolation (NPP has no
+//!   area-average filter), so downscaled Box results are not identical.
 //! - NPP cubic is its own 4-tap kernel, not the Mitchell (B=0.5, C=0.5) used
 //!   by the software pipeline.
+//! - Affine warp is rejected up front: `nppiWarpAffine_8u_C1R_Ctx`
+//!   segfaults on NPP 13.1 even for an identity transform with valid buffers
+//!   (reproduced in a standalone C program), so [`process`] returns
+//!   [`ImageError::Unsupported`] for any warp request and the caller falls
+//!   back to Vulkan compute / software. [`Npp::warp_rgb`] remains available
+//!   for hosts whose NPP build handles it.
 
 mod ffi;
 
@@ -37,11 +43,14 @@ use std::sync::OnceLock;
 
 use thiserror::Error;
 use vacc_image::{
-    i420_size, scratch_view, table, yuv_high_to_i420, ColorSpec, Filter, ImageConfig, ImageError,
-    ImageResult, ProcessedFrame, RgbChannels, RgbOutput, Scale, YuvImage, YuvLayout, YuvOutput,
+    i420_size, scratch_view, table, yuv_high_to_i420, ColorSpec, ImageConfig, ImageError,
+    ImageResult, Interpolation, ProcessedFrame, RgbChannels, RgbOutput, Scale, YuvImage, YuvLayout,
+    YuvOutput,
 };
 
-use crate::ffi::{Ffi, NppiRect, NppiSize, NPPI_INTER_CUBIC, NPPI_INTER_LINEAR, NPP_SUCCESS};
+use crate::ffi::{
+    Ffi, NppiRect, NppiSize, NPPI_INTER_CUBIC, NPPI_INTER_LINEAR, NPPI_INTER_NEAREST, NPP_SUCCESS,
+};
 use vacc_image::warp::Affine;
 
 /// Errors from loading or calling NPP.
@@ -350,12 +359,13 @@ impl Npp {
     }
 }
 
-fn interp(filter: Filter) -> c_int {
-    match filter {
-        Filter::Bilinear => NPPI_INTER_LINEAR,
-        Filter::Bicubic => NPPI_INTER_CUBIC,
+fn interp(interpolation: Interpolation) -> c_int {
+    match interpolation {
+        Interpolation::Nearest => NPPI_INTER_NEAREST,
+        Interpolation::Bilinear => NPPI_INTER_LINEAR,
+        Interpolation::Bicubic => NPPI_INTER_CUBIC,
         // NPP has no area-averaging filter; linear is the closest available.
-        Filter::Box => NPPI_INTER_LINEAR,
+        Interpolation::Box => NPPI_INTER_LINEAR,
     }
 }
 
@@ -375,6 +385,15 @@ pub fn process(src: &YuvImage, cfg: &ImageConfig) -> ImageResult<ProcessedFrame>
     }
     let npp = Npp::global()
         .ok_or_else(|| ImageError::Unsupported("NPP unavailable on this host".into()))?;
+
+    // Warp is disabled for the pipeline: nppiWarpAffine_8u_C1R_Ctx segfaults
+    // on NPP 13.1 (see module docs). Rejecting here routes the warp to the
+    // Vulkan compute or software backend instead of crashing the process.
+    if cfg.affine.is_some() {
+        return Err(ImageError::Unsupported(
+            "NPP warp is disabled (nppiWarpAffine crashes on this NPP build)".into(),
+        ));
+    }
 
     match (cfg.scale, cfg.affine, cfg.rgb) {
         (None, None, Some(ch)) => {
@@ -428,7 +447,7 @@ pub fn process(src: &YuvImage, cfg: &ImageConfig) -> ImageResult<ProcessedFrame>
             }
             let src_img = vacc_image::RgbImage::new(&rgb_data, w * 4, w, h, 4);
             let mut warped = vec![0u8; w * h * 4];
-            npp.warp_rgb(&src_img, transform, &mut warped)?;
+            npp.warp_rgb(&src_img, transform.transform, transform.interpolation, &mut warped)?;
             if ch == RgbChannels::Rgb24 {
                 let mut rgb24 = vec![0u8; w * h * 3];
                 for y in 0..h {
@@ -462,7 +481,7 @@ pub fn process(src: &YuvImage, cfg: &ImageConfig) -> ImageResult<ProcessedFrame>
             npp.yuv_to_rgb(&view, cfg.spec, RgbChannels::Rgba32, &mut rgb_data)?;
             let src_img = vacc_image::RgbImage::new(&rgb_data, w * 4, w, h, 4);
             let mut warped = vec![0u8; w * h * 4];
-            npp.warp_rgb(&src_img, transform, &mut warped)?;
+            npp.warp_rgb(&src_img, transform.transform, transform.interpolation, &mut warped)?;
             if ch == RgbChannels::Rgb24 {
                 let mut rgb24 = vec![0u8; w * h * 3];
                 for y in 0..h {
@@ -569,7 +588,18 @@ fn tight_view(buf: &[u8], layout: YuvLayout, w: usize, h: usize) -> YuvImage<'_>
 impl Npp {
 
 /// Warp an RGB image using the given affine transformation.
-pub fn warp_rgb(&self, src: &vacc_image::RgbImage, transform: Affine, dst: &mut [u8]) -> ImageResult<()> {
+///
+/// Warning: `nppiWarpAffine_8u_C1R_Ctx` segfaults on some NPP builds
+/// (NPP 13.1 on GA106, even for identity transforms); the pipeline
+/// therefore never calls this and routes warp to Vulkan compute /
+/// software instead.
+pub fn warp_rgb(
+    &self,
+    src: &vacc_image::RgbImage,
+    transform: Affine,
+    interpolation: Interpolation,
+    dst: &mut [u8],
+) -> ImageResult<()> {
     self.ensure_ctx()?;
     let (w, h) = (src.width, src.height);
     let ch = src.channels as usize;
@@ -624,7 +654,7 @@ pub fn warp_rgb(&self, src: &vacc_image::RgbImage, transform: Affine, dst: &mut 
                 NppiSize { n_width: w as c_int, n_height: h as c_int },
                 NppiRect { n_x: 0, n_y: 0, n_width: w as c_int, n_height: h as c_int },
                 d_coeffs.ptr as *const f32,
-                NPPI_INTER_LINEAR,
+                interp(interpolation),
                 self.ffi.ctx,
             )
         };
@@ -875,7 +905,7 @@ mod tests {
             let (_, img) = grad_yuv(320, 240, planar);
             let layout = if planar { YuvLayout::Planar } else { YuvLayout::Semi };
             for (tw, th) in [(200usize, 150), (640, 480), (80, 60)] {
-                for filter in [Filter::Bilinear, Filter::Bicubic] {
+                for filter in [Interpolation::Bilinear, Interpolation::Bicubic] {
                     let scale = Scale::new(tw as u32, th as u32, filter);
                     let need = out_size(layout, tw, th);
                     let mut npp_out = vec![0u8; need];
@@ -904,7 +934,7 @@ mod tests {
             let (_, img) = grad_yuv(320, 240, planar);
             let cfg = ImageConfig {
                 rgb: Some(RgbChannels::Rgb24),
-                scale: Some(Scale::new(160, 120, Filter::Bilinear)),
+                scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
                 affine: None,
                 spec: ColorSpec::auto(1080),
             };

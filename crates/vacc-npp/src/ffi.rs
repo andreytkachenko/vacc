@@ -52,6 +52,7 @@ mod cuda_driver {
 pub const NPP_SUCCESS: c_int = 0;
 
 /// `NppInterpolation` values (nppdefs.h).
+pub const NPPI_INTER_NEAREST: c_int = 1;
 pub const NPPI_INTER_LINEAR: c_int = 2;
 pub const NPPI_INTER_CUBIC: c_int = 4;
 

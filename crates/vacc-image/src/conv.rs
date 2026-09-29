@@ -63,7 +63,10 @@ pub enum Kernel {
 }
 
 /// Minimum row count before spawning helper threads.
-const PAR_ROW_THRESHOLD: usize = 256;
+/// Raised high: per-call thread spawning (std::thread::scope) at video rates
+/// (~200 calls/s x 12 streams) costs more scheduler/cache churn than the
+/// parallelism saves for these image sizes.
+const PAR_ROW_THRESHOLD: usize = 4096;
 /// Target rows per helper thread.
 const ROWS_PER_THREAD: usize = 64;
 /// Hard cap on helper threads.

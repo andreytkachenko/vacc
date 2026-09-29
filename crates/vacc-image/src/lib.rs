@@ -29,7 +29,9 @@ pub use crate::pixel::{YuvImage, YuvLayout, RgbImage, RgbImageMut, bps_bytes};
 pub use crate::pipeline::{process, ProcessedFrame, RgbOutput, YuvOutput};
 pub use crate::resize::{resize_rgb, resize_yuv};
 pub use crate::warp::Affine;
-pub use crate::spec::{ColorRange, ColorSpec, Filter, ImageConfig, MatrixCoefficients, RgbChannels, Scale};
+pub use crate::spec::{
+    ColorRange, ColorSpec, ImageConfig, Interpolation, MatrixCoefficients, RgbChannels, Scale, Warp,
+};
 pub use crate::conv::{
     conv_px, convert_rows, i420_size, parallel_rows, scratch_view, simd_features, yuv_high_to_i420,
     yuv_to_rgb, Kernel,

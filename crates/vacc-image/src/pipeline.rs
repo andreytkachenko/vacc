@@ -106,7 +106,7 @@ pub fn process(src: &YuvImage, cfg: &ImageConfig, kernel: Kernel) -> ImageResult
             yuv_to_rgb(src, cfg.spec, crate::spec::RgbChannels::Rgba32, &mut rgb_data)?;
             let src_img = crate::pixel::RgbImage::new(&rgb_data, w * 4, w, h, 4);
             let mut warped = vec![0u8; w * h * 4];
-            warp_rgb(&src_img, transform, w, h, &mut warped)?;
+            warp_rgb(&src_img, transform.transform, transform.interpolation, w, h, &mut warped)?;
             // If RGB24 was requested, drop the alpha channel.
             if ch == crate::spec::RgbChannels::Rgb24 {
                 let mut rgb24 = vec![0u8; w * h * 3];
@@ -142,7 +142,7 @@ pub fn process(src: &YuvImage, cfg: &ImageConfig, kernel: Kernel) -> ImageResult
             yuv_to_rgb(&view, cfg.spec, crate::spec::RgbChannels::Rgba32, &mut rgb_data)?;
             let src_img = crate::pixel::RgbImage::new(&rgb_data, w * 4, w, h, 4);
             let mut warped = vec![0u8; w * h * 4];
-            warp_rgb(&src_img, transform, w, h, &mut warped)?;
+            warp_rgb(&src_img, transform.transform, transform.interpolation, w, h, &mut warped)?;
             if ch == crate::spec::RgbChannels::Rgb24 {
                 let mut rgb24 = vec![0u8; w * h * 3];
                 for y in 0..h {
@@ -254,7 +254,7 @@ fn to_layout(layout: Layout) -> YuvLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{ColorSpec, Filter, MatrixCoefficients, RgbChannels};
+    use crate::spec::{ColorSpec, Interpolation, MatrixCoefficients, RgbChannels};
 
     /// Deterministic gradient 8-bit 4:2:0 (owned tight buffer + static view).
     fn grad_yuv(w: usize, h: usize, planar: bool) -> (Vec<u8>, YuvImage<'static>) {
@@ -352,7 +352,7 @@ mod tests {
         for planar in [false, true] {
             let (_, img) = grad_yuv(128, 96, planar);
             let layout = if planar { YuvLayout::Planar } else { YuvLayout::Semi };
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 for (tw, th) in [(300usize, 200usize), (40, 30), (128, 96)] {
                     let scale = Scale::new(tw as u32, th as u32, filter);
                     let mut expected = vec![0u8; out_size(layout, tw, th)];
@@ -386,7 +386,7 @@ mod tests {
         };
         for planar in [false, true] {
             let (_, img) = grad_yuv(96, 92, planar);
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 let mut expected = vec![0u8; img.width * img.height * 3];
                 yuv_to_rgb(&img, spec, RgbChannels::Rgb24, &mut expected).unwrap();
                 let scale = Scale::new(img.width as u32, img.height as u32, filter);
@@ -411,7 +411,7 @@ mod tests {
             let (_, img) = grad_yuv(192, 108, planar);
             let layout = if planar { YuvLayout::Planar } else { YuvLayout::Semi };
             for (tw, th) in [(64usize, 36), (384, 216)] {
-                for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+                for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                     let scale = Scale::new(tw as u32, th as u32, filter);
                     // Manual two-stage: resize YUV, then convert.
                     let mut mid = vec![0u8; out_size(layout, tw, th)];
@@ -440,7 +440,7 @@ mod tests {
         let (w, h) = (96usize, 92usize);
         let (_, img) = grad_p010(w, h);
         for (tw, th) in [(300usize, 200usize), (48, 46)] {
-            let scale = Scale::new(tw as u32, th as u32, Filter::Bilinear);
+            let scale = Scale::new(tw as u32, th as u32, Interpolation::Bilinear);
             // Manual: down-cast -> resize.
             let mut i420 = vec![0u8; i420_size(w, h)];
             yuv_high_to_i420(&img, &mut i420).unwrap();
@@ -471,7 +471,7 @@ mod tests {
         let (_, img) = grad_p010(w, h);
         let spec = crate::spec::ColorSpec::default();
         for (tw, th) in [(48usize, 46), (192, 184)] {
-            let scale = Scale::new(tw as u32, th as u32, Filter::Bicubic);
+            let scale = Scale::new(tw as u32, th as u32, Interpolation::Bicubic);
             // Manual: down-cast -> resize -> convert.
             let mut i420 = vec![0u8; i420_size(w, h)];
             yuv_high_to_i420(&img, &mut i420).unwrap();

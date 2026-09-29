@@ -104,11 +104,12 @@ impl fmt::Display for DecoderConfig {
     }
 }
 
-fn filter_name(filter: vacc_image::Filter) -> &'static str {
+fn filter_name(filter: vacc_image::Interpolation) -> &'static str {
     match filter {
-        vacc_image::Filter::Box => "box",
-        vacc_image::Filter::Bilinear => "bilinear",
-        vacc_image::Filter::Bicubic => "bicubic",
+        vacc_image::Interpolation::Nearest => "nearest",
+        vacc_image::Interpolation::Box => "box",
+        vacc_image::Interpolation::Bilinear => "bilinear",
+        vacc_image::Interpolation::Bicubic => "bicubic",
     }
 }
 

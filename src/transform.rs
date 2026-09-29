@@ -168,7 +168,7 @@ fn run_pipeline(img: &YuvImage, cfg: &ImageConfig) -> vacc_image::ImageResult<Pr
             Ok(p) => return Ok(p),
             Err(e) => log::warn!("npp pipeline failed ({e}); using fallback"),
         }
-    } else if !cfg.wants_warp() && vacc_vkimage::is_available() {
+    } else if vacc_vkimage::is_available() {
         match vacc_vkimage::process(img, cfg) {
             Ok(p) => return Ok(p),
             Err(e) => log::warn!("vulkan image pipeline failed ({e}); using software fallback"),
@@ -255,7 +255,7 @@ fn plane_slice(p: &PixelPlane) -> &[u8] {
 mod tests {
     use super::*;
     use crate::config::DecoderConfig;
-    use vacc_image::{Filter, RgbChannels, Scale};
+    use vacc_image::{Affine, Interpolation, RgbChannels, Scale, Warp};
 
     /// Tight planar I420 frame with a horizontal Y gradient and neutral
     /// chroma, in one backing buffer (the backend convention).
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn scale_only_replaces_pixel_data() {
         let mut frame = i420_frame(64, 32);
-        let cfg = config(Some(Scale::new(32, 16, Filter::Bilinear)), None);
+        let cfg = config(Some(Scale::new(32, 16, Interpolation::Bilinear)), None);
         match apply(&mut frame, &cfg.image()) {
             Ok(ApplyOutcome::Transformed) => {}
             other => panic!("expected transform, got {other:?}"),
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn scale_and_rgb_yields_only_rgb() {
         let mut frame = i420_frame(64, 32);
-        let cfg = config(Some(Scale::new(32, 16, Filter::Box)), Some(RgbChannels::Rgba32));
+        let cfg = config(Some(Scale::new(32, 16, Interpolation::Box)), Some(RgbChannels::Rgba32));
         match apply(&mut frame, &cfg.image()) {
             Ok(ApplyOutcome::Transformed) => {}
             other => panic!("expected transform, got {other:?}"),
@@ -381,7 +381,7 @@ mod tests {
             buffer: buf,
         });
 
-        let cfg = config(Some(Scale::new(8, 8, Filter::Bilinear)), None);
+        let cfg = config(Some(Scale::new(8, 8, Interpolation::Bilinear)), None);
         match apply(&mut frame, &cfg.image()) {
             Ok(ApplyOutcome::Transformed) => {}
             other => panic!("expected transform, got {other:?}"),
@@ -417,7 +417,7 @@ mod tests {
             buffer: buf,
         });
 
-        let cfg = config(Some(Scale::new(8, 4, Filter::Bilinear)), None);
+        let cfg = config(Some(Scale::new(8, 4, Interpolation::Bilinear)), None);
         match apply(&mut frame, &cfg.image()) {
             Ok(ApplyOutcome::Transformed) => {}
             other => panic!("expected transform, got {other:?}"),
@@ -427,5 +427,27 @@ mod tests {
         assert!(pd.v.is_none());
         assert_eq!((frame.width, frame.height), (8, 4));
         assert_eq!(pd.buffer.len(), 8 * 4 + 2 * 4 * 2);
+    }
+
+    #[test]
+    fn warp_yields_rgb_and_drops_yuv() {
+        let mut frame = i420_frame(64, 32);
+        let image = ImageConfig {
+            rgb: Some(RgbChannels::Rgba32),
+            affine: Some(Warp::bilinear(Affine::translate(4.0, 2.0))),
+            ..Default::default()
+        };
+        let cfg = DecoderConfig::new([crate::backend::Backend::Software]).with_image(image);
+        match apply(&mut frame, &cfg.image()) {
+            Ok(ApplyOutcome::Transformed) => {}
+            other => panic!("expected transform, got {other:?}"),
+        }
+        // Warping drops the original YUV; only the warped RGB remains.
+        assert!(frame.pixel_data.is_none());
+        let rgb = frame.rgb_pixels.as_ref().unwrap();
+        assert_eq!((rgb.width, rgb.height, rgb.channels), (64, 32, 4));
+        // Forward translate(4, 2): the top-left corner maps outside the
+        // source and must come out black.
+        assert!(rgb.data[0] == 0 && rgb.data[1] == 0 && rgb.data[2] == 0);
     }
 }

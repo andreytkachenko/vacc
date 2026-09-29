@@ -1,5 +1,5 @@
-//! GPU image pipeline on Vulkan compute: Y'CbCr -> RGB conversion and
-//! bilinear 4:2:0 resize.
+//! GPU image pipeline on Vulkan compute: Y'CbCr -> RGB conversion,
+//! bilinear 4:2:0 resize, and affine warp (inverse mapping over RGBA32).
 //!
 //! A process-wide device context (lazily created, shared across decoders)
 //! runs the same [`ImageConfig`] steps as the reference software pipeline in
@@ -8,10 +8,12 @@
 //! - `rgb` only -> a single yuv2rgb pass
 //! - `scale` only -> a single bilinear resize pass (8-bit output)
 //! - `scale` + `rgb` -> resize into an 8-bit scratch, then yuv2rgb
+//! - `affine` (+ `rgb`) -> yuv2rgb, then an inverse-mapping warp pass over
+//!   the RGBA32 result (nearest / bilinear / bicubic)
 //!
-//! Only [`Filter::Bilinear`] and 8/10-bit sources are handled; anything else
-//! (affine warp, box/bicubic, 12-bit) returns [`ImageError::Unsupported`] so
-//! the caller can fall back to software.
+//! Only [`Interpolation::Bilinear`] resize and 8/10-bit sources are handled;
+//! anything else (box/bicubic resize, box warp, 12-bit) returns
+//! [`ImageError::Unsupported`] so the caller can fall back to software.
 //!
 //! All plane data is exchanged through one host-visible, host-coherent arena
 //! buffer of `u32` words (one word per sample; naga has no 8-bit integer
@@ -27,7 +29,7 @@ use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
 use vacc_image::{
-    table, Filter, ImageConfig, ImageError, ImageResult, ProcessedFrame, RgbChannels,
+    table, ImageConfig, ImageError, ImageResult, Interpolation, ProcessedFrame, RgbChannels,
     YuvImage, YuvLayout,
 };
 
@@ -112,6 +114,28 @@ struct ResizeParams {
     dst_h: u32,
 }
 
+/// warp_rgb push-constant block (must mirror the WGSL `Params`). Offsets and
+/// pitches are in words; `m*` is the *inverse* transform; `interp` is
+/// 0 = nearest, 1 = bilinear, 2 = bicubic.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WarpParams {
+    src_w: u32,
+    src_h: u32,
+    src_off: u32,
+    src_pitch: u32,
+    dst_off: u32,
+    dst_w: u32,
+    dst_h: u32,
+    m00: f32,
+    m01: f32,
+    m02: f32,
+    m10: f32,
+    m11: f32,
+    m12: f32,
+    interp: u32,
+}
+
 fn params_bytes<T>(p: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>()) }
 }
@@ -170,7 +194,8 @@ struct Gpu {
     pipeline_layout: vk::PipelineLayout,
     conv_pipeline: vk::Pipeline,
     resize_pipeline: vk::Pipeline,
-    desc_sets: [vk::DescriptorSet; 2], // [conv, resize]
+    warp_pipeline: vk::Pipeline,
+    desc_sets: [vk::DescriptorSet; 3], // [conv, resize, warp]
     uniform_buf: vk::Buffer,
     uniform_ptr: *mut u8,
     arena: vk::Buffer,
@@ -299,21 +324,22 @@ fn create() -> Result<Gpu, String> {
     };
     let conv_pipeline = make_pipeline(shaders::YUV2RGB)?;
     let resize_pipeline = make_pipeline(shaders::RESIZE_YUV)?;
+    let warp_pipeline = make_pipeline(shaders::WARP_RGB)?;
 
     let arena_size = 4u64 * ARENA_STEP;
     let (arena, arena_mem, arena_ptr) =
         alloc_host_visible(&device, &instance, physical, arena_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
 
     let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(2)
+        .max_sets(3)
         .pool_sizes(&[
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 4,
+                descriptor_count: 6,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 2,
+                descriptor_count: 3,
             },
         ]);
     let desc_pool =
@@ -322,15 +348,15 @@ fn create() -> Result<Gpu, String> {
         device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(desc_pool)
-                .set_layouts(&[set_layout; 2]),
+                .set_layouts(&[set_layout; 3]),
         )
     }
     .map_err(vk_err)?;
-    let desc_sets = [desc_sets_arr[0], desc_sets_arr[1]];
+    let desc_sets = [desc_sets_arr[0], desc_sets_arr[1], desc_sets_arr[2]];
 
-    // Uniform ring: slot 0 for the conv pass, slot 1 for the resize pass.
+    // Uniform ring: one slot per pass (conv, resize, warp).
     let (uniform_buf, _uniform_mem, uniform_ptr) =
-        alloc_host_visible(&device, &instance, physical, 2 * UNIFORM_SLOT, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+        alloc_host_visible(&device, &instance, physical, 3 * UNIFORM_SLOT, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
 
     let gpu = Gpu {
         instance,
@@ -343,6 +369,7 @@ fn create() -> Result<Gpu, String> {
         pipeline_layout,
         conv_pipeline,
         resize_pipeline,
+        warp_pipeline,
         desc_sets,
         uniform_buf,
         uniform_ptr,
@@ -401,22 +428,21 @@ impl Gpu {
         let arena_info = vk::DescriptorBufferInfo::default()
             .buffer(self.arena)
             .range(u64::MAX);
-        // Conv set gets uniform slot 0, resize set slot 1.
-        let conv_uniform = vk::DescriptorBufferInfo::default()
-            .buffer(self.uniform_buf)
-            .offset(0)
-            .range(UNIFORM_SLOT);
-        let resize_uniform = vk::DescriptorBufferInfo::default()
-            .buffer(self.uniform_buf)
-            .offset(UNIFORM_SLOT)
-            .range(UNIFORM_SLOT);
         let arena_arr = [arena_info];
-        let conv_arr = [conv_uniform];
-        let resize_arr = [resize_uniform];
 
+        // One buffer info per set (slot i of the uniform ring); must outlive
+        // `writes`.
+        let mut uniform_arrays: [[vk::DescriptorBufferInfo; 1]; 3] =
+            std::array::from_fn(|_| [vk::DescriptorBufferInfo::default()]);
+        for (i, _) in self.desc_sets.iter().enumerate() {
+            uniform_arrays[i][0] = vk::DescriptorBufferInfo::default()
+                .buffer(self.uniform_buf)
+                .offset(i as u64 * UNIFORM_SLOT)
+                .range(UNIFORM_SLOT);
+        }
         let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
         for (i, set) in self.desc_sets.iter().enumerate() {
-            let uniform_arr = if i == 0 { &conv_arr } else { &resize_arr };
+            let uniform_arr = &uniform_arrays[i];
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(*set)
@@ -465,10 +491,18 @@ impl Gpu {
         if cfg.is_noop() {
             return Err(ImageError::Unsupported("no-op image config".into()));
         }
-        if cfg.affine.is_some() {
-            return Err(ImageError::Unsupported(
-                "affine warp is not supported on the vulkan path".into(),
-            ));
+        let warp = cfg.affine;
+        if let Some(w) = warp {
+            if cfg.rgb.is_none() {
+                return Err(ImageError::Unsupported(
+                    "affine warp requires RGB output".into(),
+                ));
+            }
+            if !w.interpolation.supports_warp() {
+                return Err(ImageError::Unsupported(
+                    "box interpolation is not supported for affine warp".into(),
+                ));
+            }
         }
         if !(8..=10).contains(&img.bits_per_sample) {
             return Err(ImageError::Unsupported(
@@ -477,7 +511,7 @@ impl Gpu {
         }
         let scale = cfg.scale;
         if let Some(s) = scale {
-            if s.filter != Filter::Bilinear {
+            if s.filter != Interpolation::Bilinear {
                 return Err(ImageError::Unsupported(
                     "vulkan resize supports bilinear only".into(),
                 ));
@@ -524,8 +558,16 @@ impl Gpu {
         if scale.is_some() {
             off += scratch_words as u32;
         }
+        // RGBA32 conversion output; the warp pass reads it when warping.
         let rgb_off = if rgb.is_some() { off } else { 0 };
-        off += (dw * dh) as u32;
+        if rgb.is_some() {
+            off += (dw * dh) as u32;
+        }
+        // Warped RGBA32 result (the readback target when warping).
+        let warp_off = if warp.is_some() { off } else { 0 };
+        if warp.is_some() {
+            off += (dw * dh) as u32;
+        }
 
         self.ensure_arena(off as usize * 4).map_err(ImageError::Pipeline)?;
 
@@ -617,6 +659,43 @@ impl Gpu {
             dst_w: dw as u32,
             dst_h: dh as u32,
         };
+        let warp_params = match warp {
+            Some(w) => {
+                // The shader samples the inverse map (matches the reference
+                // pipeline's inverse mapping).
+                let inv = w.transform.invert().ok_or_else(|| {
+                    ImageError::Unsupported("singular affine matrix".into())
+                })?;
+                WarpParams {
+                    src_w: dw as u32,
+                    src_h: dh as u32,
+                    src_off: rgb_off,
+                    src_pitch: dw as u32,
+                    dst_off: warp_off,
+                    dst_w: dw as u32,
+                    dst_h: dh as u32,
+                    m00: inv.m00,
+                    m01: inv.m01,
+                    m02: inv.m02,
+                    m10: inv.m10,
+                    m11: inv.m11,
+                    m12: inv.m12,
+                    interp: match w.interpolation {
+                        Interpolation::Nearest => 0,
+                        Interpolation::Bilinear => 1,
+                        Interpolation::Bicubic => 2,
+                        Interpolation::Box => unreachable!("rejected above"),
+                    },
+                }
+            }
+            None => WarpParams {
+                src_w: 0, src_h: 0, src_off: 0, src_pitch: 0,
+                dst_off: 0, dst_w: 0, dst_h: 0,
+                m00: 1.0, m01: 0.0, m02: 0.0,
+                m10: 0.0, m11: 1.0, m12: 0.0,
+                interp: 1,
+            },
+        };
 
         // Stage the parameter blocks in the uniform ring.
         unsafe {
@@ -630,6 +709,13 @@ impl Gpu {
                 self.uniform_ptr.add(UNIFORM_SLOT as usize),
                 std::mem::size_of::<ResizeParams>(),
             );
+            if warp.is_some() {
+                std::ptr::copy_nonoverlapping(
+                    params_bytes(&warp_params).as_ptr(),
+                    self.uniform_ptr.add(2 * UNIFORM_SLOT as usize),
+                    std::mem::size_of::<WarpParams>(),
+                );
+            }
         }
 
         let slot = self.cmd_slot;
@@ -646,39 +732,30 @@ impl Gpu {
                 .begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
                 .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
 
+            // Passes run in pipeline order (resize -> yuv2rgb -> warp); a
+            // full memory barrier orders every hand-off over the arena.
+            let gx = (dw as u32).div_ceil(WORKGROUP);
+            let gy = (dh as u32).div_ceil(WORKGROUP);
+            let mut pass_recorded = false;
             if scale.is_some() {
                 self.bind_pass(cb, self.resize_pipeline, 1);
-                self.device.cmd_dispatch(
-                    cb,
-                    (dw as u32).div_ceil(WORKGROUP),
-                    (dh as u32).div_ceil(WORKGROUP),
-                    1,
-                );
+                self.device.cmd_dispatch(cb, gx, gy, 1);
+                pass_recorded = true;
             }
-
             if rgb.is_some() {
-                if scale.is_some() {
-                    // Scratch was just written; order it before the read.
-                    let barrier = vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                    self.device.cmd_pipeline_barrier(
-                        cb,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[barrier],
-                        &[],
-                        &[],
-                    );
+                if pass_recorded {
+                    self.record_barrier(cb);
                 }
                 self.bind_pass(cb, self.conv_pipeline, 0);
-                self.device.cmd_dispatch(
-                    cb,
-                    (dw as u32).div_ceil(WORKGROUP),
-                    (dh as u32).div_ceil(WORKGROUP),
-                    1,
-                );
+                self.device.cmd_dispatch(cb, gx, gy, 1);
+                pass_recorded = true;
+            }
+            if warp.is_some() {
+                if pass_recorded {
+                    self.record_barrier(cb);
+                }
+                self.bind_pass(cb, self.warp_pipeline, 2);
+                self.device.cmd_dispatch(cb, gx, gy, 1);
             }
 
             self.device
@@ -728,7 +805,10 @@ impl Gpu {
             }
             Some(ch) => {
                 let words = self.arena_words();
-                let rgb_words = &words[rgb_off as usize..rgb_off as usize + dw * dh];
+                // Warping reads the conv output and writes a separate region;
+                // read back whichever holds the final RGBA32 pixels.
+                let read_off = if warp.is_some() { warp_off } else { rgb_off };
+                let rgb_words = &words[read_off as usize..read_off as usize + dw * dh];
                 let mut data = vec![0u8; rgb_size];
                 if ch == RgbChannels::Rgba32 {
                     for (i, w) in rgb_words.iter().enumerate() {
@@ -765,13 +845,34 @@ impl Gpu {
             );
         }
     }
+
+    /// Order shader writes before subsequent shader reads on the arena.
+    fn record_barrier(&self, cb: vk::CommandBuffer) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
-    use vacc_image::{ColorRange, ImageConfig, MatrixCoefficients, RgbChannels, Scale, YuvImage};
+    use vacc_image::{
+        Affine, ColorRange, ImageConfig, Interpolation, MatrixCoefficients, RgbChannels, Scale,
+        Warp, YuvImage,
+    };
 
     /// Serialize GPU tests (shared device context).
     fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -890,7 +991,7 @@ mod tests {
             for (tw, th) in [(160usize, 120), (256, 144), (400, 300)] {
                 let cfg = ImageConfig {
                     rgb: None,
-                    scale: Some(Scale::new(tw as u32, th as u32, Filter::Bilinear)),
+                    scale: Some(Scale::new(tw as u32, th as u32, Interpolation::Bilinear)),
                     affine: None,
                     spec: Default::default(),
                 };
@@ -918,7 +1019,7 @@ mod tests {
             let (_, img) = grad_yuv(320, 240, planar);
             let cfg = ImageConfig {
                 rgb: Some(RgbChannels::Rgba32),
-                scale: Some(Scale::new(160, 120, Filter::Bilinear)),
+                scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
                 affine: None,
                 spec: vacc_image::ColorSpec::auto(1080),
             };
@@ -945,18 +1046,93 @@ mod tests {
         // Box filter -> software fallback.
         let cfg = ImageConfig {
             rgb: None,
-            scale: Some(Scale::new(32, 16, Filter::Box)),
+            scale: Some(Scale::new(32, 16, Interpolation::Box)),
             affine: None,
             spec: Default::default(),
         };
         assert!(matches!(process(&img, &cfg), Err(ImageError::Unsupported(_))));
-        // Affine warp -> software fallback.
+        // Box warp -> software fallback.
         let cfg = ImageConfig {
             rgb: Some(RgbChannels::Rgba32),
             scale: None,
-            affine: Some(vacc_image::Affine::identity()),
+            affine: Some(Warp::new(Affine::identity(), Interpolation::Box)),
             spec: Default::default(),
         };
         assert!(matches!(process(&img, &cfg), Err(ImageError::Unsupported(_))));
+        // Warp without RGB output -> software fallback.
+        let cfg = ImageConfig {
+            rgb: None,
+            scale: None,
+            affine: Some(Warp::bilinear(Affine::identity())),
+            spec: Default::default(),
+        };
+        assert!(matches!(process(&img, &cfg), Err(ImageError::Unsupported(_))));
+    }
+
+    #[test]
+    fn warp_matches_sw() {
+        let Some(_guard) = require_gpu() else { return };
+        let (w, h) = (160usize, 96);
+        for planar in [false, true] {
+            let (_, img) = grad_yuv(w, h, planar);
+            let transforms: [(Affine, &str); 3] = [
+                (Affine::identity(), "identity"),
+                (Affine::translate(10.0, 5.0), "translate"),
+                (
+                    Affine::rotate_around(std::f32::consts::PI / 6.0, w as f32 / 2.0, h as f32 / 2.0),
+                    "rotate",
+                ),
+            ];
+            for interp in [
+                Interpolation::Nearest,
+                Interpolation::Bilinear,
+                Interpolation::Bicubic,
+            ] {
+                for (t, label) in transforms {
+                    for ch in [RgbChannels::Rgba32, RgbChannels::Rgb24] {
+                        let cfg = ImageConfig {
+                            rgb: Some(ch),
+                            scale: None,
+                            affine: Some(Warp::new(t, interp)),
+                            spec: Default::default(),
+                        };
+                        let vk_res = process(&img, &cfg).unwrap();
+                        let sw_res = sw_process(&img, &cfg);
+                        match (vk_res, sw_res) {
+                            (ProcessedFrame::Rgb(a), ProcessedFrame::Rgb(b)) => {
+                                assert_eq!((a.width, a.height), (w as u32, h as u32));
+                                let (max, mean) = diff(&a.data, &b.data);
+                                assert!(
+                                    max <= 4 && mean < 1.5,
+                                    "warp drift planar={planar} {interp:?} {label} {:?}: max={max} mean={mean}",
+                                    ch
+                                );
+                            }
+                            _ => panic!("expected rgb outputs"),
+                        }
+                    }
+                }
+            }
+            // Scale + warp: resize first, then warp at the scaled size.
+            let cfg = ImageConfig {
+                rgb: Some(RgbChannels::Rgba32),
+                scale: Some(Scale::new(80, 48, Interpolation::Bilinear)),
+                affine: Some(Warp::bilinear(Affine::translate(4.0, 2.0))),
+                spec: Default::default(),
+            };
+            let vk_res = process(&img, &cfg).unwrap();
+            let sw_res = sw_process(&img, &cfg);
+            match (vk_res, sw_res) {
+                (ProcessedFrame::Rgb(a), ProcessedFrame::Rgb(b)) => {
+                    assert_eq!((a.width, a.height), (80, 48));
+                    let (max, mean) = diff(&a.data, &b.data);
+                    assert!(
+                        max <= 4 && mean < 1.5,
+                        "scale+warp drift planar={planar}: max={max} mean={mean}"
+                    );
+                }
+                _ => panic!("expected rgb outputs"),
+            }
+        }
     }
 }

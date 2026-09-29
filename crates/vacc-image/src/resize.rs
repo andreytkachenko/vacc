@@ -2,8 +2,9 @@
 //!
 //! The public entry points are [`resize_rgb`] (packed RGB24 / RGBA32) and
 //! [`resize_yuv`] (8-bit 4:2:0, planar or semi-planar). Both implement the
-//! filters from [`Filter`]:
+//! interpolations from [`Interpolation`]:
 //!
+//! - `Nearest`: single tap at the rounded source position.
 //! - `Bilinear`: two-tap linear interpolation.
 //! - `Box`: area (coverage) averaging — proper anti-aliasing on downscale,
 //!   partial-coverage weights on upscale.
@@ -25,7 +26,7 @@
 use crate::conv::{Kernel, parallel_rows, simd_features};
 use crate::error::{ImageError, ImageResult};
 use crate::pixel::{YuvImage};
-use crate::spec::{Filter, Scale};
+use crate::spec::{Interpolation, Scale};
 
 pub(crate) mod avx2;
 pub(crate) mod sse4;
@@ -53,7 +54,7 @@ pub(crate) struct TapAxis {
 
 impl TapAxis {
     /// Build the tap table for one axis of `src` -> `dst` samples.
-    fn build(filter: Filter, src: usize, dst: usize) -> Self {
+    fn build(filter: Interpolation, src: usize, dst: usize) -> Self {
         assert!(src >= 1 && dst >= 1);
         let scale = src as f64 / dst as f64;
         // Exact even-integer-ratio downscale (4x, 6x, ...) degenerates the
@@ -64,12 +65,12 @@ impl TapAxis {
         // `scale`; fall back to its coverage weights there. (At 2x this
         // matches what the renormalized cubic already produced.)
         let filter = match filter {
-            Filter::Bicubic
+            Interpolation::Bicubic
                 if scale >= 2.0
                     && (scale - scale.round()).abs() < 1e-6
                     && scale.round() % 2.0 == 0.0 =>
             {
-                Filter::Box
+                Interpolation::Box
             }
             f => f,
         };
@@ -77,7 +78,13 @@ impl TapAxis {
             .map(|ox| {
                 let center = (ox as f64 + 0.5) * scale - 0.5;
                 match filter {
-                    Filter::Bilinear => {
+                    Interpolation::Nearest => {
+                        vec![(
+                            center.round().clamp(0.0, src as f64 - 1.0) as i32,
+                            1.0,
+                        )]
+                    }
+                    Interpolation::Bilinear => {
                         let i0 = center.floor() as i32;
                         let f = center - center.floor();
                         vec![
@@ -85,7 +92,7 @@ impl TapAxis {
                             ((i0 + 1).clamp(0, src as i32 - 1), f),
                         ]
                     }
-                    Filter::Box => {
+                    Interpolation::Box => {
                         let half = scale / 2.0;
                         let lo = center - half;
                         let hi = center + half;
@@ -104,7 +111,7 @@ impl TapAxis {
                             })
                             .collect()
                     }
-                    Filter::Bicubic => {
+                    Interpolation::Bicubic => {
                         // The kernel is evaluated in destination units
                         // (d = |c-t|*scale, support 2), so the tap range in
                         // source space is always 2/scale — narrower than 2
@@ -127,7 +134,7 @@ impl TapAxis {
 
         // Renormalize the filters whose raw weights do not sum to exactly 1
         // (box coverage, widened cubic). Bilinear is exact as-is.
-        if matches!(filter, Filter::Box | Filter::Bicubic) {
+        if matches!(filter, Interpolation::Box | Interpolation::Bicubic) {
             for row in rows.iter_mut() {
                 let sum: f64 = row.iter().map(|&(_, w)| w).sum();
                 if sum > 0.0 {
@@ -721,7 +728,7 @@ mod tests {
         for (w, h) in [(320usize, 240usize), (97usize, 61usize)] {
             for ch in [3u8, 4] {
                 let (_, img) = grad_rgb(w, h, ch);
-                for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+                for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                     for (tw, th) in [(200usize, 150usize), (640, 480), (80, 60), (13, 7)] {
                         resize_all_kernels(&img, Scale::new(tw as u32, th as u32, filter));
                     }
@@ -734,7 +741,7 @@ mod tests {
     fn identity_scale_is_exact() {
         for ch in [3u8, 4] {
             let (buf, img) = grad_rgb(100, 60, ch);
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 let mut out = vec![0u8; buf.len()];
                 resize_rgb(&img, Scale::new(100, 60, filter), Kernel::Auto, &mut out).unwrap();
                 assert_eq!(buf, out, "identity {filter:?} ch={ch}");
@@ -761,7 +768,7 @@ mod tests {
             }
             let data: &'static [u8] = Box::leak(buf.clone().into_boxed_slice());
             let img = RgbImage::new(data, w * ch as usize, w, h, ch);
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 let (tw, th) = (300usize, 200usize);
                 let mut out = vec![0u8; tw * th * ch as usize];
                 resize_rgb(&img, Scale::new(tw as u32, th as u32, filter), Kernel::Auto, &mut out).unwrap();
@@ -799,7 +806,7 @@ mod tests {
         let img = RgbImage::new(data, w * 3, w, h, 3);
         let (tw, th) = (32usize, 24usize);
         let mut out = vec![0u8; tw * th * 3];
-        resize_rgb(&img, Scale::new(tw as u32, th as u32, Filter::Box), Kernel::Scalar, &mut out).unwrap();
+        resize_rgb(&img, Scale::new(tw as u32, th as u32, Interpolation::Box), Kernel::Scalar, &mut out).unwrap();
         for y in 0..th {
             for x in 0..tw {
                 let s = |ox: usize, oy: usize, c: usize| buf[(oy * w + ox) * 3 + c] as f32;
@@ -834,10 +841,10 @@ mod tests {
         let img = RgbImage::new(data, w * 3, w, h, 3);
         for (tw, th) in [(8usize, 6usize), (16, 12)] {
             let mut out = vec![0u8; tw * th * 3];
-            resize_rgb(&img, Scale::new(tw as u32, th as u32, Filter::Bicubic), Kernel::Scalar, &mut out).unwrap();
+            resize_rgb(&img, Scale::new(tw as u32, th as u32, Interpolation::Bicubic), Kernel::Scalar, &mut out).unwrap();
             assert!(!out.iter().all(|&v| v == 0), "all-black output at {tw}x{th}");
             let mut box_out = vec![0u8; tw * th * 3];
-            resize_rgb(&img, Scale::new(tw as u32, th as u32, Filter::Box), Kernel::Scalar, &mut box_out).unwrap();
+            resize_rgb(&img, Scale::new(tw as u32, th as u32, Interpolation::Box), Kernel::Scalar, &mut box_out).unwrap();
             assert_eq!(out, box_out, "bicubic integer downscale != box at {tw}x{th}");
         }
     }
@@ -901,7 +908,7 @@ mod tests {
     fn yuv_kernels_agree() {
         for (w, h) in [(320usize, 240usize), (97usize, 61usize)] {
             let (_, img) = grad_i420(w, h);
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 for (tw, th) in [(200usize, 150usize), (640, 480), (80, 60)] {
                     resize_yuv_all_kernels(&img, Scale::new(tw as u32, th as u32, filter));
                 }
@@ -913,7 +920,7 @@ mod tests {
     fn yuv_identity_is_exact() {
         let (buf, img) = grad_i420(100, 60);
         let mut out = buf.clone();
-        resize_yuv(&img, Scale::new(100, 60, Filter::Bilinear), Kernel::Auto, &mut out).unwrap();
+        resize_yuv(&img, Scale::new(100, 60, Interpolation::Bilinear), Kernel::Auto, &mut out).unwrap();
         assert_eq!(buf, out);
     }
 
@@ -946,7 +953,7 @@ mod tests {
         );
         let (tw, th) = (400usize, 300usize);
         let mut out = vec![0u8; crate::conv::i420_size(tw, th)];
-        resize_yuv(&img, Scale::new(tw as u32, th as u32, Filter::Bicubic), Kernel::Auto, &mut out).unwrap();
+        resize_yuv(&img, Scale::new(tw as u32, th as u32, Interpolation::Bicubic), Kernel::Auto, &mut out).unwrap();
         let view = crate::conv::scratch_view(&out, tw, th);
         let mut rgb = vec![0u8; tw * th * 3];
         crate::conv::yuv_to_rgb(&view, ColorSpec::default(), RgbChannels::Rgb24, &mut rgb).unwrap();
@@ -1001,7 +1008,7 @@ mod tests {
         );
         let simg = YuvImage::semi(&sdata[..w * h], w, &sdata[w * h..], w, w, h, 8);
 
-        let scale = Scale::new(200, 150, Filter::Bilinear);
+        let scale = Scale::new(200, 150, Interpolation::Bilinear);
         let mut pout = vec![0u8; crate::conv::i420_size(200, 150)];
         resize_yuv(&pimg, scale, Kernel::Auto, &mut pout).unwrap();
         let mut sout = vec![0u8; 200 * 150 + 100 * 2 * 75];
@@ -1013,14 +1020,14 @@ mod tests {
     fn tiny_images_do_not_crash() {
         for ch in [3u8, 4] {
             let (_, img) = grad_rgb(1, 1, ch);
-            for filter in [Filter::Bilinear, Filter::Box, Filter::Bicubic] {
+            for filter in [Interpolation::Bilinear, Interpolation::Box, Interpolation::Bicubic] {
                 let mut out = vec![0u8; 64 * 32 * ch as usize];
                 resize_rgb(&img, Scale::new(64, 32, filter), Kernel::Auto, &mut out).unwrap();
             }
         }
         let (_, img) = grad_i420(1, 1);
         let mut out = vec![0u8; crate::conv::i420_size(8, 8)];
-        resize_yuv(&img, Scale::new(8, 8, Filter::Bicubic), Kernel::Auto, &mut out).unwrap();
+        resize_yuv(&img, Scale::new(8, 8, Interpolation::Bicubic), Kernel::Auto, &mut out).unwrap();
     }
 
     #[test]

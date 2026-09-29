@@ -102,4 +102,4 @@ pub use error::{BackendFailure, UnifiedError, UnifiedResult};
 pub use vacc_core::{decoder::Decoder, frame::DecodedFrame, DecoderInfo, VideoCodec};
 
 // Image-pipeline configuration types.
-pub use vacc_image::{ColorSpec, Filter, ImageConfig, RgbChannels, Scale};
+pub use vacc_image::{Affine, ColorSpec, ImageConfig, Interpolation, RgbChannels, Scale, Warp};

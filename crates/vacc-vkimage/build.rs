@@ -6,7 +6,7 @@ use std::path::Path;
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    for name in ["yuv2rgb", "resize_yuv"] {
+    for name in ["yuv2rgb", "resize_yuv", "warp_rgb"] {
         let source =
             std::fs::read_to_string(Path::new("src/shaders").join(format!("{name}.wgsl")))
                 .unwrap_or_else(|e| panic!("reading {name}.wgsl: {e}"));
