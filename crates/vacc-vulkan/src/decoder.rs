@@ -870,16 +870,13 @@ impl VideoDecoder {
                         loop {
                             match parser.parse(packet) {
                                 Ok(vacc_parser::ParseResult::Slice { slices, .. }) => {
-                                    let vacc_parser::SliceHeader::H265(i) = slices[0]
-                                        .slice_header
-                                        .clone()
-                                        .expect("slice header parsed")
-                                    else {
-                                        return Err(VideoError::DecoderInit(
-                                            "expected H265 slice header".to_string(),
-                                        ));
-                                    };
-                                    info = Some(i);
+                                    // A corrupted first slice segment can carry no parsed
+                                    // header; fall back to the first slice in the access
+                                    // unit that did parse.
+                                    info = slices.iter().find_map(|s| match &s.slice_header {
+                                        Some(vacc_parser::SliceHeader::H265(i)) => Some(i.clone()),
+                                        _ => None,
+                                    });
                                     break;
                                 }
                                 Ok(vacc_parser::ParseResult::ParameterSet { .. }) => continue,

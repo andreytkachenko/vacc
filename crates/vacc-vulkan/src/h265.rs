@@ -599,11 +599,13 @@ impl H265Decoder {
         //   entries (S0 + S1) in that SPS short-term reference picture set;
         // - in-slice RPS: its SizeInBits in the slice header.
         if !info.is_idr && info.short_term_ref_pic_set_sps_flag {
-            let rps = sps
-                .short_term_ref_pic_sets
-                .get(info.short_term_ref_pic_set_idx as usize)
-                .expect("SPS STRPS index out of range");
-            pic_info.NumDeltaPocsOfRefRpsIdx = rps.num_negative_pics + rps.num_positive_pics;
+            // Corrupted streams may index past the SPS STRPS table; clamp as in
+            // the common DPB's resolve_refs (this field is a reconstruction hint).
+            let idx = (info.short_term_ref_pic_set_idx as usize)
+                .min(sps.short_term_ref_pic_sets.len().saturating_sub(1));
+            if let Some(rps) = sps.short_term_ref_pic_sets.get(idx) {
+                pic_info.NumDeltaPocsOfRefRpsIdx = rps.num_negative_pics + rps.num_positive_pics;
+            }
             pic_info.NumBitsForSTRefPicSetInSlice = 0;
         } else if !info.is_idr {
             pic_info.NumDeltaPocsOfRefRpsIdx = 0;

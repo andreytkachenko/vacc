@@ -676,6 +676,13 @@ impl H265Parser {
             // Matches C++: VulkanH265Parser.cpp:1870-1914
             let num_negative_pics = r.read_ue()? as u8;
             let num_positive_pics = r.read_ue()? as u8;
+            // H.265 constraint (7.3.7.2.1): both counts are <= 16; the
+            // delta_poc_s0/s1_minus1 arrays below are 16 entries. Corrupted
+            // streams with larger values must be rejected, not indexed into
+            // the fixed arrays (out-of-bounds write / shift overflow).
+            if num_negative_pics > 16 || num_positive_pics > 16 {
+                return Err(ParserError::InvalidBitstream);
+            }
             strps.num_negative_pics = num_negative_pics;
             strps.num_positive_pics = num_positive_pics;
 
@@ -730,8 +737,12 @@ impl H265Parser {
         let delta_rps: i32 = if delta_rps_sign { -1i32 } else { 1i32 };
         let delta_rps_val: i32 = delta_rps * (abs_delta_rps_minus1 as i32 + 1);
 
-        // Reference RPS index
-        let r_idx = idx - (delta_idx_minus1 as usize + 1);
+        // Reference RPS index. delta_idx_minus1 is an unbounded ue(v): guard the
+        // subtraction against underflow (corrupted bitstream) and the result
+        // against the reference list.
+        let Some(r_idx) = idx.checked_sub(delta_idx_minus1 as usize + 1) else {
+            return Err(ParserError::InvalidBitstream);
+        };
         if r_idx >= prev_strps.len() {
             return Err(ParserError::InvalidBitstream);
         }
@@ -999,7 +1010,15 @@ impl H265Parser {
 
         sps.bit_depth_luma_minus8 = r.read_ue()? as u8;
         sps.bit_depth_chroma_minus8 = r.read_ue()? as u8;
-        sps.log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()? as u8;
+        // H.265 constraint (7.3.2.1.1): log2_max_pic_order_cnt_lsb_minus4 <= 14.
+        // Downstream code computes the POC wrap period as 2^(x+4) in fixed-width
+        // integers; a corrupted SPS with a larger value would overflow those
+        // shifts instead of failing cleanly.
+        let log2_max_poc_lsb = r.read_ue()? as u8;
+        if log2_max_poc_lsb > 14 {
+            return Err(ParserError::InvalidBitstream);
+        }
+        sps.log2_max_pic_order_cnt_lsb_minus4 = log2_max_poc_lsb;
 
         sps.sps_sub_layer_ordering_info_present_flag = r.read_bit()?;
 
@@ -1073,6 +1092,11 @@ impl H265Parser {
         sps.long_term_ref_pics_present_flag = r.read_bit()?;
         if sps.long_term_ref_pics_present_flag {
             let num_long_term_ref_pics_sps = r.read_ue()? as u8;
+            // lt_ref_pic_poc_lsb_sps is a 32-entry array and used_by_curr_pic_lt_sps_flag
+            // is a u32; a corrupted count above 32 would index/shift out of bounds.
+            if num_long_term_ref_pics_sps > 32 {
+                return Err(ParserError::InvalidBitstream);
+            }
             sps.num_long_term_ref_pics_sps = num_long_term_ref_pics_sps;
 
             let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
@@ -3036,6 +3060,132 @@ mod tests {
         assert_eq!(strps.used_by_curr_pic_s1_flag, 1);
     }
 
+    // ========================================================================
+    // Regression: corrupted bitstreams must be rejected, not panic
+    // ========================================================================
+
+    /// Synthesize a minimal H.265 SPS NAL with the given POC-lsb exponent and
+    /// SPS long-term reference count. All other fields take safe defaults.
+    fn synthesize_sps_nal(log2_max_poc_lsb: u32, num_lt_refs: u32, lt_present: bool) -> Vec<u8> {
+        let mut b = BitBuf::new();
+        // NAL header: SPS (type 33)
+        b.put(0x10, 8);
+        b.put(0x01, 8);
+        // sps_video_parameter_set_id(4)=0 + sps_max_sub_layers_minus1(3)=0
+        // + sps_temporal_id_nesting_flag(1)=1
+        b.put(0b0000_0001, 8);
+        // profile_tier_level: profile byte (space=0, tier=0, idc=1),
+        // compatibility(32), source/constraints(48), level_idc(8)
+        b.put(0x21, 8);
+        b.put(0, 16);
+        b.put(0, 16);
+        b.put(0, 24);
+        b.put(0, 24);
+        b.put(93, 8); // level 3.1
+        // sps_seq_parameter_set_id, chroma_format_idc=1 (no separate_colour_plane)
+        b.ue(0);
+        b.ue(1);
+        // picture size
+        b.ue(640);
+        b.ue(360);
+        // conformance_window_flag = 0
+        b.put(0, 1);
+        // bit_depth_luma_minus8, bit_depth_chroma_minus8, POC lsb exponent
+        b.ue(0);
+        b.ue(0);
+        b.ue(log2_max_poc_lsb);
+        // sub_layer_ordering_info_present = 1; DPB (single sublayer)
+        b.put(1, 1);
+        b.ue(4); // max_dec_pic_buffering_minus1
+        b.ue(3); // max_num_reorder_pics
+        b.ue(0); // max_latency_increase_plus1
+        // coding/transform block sizes
+        b.ue(0); // log2_min_luma_coding_block_size_minus3
+        b.ue(3); // log2_diff_max_min_luma_coding_block_size
+        b.ue(0); // log2_min_luma_transform_block_size_minus2
+        b.ue(3); // log2_diff_max_min_luma_transform_block_size
+        b.ue(0); // max_transform_hierarchy_depth_inter
+        b.ue(0); // max_transform_hierarchy_depth_intra
+        // scaling_list_enabled, amp, sao, pcm = 0
+        b.put(0, 4);
+        // one direct STRPS with no entries
+        b.ue(1); // num_short_term_ref_pic_sets
+        b.ue(0); // num_negative_pics
+        b.ue(0); // num_positive_pics
+        // long-term reference pictures
+        b.put(u32::from(lt_present), 1);
+        if lt_present {
+            b.ue(num_lt_refs);
+            for _ in 0..num_lt_refs {
+                b.put(0, log2_max_poc_lsb + 4); // poc_lsb_sps
+                b.put(0, 1); // used_by_curr_pic_lt_sps_flag
+            }
+        }
+        // temporal_mvp=0, strong_intra_smoothing=1, vui=0, sps_extension=0
+        b.put(0b0_1_0_0, 4);
+        b.finish()
+    }
+
+    #[test]
+    fn test_sps_rejects_poc_lsb_above_spec_limit() {
+        // Spec limit (log2_max_pic_order_cnt_lsb_minus4 <= 14) parses fine.
+        let mut parser = H265Parser::new();
+        let sps = parser.parse_sps(&synthesize_sps_nal(14, 0, false)).expect("log2=14 valid");
+        assert_eq!(sps.log2_max_pic_order_cnt_lsb_minus4, 14);
+
+        // Above the limit the 2^(x+4) POC wrap period overflows fixed-width
+        // shifts downstream — must be rejected, not panic.
+        let mut parser = H265Parser::new();
+        assert!(parser.parse_sps(&synthesize_sps_nal(15, 0, false)).is_err());
+    }
+
+    #[test]
+    fn test_sps_rejects_too_many_sps_lt_refs() {
+        // 32 LT refs fill the lt_ref_pic_poc_lsb_sps array exactly.
+        let mut parser = H265Parser::new();
+        let sps = parser.parse_sps(&synthesize_sps_nal(4, 32, true)).expect("32 LT refs valid");
+        assert_eq!(sps.num_long_term_ref_pics_sps, 32);
+
+        // 33 would index/shift past the 32-entry array / u32 flag.
+        let mut parser = H265Parser::new();
+        assert!(parser.parse_sps(&synthesize_sps_nal(4, 33, true)).is_err());
+    }
+
+    #[test]
+    fn test_strps_rejects_counts_above_array_size() {
+        // num_negative_pics=17 writes past the 16-entry delta_poc arrays.
+        let mut b = BitBuf::new();
+        b.ue(17); // num_negative_pics
+        b.ue(0); // num_positive_pics
+        let data = b.finish();
+        let mut r = BitReader::new(&data, false);
+        assert!(H265Parser::parse_short_term_ref_pic_set(&mut r, 0, 1, &[]).is_err());
+
+        // Boundary: 16/16 entries parses fine.
+        let mut b = BitBuf::new();
+        b.ue(16);
+        b.ue(16);
+        for _ in 0..32 {
+            b.ue(0); // delta_poc
+            b.put(1, 1); // used_by_curr_pic flag
+        }
+        let data = b.finish();
+        let mut r = BitReader::new(&data, false);
+        let strps = H265Parser::parse_short_term_ref_pic_set(&mut r, 0, 1, &[])
+            .expect("16/16 entries valid");
+        assert_eq!(strps.num_negative_pics, 16);
+        assert_eq!(strps.num_positive_pics, 16);
+    }
+
+    #[test]
+    fn test_predictive_strps_idx_underflow_rejected() {
+        // delta_idx_minus1 > idx used to underflow the r_idx subtraction.
+        let data = [0u8; 4];
+        let mut r = BitReader::new(&data, false);
+        let mut strps = vacc_core::picture::H265ShortTermRefPicSet::default();
+        assert!(H265Parser::resolve_predictive_rps(&mut r, false, 0, 1, 5, &[], &mut strps).is_err());
+    }
+
     // =========================================================================
     // RPS parsing with used_by_curr_pic filtering
     // =========================================================================
@@ -3544,6 +3694,10 @@ mod tests {
             }
         }
         fn put(&mut self, val: u32, n: u32) {
+            let need = ((self.pos + n) / 8 + 1) as usize;
+            if need > self.bytes.len() {
+                self.bytes.resize(need, 0);
+            }
             for i in (0..n).rev() {
                 if val >> i & 1 == 1 {
                     let byte = (self.pos / 8) as usize;

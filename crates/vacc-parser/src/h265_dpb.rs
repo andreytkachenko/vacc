@@ -105,14 +105,20 @@ pub fn resolve_refs(sps: &H265Sps, info: &SliceHeaderInfo) -> H265ResolvedRefs {
     }
 
     // --- Short-term references (STRPS from SPS or in-slice) ---
-    let strps: &H265ShortTermRefPicSet = if info.short_term_ref_pic_set_sps_flag {
-        sps.short_term_ref_pic_sets
-            .get(info.short_term_ref_pic_set_idx as usize)
-            .expect("SPS STRPS index out of range")
+    // A corrupted bitstream may index past the SPS STRPS table (the slice
+    // header's idx is not range-checked against NumShortTermRefPicSets) or
+    // signal an in-slice RPS the parser could not reconstruct. Degrade to a
+    // clamped entry / no short-term refs instead of panicking.
+    let strps: Option<&H265ShortTermRefPicSet> = if info.short_term_ref_pic_set_sps_flag {
+        sps.short_term_ref_pic_sets.get(
+            (info.short_term_ref_pic_set_idx as usize)
+                .min(sps.short_term_ref_pic_sets.len().saturating_sub(1)),
+        )
     } else {
-        info.slice_strps
-            .as_ref()
-            .expect("in-slice STRPS missing for non-SPS RPS")
+        info.slice_strps.as_ref()
+    };
+    let Some(strps) = strps else {
+        return out;
     };
 
     // delta_poc_s0/s1_minus1 hold the *cumulative* DeltaPoc (signed, stored as
@@ -863,6 +869,49 @@ mod tests {
         assert_eq!(r.l1.len(), 3);
         assert_eq!(r.l1[0].poc, 9);
         assert_eq!(r.l1[1].poc, 7);
+    }
+
+    /// Regression: a corrupted slice header may index past the SPS STRPS table
+    /// (short_term_ref_pic_set_idx is not range-checked against
+    /// NumShortTermRefPicSets). resolve_refs must clamp instead of panicking.
+    #[test]
+    fn resolve_refs_oob_strps_idx_clamps() {
+        let sps = H265Sps::new();
+        let mut sps = sps;
+        sps.log2_max_pic_order_cnt_lsb_minus4 = 4; // max_poc_lsb = 256
+        sps.short_term_ref_pic_sets.push(strps_s0_1_used_s1_2_unused());
+
+        let mut info = SliceHeaderInfo::new();
+        info.slice_type = 1; // P
+        info.curr_pic_order_cnt_val = 10;
+        info.pic_order_cnt_lsb = 10;
+        info.num_ref_idx_l0_active_minus1 = 1;
+        // Out-of-range SPS STRPS index: must clamp to the last (only) entry.
+        info.short_term_ref_pic_set_sps_flag = true;
+        info.short_term_ref_pic_set_idx = 5;
+
+        let r = resolve_refs(&sps, &info);
+        assert_eq!(r.st_curr_before.len(), 1);
+        assert_eq!(r.st_curr_before[0].poc, 9); // 10 + (-1), from the clamped entry
+    }
+
+    /// Regression: SPS-flagged RPS with an empty STRPS table (corrupted SPS)
+    /// must degrade to no short-term refs instead of panicking.
+    #[test]
+    fn resolve_refs_empty_strps_table_no_refs() {
+        let sps = H265Sps::new();
+
+        let mut info = SliceHeaderInfo::new();
+        info.slice_type = 1; // P
+        info.curr_pic_order_cnt_val = 10;
+        info.pic_order_cnt_lsb = 10;
+        info.num_ref_idx_l0_active_minus1 = 0;
+        info.short_term_ref_pic_set_sps_flag = true;
+        info.short_term_ref_pic_set_idx = 0;
+
+        let r = resolve_refs(&sps, &info);
+        assert!(r.st_curr_before.is_empty());
+        assert!(r.st_curr_after.is_empty());
     }
 
     /// Mark `info` as using an in-slice STRPS (new() defaults to SPS RPS).

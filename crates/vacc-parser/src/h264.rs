@@ -386,6 +386,12 @@ impl H264Parser {
         }
 
         let log2_max_frame_num_minus4 = r.read_ue()? as u8;
+        // Keep the frame-number wrap period (2^(x+4)) within u32 range. FFmpeg
+        // caps these ue(v) fields at 16 via get_ue_golomb_length; larger values
+        // only occur in corrupted streams and would overflow the shift below.
+        if log2_max_frame_num_minus4 > 16 {
+            return Err(ParserError::InvalidBitstream);
+        }
         let max_frame_num = 1u32 << (log2_max_frame_num_minus4 as u32 + 4);
 
         let pic_order_cnt_type = r.read_ue()? as u8;
@@ -402,6 +408,9 @@ impl H264Parser {
         match pic_order_cnt_type {
             0 => {
                 log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()? as u8;
+                if log2_max_pic_order_cnt_lsb_minus4 > 16 {
+                    return Err(ParserError::InvalidBitstream);
+                }
                 max_pic_order_cnt_lsb = 1u32 << (log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
             }
             1 => {
