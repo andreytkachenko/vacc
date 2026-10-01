@@ -437,6 +437,7 @@ impl VideoDeviceBuilder {
             let mut decode_queue_family: Option<u32> = None;
             let mut graphics_queue_family: Option<u32> = None;
             let mut transfer_queue_family: Option<u32> = None;
+            let mut compute_queue_family: Option<u32> = None;
 
             for (i, qf) in queue_families_list.iter().enumerate() {
                 let i = i as u32;
@@ -455,6 +456,11 @@ impl VideoDeviceBuilder {
                 {
                     transfer_queue_family = Some(i);
                 }
+                if qf.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                    && compute_queue_family.is_none()
+                {
+                    compute_queue_family = Some(i);
+                }
             }
 
             if let Some(decode_qf) = decode_queue_family {
@@ -470,7 +476,7 @@ impl VideoDeviceBuilder {
                 }
                 let queue_families = QueueFamilies {
                     graphics: graphics_queue_family,
-                    compute: None,
+                    compute: compute_queue_family,
                     transfer: transfer_queue_family.or(Some(decode_qf)),
                     video_decode: decode_queue_family,
                     video_encode: None,
@@ -672,6 +678,20 @@ impl VideoDeviceBuilder {
                         .queue_priorities(&[1.0f32]),
                 );
             }
+        }
+
+        // Always create a compute-capable queue (when the decode family lacks
+        // COMPUTE): the zero-copy GPU track runs vkimage compute passes on
+        // this same device, and vkGetDeviceQueue for a family with no created
+        // queue is undefined behavior (crashes in NVIDIA drivers at submit).
+        if let Some(qf) = queue_families.compute
+            && queue_families.video_decode != Some(qf)
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&[1.0f32]),
+            );
         }
 
         #[allow(deprecated)]

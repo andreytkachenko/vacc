@@ -96,14 +96,30 @@ struct VulkanAdapter {
     queue: VecDeque<vacc_vulkan_decode::DecodedFrame>,
     next_index: u32,
     started: bool,
+    gpu: bool,
+    /// GPU mode only: kept alive because queued frames reference the
+    /// decoder's instance/device memory (their `GpuFrame` handles are only
+    /// valid while the owning `VulkanDecoder` lives).
+    decoder: Option<vacc_vulkan_decode::VulkanDecoder>,
 }
 
 #[cfg(feature = "vulkan")]
 impl VulkanAdapter {
-    fn new(data: Vec<u8>) -> UnifiedResult<Self> {
+    fn new(data: Vec<u8>, gpu: bool) -> UnifiedResult<Self> {
         // Validate eagerly so a bad stream falls through to the next backend.
-        vacc_vulkan_decode::VulkanDecoder::new(data.clone()).map_err(be)?;
-        Ok(Self { data, queue: VecDeque::new(), next_index: 0, started: false })
+        if gpu {
+            vacc_vulkan_decode::VulkanDecoder::new_gpu(data.clone()).map_err(be)?;
+        } else {
+            vacc_vulkan_decode::VulkanDecoder::new(data.clone()).map_err(be)?;
+        }
+        Ok(Self {
+            data,
+            queue: VecDeque::new(),
+            next_index: 0,
+            started: false,
+            gpu,
+            decoder: None,
+        })
     }
 
     fn start(&mut self) -> UnifiedResult<()> {
@@ -111,8 +127,18 @@ impl VulkanAdapter {
             return Ok(());
         }
         self.started = true;
-        let mut decoder = vacc_vulkan_decode::VulkanDecoder::new(std::mem::take(&mut self.data)).map_err(be)?;
+        let mut decoder = if self.gpu {
+            vacc_vulkan_decode::VulkanDecoder::new_gpu(std::mem::take(&mut self.data))
+        } else {
+            vacc_vulkan_decode::VulkanDecoder::new(std::mem::take(&mut self.data))
+        }
+        .map_err(be)?;
         let frames = decoder.decode_all(usize::MAX).map_err(be)?;
+        if self.gpu {
+            // The frames' device buffers live on this decoder's device; keep
+            // it alive until the frames (and its clones) are dropped.
+            self.decoder = Some(decoder);
+        }
         self.queue.extend(frames);
         Ok(())
     }
@@ -125,12 +151,33 @@ impl VulkanAdapter {
     }
 }
 
+#[cfg(feature = "vulkan")]
+impl Drop for VulkanAdapter {
+    fn drop(&mut self) {
+        // Forget vkimage compute state before the decoder's device is
+        // destroyed: the registry keys on raw pointers, which a later
+        // device may reuse.
+        if let Some(dec) = &self.decoder {
+            vacc_vkimage::forget_device(dec.device());
+        }
+    }
+}
+
 /// Convert a Vulkan backend frame (coded-size planes) into the core frame
 /// type with cropped, display-size planes — the same convention the other
 /// backends use. All three planes are packed into a single allocation: one
 /// `Vec`, one copy per pixel, no per-plane temporaries.
 #[cfg(feature = "vulkan")]
 fn to_core_frame(vk_frame: vacc_vulkan_decode::DecodedFrame, index: u32) -> DecodedFrame {
+    // GPU track: device-resident frame, no host pixels (mirrors the NVDEC
+    // gpu-mode frames).
+    if let Some(gpu) = vk_frame.gpu {
+        let mut frame =
+            DecodedFrame::new(index, 0, vk_frame.display_width, vk_frame.display_height, false);
+        frame.poc = vk_frame.poc;
+        frame.gpu = Some(gpu);
+        return frame;
+    }
     let pixels = vk_frame.pixels;
     let ss = pixels.sample_size.max(1) as usize;
     let (dw, dh) = (vk_frame.display_width as usize, vk_frame.display_height as usize);
@@ -319,16 +366,29 @@ impl VaccDecoder {
     /// selected backend to find its parameter sets; a few tens of KiB always
     /// suffices for Annex-B and IVF streams.
     pub fn new(probe: &[u8], config: &DecoderConfig) -> UnifiedResult<Self> {
-        if config.is_empty() {
+        // GPU decode track: only Vulkan and NVDEC emit device-resident
+        // frames, so restrict the configured order to them while preserving
+        // the caller's explicit choice (e.g. `only(Nvdec)`).
+        let order: Vec<Backend> = if config.gpu() {
+            config
+                .order()
+                .iter()
+                .copied()
+                .filter(|b| matches!(b, Backend::Vulkan | Backend::Nvdec))
+                .collect()
+        } else {
+            config.order().to_vec()
+        };
+        if order.is_empty() {
             return Err(UnifiedError::EmptyBackendOrder);
         }
         let mut failures = Vec::new();
-        for &backend in config.order() {
+        for &backend in &order {
             // A panicking backend (e.g. an out-of-bounds bug) must not take
             // down the caller: treat it like any other init failure and fall
             // through to the next backend.
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                create(backend, probe)
+                create(backend, probe, config.gpu())
             }));
             match created {
                 Ok(Ok(inner)) => {
@@ -375,10 +435,10 @@ impl VaccDecoder {
     }
 }
 
-fn create(backend: Backend, data: &[u8]) -> UnifiedResult<Box<dyn AnyDecode>> {
+fn create(backend: Backend, data: &[u8], gpu: bool) -> UnifiedResult<Box<dyn AnyDecode>> {
     match backend {
         #[cfg(feature = "vulkan")]
-        Backend::Vulkan => Ok(Box::new(VulkanAdapter::new(data.to_vec())?)),
+        Backend::Vulkan => Ok(Box::new(VulkanAdapter::new(data.to_vec(), gpu)?)),
         #[cfg(not(feature = "vulkan"))]
         Backend::Vulkan => Err(disabled("vulkan")),
 
@@ -386,18 +446,38 @@ fn create(backend: Backend, data: &[u8]) -> UnifiedResult<Box<dyn AnyDecode>> {
         Backend::Nvdec => {
             let codec = detect_codec(data).ok_or(UnifiedError::CodecNotDetected)?;
             match codec {
-                VideoCodec::DecodeH264 => Ok(Box::new(
-                    vacc_nvdec_decode::NvdecH264Decoder::new(data.to_vec()).map_err(be)?,
-                )),
-                VideoCodec::DecodeH265 => Ok(Box::new(
-                    vacc_nvdec_decode::NvdecH265Decoder::new(data.to_vec()).map_err(be)?,
-                )),
-                VideoCodec::DecodeVp9 => Ok(Box::new(
-                    vacc_nvdec_decode::NvdecVp9Decoder::new(data.to_vec()).map_err(be)?,
-                )),
-                VideoCodec::DecodeAv1 => Ok(Box::new(
-                    vacc_nvdec_decode::NvdecAv1Decoder::new(data.to_vec()).map_err(be)?,
-                )),
+                VideoCodec::DecodeH264 => {
+                    let d = if gpu {
+                        vacc_nvdec_decode::NvdecH264Decoder::new_gpu(data.to_vec())
+                    } else {
+                        vacc_nvdec_decode::NvdecH264Decoder::new(data.to_vec())
+                    };
+                    Ok(Box::new(d.map_err(be)?))
+                }
+                VideoCodec::DecodeH265 => {
+                    let d = if gpu {
+                        vacc_nvdec_decode::NvdecH265Decoder::new_gpu(data.to_vec())
+                    } else {
+                        vacc_nvdec_decode::NvdecH265Decoder::new(data.to_vec())
+                    };
+                    Ok(Box::new(d.map_err(be)?))
+                }
+                VideoCodec::DecodeVp9 => {
+                    let d = if gpu {
+                        vacc_nvdec_decode::NvdecVp9Decoder::new_gpu(data.to_vec())
+                    } else {
+                        vacc_nvdec_decode::NvdecVp9Decoder::new(data.to_vec())
+                    };
+                    Ok(Box::new(d.map_err(be)?))
+                }
+                VideoCodec::DecodeAv1 => {
+                    let d = if gpu {
+                        vacc_nvdec_decode::NvdecAv1Decoder::new_gpu(data.to_vec())
+                    } else {
+                        vacc_nvdec_decode::NvdecAv1Decoder::new(data.to_vec())
+                    };
+                    Ok(Box::new(d.map_err(be)?))
+                }
                 other => Err(UnifiedError::Unsupported {
                     message: format!("nvdec backend does not support {}", other.name()),
                 }),
@@ -546,6 +626,8 @@ impl VaccDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vacc_core::gpu::GpuPixelFormat;
+    use vacc_image::{Interpolation, RgbChannels, Scale};
 
     fn sample(name: &str) -> Vec<u8> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/samples/");
@@ -753,5 +835,138 @@ mod tests {
     #[test]
     fn streaming_chunked_input_matches_whole_stream_vaapi() {
         chunked_matches_whole(Backend::Vaapi, "h264_main.h264");
+    }
+
+    /// GPU decode track: frames must come out device-resident and the GPU
+    /// image pipeline must match the host pipeline (same NPP kernels on the
+    /// same decoded surface).
+    #[cfg(feature = "nvdec")]
+    #[test]
+    fn gpu_track_matches_cpu_path() {
+        if !vacc_npp::Npp::is_available() {
+            eprintln!("NPP unavailable; skipping gpu track test");
+            return;
+        }
+        let data = sample("h264_main.h264");
+        for scale in [None, Some(Scale::new(320, 180, Interpolation::Bilinear))] {
+            let img_cfg = ImageConfig {
+                rgb: Some(RgbChannels::Rgb24),
+                scale,
+                affine: None,
+                ..Default::default()
+            };
+            let mut cpu =
+                VaccDecoder::new(&data, &DecoderConfig::only(Backend::Nvdec).with_image(img_cfg)).unwrap();
+            let cpu_frames = drain(&mut cpu);
+            let mut gpu = VaccDecoder::new(
+                &data,
+                &DecoderConfig::only(Backend::Nvdec).with_image(img_cfg).with_gpu(),
+            )
+            .unwrap();
+            assert_eq!(gpu.backend(), Backend::Nvdec);
+            let gpu_frames = drain(&mut gpu);
+            assert_eq!(cpu_frames.len(), gpu_frames.len(), "frame count mismatch (scale={scale:?})");
+            for (c, g) in cpu_frames.iter().zip(&gpu_frames) {
+                let dev = g
+                    .gpu
+                    .as_ref()
+                    .unwrap_or_else(|| panic!(
+                        "frame {} carries no gpu buffer (pixel_data={}, rgb={})",
+                        c.frame_index,
+                        g.pixel_data.is_some(),
+                        g.rgb_pixels.is_some(),
+                    ));
+                assert_eq!(dev.format, GpuPixelFormat::Rgb24);
+                let host = vacc_npp::readback(dev).unwrap();
+                let ref_rgb = c
+                    .rgb_pixels
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("cpu frame {} has no rgb", c.frame_index));
+                assert_eq!(host.len(), ref_rgb.data.len());
+                let off = host
+                    .iter()
+                    .zip(ref_rgb.data.iter())
+                    .filter(|&(a, b)| (i32::from(*a) - i32::from(*b)).abs() > 2)
+                    .count();
+                assert!(
+                    off * 100 < host.len(),
+                    "gpu/cpu rgb drift: {off}/{} bytes differ by more than 2",
+                    host.len()
+                );
+            }
+        }
+    }
+
+    /// Vulkan decode track: frames stay in the decoder's device memory and
+    /// the image pipeline runs on-GPU (vkimage). Compared against the software
+    /// reference pipeline run on the same backend's readback YUV. The host
+    /// pipeline is deliberately not the reference: on NPP hosts it routes
+    /// scaling through nppiResize, whose phase convention deviates from the
+    /// reference bilinear (an exact 2x downscale degenerates to
+    /// nearest-neighbor decimation), while vkimage implements the reference
+    /// tap mapping.
+    #[test]
+    fn vulkan_gpu_track_matches_sw_reference() {
+        let data = sample("h264_main.h264");
+        for scale in [None, Some(Scale::new(320, 180, Interpolation::Bilinear))] {
+            let img_cfg = ImageConfig {
+                rgb: Some(RgbChannels::Rgb24),
+                scale,
+                affine: None,
+                ..Default::default()
+            };
+            // Reference: plain decode + software pipeline on the readback YUV.
+            let mut ref_dec =
+                VaccDecoder::new(&data, &DecoderConfig::only(Backend::Vulkan)).unwrap();
+            let ref_frames = drain(&mut ref_dec);
+            let mut gpu = match VaccDecoder::new(
+                &data,
+                &DecoderConfig::only(Backend::Vulkan).with_image(img_cfg).with_gpu(),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("vulkan gpu track unavailable ({e}); skipping");
+                    return;
+                }
+            };
+            assert_eq!(gpu.backend(), Backend::Vulkan);
+            let gpu_frames = drain(&mut gpu);
+            assert_eq!(ref_frames.len(), gpu_frames.len(), "frame count mismatch (scale={scale:?})");
+            for (r, g) in ref_frames.iter().zip(&gpu_frames) {
+                let pd = r
+                    .pixel_data
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("reference frame {} has no yuv", r.frame_index));
+                let src = crate::transform::map_source(pd)
+                    .unwrap_or_else(|e| panic!("mapping reference frame {}: {e}", r.frame_index));
+                let sw_rgb = match vacc_image::process(&src.image(), &img_cfg, vacc_image::Kernel::Auto) {
+                    Ok(vacc_image::ProcessedFrame::Rgb(r)) => r.data,
+                    other => panic!("sw reference on frame {} did not yield rgb: {other:?})", r.frame_index),
+                };
+                let dev = g
+                    .gpu
+                    .as_ref()
+                    .unwrap_or_else(|| panic!(
+                        "frame {} carries no gpu buffer (pixel_data={}, rgb={})",
+                        g.frame_index,
+                        g.pixel_data.is_some(),
+                        g.rgb_pixels.is_some(),
+                    ));
+                assert_eq!(dev.format, GpuPixelFormat::Rgb24);
+                let host = vacc_vkimage::readback(dev).unwrap();
+                assert_eq!(host.len(), sw_rgb.len());
+                let off = host
+                    .iter()
+                    .zip(sw_rgb.iter())
+                    .filter(|&(a, b)| (i32::from(*a) - i32::from(*b)).abs() > 2)
+                    .count();
+                assert!(
+                    off * 100 < host.len(),
+                    "vulkan gpu/sw rgb drift: {off}/{} bytes differ by more than 2 (frame {})",
+                    host.len(),
+                    g.frame_index
+                );
+            }
+        }
     }
 }

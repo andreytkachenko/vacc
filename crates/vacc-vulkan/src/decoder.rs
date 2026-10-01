@@ -34,6 +34,10 @@ pub struct DecodedFrame {
     pub is_idr: bool,
     pub is_reference: bool,
     pub pixels: DecodedPixels,
+    /// Zero-copy GPU mode: device-resident frame (tight NV12 in an owned
+    /// `VkBuffer`, cropped to the display region) instead of host pixels;
+    /// `pixels` is then empty.
+    pub gpu: Option<vacc_core::gpu::GpuFrame>,
     pub coded_width: u32,
     pub coded_height: u32,
     pub display_width: u32,
@@ -123,9 +127,18 @@ pub struct VideoDecoder {
     av1_parser: Option<vacc_parser::av1::Av1Parser>,
     /// AV1 sequence header (SPS)
     av1_sps: Option<vacc_core::picture::Av1Sps>,
+    /// Zero-copy GPU mode: emit device frames instead of host pixels.
+    gpu_mode: bool,
 }
 
 impl VideoDecoder {
+    /// The raw `VkDevice` this decoder runs on, for producer-bound work
+    /// (e.g. vkimage compute state) and for invalidating that state when the
+    /// decoder is torn down.
+    pub fn device(&self) -> vk::Device {
+        self.vulkan.device.handle()
+    }
+
     /// The common AV1 DPB/POC state (owned by the parser).
     fn av1_dpb(&self) -> &vacc_parser::av1_dpb::Av1Dpb {
         self.av1_parser
@@ -140,6 +153,91 @@ impl VideoDecoder {
     /// image, so the layer is always 0.
     fn dpb_base_layer(&self, slot: u32) -> u32 {
         if self.dpb_use_image_array { slot } else { 0 }
+    }
+
+    /// Emit pixels for a decoded DPB image: host readback in normal mode, or
+    /// (GPU mode) a zero-copy device buffer — tight NV12 cropped to the
+    /// display region — with no host staging.
+    fn emit_pixels(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        base_layer: u32,
+        coded_w: u32,
+        coded_h: u32,
+        old_layout: vk::ImageLayout,
+    ) -> VideoResult<(DecodedPixels, Option<vacc_core::gpu::GpuFrame>)> {
+        if !self.gpu_mode {
+            let pixels = super::readback::readback_decoded_image_format(
+                &self.vulkan.instance,
+                &self.vulkan.device,
+                &self.vulkan.memory_properties,
+                self.decode_queue_family,
+                self.command_pool,
+                self.fence,
+                image,
+                base_layer,
+                coded_w,
+                coded_h,
+                old_layout,
+                format,
+            )?;
+            return Ok((pixels, None));
+        }
+        let (buffer, memory) = super::readback::copy_decoded_image_to_device(
+            &self.vulkan.instance,
+            &self.vulkan.device,
+            &self.vulkan.memory_properties,
+            self.decode_queue_family,
+            self.command_pool,
+            self.fence,
+            image,
+            format,
+            base_layer,
+            old_layout,
+            self.parsed.crop_left,
+            self.parsed.crop_top,
+            self.parsed.display_width,
+            self.parsed.display_height,
+        )?;
+        Ok((DecodedPixels::empty(), Some(self.gpu_frame(buffer, memory))))
+    }
+
+    /// Wrap a device NV12 buffer as an owned [`GpuFrame`](vacc_core::gpu::GpuFrame)
+    /// on this decoder's device; the buffer is destroyed when the last clone
+    /// of the frame drops.
+    fn gpu_frame(
+        &self,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    ) -> vacc_core::gpu::GpuFrame {
+        let dw = self.parsed.display_width;
+        let dh = self.parsed.display_height;
+        let device = self.vulkan.device.clone();
+        vacc_core::gpu::GpuFrame::new_owned(
+            vacc_core::gpu::GpuDevice::Vulkan {
+                index: 0,
+                handles: vacc_core::gpu::VulkanHandles {
+                    instance: self.vulkan.instance.handle().as_raw() as usize,
+                    physical: self.vulkan.physical_device.as_raw() as usize,
+                    device: device.handle().as_raw() as usize,
+                    queue_family: self.decode_queue_family,
+                },
+            },
+            vacc_core::gpu::GpuPixelFormat::Nv12,
+            dw,
+            dh,
+            dw as usize,
+            (dw * dh) as usize,
+            buffer.as_raw() as usize,
+            Some(memory.as_raw() as usize),
+            Box::new(move |ptr: usize| {
+                unsafe {
+                    device.destroy_buffer(vk::Buffer::from_raw(ptr as u64), None);
+                    device.free_memory(memory, None);
+                }
+            }),
+        )
     }
 
     /// Create a new video decoder from bitstream data.
@@ -535,7 +633,30 @@ impl VideoDecoder {
             vp9_parser,
             av1_parser,
             av1_sps,
+            gpu_mode: false,
         })
+    }
+
+    /// Create a decoder in zero-copy GPU mode: decoded display frames are
+    /// copied device-to-device into owned `VkBuffer`s (tight NV12, cropped to
+    /// the display region) and emitted via [`DecodedFrame::gpu`] instead of
+    /// host pixels. Only 8-bit 4:2:0 content is supported.
+    pub fn new_gpu(data: Vec<u8>, max_frames: usize) -> VideoResult<Self> {
+        let mut decoder = Self::new(data, max_frames)?;
+        if decoder.parsed.luma_bit_depth != vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+            || decoder.parsed.chroma_subsampling != vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+        {
+            return Err(VideoError::DecoderInit(
+                "GPU mode only supports 8-bit 4:2:0 content".to_string(),
+            ));
+        }
+        if decoder.parsed.display_width % 2 != 0 || decoder.parsed.display_height % 2 != 0 {
+            return Err(VideoError::DecoderInit(
+                "GPU mode requires an even display extent".to_string(),
+            ));
+        }
+        decoder.gpu_mode = true;
+        Ok(decoder)
     }
 
     /// Decode up to `max_frames` frames from the bitstream.
@@ -666,7 +787,7 @@ impl VideoDecoder {
             return Err(VideoError::DecoderInit("No access units found".to_string()));
         }
 
-        let items: Vec<_> = items.into_iter().take(au_budget * 2).collect();
+        let items: Vec<_> = items.into_iter().take(au_budget.saturating_mul(2)).collect();
 
         // The buffer was sized from the construction-time budget; make sure it
         // can hold the largest access unit we are actually about to write.
@@ -1057,13 +1178,7 @@ impl VideoDecoder {
                         };
                     }
 
-                    let pixels = super::readback::readback_decoded_image(
-                        &self.vulkan.instance,
-                        &self.vulkan.device,
-                        &self.vulkan.memory_properties,
-                        self.decode_queue_family,
-                        self.command_pool,
-                        self.fence,
+                    let (pixels, gpu) = self.emit_pixels(
                         output_img,
                         self.output_format,
                         self.dpb_base_layer(output_slot as u32),
@@ -1099,6 +1214,7 @@ impl VideoDecoder {
                         is_idr: au.is_idr,
                         is_reference: au.is_reference,
                         pixels,
+                        gpu,
                         coded_width: self.coded_extent.width,
                         coded_height: self.coded_extent.height,
                         display_width: self.parsed.display_width,
@@ -1275,19 +1391,13 @@ impl VideoDecoder {
                 if slot >= 0 {
                     let slot = slot as usize;
                     let img = self.dpb_images[slot];
-                    let pixels = super::readback::readback_decoded_image_format(
-                        &self.vulkan.instance,
-                        &self.vulkan.device,
-                        &self.vulkan.memory_properties,
-                        self.decode_queue_family,
-                        self.command_pool,
-                        self.fence,
+                    let (pixels, gpu) = self.emit_pixels(
                         img,
+                        output_format,
                         self.dpb_base_layer(slot as u32),
                         frame_coded_extent.width,
                         frame_coded_extent.height,
                         vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                        output_format,
                     )?;
                     let frame = DecodedFrame {
                         poc: frame_count as i32,
@@ -1295,6 +1405,7 @@ impl VideoDecoder {
                         is_idr: false,
                         is_reference: false,
                         pixels,
+                        gpu,
                         coded_width: frame_coded_extent.width,
                         coded_height: frame_coded_extent.height,
                         display_width: self.parsed.display_width,
@@ -1471,19 +1582,13 @@ impl VideoDecoder {
 
             // Readback (only frames that are displayed).
             if parsed.picture_info.flags.show_frame != 0 {
-                let pixels = super::readback::readback_decoded_image_format(
-                    &self.vulkan.instance,
-                    &self.vulkan.device,
-                    &self.vulkan.memory_properties,
-                    self.decode_queue_family,
-                    self.command_pool,
-                    self.fence,
+                let (pixels, gpu) = self.emit_pixels(
                     output_img,
+                    output_format,
                     self.dpb_base_layer(output_slot_u),
                     frame_coded_extent.width,
                     frame_coded_extent.height,
                     self.dpb_manager.get_slot_layout(output_slot_u),
-                    output_format,
                 )?;
 
                 self.dpb_manager
@@ -1495,6 +1600,7 @@ impl VideoDecoder {
                     is_idr: is_key_frame,
                     is_reference: true,
                     pixels,
+                    gpu,
                     coded_width: frame_coded_extent.width,
                     coded_height: frame_coded_extent.height,
                     display_width: self.parsed.display_width,
@@ -1647,19 +1753,13 @@ impl VideoDecoder {
                     } else {
                         (ref_width, ref_height)
                     };
-                    let pixels = super::readback::readback_decoded_image_format(
-                        &self.vulkan.instance,
-                        &self.vulkan.device,
-                        &self.vulkan.memory_properties,
-                        self.decode_queue_family,
-                        self.command_pool,
-                        self.fence,
+                    let (pixels, gpu) = self.emit_pixels(
                         img,
+                        decode_output_format(self.parsed.luma_bit_depth),
                         self.dpb_base_layer(slot as u32),
                         ref_width,
                         ref_height,
                         vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                        decode_output_format(self.parsed.luma_bit_depth),
                     )?;
                     if super::vacc_debug() {
                         let n = pixels.y_plane.len().clamp(1, 1000);
@@ -1684,6 +1784,7 @@ impl VideoDecoder {
                         is_idr: false,
                         is_reference: false,
                         pixels,
+                        gpu,
                         coded_width: ref_width,
                         coded_height: ref_height,
                         display_width: self.parsed.display_width,
@@ -2938,19 +3039,13 @@ impl VideoDecoder {
             }
 
             // Readback the display frame from its DPB slot.
-            let pixels = super::readback::readback_decoded_image_format(
-                &self.vulkan.instance,
-                &self.vulkan.device,
-                &self.vulkan.memory_properties,
-                self.decode_queue_family,
-                self.command_pool,
-                self.fence,
+            let (pixels, gpu) = self.emit_pixels(
                 output_img,
+                decode_output_format(self.parsed.luma_bit_depth),
                 self.dpb_base_layer(output_slot as u32),
                 frame_coded_extent.width,
                 frame_coded_extent.height,
                 post_decode_layout,
-                decode_output_format(self.parsed.luma_bit_depth),
             )?;
 
             self.dpb_manager
@@ -2979,6 +3074,7 @@ impl VideoDecoder {
                 is_idr: is_key_frame,
                 is_reference: true,
                 pixels,
+                gpu,
                 coded_width: frame_coded_extent.width,
                 coded_height: frame_coded_extent.height,
                 display_width: self.parsed.display_width,

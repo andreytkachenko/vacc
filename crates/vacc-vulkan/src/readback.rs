@@ -32,6 +32,20 @@ enum Layout {
     Mono,
 }
 
+impl DecodedPixels {
+    /// Empty pixel payload; GPU-mode frames carry a device frame instead.
+    pub fn empty() -> Self {
+        Self {
+            y_plane: Vec::new(),
+            u_plane: Vec::new(),
+            v_plane: Vec::new(),
+            sample_size: 1,
+            chroma_width: 0,
+            chroma_height: 0,
+        }
+    }
+}
+
 /// Classify the decode output format into a readback layout.
 fn classify_format(format: vk::Format, width: u32, height: u32) -> Option<(u32, u32, u32, Layout)> {
     let (sample_size, chroma_w, chroma_h, layout) = match format {
@@ -998,6 +1012,246 @@ pub fn readback_decoded_image_format(
             chroma_height: uv_height,
         })
     }
+}
+
+/// Zero-copy GPU mode: copy a decoded DPB image into an owned device buffer
+/// in tight NV12 layout (Y rows first, then interleaved CbCr), cropped to the
+/// display region. No host staging: the returned buffer stays on the device
+/// and is exposed as a [`vacc_core::gpu::GpuFrame`] by the caller.
+///
+/// Only 8-bit 4:2:0 (`VK_FORMAT_G8B8R8_2PLANE_420_UNORM`) with an even
+/// display extent is supported. The buffer is host-visible so it can also be
+/// mapped for readback without an extra copy.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_decoded_image_to_device(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue_family: u32,
+    command_pool: vk::CommandPool,
+    fence: vk::Fence,
+    image: vk::Image,
+    format: vk::Format,
+    base_array_layer: u32,
+    old_layout: vk::ImageLayout,
+    crop_left: u32,
+    crop_top: u32,
+    display_width: u32,
+    display_height: u32,
+) -> Result<(vk::Buffer, vk::DeviceMemory), VideoError> {
+    if format != vk::Format::G8_B8R8_2PLANE_420_UNORM {
+        return Err(VideoError::DecoderInit(format!(
+            "GPU mode only supports 8-bit 4:2:0 output (got {:?})",
+            format
+        )));
+    }
+    if display_width % 2 != 0 || display_height % 2 != 0 {
+        return Err(VideoError::DecoderInit(
+            "GPU mode requires an even display extent".to_string(),
+        ));
+    }
+    let dw = display_width;
+    let dh = display_height;
+    let y_size = (dw * dh) as u64;
+    let total_size = y_size + y_size / 2;
+
+    let buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(total_size)
+                    .usage(
+                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    ),
+                None,
+            )
+            .map_err(|e| VideoError::BufferAllocation(e.to_string()))?
+    };
+
+    let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mem_type_index = find_memory_type(
+        memory_properties,
+        mem_reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .or_else(|| {
+        find_memory_type(
+            memory_properties,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )
+    })
+    .ok_or_else(|| {
+        VideoError::MemoryAllocation("No suitable memory type for GPU frame buffer".to_string())
+    })?;
+
+    let memory = unsafe {
+        device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mem_reqs.size)
+                    .memory_type_index(mem_type_index),
+                None,
+            )
+            .map_err(|e| VideoError::MemoryAllocation(e.to_string()))?
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| VideoError::BufferAllocation(e.to_string()))?;
+    }
+
+    let cmd_buffers = unsafe {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
+    let cmd_buffer = cmd_buffers[0];
+
+    // Cropped regions: luma at (crop_left, crop_top) in samples; chroma in
+    // half-pel units. Buffer rows are tightly packed (buffer_row_length 0).
+    let regions: [(vk::ImageAspectFlags, u64, u32, u32, u32, u32); 2] = [
+        (vk::ImageAspectFlags::PLANE_0, 0, crop_left, crop_top, dw, dh),
+        (vk::ImageAspectFlags::PLANE_1, y_size, crop_left / 2, crop_top / 2, dw / 2, dh / 2),
+    ];
+
+    unsafe {
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device
+            .begin_command_buffer(cmd_buffer, &begin_info)
+            .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
+
+        // Transition the planes being copied to TRANSFER_SRC_OPTIMAL.
+        let barriers: Vec<vk::ImageMemoryBarrier2> = regions
+            .iter()
+            .map(|&(aspect, _, _, _, _, _)| vk::ImageMemoryBarrier2 {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                p_next: std::ptr::null(),
+                src_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                src_access_mask: vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+                dst_stage_mask: vk::PipelineStageFlags2::TRANSFER,
+                dst_access_mask: vk::AccessFlags2::TRANSFER_READ,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                old_layout,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer,
+                    layer_count: 1,
+                },
+                _marker: Default::default(),
+            })
+            .collect();
+        let dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 0,
+            p_buffer_memory_barriers: std::ptr::null(),
+            image_memory_barrier_count: barriers.len() as u32,
+            p_image_memory_barriers: barriers.as_ptr(),
+            _marker: Default::default(),
+        };
+        cmd_pipeline_barrier_2(instance, device.handle(), cmd_buffer, &dep_info);
+
+        for &(aspect, buf_off, off_x, off_y, w, h) in &regions {
+            device.cmd_copy_image_to_buffer(
+                cmd_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[vk::BufferImageCopy::default()
+                    .buffer_offset(buf_off)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(aspect)
+                            .mip_level(0)
+                            .base_array_layer(base_array_layer)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D {
+                        x: off_x as i32,
+                        y: off_y as i32,
+                        z: 0,
+                    })
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 })],
+            );
+        }
+
+        // Restore the planes to the decode layout for DPB reuse.
+        let restore: Vec<vk::ImageMemoryBarrier2> = regions
+            .iter()
+            .map(|&(aspect, _, _, _, _, _)| vk::ImageMemoryBarrier2 {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+                p_next: std::ptr::null(),
+                src_stage_mask: vk::PipelineStageFlags2::TRANSFER,
+                src_access_mask: vk::AccessFlags2::TRANSFER_READ,
+                dst_stage_mask: vk::PipelineStageFlags2::VIDEO_DECODE_KHR,
+                dst_access_mask: vk::AccessFlags2::VIDEO_DECODE_READ_KHR,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer,
+                    layer_count: 1,
+                },
+                _marker: Default::default(),
+            })
+            .collect();
+        let dep_info = vk::DependencyInfo {
+            s_type: vk::StructureType::DEPENDENCY_INFO,
+            p_next: std::ptr::null(),
+            dependency_flags: vk::DependencyFlags::BY_REGION,
+            memory_barrier_count: 0,
+            p_memory_barriers: std::ptr::null(),
+            buffer_memory_barrier_count: 0,
+            p_buffer_memory_barriers: std::ptr::null(),
+            image_memory_barrier_count: restore.len() as u32,
+            p_image_memory_barriers: restore.as_ptr(),
+            _marker: Default::default(),
+        };
+        cmd_pipeline_barrier_2(instance, device.handle(), cmd_buffer, &dep_info);
+
+        device
+            .end_command_buffer(cmd_buffer)
+            .map_err(|e| VideoError::CommandBufferRecording(e.to_string()))?;
+
+        device
+            .reset_fences(&[fence])
+            .map_err(|e| VideoError::FenceWait(e.to_string()))?;
+
+        device
+            .queue_submit(
+                device.get_device_queue(queue_family, 0),
+                &[vk::SubmitInfo::default().command_buffers(&[cmd_buffer])],
+                fence,
+            )
+            .map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
+
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| VideoError::FenceWait(format!("gpu copy fence wait: {e:?}")))?;
+    }
+
+    Ok((buffer, memory))
 }
 
 fn find_memory_type(

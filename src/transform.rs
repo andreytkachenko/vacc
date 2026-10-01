@@ -17,6 +17,7 @@
 //! through untouched ([`ApplyOutcome::Skipped`]).
 
 use vacc_core::frame::{DecodedFrame, PixelData, PixelPlane, RgbFrame};
+use vacc_core::gpu::{GpuDevice, GpuFrame};
 use vacc_image::{ImageConfig, Kernel, ProcessedFrame, YuvImage, YuvLayout};
 
 use crate::error::{UnifiedError, UnifiedResult};
@@ -37,6 +38,18 @@ pub(crate) fn apply(frame: &mut DecodedFrame, cfg: &ImageConfig) -> UnifiedResul
     if cfg.is_noop() {
         return Ok(ApplyOutcome::Skipped("no-op image config".into()));
     }
+    // GPU decode track: run the zero-copy NPP pipeline on the device frame.
+    // An unsupported combination (e.g. 10-bit sources) or a missing NPP falls
+    // back to a readback + the host pipeline below.
+    if let Some(src) = frame.gpu.as_ref() {
+        match gpu_pipeline(src, cfg) {
+            Some(out) => {
+                write_back_gpu(frame, out);
+                return Ok(ApplyOutcome::Transformed);
+            }
+            None => readback_into_pixel_data(frame)?,
+        }
+    }
     let Some(pd) = frame.pixel_data.as_ref() else {
         return Ok(ApplyOutcome::Skipped("frame carries no pixel data".into()));
     };
@@ -55,16 +68,79 @@ pub(crate) fn apply(frame: &mut DecodedFrame, cfg: &ImageConfig) -> UnifiedResul
     Ok(ApplyOutcome::Transformed)
 }
 
+/// Zero-copy GPU pipeline over a device-resident frame, dispatched on the
+/// owning device (NPP for CUDA frames, Vulkan compute otherwise). Returns the
+/// transformed device frame, or `None` when the engine is unavailable or the
+/// source/config combination is unsupported (the caller then reads back and
+/// uses the host pipeline).
+fn gpu_pipeline(src: &GpuFrame, cfg: &ImageConfig) -> Option<GpuFrame> {
+    let result = match src.device {
+        GpuDevice::Cuda { .. } => {
+            if !vacc_npp::Npp::is_available() {
+                log::warn!("cuda gpu frame but NPP unavailable; falling back to readback + host pipeline");
+                return None;
+            }
+            vacc_npp::process_gpu(src, cfg)
+        }
+        GpuDevice::Vulkan { .. } => vacc_vkimage::process_device(src, cfg),
+    };
+    match result {
+        Ok(out) => Some(out),
+        Err(e) => {
+            log::warn!("gpu image pipeline failed ({e}); falling back to readback + host pipeline");
+            None
+        }
+    }
+}
+
+/// Move a GPU frame's contents to the host as tight NV12 `pixel_data` and
+/// drop the device handle, so the host pipeline can process it. Only used for
+/// the 8-bit NV12 frames the NVDEC gpu mode produces.
+fn readback_into_pixel_data(frame: &mut DecodedFrame) -> UnifiedResult<()> {
+    let src = frame.gpu.take().expect("gpu checked by caller");
+    let buf = match src.device {
+        GpuDevice::Cuda { .. } => vacc_npp::readback(&src),
+        GpuDevice::Vulkan { .. } => vacc_vkimage::readback(&src),
+    }
+    .map_err(|e| UnifiedError::ImageProcessing { message: e.to_string() })?;
+    let (w, h) = (src.width as usize, src.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    frame.pixel_data = Some(PixelData {
+        format: "NV12".to_string(),
+        y: PixelPlane { data: buf.as_ptr(), pitch: w, width: w, height: h },
+        u: PixelPlane {
+            data: unsafe { buf.as_ptr().add(w * h) },
+            pitch: cw * 2,
+            width: cw,
+            height: ch,
+        },
+        v: None,
+        buffer: buf,
+    });
+    Ok(())
+}
+
+/// Install the GPU pipeline output into the frame; the result stays
+/// device-resident and any host copies are dropped.
+fn write_back_gpu(frame: &mut DecodedFrame, out: GpuFrame) {
+    let (w, h) = (out.width, out.height);
+    frame.gpu = Some(out);
+    frame.pixel_data = None;
+    frame.rgb_pixels = None;
+    frame.width = w;
+    frame.height = h;
+}
+
 /// A 4:2:0 source for the pipeline: either a direct view over the decoded
 /// planes or an owned top-justified copy of a bottom-justified u16 source.
-enum MappedSource<'a> {
+pub(crate) enum MappedSource<'a> {
     Direct(YuvImage<'a>),
     /// Top-justified (v << 6) tight copy; all backends store u16 LE.
     Normalized { buf: Vec<u8>, width: usize, height: usize },
 }
 
 impl MappedSource<'_> {
-    fn image(&self) -> YuvImage<'_> {
+    pub(crate) fn image(&self) -> YuvImage<'_> {
         match self {
             Self::Direct(img) => *img,
             Self::Normalized { buf, width, height } => planar_u16_view(buf, *width, *height),
@@ -73,7 +149,7 @@ impl MappedSource<'_> {
 }
 
 /// Map a decoded frame's planes to a pipeline source.
-fn map_source(pd: &PixelData) -> Result<MappedSource<'_>, vacc_image::ImageError> {
+pub(crate) fn map_source(pd: &PixelData) -> Result<MappedSource<'_>, vacc_image::ImageError> {
     use vacc_image::ImageError;
 
     let (w, h) = (pd.y.width, pd.y.height);
@@ -183,7 +259,7 @@ fn write_back(frame: &mut DecodedFrame, out: ProcessedFrame, img_cfg: &ImageConf
     match out {
         ProcessedFrame::Yuv(y) => {
             let (w, h) = (y.width as usize, y.height as usize);
-            let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
             let buffer = y.data;
             frame.pixel_data = match y.layout {
                 YuvLayout::Planar => {

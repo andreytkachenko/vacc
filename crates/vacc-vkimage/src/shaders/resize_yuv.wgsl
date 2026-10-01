@@ -4,8 +4,10 @@
 //
 //   center = (dst + 0.5) * (src / dst) - 0.5, taps clamped to [0, src-1]
 //
-// matching the reference software pipeline's tap mapping (which uses two
-// f64 passes; single-pass f32 here drifts by at most a couple of LSB).
+// matching the reference software pipeline bit-for-bit: the h pass rounds to
+// u8 (the software scratch is u8), then the v pass blends the rounded rows —
+// at integer scale ratios every intermediate is exact, so the result is
+// identical to the SIMD host kernels.
 //
 // The output scratch is always stored planar-style: [Y][Cb][Cr], one word
 // per sample; the CPU repacks it into tight I420 or NV12 bytes on readback.
@@ -30,8 +32,19 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> p: Params;
 
-// Centered two-tap bilinear over a plane of `w x h` samples.
-fn bilinear(off: u32, pitch: u32, stride: u32, fx: f32, fy: f32, w: u32, h: u32) -> f32 {
+// One horizontal bilinear tap pair over a plane of samples, rounded to u8
+// exactly like the software h pass (its scratch is u8, so the v pass sees
+// rounded values). `stride` is the word distance between horizontal samples.
+fn h_tap(off: u32, x0: u32, x1: u32, wx: f32, stride: u32) -> u32 {
+    let a = f32(src[off + x0 * stride]);
+    let b = f32(src[off + x1 * stride]);
+    return round_clamp(a * (1.0 - wx) + b * wx);
+}
+
+// Centered two-tap bilinear over a plane of `w x h` samples: horizontal taps
+// rounded to u8, then a vertical blend of the rounded rows (two passes, like
+// the reference software pipeline).
+fn bilinear(off: u32, pitch: u32, stride: u32, fx: f32, fy: f32, w: u32, h: u32) -> u32 {
     let cx = clamp(fx, 0.0, f32(w - 1u));
     let cy = clamp(fy, 0.0, f32(h - 1u));
     let x0 = u32(cx);
@@ -40,11 +53,9 @@ fn bilinear(off: u32, pitch: u32, stride: u32, fx: f32, fy: f32, w: u32, h: u32)
     let y1 = min(y0 + 1u, h - 1u);
     let wx = cx - f32(x0);
     let wy = cy - f32(y0);
-    let tl = f32(src[off + y0 * pitch + x0 * stride]);
-    let tr = f32(src[off + y0 * pitch + x1 * stride]);
-    let bl = f32(src[off + y1 * pitch + x0 * stride]);
-    let br = f32(src[off + y1 * pitch + x1 * stride]);
-    return mix(mix(tl, tr, wx), mix(bl, br, wx), wy);
+    let top = h_tap(off + y0 * pitch, x0, x1, wx, stride);
+    let bot = h_tap(off + y1 * pitch, x0, x1, wx, stride);
+    return round_clamp(f32(top) * (1.0 - wy) + f32(bot) * wy);
 }
 
 fn round_clamp(v: f32) -> u32 {
@@ -63,7 +74,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fx = (f32(x) + 0.5) * f32(p.src_w) / f32(p.dst_w) - 0.5;
     let fy = (f32(y) + 0.5) * f32(p.src_h) / f32(p.dst_h) - 0.5;
     let yv = bilinear(p.y_off, p.y_pitch, 1u, fx, fy, p.src_w, p.src_h);
-    dst[p.dst_off + y * p.dst_w + x] = round_clamp(yv);
+    dst[p.dst_off + y * p.dst_w + x] = yv;
 
     // Chroma: output plane is (dw+1)/2 x (dh+1)/2.
     let dwc = (p.dst_w + 1u) / 2u;
@@ -82,6 +93,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Planar-style scratch: [Y][Cb][Cr].
     let uv_base = p.dst_off + p.dst_w * p.dst_h;
-    dst[uv_base + cyo * dwc + cxo] = round_clamp(cb);
-    dst[uv_base + dwc * dhc + cyo * dwc + cxo] = round_clamp(cr);
+    dst[uv_base + cyo * dwc + cxo] = cb;
+    dst[uv_base + dwc * dhc + cyo * dwc + cxo] = cr;
 }

@@ -576,7 +576,7 @@ pub fn extract_all_access_units(
         seen_h265_pps_ids.insert(pps.pps_pic_parameter_set_id);
     }
 
-    while offset < data.len() && items.len() < max_frames * 2 {
+    while offset < data.len() && items.len() < max_frames.saturating_mul(2) {
         let Some((start, code_len)) = find_next_start_code(data, offset) else {
             break;
         };

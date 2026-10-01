@@ -173,11 +173,20 @@ pub struct NvdecH265Decoder {
 
     /// Cached pinned host buffer for frame extraction.
     pinned_cache: Mutex<Option<(*mut std::ffi::c_void, usize)>>,
+
+    /// Zero-copy mode: frames are copied device-to-device into owned buffers
+    /// and emitted as [`GpuFrame`](vacc_core::gpu::GpuFrame) instead of host
+    /// `PixelData`.
+    gpu_mode: bool,
 }
 
 impl NvdecH265Decoder {
     /// Create a new NVDEC HEVC decoder and begin decoding the input data.
     pub fn new(data: Vec<u8>) -> NvdecResult<Self> {
+        Self::new_impl(data, false)
+    }
+
+    fn new_impl(data: Vec<u8>, gpu_mode: bool) -> NvdecResult<Self> {
         init_nvdec()?;
 
         let mut decoder = Self {
@@ -220,6 +229,7 @@ impl NvdecH265Decoder {
             uw_min: None,
             uw_max: None,
             pinned_cache: Mutex::new(None),
+            gpu_mode,
         };
 
         decoder.init_parser_format()?;
@@ -233,6 +243,14 @@ impl NvdecH265Decoder {
         }
 
         Ok(decoder)
+    }
+
+    /// Create a decoder in zero-copy GPU mode: decoded frames are copied
+    /// device-to-device into owned CUDA buffers and emitted via
+    /// [`DecodedFrame::gpu`](vacc_core::frame::DecodedFrame) (no host pixel
+    /// data). Only 4:2:0 content is supported.
+    pub fn new_gpu(data: Vec<u8>) -> NvdecResult<Self> {
+        Self::new_impl(data, true)
     }
 
     /// Initialize the parser with the HEVC format (required before parsing).
@@ -748,6 +766,15 @@ impl NvdecH265Decoder {
             *decoder = ph_decoder;
         }
 
+        // GPU mode emits tight NV12/P016 device buffers and has no 4:2:2,
+        // 4:4:4 or monochrome layout; reject such content up front.
+        if self.gpu_mode && sps.chroma_format_idc != 1 {
+            return Err(NvdecError::DecoderCreationFailed(format!(
+                "GPU mode only supports 4:2:0 content (chroma_format_idc={})",
+                sps.chroma_format_idc
+            )));
+        }
+
         let mut info = self.info.lock().unwrap();
         *info = DecoderInfo {
             backend: "nvdec".to_string(),
@@ -988,6 +1015,59 @@ impl NvdecH265Decoder {
             1
         };
         let row_bytes = display_width * bps;
+
+        // Zero-copy mode: copy the surface into an owned device buffer and
+        // skip all host staging. The helper unmaps the surface.
+        if self.gpu_mode {
+            let gpu_frame = crate::gpu::extract_gpu_surface(
+                decoder,
+                funcs,
+                dev_ptr,
+                pitch,
+                display_width,
+                display_height,
+                bps,
+                crop_left,
+                crop_top,
+                info.coded_size.height as i32,
+                true,
+            )?;
+
+            let frame_index = {
+                let mut count = self.frame_count.lock().unwrap();
+                let idx = *count;
+                *count += 1;
+                idx
+            };
+
+            return Some(DecodedFrame {
+                frame_index,
+                timestamp: 0,
+                width: info.display_size.width,
+                height: info.display_size.height,
+                skipped: false,
+                pts_valid: false,
+                poc,
+                field_flags: FieldFlags {
+                    progressive_frame: true,
+                    field_pic: false,
+                    bottom_field: false,
+                    second_field: false,
+                    top_field_first: true,
+                    unpaired_field: false,
+                    sync_first_ready: false,
+                    sync_to_first_field: false,
+                    repeat_first_field: 0,
+                    ref_pic: false,
+                    apply_film_grain: false,
+                },
+                sync_info: vacc_core::frame::FrameSyncInfo::default(),
+                pixel_data: None,
+                rgb_pixels: None,
+                gpu: Some(gpu_frame),
+            });
+        }
+
         let y_size = row_bytes * display_height;
         // NV12/P016: one interleaved UV plane at half resolution.
         // YUV444/YUV444_16Bit: two planar U/V planes at full resolution.
@@ -1258,6 +1338,7 @@ impl NvdecH265Decoder {
             sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
             rgb_pixels: None,
+            gpu: None,
         })
     }
 

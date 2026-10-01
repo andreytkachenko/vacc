@@ -22,6 +22,21 @@ impl VulkanDecoder {
         Ok(Self { inner })
     }
 
+    /// Create a decoder in zero-copy GPU mode: decoded display frames are
+    /// emitted as device-resident [`vacc_core::gpu::GpuFrame`]s (tight NV12
+    /// in an owned `VkBuffer`) instead of host pixels. Only 8-bit 4:2:0
+    /// content is supported.
+    pub fn new_gpu(data: Vec<u8>) -> Result<Self> {
+        let inner = vacc_vulkan::VideoDecoder::new_gpu(data, 64).map_err(Error::Vulkan)?;
+        Ok(Self { inner })
+    }
+
+    /// The raw `VkDevice` this decoder runs on (producer-bound image work
+    /// must use it; also used to invalidate vkimage state on teardown).
+    pub fn device(&self) -> ash::vk::Device {
+        self.inner.device()
+    }
+
     /// Decode all frames from the bitstream.
     pub fn decode_all(&mut self, max_frames: usize) -> Result<Vec<vacc_vulkan::DecodedFrame>> {
         self.inner.decode_all(max_frames).map_err(Error::Vulkan)

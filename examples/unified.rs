@@ -13,6 +13,8 @@
 //!                           nearest | box | bilinear | bicubic (default: bilinear)
 //!       --rgb24          convert frames to packed RGB24
 //!       --rgb32          convert frames to packed RGBA32
+//!       --gpu            GPU decode track (NVDEC only): frames stay in
+//!                        device memory; the image pipeline runs on the GPU
 //!   -O, --out      <file>   write the first decoded frame as PPM (needs --rgb24/--rgb32)
 //! ```
 
@@ -21,7 +23,10 @@ use std::time::Instant;
 
 use vacc_core::decoder::Decoder;
 use vacc_core::frame::RgbFrame;
-use vacc::{Backend, DecodedFrame, DecoderConfig, ImageConfig, Interpolation, RgbChannels, Scale, VaccDecoder};
+use vacc::{
+    Backend, DecodedFrame, DecoderConfig, GpuPixelFormat, ImageConfig, Interpolation, RgbChannels,
+    Scale, VaccDecoder,
+};
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -31,12 +36,16 @@ fn die(msg: &str) -> ! {
 /// Print one decoded frame and bump the counter.
 fn print_frame(frame: &DecodedFrame, total: &mut usize) {
     // Hash whatever the frame carries after the image pipeline ran.
+    // Hash whatever the frame carries after the image pipeline ran. A
+    // device-resident frame (GPU track) reports its pointer instead.
     let (hash, kind) = if let Some(rgb) = &frame.rgb_pixels {
-        (fnv1a(&rgb.data), "rgb")
+        (fnv1a(&rgb.data), "rgb".to_string())
     } else if let Some(p) = &frame.pixel_data {
-        (fnv1a(&p.buffer), "yuv")
+        (fnv1a(&p.buffer), "yuv".to_string())
+    } else if let Some(g) = &frame.gpu {
+        (g.ptr as u64, format!("gpu:{:?}", g.format))
     } else {
-        (0, "none")
+        (0, "none".to_string())
     };
     println!(
         "frame {}: ts={} size={}x{} {kind} hash={:016x}",
@@ -45,14 +54,24 @@ fn print_frame(frame: &DecodedFrame, total: &mut usize) {
     *total += 1;
 }
 
-/// Write the first RGB frame as PPM (once), when `-O` was given.
+/// Write the first RGB frame as PPM (once), when `-O` was given. In GPU mode
+/// the device RGB buffer is read back once for the file.
 fn maybe_write_ppm(args: &Args, frame: &DecodedFrame, wrote: &mut bool) {
     if *wrote {
         return;
     }
-    if let (Some(path), Some(rgb)) = (&args.out, &frame.rgb_pixels) {
+    let Some(path) = &args.out else { return };
+    if let Some(rgb) = &frame.rgb_pixels {
         write_ppm(path, rgb);
         println!("wrote {path} ({}x{})", rgb.width, rgb.height);
+        *wrote = true;
+        return;
+    }
+    if let Some(g) = frame.gpu.as_ref().filter(|g| g.format == GpuPixelFormat::Rgb24) {
+        let buf = vacc_npp::readback(g).unwrap_or_else(|e| die(&format!("gpu readback: {e}")));
+        let rgb = RgbFrame { data: buf, width: g.width, height: g.height, channels: 3 };
+        write_ppm(path, &rgb);
+        println!("wrote {path} ({}x{})", g.width, g.height);
         *wrote = true;
     }
 }
@@ -75,6 +94,7 @@ struct Args {
     height: Option<u32>,
     filter: Interpolation,
     rgb: Option<RgbChannels>,
+    gpu: bool,
     out: Option<String>,
 }
 
@@ -86,6 +106,7 @@ fn parse_args() -> Args {
     let mut height = None;
     let mut filter = Interpolation::Bilinear;
     let mut rgb = None;
+    let mut gpu = false;
     let mut out = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -110,6 +131,7 @@ fn parse_args() -> Args {
             }
             "--rgb24" => rgb = Some(RgbChannels::Rgb24),
             "--rgb32" => rgb = Some(RgbChannels::Rgba32),
+            "--gpu" => gpu = true,
             "-O" | "--out" => out = Some(args.next().unwrap_or_else(|| die("-O needs a value"))),
             other => die(&format!("unknown argument '{other}'")),
         }
@@ -120,8 +142,8 @@ fn parse_args() -> Args {
     if out.is_some() && rgb.is_none() {
         die("--out writes RGB frames; pass --rgb24 or --rgb32");
     }
-    let usage = "usage: unified -i <file> [-o order] [-n max] [-w px -H px] [-f filter] [--rgb24|--rgb32] [-O out.ppm]";
-    Args { input: input.unwrap_or_else(|| die(usage)), order, max_frames, width, height, filter, rgb, out }
+    let usage = "usage: unified -i <file> [-o order] [-n max] [-w px -H px] [-f filter] [--rgb24|--rgb32] [--gpu] [-O out.ppm]";
+    Args { input: input.unwrap_or_else(|| die(usage)), order, max_frames, width, height, filter, rgb, gpu, out }
 }
 
 /// Write the first frame as a binary PPM (alpha is dropped for RGBA32).
@@ -156,6 +178,9 @@ fn main() {
             ..Default::default()
         };
         config = config.with_image(image);
+    }
+    if args.gpu {
+        config = config.with_gpu();
     }
 
     // Stream the file in chunks: seed the decoder with the head, then feed

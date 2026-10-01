@@ -84,6 +84,17 @@
 //! GPU path fails) the SIMD software pipeline in `vacc-image` is used. The
 //! result lands in the frame itself: scaled 4:2:0 output replaces
 //! `pixel_data`, RGB output lands in `rgb_pixels`.
+//!
+//! ## GPU decode track
+//!
+//! [`DecoderConfig::with_gpu`] requests the zero-host-copy path: NVDEC writes
+//! decoded frames straight into device buffers and the image pipeline runs on
+//! the GPU through NPP, so frames come out with [`DecodedFrame::gpu`] set and
+//! `pixel_data`/`rgb_pixels` empty. The device pointer is stable while the
+//! frame handle is alive, which makes the buffer suitable for downstream
+//! inference (e.g. TensorRT). Only the NVDEC backend supports the track;
+//! unsupported combinations (e.g. 10-bit sources) transparently fall back to
+//! a readback + host processing.
 
 pub mod backend;
 pub mod codec;
@@ -100,6 +111,9 @@ pub use error::{BackendFailure, UnifiedError, UnifiedResult};
 
 // Re-export the core API so a user only needs this crate for the common path.
 pub use vacc_core::{decoder::Decoder, frame::DecodedFrame, DecoderInfo, VideoCodec};
+
+// GPU decode track types (device-resident frames).
+pub use vacc_core::gpu::{GpuDevice, GpuFrame, GpuPixelFormat};
 
 // Image-pipeline configuration types.
 pub use vacc_image::{Affine, ColorSpec, ImageConfig, Interpolation, RgbChannels, Scale, Warp};

@@ -9,4 +9,5 @@ repository.workspace = true
 [dependencies]
 libloading = { workspace = true }
 thiserror = { workspace = true }
+vacc-core = { workspace = true }
 vacc-image = { workspace = true }

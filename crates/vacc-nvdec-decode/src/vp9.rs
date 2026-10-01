@@ -384,6 +384,11 @@ pub struct NvdecVp9Decoder {
     /// single-element array would make the driver read adjacent memory and
     /// corrupt the decode. See the AV1 decoder for details.
     slice_offsets: [u32; 64],
+
+    /// Zero-copy mode: frames are copied device-to-device into owned buffers
+    /// and emitted as [`GpuFrame`](vacc_core::gpu::GpuFrame) instead of host
+    /// `PixelData`.
+    gpu_mode: bool,
 }
 
 impl NvdecVp9Decoder {
@@ -392,6 +397,10 @@ impl NvdecVp9Decoder {
     /// `data` is either an IVF container (magic `DKIF`, packets at offset 32)
     /// or a raw single VP9 frame.
     pub fn new(data: Vec<u8>) -> NvdecResult<Self> {
+        Self::new_impl(data, false)
+    }
+
+    fn new_impl(data: Vec<u8>, gpu_mode: bool) -> NvdecResult<Self> {
         init_nvdec()?;
 
         let is_ivf = data.len() >= IVF_HEADER_SIZE && &data[0..4] == b"DKIF";
@@ -428,6 +437,7 @@ impl NvdecVp9Decoder {
             is_ivf,
             pinned_cache: Mutex::new(None),
             slice_offsets: [0; 64],
+            gpu_mode,
         };
 
         decoder.init_parser_format()?;
@@ -441,6 +451,14 @@ impl NvdecVp9Decoder {
         }
 
         Ok(decoder)
+    }
+
+    /// Create a decoder in zero-copy GPU mode: decoded frames are copied
+    /// device-to-device into owned CUDA buffers and emitted via
+    /// [`DecodedFrame::gpu`](vacc_core::frame::DecodedFrame) (no host pixel
+    /// data).
+    pub fn new_gpu(data: Vec<u8>) -> NvdecResult<Self> {
+        Self::new_impl(data, true)
     }
 
     /// Initialize the parser with the VP9 format (required before parsing).
@@ -907,6 +925,52 @@ impl NvdecVp9Decoder {
         let bps = if luma_bd > 8 { 2 } else { 1 }; // bytes per sample on device
         let row_bytes = display_width * bps;
 
+        // Zero-copy mode: copy the surface into an owned device buffer and
+        // skip all host staging. The helper unmaps the surface.
+        if self.gpu_mode {
+            let gpu_frame = crate::gpu::extract_gpu_surface(
+                decoder,
+                funcs,
+                dev_ptr,
+                pitch,
+                display_width,
+                display_height,
+                bps,
+                crop_left,
+                crop_top,
+                info.coded_size.height as i32,
+                true,
+            )?;
+
+            let frame_index = self.display_count;
+            return Some(DecodedFrame {
+                frame_index,
+                timestamp: 0,
+                width: info.display_size.width,
+                height: info.display_size.height,
+                skipped: false,
+                pts_valid: false,
+                poc: frame_index as i32,
+                field_flags: FieldFlags {
+                    progressive_frame: true,
+                    field_pic: false,
+                    bottom_field: false,
+                    second_field: false,
+                    top_field_first: true,
+                    unpaired_field: false,
+                    sync_first_ready: false,
+                    sync_to_first_field: false,
+                    repeat_first_field: 0,
+                    ref_pic: false,
+                    apply_film_grain: false,
+                },
+                sync_info: vacc_core::frame::FrameSyncInfo::default(),
+                pixel_data: None,
+                rgb_pixels: None,
+                gpu: Some(gpu_frame),
+            });
+        }
+
         let y_size = row_bytes * display_height;
         let interleaved_uv_size = row_bytes * (display_height / 2);
         let total = y_size + interleaved_uv_size;
@@ -1115,6 +1179,7 @@ impl NvdecVp9Decoder {
             sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
             rgb_pixels: None,
+            gpu: None,
         })
     }
 }

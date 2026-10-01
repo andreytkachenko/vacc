@@ -18,6 +18,8 @@ pub struct DecoderConfig {
     /// Post-decode image pipeline (scale and/or Y'CbCr -> RGB). No-op by
     /// default: frames are emitted exactly as the backend produces them.
     image: ImageConfig,
+    /// GPU decode track: frames stay device-resident (NVDEC only).
+    gpu: bool,
 }
 
 impl DecoderConfig {
@@ -39,13 +41,31 @@ impl DecoderConfig {
                 out.push(b);
             }
         }
-        Self { order: out, image: ImageConfig::default() }
+        Self { order: out, image: ImageConfig::default(), gpu: false }
     }
 
     /// Set the post-decode image pipeline (scale and/or RGB conversion).
     pub fn with_image(mut self, image: ImageConfig) -> Self {
         self.image = image;
         self
+    }
+
+    /// Request the GPU decode track: NVDEC writes decoded frames straight
+    /// into device buffers and the image pipeline (if any) runs on the GPU
+    /// without a host round-trip. The backend is forced to
+    /// [`Backend::Nvdec`] — it is the only backend with a GPU frame path.
+    /// Frames come out with `pixel_data`/`rgb_pixels` empty and
+    /// [`vacc_core::frame::DecodedFrame::gpu`] set; unsupported combinations
+    /// (e.g. 10-bit sources) transparently fall back to readback + host
+    /// processing.
+    pub fn with_gpu(mut self) -> Self {
+        self.gpu = true;
+        self
+    }
+
+    /// Whether the GPU decode track was requested.
+    pub const fn gpu(&self) -> bool {
+        self.gpu
     }
 
     /// The default fallback chain: `vulkan -> nvdec -> vaapi -> software`.
@@ -99,6 +119,9 @@ impl fmt::Display for DecoderConfig {
                 write!(f, " rgb={}", if r == vacc_image::RgbChannels::Rgb24 { "rgb24" } else { "rgba32" })?;
             }
             f.write_str("]")?;
+        }
+        if self.gpu {
+            f.write_str(" [gpu]")?;
         }
         Ok(())
     }

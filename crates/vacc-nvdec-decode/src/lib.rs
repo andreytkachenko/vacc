@@ -159,6 +159,7 @@ pub mod decoder;
 pub mod device;
 pub mod dpb;
 pub mod error;
+mod gpu;
 pub mod ffi;
 pub mod h265;
 pub mod picparams;

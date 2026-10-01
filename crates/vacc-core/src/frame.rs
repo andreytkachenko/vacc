@@ -27,6 +27,11 @@ pub struct DecodedFrame {
     /// facade) converted the decoded frame to RGB, optionally after
     /// scaling. `None` unless image conversion was requested.
     pub rgb_pixels: Option<RgbFrame>,
+    /// GPU-resident pixel data (zero-copy decode path). When set, the frame's
+    /// pixels live in device memory and [`pixel_data`](Self::pixel_data) is
+    /// `None`; the image pipeline and inference engines operate on the device
+    /// buffer directly.
+    pub gpu: Option<crate::gpu::GpuFrame>,
 }
 
 impl DecodedFrame {
@@ -44,6 +49,7 @@ impl DecodedFrame {
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
             rgb_pixels: None,
+            gpu: None,
         }
     }
 
@@ -72,6 +78,7 @@ impl Default for DecodedFrame {
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
             rgb_pixels: None,
+            gpu: None,
         }
     }
 }

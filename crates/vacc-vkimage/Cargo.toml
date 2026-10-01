@@ -7,6 +7,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+vacc-core = { workspace = true }
 vacc-image = { workspace = true }
 ash = { workspace = true }
 thiserror = { workspace = true }

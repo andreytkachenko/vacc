@@ -25,9 +25,11 @@
 
 mod shaders;
 
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use ash::vk;
+use ash::vk::{self, Handle};
+use vacc_core::gpu::{GpuDevice, GpuFrame, GpuPixelFormat, VulkanHandles};
 use vacc_image::{
     table, ImageConfig, ImageError, ImageResult, Interpolation, ProcessedFrame, RgbChannels,
     YuvImage, YuvLayout,
@@ -136,6 +138,57 @@ struct WarpParams {
     interp: u32,
 }
 
+/// Zero-copy conversion block (mirrors nv12_to_rgba.wgsl). Offsets and
+/// pitches are in bytes; `dst_off` is in u32 words.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Nv12ConvParams {
+    src_w: u32,
+    src_h: u32,
+    y_off: u32,
+    y_pitch: u32,
+    uv_off: u32,
+    uv_pitch: u32,
+    dst_off: u32,
+    dst_w: u32,
+    dst_h: u32,
+    ky: i32,
+    r_cr: i32,
+    r_off: i32,
+    g_cb: i32,
+    g_cr: i32,
+    g_off: i32,
+    b_cb: i32,
+    b_off: i32,
+}
+
+/// Zero-copy resize block (mirrors nv12_resize.wgsl). All offsets and
+/// pitches are in bytes; the output is tight NV12.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Nv12ResizeParams {
+    src_w: u32,
+    src_h: u32,
+    y_off: u32,
+    y_pitch: u32,
+    uv_off: u32,
+    uv_pitch: u32,
+    dst_off: u32,
+    dst_w: u32,
+    dst_h: u32,
+}
+
+/// Zero-copy RGBA32 -> RGB24 repack block (mirrors rgba_to_rgb24.wgsl).
+/// `src_off` is in u32 words; `dst_off` and `total_bytes` are in bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RepackParams {
+    count: u32,
+    src_off: u32,
+    dst_off: u32,
+    total_bytes: u32,
+}
+
 fn params_bytes<T>(p: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>()) }
 }
@@ -184,8 +237,6 @@ fn copy_plane_words(
 unsafe impl Send for Gpu {}
 
 struct Gpu {
-    instance: ash::Instance,
-    physical: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     cmd_buffers: Vec<vk::CommandBuffer>,
@@ -195,9 +246,16 @@ struct Gpu {
     conv_pipeline: vk::Pipeline,
     resize_pipeline: vk::Pipeline,
     warp_pipeline: vk::Pipeline,
-    desc_sets: [vk::DescriptorSet; 3], // [conv, resize, warp]
+    nv12_resize_pipeline: vk::Pipeline,
+    nv12_conv_pipeline: vk::Pipeline,
+    repack_pipeline: vk::Pipeline,
+    desc_sets: [vk::DescriptorSet; 3], // host path: [conv, resize, warp]
+    // Zero-copy path: one set per pass (all bound sets are live at execute
+    // time, so they can't share a set that is rewritten between passes).
+    dev_sets: [vk::DescriptorSet; 3], // [nv12 resize, nv12 conv, repack]
     uniform_buf: vk::Buffer,
     uniform_ptr: *mut u8,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     arena: vk::Buffer,
     arena_mem: vk::DeviceMemory,
     arena_ptr: *mut u8,
@@ -205,12 +263,14 @@ struct Gpu {
 }
 
 fn create() -> Result<Gpu, String> {
-    let entry = unsafe { ash::Entry::load() }.map_err(vk_err)?;
+    let entry = entry()?;
 
     let app_name = std::ffi::CString::new("vacc-vkimage").unwrap();
+    // 1.1: storage-buffer SPIR-V (all our compute shaders) requires Vulkan
+    // 1.1 or VK_KHR_storage_buffer_storage_class on a 1.0 device.
     let app_info = vk::ApplicationInfo::default()
         .application_name(app_name.as_c_str())
-        .api_version(vk::API_VERSION_1_0);
+        .api_version(vk::API_VERSION_1_1);
     let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
     let instance =
         unsafe { entry.create_instance(&create_info, None) }.map_err(vk_err)?;
@@ -250,6 +310,20 @@ fn create() -> Result<Gpu, String> {
         .map_err(vk_err)?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+    let memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical) };
+    build_state(&device, queue, queue_family, memory_properties)
+}
+
+/// Build compute pipelines, buffers and descriptor state on an existing
+/// device. Shared by our own device ([`create`]) and the producer devices of
+/// zero-copy frames ([`on_device`]).
+fn build_state(
+    device: &ash::Device,
+    queue: vk::Queue,
+    queue_family: u32,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+) -> Result<Gpu, String> {
     let pool_info = vk::CommandPoolCreateInfo::default()
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
         .queue_family_index(queue_family);
@@ -325,21 +399,24 @@ fn create() -> Result<Gpu, String> {
     let conv_pipeline = make_pipeline(shaders::YUV2RGB)?;
     let resize_pipeline = make_pipeline(shaders::RESIZE_YUV)?;
     let warp_pipeline = make_pipeline(shaders::WARP_RGB)?;
+    let nv12_resize_pipeline = make_pipeline(shaders::NV12_RESIZE)?;
+    let nv12_conv_pipeline = make_pipeline(shaders::NV12_TO_RGBA)?;
+    let repack_pipeline = make_pipeline(shaders::RGBA_TO_RGB24)?;
 
     let arena_size = 4u64 * ARENA_STEP;
     let (arena, arena_mem, arena_ptr) =
-        alloc_host_visible(&device, &instance, physical, arena_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        alloc_host_visible(device, &memory_properties, arena_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
 
     let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(3)
+        .max_sets(6)
         .pool_sizes(&[
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 6,
+                descriptor_count: 12,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 3,
+                descriptor_count: 6,
             },
         ]);
     let desc_pool =
@@ -348,20 +425,20 @@ fn create() -> Result<Gpu, String> {
         device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(desc_pool)
-                .set_layouts(&[set_layout; 3]),
+                .set_layouts(&[set_layout; 6]),
         )
     }
     .map_err(vk_err)?;
     let desc_sets = [desc_sets_arr[0], desc_sets_arr[1], desc_sets_arr[2]];
+    let dev_sets = [desc_sets_arr[3], desc_sets_arr[4], desc_sets_arr[5]];
 
-    // Uniform ring: one slot per pass (conv, resize, warp).
+    // Uniform ring: one slot per pass (host: conv, resize, warp; zero-copy:
+    // nv12 resize, nv12 conv, repack).
     let (uniform_buf, _uniform_mem, uniform_ptr) =
-        alloc_host_visible(&device, &instance, physical, 3 * UNIFORM_SLOT, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+        alloc_host_visible(device, &memory_properties, 6 * UNIFORM_SLOT, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
 
     let gpu = Gpu {
-        instance,
-        physical,
-        device,
+        device: device.clone(),
         queue,
         cmd_buffers,
         cmd_slot: 0,
@@ -370,9 +447,14 @@ fn create() -> Result<Gpu, String> {
         conv_pipeline,
         resize_pipeline,
         warp_pipeline,
+        nv12_resize_pipeline,
+        nv12_conv_pipeline,
+        repack_pipeline,
         desc_sets,
+        dev_sets,
         uniform_buf,
         uniform_ptr,
+        memory_properties,
         arena,
         arena_mem,
         arena_ptr,
@@ -385,8 +467,7 @@ fn create() -> Result<Gpu, String> {
 /// Create a host-visible coherent buffer and map it.
 fn alloc_host_visible(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
     usage: vk::BufferUsageFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
@@ -396,8 +477,8 @@ fn alloc_host_visible(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&bi, None) }.map_err(vk_err)?;
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
-    let idx = (0..mem_props.memory_type_count as u32)
+    let mem_props = memory_properties;
+    let idx = (0..mem_props.memory_type_count)
         .find(|&t| {
             (reqs.memory_type_bits >> t) & 1 != 0
                 && mem_props.memory_types[t as usize]
@@ -478,7 +559,7 @@ impl Gpu {
             self.device.free_memory(self.arena_mem, None);
         }
         let (arena, mem, ptr) =
-            alloc_host_visible(&self.device, &self.instance, self.physical, size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            alloc_host_visible(&self.device, &self.memory_properties, size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
         self.arena = arena;
         self.arena_mem = mem;
         self.arena_ptr = ptr;
@@ -865,6 +946,487 @@ impl Gpu {
     }
 }
 
+
+
+/// The Vulkan loader must stay mapped while any Vulkan object in this process
+/// is alive: dropping the last `ash::Entry` unloads libvulkan and leaves every
+/// dispatchable object's function tables dangling (calls then wild-jump). All
+/// `Entry::load()` calls share one refcounted dlopen of libvulkan, so keeping
+/// a single Entry alive for the process keeps objects created through ANY
+/// Entry valid.
+static LOADER: OnceLock<Result<ash::Entry, String>> = OnceLock::new();
+
+fn entry() -> Result<&'static ash::Entry, String> {
+    match LOADER.get_or_init(|| unsafe { ash::Entry::load() }.map_err(vk_err)) {
+        Ok(e) => Ok(e),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Compute state keyed by the producer `VkDevice` raw handle: Vulkan buffers
+/// only belong to the device that allocated them, so decoder frames are
+/// processed on their own device, not ours.
+static DEVICES: OnceLock<Mutex<HashMap<u64, Arc<Mutex<Gpu>>>>> = OnceLock::new();
+
+fn devices() -> &'static Mutex<HashMap<u64, Arc<Mutex<Gpu>>>> {
+    DEVICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bare device wrappers (no pipelines, no compute requirement) for host
+/// access such as [`readback`].
+static ACCESSORS: OnceLock<Mutex<HashMap<u64, Arc<ash::Device>>>> = OnceLock::new();
+
+fn load_device(handles: &VulkanHandles) -> Result<Arc<ash::Device>, String> {
+    let key = handles.device as u64;
+    let map = ACCESSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap();
+    if let Some(existing) = map.get(&key) {
+        return Ok(existing.clone());
+    }
+    let entry = entry()?;
+    let instance = vk::Instance::from_raw(handles.instance as u64);
+    let instance = unsafe { ash::Instance::load(entry.static_fn(), instance) };
+    let device = vk::Device::from_raw(key);
+    let device = unsafe { ash::Device::load(instance.fp_v1_0(), device) };
+    let arc = Arc::new(device);
+    map.insert(key, arc.clone());
+    Ok(arc)
+}
+
+/// Compute state built on the producer device identified by `handles` (built
+/// once per device; the map lock is held for the build, which is fine since
+/// it happens at most once per decoder).
+fn on_device(handles: &VulkanHandles) -> Result<Arc<Mutex<Gpu>>, String> {
+    let key = handles.device as u64;
+    let arc = {
+        let mut map = devices().lock().unwrap();
+        if let Some(existing) = map.get(&key) {
+            existing.clone()
+        } else {
+            let entry = entry()?;
+            let instance = vk::Instance::from_raw(handles.instance as u64);
+            let instance = unsafe { ash::Instance::load(entry.static_fn(), instance) };
+            let physical = vk::PhysicalDevice::from_raw(handles.physical as u64);
+            let memory_properties =
+                unsafe { instance.get_physical_device_memory_properties(physical) };
+            let device = vk::Device::from_raw(key);
+            let device = unsafe { ash::Device::load(instance.fp_v1_0(), device) };
+
+            // Buffers belong to the device, not a queue: prefer the
+            // producer's queue when it runs compute, otherwise any
+            // compute-capable family. The producer decoder already waited
+            // its fence, so cross-queue reads are ordered by completion.
+            let qfs =
+                unsafe { instance.get_physical_device_queue_family_properties(physical) };
+            let producer_runs_compute = qfs
+                .get(handles.queue_family as usize)
+                .is_some_and(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
+            let compute_qf = if producer_runs_compute {
+                Some(handles.queue_family as usize)
+            } else {
+                qfs.iter()
+                    .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            };
+            let Some(compute_qf) = compute_qf else {
+                return Err(format!(
+                    "producer device has no compute-capable queue family (producer family {})",
+                    handles.queue_family
+                ));
+            };
+            let queue = unsafe { device.get_device_queue(compute_qf as u32, 0) };
+            let gpu = build_state(&device, queue, compute_qf as u32, memory_properties)?;
+            let arc = Arc::new(Mutex::new(gpu));
+            map.insert(key, arc.clone());
+            arc
+        }
+    };
+    Ok(arc)
+}
+
+/// Drop the registry entries for `device` (compute state and bare accessor).
+/// Must be called before the producer device is destroyed: keys are raw
+/// pointers, which a later device may reuse — a stale entry would route work
+/// into buffers and pipelines of the dead device.
+pub fn forget_device(device: vk::Device) {
+    let key = device.as_raw();
+    devices().lock().unwrap().remove(&key);
+    if let Some(accessors) = ACCESSORS.get() {
+        accessors.lock().unwrap().remove(&key);
+    }
+}
+
+/// Allocate device-local storage (scratch only; never read back by the host).
+fn alloc_device_storage(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+    let bi = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&bi, None) }.map_err(vk_err)?;
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let idx = (0..memory_properties.memory_type_count)
+        .find(|&t| (reqs.memory_type_bits >> t) & 1 != 0)
+        .ok_or_else(|| "no memory type for scratch buffer".to_string())?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(idx);
+    let memory = unsafe { device.allocate_memory(&alloc, None) }.map_err(vk_err)?;
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }.map_err(vk_err)?;
+    Ok((buffer, memory))
+}
+
+/// Rewrite the zero-copy descriptor set of one pass (src/dst/uniform slot).
+fn write_dev_set(g: &Gpu, pass: usize, src: vk::Buffer, dst: vk::Buffer, uniform_slot: u64) {
+    let set = g.dev_sets[pass];
+    let src_info = [vk::DescriptorBufferInfo::default().buffer(src).range(u64::MAX)];
+    let dst_info = [vk::DescriptorBufferInfo::default().buffer(dst).range(u64::MAX)];
+    let uni_info = [vk::DescriptorBufferInfo::default()
+        .buffer(g.uniform_buf)
+        .offset(uniform_slot * UNIFORM_SLOT)
+        .range(UNIFORM_SLOT)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&src_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&dst_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&uni_info),
+    ];
+    unsafe { g.device.update_descriptor_sets(&writes, &[]) };
+}
+
+/// Run `cfg` on a frame that already lives in its producer's device memory
+/// (zero-copy path). Supported combinations mirror [`process`]: NV12 input,
+/// optional bilinear scale, optional RGB output, no affine warp. The result
+/// is a new owned [`GpuFrame`] on the same device.
+pub fn process_device(frame: &GpuFrame, cfg: &ImageConfig) -> ImageResult<GpuFrame> {
+    let handles = match frame.device {
+        GpuDevice::Vulkan { handles, .. } => handles,
+        _ => {
+            return Err(ImageError::Unsupported(
+                "frame is not on a Vulkan device".into(),
+            ))
+        }
+    };
+    if frame.format != GpuPixelFormat::Nv12 {
+        return Err(ImageError::Unsupported(
+            "device path expects NV12 input".into(),
+        ));
+    }
+    if cfg.is_noop() {
+        return Err(ImageError::Unsupported("no-op image config".into()));
+    }
+    if cfg.affine.is_some() {
+        return Err(ImageError::Unsupported(
+            "device path does not support affine warp".into(),
+        ));
+    }
+    let scale = cfg.scale;
+    if let Some(s) = scale {
+        if s.filter != Interpolation::Bilinear {
+            return Err(ImageError::Unsupported(
+                "device resize supports bilinear only".into(),
+            ));
+        }
+        if s.width == 0 || s.height == 0 {
+            return Err(ImageError::InvalidDimensions("scale target must be non-zero".into()));
+        }
+    }
+    let (sw, sh) = (frame.width, frame.height);
+    if sw % 2 != 0 || sh % 2 != 0 || sw == 0 || sh == 0 {
+        return Err(ImageError::InvalidDimensions(
+            "device path expects even non-zero NV12 dimensions".into(),
+        ));
+    }
+    let rgb = cfg.rgb;
+    let (dw, dh) = match scale {
+        Some(s) => (s.width, s.height),
+        None => (sw, sh),
+    };
+    // Even targets keep the NV12 Y/UV boundary word-aligned (the resize
+    // shader writes whole words per plane region).
+    if dw % 2 != 0 || dh % 2 != 0 {
+        return Err(ImageError::InvalidDimensions(
+            "device path requires even scale targets".into(),
+        ));
+    }
+    let (dwc, dhc) = (dw.div_ceil(2), dh.div_ceil(2));
+
+    // Output layout: tight NV12 (UV region word-padded), RGBA32 words, or
+    // word-padded RGB24.
+    let nv12_size = dw * dh + ((2 * dwc * dhc + 3) & !3);
+    let out_size = match rgb {
+        None => nv12_size,
+        Some(RgbChannels::Rgba32) => dw * dh * 4,
+        Some(RgbChannels::Rgb24) => (dw * dh * 3 + 3) & !3,
+    };
+
+    let g_arc = on_device(&handles).map_err(ImageError::Pipeline)?;
+    let mut g = g_arc.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Scratch: scaled NV12 (resize feeds the conv pass) and an RGBA32
+    // intermediate for RGB24 repack. Device-local; freed after the fence.
+    let scratch_nv12 = if scale.is_some() && rgb.is_some() {
+        Some(
+            alloc_device_storage(&g.device, &g.memory_properties, nv12_size as u64)
+                .map_err(ImageError::Pipeline)?,
+        )
+    } else {
+        None
+    };
+    let scratch_rgba = if rgb == Some(RgbChannels::Rgb24) {
+        Some(
+            alloc_device_storage(&g.device, &g.memory_properties, (dw * dh * 4) as u64)
+                .map_err(ImageError::Pipeline)?,
+        )
+    } else {
+        None
+    };
+    let (out_buf, out_mem, _out_ptr) = alloc_host_visible(
+        &g.device,
+        &g.memory_properties,
+        out_size as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+    )
+    .map_err(ImageError::Pipeline)?;
+    unsafe { g.device.unmap_memory(out_mem) };
+
+    // Uniform slots 3..6: nv12 resize, nv12 conv, repack.
+    let resize_params = Nv12ResizeParams {
+        src_w: sw,
+        src_h: sh,
+        y_off: 0,
+        y_pitch: frame.pitch as u32,
+        uv_off: frame.chroma_offset as u32,
+        uv_pitch: frame.pitch as u32,
+        dst_off: 0,
+        dst_w: dw,
+        dst_h: dh,
+    };
+    let (csw, csh, cpitch, cuv) = if scale.is_some() {
+        (dw, dh, dw, dw * dh)
+    } else {
+        (sw, sh, frame.pitch as u32, frame.chroma_offset as u32)
+    };
+    let coeff = table(cfg.spec);
+    let conv_params = Nv12ConvParams {
+        src_w: csw,
+        src_h: csh,
+        y_off: 0,
+        y_pitch: cpitch,
+        uv_off: cuv,
+        uv_pitch: cpitch,
+        dst_off: 0,
+        dst_w: dw,
+        dst_h: dh,
+        ky: coeff.ky,
+        r_cr: coeff.r_cr,
+        r_off: coeff.r_off,
+        g_cb: coeff.g_cb,
+        g_cr: coeff.g_cr,
+        g_off: coeff.g_off,
+        b_cb: coeff.b_cb,
+        b_off: coeff.b_off,
+    };
+    let repack_params = RepackParams {
+        count: (dw * dh * 3).div_ceil(4),
+        src_off: 0,
+        dst_off: 0,
+        total_bytes: dw * dh * 3,
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            params_bytes(&resize_params).as_ptr(),
+            g.uniform_ptr.add(3 * UNIFORM_SLOT as usize),
+            std::mem::size_of::<Nv12ResizeParams>(),
+        );
+        if rgb.is_some() {
+            std::ptr::copy_nonoverlapping(
+                params_bytes(&conv_params).as_ptr(),
+                g.uniform_ptr.add(4 * UNIFORM_SLOT as usize),
+                std::mem::size_of::<Nv12ConvParams>(),
+            );
+        }
+        if rgb == Some(RgbChannels::Rgb24) {
+            std::ptr::copy_nonoverlapping(
+                params_bytes(&repack_params).as_ptr(),
+                g.uniform_ptr.add(5 * UNIFORM_SLOT as usize),
+                std::mem::size_of::<RepackParams>(),
+            );
+        }
+    }
+
+    let src_buf = vk::Buffer::from_raw(frame.ptr as u64);
+    let slot = g.cmd_slot;
+    g.cmd_slot = (slot + 1) % CMD_SLOTS;
+    let cb = g.cmd_buffers[slot];
+    unsafe {
+        g.device
+            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+        g.device
+            .reset_fences(&[g.fence])
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+        g.device
+            .begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+
+        // Passes run in pipeline order (resize -> conv -> repack); a full
+        // memory barrier orders every hand-off. The producer decoder already
+        // waited its own fence, so the source buffer needs no entry barrier.
+        let gx = dw.div_ceil(WORKGROUP);
+        let gy = dh.div_ceil(WORKGROUP);
+        let mut recorded = false;
+        if scale.is_some() {
+            let dst = scratch_nv12.map_or(out_buf, |(b, _)| b);
+            write_dev_set(&g, 0, src_buf, dst, 3);
+            g.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, g.nv12_resize_pipeline);
+            g.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                g.pipeline_layout,
+                0,
+                &[g.dev_sets[0]],
+                &[],
+            );
+            // The resize shader is a 1-D grid over output words (Y region
+            // then CbCr region).
+            let resize_words = (dw * dh).div_ceil(4) + (dw * dhc).div_ceil(4);
+            g.device.cmd_dispatch(cb, resize_words.div_ceil(WORKGROUP), 1, 1);
+            recorded = true;
+        }
+        if rgb.is_some() {
+            if recorded {
+                g.record_barrier(cb);
+            }
+            let conv_src = scratch_nv12.map_or(src_buf, |(b, _)| b);
+            let conv_dst = match rgb {
+                Some(RgbChannels::Rgba32) => out_buf,
+                _ => scratch_rgba.expect("rgb24 needs scratch").0,
+            };
+            write_dev_set(&g, 1, conv_src, conv_dst, 4);
+            g.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, g.nv12_conv_pipeline);
+            g.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                g.pipeline_layout,
+                0,
+                &[g.dev_sets[1]],
+                &[],
+            );
+            g.device.cmd_dispatch(cb, gx, gy, 1);
+            recorded = true;
+        }
+        if rgb == Some(RgbChannels::Rgb24) {
+            if recorded {
+                g.record_barrier(cb);
+            }
+            write_dev_set(&g, 2, scratch_rgba.expect("rgb24 needs scratch").0, out_buf, 5);
+            g.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, g.repack_pipeline);
+            g.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                g.pipeline_layout,
+                0,
+                &[g.dev_sets[2]],
+                &[],
+            );
+            g.device.cmd_dispatch(cb, repack_params.count.div_ceil(WORKGROUP), 1, 1);
+        }
+
+        g.device
+            .end_command_buffer(cb)
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+        let cbsub = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbsub);
+        g.device
+            .queue_submit(g.queue, &[submit], g.fence)
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+        g.device
+            .wait_for_fences(&[g.fence], true, FENCE_TIMEOUT_NS)
+            .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+    }
+
+    // Scratch is done (fence waited); release it.
+    for s in scratch_nv12.into_iter().chain(scratch_rgba.into_iter()) {
+        unsafe {
+            g.device.destroy_buffer(s.0, None);
+            g.device.free_memory(s.1, None);
+        }
+    }
+
+    let (format, pitch) = match rgb {
+        None => (GpuPixelFormat::Nv12, dw as usize),
+        Some(RgbChannels::Rgba32) => (GpuPixelFormat::Rgba32, (dw * 4) as usize),
+        Some(RgbChannels::Rgb24) => (GpuPixelFormat::Rgb24, (dw * 3) as usize),
+    };
+    let chroma_offset = if rgb.is_none() { (dw * dh) as usize } else { 0 };
+    let device = frame.device;
+    let dev = g.device.clone();
+    let buf = out_buf;
+    let mem = out_mem;
+    Ok(GpuFrame::new_owned(
+        device,
+        format,
+        dw,
+        dh,
+        pitch,
+        chroma_offset,
+        buf.as_raw() as usize,
+        Some(mem.as_raw() as usize),
+        Box::new(move |_| {
+            unsafe {
+                dev.destroy_buffer(buf, None);
+                dev.free_memory(mem, None);
+            }
+        }),
+    ))
+}
+
+/// Copy a Vulkan device frame to the host (tight layout). Only works for
+/// frames backed by host-visible memory (decoder and pipeline outputs are).
+pub fn readback(frame: &GpuFrame) -> ImageResult<Vec<u8>> {
+    let handles = match frame.device {
+        GpuDevice::Vulkan { handles, .. } => handles,
+        _ => {
+            return Err(ImageError::Unsupported(
+                "frame is not on a Vulkan device".into(),
+            ))
+        }
+    };
+    let memory = frame
+        .memory
+        .ok_or_else(|| ImageError::Unsupported("vulkan frame carries no memory handle".into()))?;
+    // Host access only: no compute state is needed (and the producer's
+    // decode queue may not even support compute).
+    let device = load_device(&handles).map_err(ImageError::Pipeline)?;
+    let memory = vk::DeviceMemory::from_raw(memory as u64);
+    let size = frame.total_bytes() as u64;
+    let ptr = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }
+        .map_err(|e| ImageError::Pipeline(vk_err(e)))?;
+    let mut data = vec![0u8; size as usize];
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr as *const u8, data.as_mut_ptr(), data.len());
+    }
+    unsafe { device.unmap_memory(memory) };
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,5 +1696,264 @@ mod tests {
                 _ => panic!("expected rgb outputs"),
             }
         }
+    }
+
+    /// A bare compute device standing in for a video decoder's producer
+    /// device (real instance/physical/device handles for [`on_device`]).
+    /// `instance`/`physical` exist to keep the handle chain alive.
+    #[allow(dead_code)]
+    struct TestDevice {
+        instance: ash::Instance,
+        physical: vk::PhysicalDevice,
+        device: ash::Device,
+        memory_properties: vk::PhysicalDeviceMemoryProperties,
+        handles: VulkanHandles,
+    }
+
+    fn test_device() -> Option<TestDevice> {
+        let Ok(entry) = entry() else {
+            return None;
+        };
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let instance = unsafe {
+            entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app_info), None)
+        }
+        .ok()?;
+        // Prefer a discrete GPU (like [`create`]) so the test exercises real
+        // hardware, not just llvmpipe.
+        let mut best: Option<(vk::PhysicalDevice, u32, u8)> = None;
+        for pd in unsafe { instance.enumerate_physical_devices() }.ok()? {
+            let qfs = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+            let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            else {
+                continue;
+            };
+            let props = unsafe { instance.get_physical_device_properties(pd) };
+            let score = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 4,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+                _ => 1,
+            };
+            if best.map_or(true, |(_, _, s)| score > s) {
+                best = Some((pd, qf as u32, score));
+            }
+        }
+        let (pd, qf, _) = best?;
+        let queue_infos = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qf as u32)
+                .queue_priorities(&[1.0]),
+        ];
+        let device = unsafe {
+            instance.create_device(
+                pd,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queue_infos),
+                None,
+            )
+        }
+        .ok()?;
+        Some(TestDevice {
+            handles: VulkanHandles {
+                instance: instance.handle().as_raw() as usize,
+                physical: pd.as_raw() as usize,
+                device: device.handle().as_raw() as usize,
+                queue_family: qf as u32,
+            },
+            memory_properties: unsafe { instance.get_physical_device_memory_properties(pd) },
+            instance,
+            physical: pd,
+            device,
+        })
+    }
+
+    /// Upload a tight NV12 buffer to the test device as an owned GpuFrame.
+    fn nv12_gpu_frame(td: &TestDevice, data: &[u8], w: u32, h: u32) -> GpuFrame {
+        let size = (w * h * 3 / 2) as u64;
+        let (buf, mem, ptr) = alloc_host_visible(
+            &td.device,
+            &td.memory_properties,
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
+        .unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, size as usize);
+            td.device.unmap_memory(mem);
+        };
+        let dev = td.device.clone();
+        GpuFrame::new_owned(
+            GpuDevice::Vulkan {
+                index: 0,
+                handles: td.handles,
+            },
+            GpuPixelFormat::Nv12,
+            w,
+            h,
+            w as usize,
+            (w * h) as usize,
+            buf.as_raw() as usize,
+            Some(mem.as_raw() as usize),
+            Box::new(move |_| unsafe {
+                dev.destroy_buffer(buf, None);
+                dev.free_memory(mem, None);
+            }),
+        )
+    }
+
+    #[test]
+    fn device_path_matches_sw() {
+        let Some(_guard) = require_gpu() else { return };
+        let td = match test_device() {
+            Some(t) => t,
+            None => return,
+        };
+        let (buf, img) = grad_yuv(320, 240, false); // tight NV12
+        let frame = nv12_gpu_frame(&td, &buf, 320, 240);
+
+        for ch in [RgbChannels::Rgba32, RgbChannels::Rgb24] {
+            // Convert only (src buffer read directly).
+            let cfg = ImageConfig {
+                rgb: Some(ch),
+                scale: None,
+                affine: None,
+                spec: vacc_image::ColorSpec::auto(720),
+            };
+            let dev_res = process_device(&frame, &cfg).unwrap();
+            assert_eq!(dev_res.format, if ch == RgbChannels::Rgba32 { GpuPixelFormat::Rgba32 } else { GpuPixelFormat::Rgb24 });
+            let got = readback(&dev_res).unwrap();
+            match sw_process(&img, &cfg) {
+                ProcessedFrame::Rgb(b) => {
+                    let (max, mean) = diff(&got, &b.data);
+                    assert!(
+                        max <= 1 && mean < 0.05,
+                        "device convert drift {:?}: max={max} mean={mean}",
+                        ch
+                    );
+                }
+                _ => panic!("expected rgb output"),
+            }
+
+            // Scale + convert (scratch NV12, plus RGBA scratch for Rgb24).
+            let cfg = ImageConfig {
+                rgb: Some(ch),
+                scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
+                affine: None,
+                spec: vacc_image::ColorSpec::auto(720),
+            };
+            let dev_res = process_device(&frame, &cfg).unwrap();
+            let got = readback(&dev_res).unwrap();
+            match sw_process(&img, &cfg) {
+                ProcessedFrame::Rgb(b) => {
+                    assert_eq!((b.width, b.height), (160, 120));
+                    let (max, mean) = diff(&got, &b.data);
+                    assert!(
+                        max <= 4 && mean < 1.5,
+                        "device scale+convert drift {:?}: max={max} mean={mean}",
+                        ch
+                    );
+                }
+                _ => panic!("expected rgb output"),
+            }
+        }
+
+        // Scale only (tight NV12 out; resize writes the output buffer).
+        let cfg = ImageConfig {
+            rgb: None,
+            scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
+            affine: None,
+            spec: Default::default(),
+        };
+        let dev_res = process_device(&frame, &cfg).unwrap();
+        assert_eq!(dev_res.format, GpuPixelFormat::Nv12);
+        let got = readback(&dev_res).unwrap();
+        match sw_process(&img, &cfg) {
+            ProcessedFrame::Yuv(b) => {
+                let (max, mean) = diff(&got, &b.data);
+                assert!(
+                    max <= 4 && mean < 1.5,
+                    "device scale drift: max={max} mean={mean}"
+                );
+            }
+            _ => panic!("expected yuv output"),
+        }
+
+        // High-frequency content at an exact 2x downscale: the two-pass
+        // rounding must reproduce the software pipeline bit-for-bit (the old
+        // single-pass f32 mix drifted by a couple of LSB here, which the
+        // smooth-gradient cases above cannot expose).
+        let (w, h) = (320usize, 240usize);
+        let cw = w / 2;
+        let chh = h / 2;
+        let mut nv12 = vec![0u8; w * h + w * chh];
+        for y in 0..h {
+            for x in 0..w {
+                nv12[y * w + x] = if (x / 4 + y / 4) % 2 == 0 { 200 } else { 55 };
+            }
+        }
+        for y in 0..chh {
+            for x in 0..cw {
+                let base = w * h + y * w + x * 2;
+                nv12[base] = if (x / 4 + y / 4) % 2 == 0 { 230 } else { 60 };
+                nv12[base + 1] = if (x / 4 + y / 4 + 1) % 2 == 0 { 210 } else { 40 };
+            }
+        }
+        let data: &'static [u8] = Box::leak(nv12.into_boxed_slice());
+        let img = YuvImage::semi(&data[..w * h], w, &data[w * h..], w, w, h, 8);
+        let frame = nv12_gpu_frame(&td, data, w as u32, h as u32);
+        let cfg = ImageConfig {
+            rgb: Some(RgbChannels::Rgb24),
+            scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
+            affine: None,
+            spec: vacc_image::ColorSpec::auto(720),
+        };
+        let dev_res = process_device(&frame, &cfg).unwrap();
+        let got = readback(&dev_res).unwrap();
+        match sw_process(&img, &cfg) {
+            ProcessedFrame::Rgb(b) => {
+                let (max, mean) = diff(&got, &b.data);
+                assert!(
+                    max == 0,
+                    "device 2x checkerboard drift: max={max} mean={mean}"
+                );
+            }
+            _ => panic!("expected rgb output"),
+        }
+
+        // Unsupported inputs are rejected without touching the device.
+        let (buf2, mem2, _ptr2) = alloc_host_visible(
+            &td.device,
+            &td.memory_properties,
+            64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
+        .unwrap();
+        let dev2 = td.device.clone();
+        let bad = GpuFrame::new_owned(
+            GpuDevice::Vulkan {
+                index: 0,
+                handles: td.handles,
+            },
+            GpuPixelFormat::Rgba32,
+            8,
+            8,
+            32,
+            0,
+            buf2.as_raw() as usize,
+            Some(mem2.as_raw() as usize),
+            Box::new(move |_| unsafe {
+                dev2.destroy_buffer(buf2, None);
+                dev2.free_memory(mem2, None);
+            }),
+        );
+        let cfg = ImageConfig {
+            rgb: Some(RgbChannels::Rgba32),
+            scale: None,
+            affine: None,
+            spec: Default::default(),
+        };
+        assert!(matches!(
+            process_device(&bad, &cfg),
+            Err(ImageError::Unsupported(_))
+        ));
     }
 }

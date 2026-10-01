@@ -42,6 +42,7 @@ mod cuda_driver {
         pub fn cuStreamCreate(stream: *mut *mut c_void, flags: u32) -> c_int;
         pub fn cuStreamSynchronize(stream: *mut c_void) -> c_int;
         pub fn cuMemAlloc_v2(ptr: *mut usize, size: usize) -> c_int;
+        pub fn cuMemFree_v2(ptr: usize) -> c_int;
         pub fn cuMemFreeAsync(ptr: usize, stream: *mut c_void) -> c_int;
         pub fn cuMemcpyHtoDAsync_v2(dst: usize, src: *const c_void, size: usize, stream: *mut c_void) -> c_int;
         pub fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: usize, size: usize, stream: *mut c_void) -> c_int;
@@ -92,6 +93,8 @@ pub struct NppStreamContext {
     pub n_multi_processor_count: c_int,
     pub n_max_threads_per_multi_processor: c_int,
     pub n_max_threads_per_block: c_int,
+    // C type is `size_t` (8 bytes on x86_64): a narrower Rust type here would
+    // shift every following field and corrupt the context NPP reads.
     pub n_shared_mem_per_block: usize,
     pub n_compute_capability_major: c_int,
     pub n_compute_capability_minor: c_int,
@@ -105,7 +108,7 @@ unsafe impl Send for NppStreamContext {}
 unsafe impl Sync for NppStreamContext {}
 
 impl NppStreamContext {
-    fn zeroed() -> Self {
+    pub fn zeroed() -> Self {
         Self {
             h_stream: std::ptr::null_mut(),
             n_cuda_device_id: 0,
@@ -149,6 +152,35 @@ pub type Nv12ToRgbTwist = unsafe extern "C" fn(
     ctx: NppStreamContext,
 ) -> c_int;
 
+/// `nppiResize_8u_P3R_Ctx` (libnppig): resize a planar 3-channel image
+/// (steps `[Y, Cb, Cr]`) in a single call.
+/// `nppiNV12ToYUV420_8u_P2P3R_Ctx` (libnppicc): semi-planar NV12 to planar
+/// Y'CbCr 4:2:0 at the same size. `a_src_step` is `[Y, interleaved UV]`,
+/// `a_dst_step` is `[Y, Cb, Cr]`.
+pub type Nv12ToPlanar420 = unsafe extern "C" fn(
+    p_src: *const *const u8,
+    // A single step used for both source planes (see header docs).
+    n_src_step: c_int,
+    p_dst: *mut *mut u8,
+    a_dst_step: *const c_int,
+    o_size_roi: NppiSize,
+    ctx: NppStreamContext,
+) -> c_int;
+
+/// `nppiYCbCr420_8u_P3P2R_Ctx` (libnppicc): planar Y'CbCr 4:2:0 to semi-planar
+/// NV12 at the same size. The destination is two separate (pointer, step)
+/// pairs — not an array.
+pub type Planar420ToNv12 = unsafe extern "C" fn(
+    p_src: *const *const u8,
+    r_src_step: *const c_int,
+    p_dst_y: *mut u8,
+    n_dst_y_step: c_int,
+    p_dst_cbcr: *mut u8,
+    n_dst_cbcr_step: c_int,
+    o_size_roi: NppiSize,
+    ctx: NppStreamContext,
+) -> c_int;
+
 /// `nppiWarpAffine_8u_C1R_Ctx` (libnppig) - single-channel affine warp.
 pub type WarpAffineC1R = unsafe extern "C" fn(
     p_src: *const u8,
@@ -178,6 +210,8 @@ pub struct Ffi {
     libs: Vec<Library>,
     pub resize_c1r: ResizeC1R,
     pub nv12_to_rgb_twist: Nv12ToRgbTwist,
+    pub nv12_to_planar420: Nv12ToPlanar420,
+    pub planar420_to_nv12: Planar420ToNv12,
     pub warp_affine_c1r: WarpAffineC1R,
     /// The non-blocking stream all NPP calls are enqueued on.
     #[allow(dead_code)]
@@ -210,14 +244,20 @@ impl Ffi {
         let warp_affine_c1r: WarpAffineC1R = unsafe { get(&nppig, b"nppiWarpAffine_8u_C1R_Ctx")? };
         let nv12_to_rgb_twist: Nv12ToRgbTwist =
             unsafe { get(&nppicc, b"nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx")? };
+        let nv12_to_planar420: Nv12ToPlanar420 =
+            unsafe { get(&nppicc, b"nppiNV12ToYUV420_8u_P2P3R_Ctx")? };
+        let planar420_to_nv12: Planar420ToNv12 =
+            unsafe { get(&nppicc, b"nppiYCbCr420_8u_P3P2R_Ctx")? };
 
         let (primary_ctx, stream, ctx) = build_cuda()?;
 
         let ffi = Self {
             libs: vec![nppig, nppicc],
             resize_c1r,
-            warp_affine_c1r,
             nv12_to_rgb_twist,
+            nv12_to_planar420,
+            planar420_to_nv12,
+            warp_affine_c1r,
             stream,
             primary_ctx,
             ctx,
@@ -268,6 +308,12 @@ impl Ffi {
         unsafe { cuda_driver::cuMemFreeAsync(ptr, self.stream) }
     }
 
+    /// Synchronous free: blocks until all in-flight GPU work completes. Used
+    /// when releasing buffers handed to external consumers (inference).
+    pub fn mem_free(&self, ptr: usize) -> c_int {
+        unsafe { cuda_driver::cuMemFree_v2(ptr) }
+    }
+
     /// Enqueue an async H2D copy on the NPP stream.
     pub fn h2d_async(&self, dst: usize, src: *const c_void, size: usize) -> c_int {
         unsafe { cuda_driver::cuMemcpyHtoDAsync_v2(dst, src, size, self.stream) }
@@ -282,6 +328,7 @@ impl Ffi {
     pub fn stream_sync(&self) -> c_int {
         unsafe { cuda_driver::cuStreamSynchronize(self.stream) }
     }
+
 
     /// Make the primary context current on the calling thread.
     pub fn set_current(&self) -> c_int {

@@ -29,6 +29,14 @@
 //!   area-average filter), so downscaled Box results are not identical.
 //! - NPP cubic is its own 4-tap kernel, not the Mitchell (B=0.5, C=0.5) used
 //!   by the software pipeline.
+//! - `nppiResize`'s linear phase convention differs from the reference
+//!   center-based bilinear, and an *exact* 2x downscale degenerates to
+//!   nearest-neighbor decimation (measured on NPP 13.1: 100% top-left taps
+//!   on real content; other ratios drift by a few LSBs on smooth ramps but
+//!   up to ~10 mean / 170 max on high-frequency content). Resize output is
+//!   therefore only comparable to the software reference within loose
+//!   tolerances; backends that must match the reference exactly (vkimage)
+//!   implement their own tap mapping.
 //! - Affine warp is rejected up front: `nppiWarpAffine_8u_C1R_Ctx`
 //!   segfaults on NPP 13.1 even for an identity transform with valid buffers
 //!   (reproduced in a standalone C program), so [`process`] returns
@@ -42,6 +50,7 @@ use std::os::raw::{c_int, c_void};
 use std::sync::OnceLock;
 
 use thiserror::Error;
+use vacc_core::gpu::{GpuDevice, GpuFrame, GpuPixelFormat};
 use vacc_image::{
     i420_size, scratch_view, table, yuv_high_to_i420, ColorSpec, ImageConfig, ImageError,
     ImageResult, Interpolation, ProcessedFrame, RgbChannels, RgbOutput, Scale, YuvImage, YuvLayout,
@@ -357,6 +366,394 @@ impl Npp {
         drop(d_y);
         self.sync()
     }
+}
+
+// =====================================================================
+// Zero-copy GPU pipeline: runs directly on device frames (no host staging)
+// =====================================================================
+
+impl Npp {
+    /// Synchronously release a device buffer: blocks until all in-flight GPU
+    /// work completes, so it is safe as the drop handler for owned
+    /// [`GpuFrame`]s even while other streams (e.g. inference) read it.
+    fn free_device(&self, ptr: usize) {
+        if self.ensure_ctx().is_err() || self.ffi.mem_free(ptr) != 0 {
+            eprintln!("vacc-npp: failed to free GPU frame buffer {ptr:#x}");
+        }
+    }
+
+    /// Float twist matrix for `spec` (Q14 coefficients, same convention as the
+    /// host pipeline's `conv_px`).
+    fn twist_matrix(spec: ColorSpec) -> [f32; 12] {
+        let c = table(spec);
+        let q = 1.0f32 / 16384.0;
+        [
+            c.ky as f32 * q, 0.0, c.r_cr as f32 * q, (c.r_off + vacc_image::RND) as f32 * q,
+            c.ky as f32 * q, c.g_cb as f32 * q, c.g_cr as f32 * q,
+            (c.g_off + vacc_image::RND) as f32 * q, c.ky as f32 * q, c.b_cb as f32 * q, 0.0,
+            (c.b_off + vacc_image::RND) as f32 * q,
+        ]
+    }
+
+    /// Y'CbCr -> RGB conversion reading device NV12 planes directly; writes
+    /// packed RGB24 into the device buffer `dst`.
+    #[allow(clippy::too_many_arguments)]
+    fn twist_nv12_to_rgb(
+        &self,
+        y: usize,
+        uv: usize,
+        pitch: c_int,
+        w: c_int,
+        h: c_int,
+        spec: ColorSpec,
+        dst: usize,
+    ) -> ImageResult<()> {
+        let a_src = [y as *const u8, uv as *const u8];
+        let steps = [pitch, pitch];
+        let twist = Self::twist_matrix(spec);
+        let status = unsafe {
+            (self.ffi.nv12_to_rgb_twist)(
+                a_src.as_ptr(),
+                steps.as_ptr(),
+                dst as *mut u8,
+                (w * 3) as c_int,
+                NppiSize { n_width: w, n_height: h },
+                twist.as_ptr(),
+                self.ffi.ctx,
+            )
+        };
+        if status != NPP_SUCCESS {
+            return Err(npp_status_error("nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx", status));
+        }
+        Ok(())
+    }
+
+    /// Split a device NV12 frame into tight planar Y/Cb/Cr device buffers.
+    fn planarize_nv12(&self, src: &GpuFrame) -> ImageResult<Planar420<'_>> {
+        let (w, h) = (src.width as c_int, src.height as c_int);
+        let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
+        let y = GpuBuf::alloc(&self.ffi, (w * h) as usize)?;
+        let u = GpuBuf::alloc(&self.ffi, (cw * ch) as usize)?;
+        let v = GpuBuf::alloc(&self.ffi, (cw * ch) as usize)?;
+        let a_src = [src.ptr as *const u8, src.chroma_ptr() as *const u8];
+        let mut a_dst = [y.ptr as *mut u8, u.ptr as *mut u8, v.ptr as *mut u8];
+        let d_steps = [w, cw, cw];
+        let status = unsafe {
+            (self.ffi.nv12_to_planar420)(
+                a_src.as_ptr(),
+                src.pitch as c_int,
+                a_dst.as_mut_ptr(),
+                d_steps.as_ptr(),
+                NppiSize { n_width: w, n_height: h },
+                self.ffi.ctx,
+            )
+        };
+        if status != NPP_SUCCESS {
+            return Err(npp_status_error("nppiNV12ToYUV420_8u_P2P3R_Ctx", status));
+        }
+        Ok(Planar420 { y, u, v, width: w as usize, height: h as usize })
+    }
+
+    /// Resize one device plane (`nppiResize_8u_C1R_Ctx`, the same kernel the
+    /// host pipeline uses).
+    #[allow(clippy::too_many_arguments)]
+    fn resize_dev_plane(
+        &self,
+        src: usize,
+        sw: c_int,
+        sh: c_int,
+        dst: usize,
+        dw: c_int,
+        dh: c_int,
+        interp: c_int,
+    ) -> ImageResult<()> {
+        let status = unsafe {
+            (self.ffi.resize_c1r)(
+                src as *const u8,
+                sw,
+                NppiSize { n_width: sw, n_height: sh },
+                NppiRect { n_x: 0, n_y: 0, n_width: sw, n_height: sh },
+                dst as *mut u8,
+                dw,
+                NppiSize { n_width: dw, n_height: dh },
+                NppiRect { n_x: 0, n_y: 0, n_width: dw, n_height: dh },
+                interp,
+                self.ffi.ctx,
+            )
+        };
+        if status != NPP_SUCCESS {
+            return Err(npp_status_error("nppiResize_8u_C1R_Ctx", status));
+        }
+        Ok(())
+    }
+
+    /// Resize the three planar device planes of `src` (4:2:0) into `out_*`.
+    #[allow(clippy::too_many_arguments)]
+    fn resize_planar3(
+        &self,
+        src: &Planar420<'_>,
+        dw: usize,
+        dh: usize,
+        interp: c_int,
+        out_y: &GpuBuf<'_>,
+        out_u: &GpuBuf<'_>,
+        out_v: &GpuBuf<'_>,
+    ) -> ImageResult<()> {
+        let (w, h) = (src.width as c_int, src.height as c_int);
+        let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
+        let (dw, dh) = (dw as c_int, dh as c_int);
+        let (dwc, dhc) = ((dw + 1) / 2, (dh + 1) / 2);
+        self.resize_dev_plane(src.y.ptr, w, h, out_y.ptr, dw, dh, interp)?;
+        self.resize_dev_plane(src.u.ptr, cw, ch, out_u.ptr, dwc, dhc, interp)?;
+        self.resize_dev_plane(src.v.ptr, cw, ch, out_v.ptr, dwc, dhc, interp)
+    }
+
+    /// Merge tight planar Y/Cb/Cr device planes back into a semi-planar NV12
+    /// pair (Y, interleaved UV).
+    fn merge_to_nv12(
+        &self,
+        src: &Planar420<'_>,
+        dst_y: usize,
+        dst_uv: usize,
+    ) -> ImageResult<()> {
+        let (w, h) = (src.width as c_int, src.height as c_int);
+        let cw = (w + 1) / 2;
+        let a_src = [src.y.ptr as *const u8, src.u.ptr as *const u8, src.v.ptr as *const u8];
+        let s_steps = [w, cw, cw];
+        let status = unsafe {
+            (self.ffi.planar420_to_nv12)(
+                a_src.as_ptr(),
+                s_steps.as_ptr(),
+                dst_y as *mut u8,
+                w,
+                dst_uv as *mut u8,
+                w,
+                NppiSize { n_width: w, n_height: h },
+                self.ffi.ctx,
+            )
+        };
+        if status != NPP_SUCCESS {
+            return Err(npp_status_error("nppiYCbCr420_8u_P3P2R_Ctx", status));
+        }
+        Ok(())
+    }
+}
+
+/// Tight planar Y'CbCr 4:2:0 in device memory (intermediate of the GPU
+/// resize path).
+struct Planar420<'a> {
+    y: GpuBuf<'a>,
+    u: GpuBuf<'a>,
+    v: GpuBuf<'a>,
+    width: usize,
+    height: usize,
+}
+
+/// A scratch device buffer on the NPP stream. Dropping enqueues a
+/// stream-ordered free (safe: only NPP work on this stream uses it); the
+/// final output of [`process_gpu`] transfers ownership out via `into_raw`.
+struct GpuBuf<'a> {
+    ffi: &'a Ffi,
+    ptr: usize,
+}
+
+impl<'a> GpuBuf<'a> {
+    fn alloc(ffi: &'a Ffi, size: usize) -> ImageResult<Self> {
+        let ptr = ffi.mem_alloc(size).map_err(|st| cuda_err("cuMemAlloc_v2", st))?;
+        Ok(Self { ffi, ptr })
+    }
+
+    /// Transfer ownership of the device buffer to the caller (bypasses the
+    /// stream-ordered drop free); the caller arranges a later release.
+    fn into_raw(self) -> usize {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for GpuBuf<'_> {
+    fn drop(&mut self) {
+        let _ = self.ffi.mem_free_async(self.ptr);
+    }
+}
+
+/// Run `cfg` on a GPU-resident frame without touching host memory.
+///
+/// Supported combinations (anything else returns [`ImageError::Unsupported`]
+/// so the caller can fall back to a readback + host pipeline):
+///
+/// - NV12 source + `rgb = Rgb24` (with or without `scale`);
+/// - NV12 source + `scale` only (output stays NV12).
+///
+/// The output is an owned [`GpuFrame`] in device memory; dropping the last
+/// clone releases the buffer synchronously. The frame's
+/// [`GpuFrame::device_ptr`] can be handed to inference engines (e.g.
+/// TensorRT) while the handle is alive.
+pub fn process_gpu(src: &GpuFrame, cfg: &ImageConfig) -> ImageResult<GpuFrame> {
+    if cfg.is_noop() {
+        return Err(ImageError::Unsupported(
+            "no-op ImageConfig: neither rgb nor scale is set".into(),
+        ));
+    }
+    let npp = Npp::global()
+        .ok_or_else(|| ImageError::Unsupported("NPP unavailable on this host".into()))?;
+    npp.ensure_ctx()?;
+
+    if src.device != (GpuDevice::Cuda { index: 0 }) {
+        return Err(ImageError::Unsupported(format!(
+            "GPU pipeline supports CUDA device 0 frames, got {:?}",
+            src.device
+        )));
+    }
+    if src.format != GpuPixelFormat::Nv12 {
+        return Err(ImageError::Unsupported(format!(
+            "GPU pipeline supports NV12 sources only, got {:?}",
+            src.format
+        )));
+    }
+    if cfg.affine.is_some() {
+        return Err(ImageError::Unsupported(
+            "GPU pipeline does not support affine warp".into(),
+        ));
+    }
+    let want_rgb = match cfg.rgb {
+        None => false,
+        Some(RgbChannels::Rgb24) => true,
+        Some(ch) => {
+            return Err(ImageError::Unsupported(format!(
+                "GPU pipeline supports RGB24 output only, got {ch:?}"
+            )))
+        }
+    };
+
+    let (w, h) = (src.width as usize, src.height as usize);
+    let scaled = cfg.scale.map(|s| (s.width as usize, s.height as usize));
+    if scaled.is_some_and(|(dw, dh)| dw == 0 || dh == 0) {
+        return Err(ImageError::InvalidDimensions("scale target must be non-zero".into()));
+    }
+    let filter = cfg.scale.map_or(NPPI_INTER_LINEAR, |s| interp(s.filter));
+
+    match (scaled, want_rgb) {
+        // rgb only: twist straight from the decoded surface.
+        (None, true) => {
+            let out = GpuBuf::alloc(&npp.ffi, w * h * 3)?;
+            npp.twist_nv12_to_rgb(
+                src.ptr,
+                src.chroma_ptr(),
+                src.pitch as c_int,
+                w as c_int,
+                h as c_int,
+                cfg.spec,
+                out.ptr,
+            )?;
+            npp.sync()?;
+            Ok(gpu_frame_out(npp, out.into_raw(), GpuPixelFormat::Rgb24, w as u32, h as u32))
+        }
+        // scale only: planar round-trip, output stays NV12.
+        (Some((dw, dh)), false) => {
+            let planar = npp.planarize_nv12(src)?;
+            let out_y = GpuBuf::alloc(&npp.ffi, dw * dh)?;
+            let out_u = GpuBuf::alloc(&npp.ffi, dw.div_ceil(2) * dh.div_ceil(2))?;
+            let out_v = GpuBuf::alloc(&npp.ffi, dw.div_ceil(2) * dh.div_ceil(2))?;
+            npp.resize_planar3(&planar, dw, dh, filter, &out_y, &out_u, &out_v)?;
+            // One contiguous buffer holds Y then UV so a single free releases both.
+            let dst = GpuBuf::alloc(&npp.ffi, dw * dh + dw * (dh / 2))?;
+            npp.merge_to_nv12(
+                &Planar420 { y: out_y, u: out_u, v: out_v, width: dw, height: dh },
+                dst.ptr,
+                dst.ptr + dw * dh,
+            )?;
+            npp.sync()?;
+            Ok(gpu_frame_nv12_out(npp, dst.into_raw(), dw as u32, dh as u32))
+        }
+        // scale + rgb: planar round-trip, then twist from the scaled planes.
+        (Some((dw, dh)), true) => {
+            let planar = npp.planarize_nv12(src)?;
+            let out_y = GpuBuf::alloc(&npp.ffi, dw * dh)?;
+            let out_u = GpuBuf::alloc(&npp.ffi, dw.div_ceil(2) * dh.div_ceil(2))?;
+            let out_v = GpuBuf::alloc(&npp.ffi, dw.div_ceil(2) * dh.div_ceil(2))?;
+            npp.resize_planar3(&planar, dw, dh, filter, &out_y, &out_u, &out_v)?;
+            // NPP has no 8-bit planar->RGB twist: merge the scaled planes
+            // into scratch NV12 and twist from there.
+            let nv12 = GpuBuf::alloc(&npp.ffi, dw * dh + dw * (dh / 2))?;
+            npp.merge_to_nv12(
+                &Planar420 { y: out_y, u: out_u, v: out_v, width: dw, height: dh },
+                nv12.ptr,
+                nv12.ptr + dw * dh,
+            )?;
+            let out_rgb = GpuBuf::alloc(&npp.ffi, dw * dh * 3)?;
+            npp.twist_nv12_to_rgb(
+                nv12.ptr,
+                nv12.ptr + dw * dh,
+                dw as c_int,
+                dw as c_int,
+                dh as c_int,
+                cfg.spec,
+                out_rgb.ptr,
+            )?;
+            npp.sync()?;
+            Ok(gpu_frame_out(npp, out_rgb.into_raw(), GpuPixelFormat::Rgb24, dw as u32, dh as u32))
+        }
+        (None, false) => unreachable!("no-op configs are rejected above"),
+    }
+}
+
+/// Wrap an allocated device buffer into an owned RGB [`GpuFrame`].
+fn gpu_frame_out(npp: &'static Npp, ptr: usize, format: GpuPixelFormat, w: u32, h: u32) -> GpuFrame {
+    let pitch = (w as usize) * format.bytes_per_pixel();
+    GpuFrame::new_owned(
+        GpuDevice::Cuda { index: 0 },
+        format,
+        w,
+        h,
+        pitch,
+        0,
+        ptr,
+        None,
+        Box::new(move |p| npp.free_device(p)),
+    )
+}
+
+/// Wrap an allocated NV12 device buffer (Y then interleaved UV in one
+/// allocation) into an owned [`GpuFrame`].
+fn gpu_frame_nv12_out(npp: &'static Npp, ptr: usize, w: u32, h: u32) -> GpuFrame {
+    let pitch = w as usize;
+    GpuFrame::new_owned(
+        GpuDevice::Cuda { index: 0 },
+        GpuPixelFormat::Nv12,
+        w,
+        h,
+        pitch,
+        pitch * h as usize,
+        ptr,
+        None,
+        Box::new(move |p| npp.free_device(p)),
+    )
+}
+
+/// Copy a GPU frame to the host as one tight buffer (Y, then interleaved UV
+/// for NV12/P016; packed rows for RGB). The frame must use the tight layout
+/// produced by vacc decoders and pipelines (`pitch == width * bytes per
+/// sample`).
+pub fn readback(src: &GpuFrame) -> ImageResult<Vec<u8>> {
+    let npp = Npp::global()
+        .ok_or_else(|| ImageError::Unsupported("NPP unavailable on this host".into()))?;
+    npp.ensure_ctx()?;
+    debug_assert_eq!(
+        src.pitch,
+        (src.width as usize) * src.format.bytes_per_pixel(),
+        "readback expects tight rows"
+    );
+    let mut out = vec![0u8; src.total_bytes()];
+    let st = npp
+        .ffi
+        .d2h_async(out.as_mut_ptr() as *mut c_void, src.ptr, out.len());
+    if st != 0 {
+        return Err(cuda_err("cuMemcpyDtoHAsync_v2", st));
+    }
+    npp.sync()?;
+    Ok(out)
 }
 
 fn interp(interpolation: Interpolation) -> c_int {
@@ -948,6 +1345,67 @@ mod tests {
                 }
                 _ => panic!("expected rgb outputs"),
             }
+        }
+    }
+
+    /// Upload a tight NV12 buffer to the device as an owned [`GpuFrame`].
+    fn upload_gpu_nv12(buf: &[u8], w: u32, h: u32) -> GpuFrame {
+        let npp = Npp::global().unwrap();
+        npp.ensure_ctx().unwrap();
+        let ptr = npp.ffi.mem_alloc(buf.len()).unwrap();
+        assert_eq!(
+            npp.ffi.h2d_async(ptr, buf.as_ptr() as *const std::os::raw::c_void, buf.len()),
+            0
+        );
+        npp.sync().unwrap();
+        GpuFrame::new_owned(
+            GpuDevice::Cuda { index: 0 },
+            GpuPixelFormat::Nv12,
+            w,
+            h,
+            w as usize,
+            (w * h) as usize,
+            ptr,
+            None,
+            Box::new(move |p| npp.free_device(p)),
+        )
+    }
+
+    /// The zero-copy GPU pipeline must track the host pipeline: same inputs,
+    /// same NPP kernels, so outputs stay within the resize tolerance.
+    #[test]
+    fn process_gpu_matches_host_pipeline() {
+        let Some(_guard) = require_npp() else { return };
+        let (buf, img) = grad_yuv(320, 240, false); // tight NV12
+        let g = upload_gpu_nv12(&buf, 320, 240);
+        for cfg in [
+            ImageConfig { rgb: Some(RgbChannels::Rgb24), scale: None, affine: None, spec: ColorSpec::auto(240) },
+            ImageConfig {
+                rgb: None,
+                scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
+                affine: None,
+                spec: ColorSpec::auto(240),
+            },
+            ImageConfig {
+                rgb: Some(RgbChannels::Rgb24),
+                scale: Some(Scale::new(160, 120, Interpolation::Bilinear)),
+                affine: None,
+                spec: ColorSpec::auto(240),
+            },
+        ] {
+            let host = process(&img, &cfg).unwrap();
+            let dev = process_gpu(&g, &cfg).unwrap();
+            let out = readback(&dev).unwrap();
+            let host_buf = match &host {
+                ProcessedFrame::Rgb(r) => &r.data[..],
+                ProcessedFrame::Yuv(y) => &y.data[..],
+            };
+            assert_eq!(out.len(), host_buf.len(), "output size mismatch");
+            let (max, mean) = diff(&out, host_buf);
+            assert!(
+                max <= 8 && mean < 3.0,
+                "gpu pipeline drift: max={max} mean={mean}"
+            );
         }
     }
 }

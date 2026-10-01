@@ -45,6 +45,29 @@ let config = DecoderConfig::default().with_image(ImageConfig {
 let decoder = VaccDecoder::new(&data, &config).unwrap();
 ```
 
+### Zero-copy GPU track
+
+On NVIDIA hosts frames can stay on the device end to end: NVDEC writes into owned
+CUDA buffers (no host staging) and the image pipeline (RGB conversion + scaling)
+runs on-GPU via NPP. Frames then carry a [`GpuFrame`](src/lib.rs#L116) whose
+`device_ptr()` is a stable `CUdeviceptr` an inference engine can consume directly
+while the handle (or any clone of it) is alive:
+
+```rust
+let config = DecoderConfig::default()
+    .with_gpu() // forces NVDEC and the zero-copy track
+    .with_image(/* scale / rgb as above */);
+let decoder = VaccDecoder::new(&data, &config).unwrap();
+for frame in decoder.decode_all(usize::MAX).unwrap() {
+    if let Some(gpu) = &frame.gpu {
+        feed_to_inference(gpu.device_ptr(), gpu.width, gpu.height);
+    }
+}
+```
+
+Only 4:2:0 content is supported on this track; other chroma formats fall back to
+the normal host pipeline with a warning. The `unified` example accepts `--gpu`.
+
 Each backend is an optional cargo feature (`vulkan`, `nvdec`, `vaapi`, `sw`, all on by
 default), so a distribution build can omit any GPU dependency:
 
