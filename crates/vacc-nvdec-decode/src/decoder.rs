@@ -249,6 +249,12 @@ pub struct NvdecH264Decoder {
     /// copy is long finished, so this never stalls in steady state; flushed
     /// on `reset`/drop.
     pending_unmaps: Mutex<Vec<(u64, i32, *mut std::ffi::c_void)>>,
+
+    /// Set when a decode error was recovered by resetting the decoder (see
+    /// `decode`). All buffered input was dropped and the NVDEC handle will be
+    /// re-created at the next SPS (i.e., the next keyframe). Cleared by
+    /// [`take_recovered`](Self::take_recovered).
+    recovered: Mutex<bool>,
 }
 
 impl NvdecH264Decoder {
@@ -325,6 +331,7 @@ impl NvdecH264Decoder {
             copy_stream: Mutex::new(None),
             copy_events: Mutex::new((Vec::new(), 0)),
             pending_unmaps: Mutex::new(Vec::new()),
+            recovered: Mutex::new(false),
         };
 
         // Parse all initial data
@@ -347,6 +354,30 @@ impl NvdecH264Decoder {
     /// the device buffer directly. Only 4:2:0 content is supported.
     pub fn new_gpu(data: Vec<u8>) -> NvdecResult<Self> {
         Self::new_impl(data, true)
+    }
+
+    /// Returns and clears the flag indicating that the most recent
+    /// `decode()` call hit an error and recovered by resetting the decoder.
+    ///
+    /// When true, all previously submitted but not yet decoded input was
+    /// dropped: callers tracking outstanding input (e.g., packet counters)
+    /// must reset it, or they will underfeed the pipeline. The decoder
+    /// resynchronizes at the next keyframe (the first picture carrying SPS).
+    pub fn take_recovered(&self) -> bool {
+        let mut r = self.recovered.lock().unwrap();
+        std::mem::take(&mut *r)
+    }
+
+    /// Recover from a decode error: log it, reset the decoder (destroys the
+    /// NVDEC handle, clears DPB and all buffered input), and set the flag
+    /// reported by [`take_recovered`](Self::take_recovered). Callers resume
+    /// feeding fresh data; the decoder resynchronizes at the next keyframe
+    /// (the first picture carrying SPS).
+    fn recover_from_error(&mut self, e: &NvdecError) -> NvdecResult<()> {
+        eprintln!("[NVDEC] decode error, resetting decoder (resyncs at next keyframe): {e}");
+        self.reset()?;
+        *self.recovered.lock().unwrap() = true;
+        Ok(())
     }
 
     /// Set the device buffer that decoded frames are extracted into.
@@ -1823,12 +1854,18 @@ impl Decoder for NvdecH264Decoder {
             if let Some(frame) = self.get_decoded_frame() {
                 return Ok(Some(frame));
             }
-            match self.parse_and_decode()? {
-                PassOutcome::More => continue,
+            match self.parse_and_decode() {
+                Ok(PassOutcome::More) => continue,
                 // The window tail NAL may be incomplete: wait for the next
                 // submit() (or flush() at end of stream).
-                PassOutcome::Stalled => return Ok(None),
-                PassOutcome::Exhausted => return Ok(None),
+                Ok(PassOutcome::Stalled) => return Ok(None),
+                Ok(PassOutcome::Exhausted) => return Ok(None),
+                // Recover from a transient decode/parse error instead of
+                // failing the whole stream (see `recover_from_error`).
+                Err(e) => {
+                    self.recover_from_error(&e)?;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -1968,3 +2005,125 @@ impl Drop for NvdecH264Decoder {
         }
     }
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn load_born_trailer() -> Vec<u8> {
+        let path = format!(
+            "{}/assets/born_trailer.h264",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../..")
+        );
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {}", path))
+    }
+
+    /// Scan Annex-B start codes in `data`, returning
+    /// `(start incl. start code, end excl., NAL type)` per NAL. A NAL cut off
+    /// at the end of `data` is reported with `end == data.len()`.
+    fn nal_ranges(data: &[u8]) -> Vec<(usize, usize, u8)> {
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            let sc_len = if data[i] == 0
+                && data[i + 1] == 0
+                && data[i + 2] == 0
+                && i + 4 <= data.len()
+                && data[i + 3] == 1
+            {
+                4
+            } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + sc_len;
+            if nal_start >= data.len() {
+                break;
+            }
+            let mut j = nal_start;
+            while j + 2 < data.len() && !(data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1) {
+                j += 1;
+            }
+            let end = if j + 2 < data.len() { j } else { data.len() };
+            ranges.push((i, end, data[nal_start] & 0x1F));
+            i = nal_start + 1;
+        }
+        ranges
+    }
+
+    /// Verify that decode() recovers from a decode error instead of
+    /// propagating it: the decoder resets (dropping all buffered input),
+    /// `take_recovered()` reports the recovery exactly once, and decoding
+    /// resumes once fresh SPS/PPS + keyframe data is submitted.
+    ///
+    /// The recovery is forced with a synthetic [`NvdecError`] via
+    /// `recover_from_error` — the same handler `decode()` invokes on any
+    /// parse/decode failure (e.g., a failed `cuvidDecodePicture` from corrupt
+    /// RTSP input). Real hardware errors are not reproducible deterministically
+    /// (NVDEC conceals most bitstream corruption), but from the recovery path's
+    /// point of view every error looks the same.
+    #[test]
+    fn test_decode_error_recovery_resyncs_at_next_keyframe() {
+        let data = load_born_trailer();
+
+        // Locate the first IDR and the non-IDR slices that follow it.
+        let r = nal_ranges(&data[..1_000_000]);
+        let idr_i = r
+            .iter()
+            .position(|&(_, _, t)| t == 5)
+            .expect("born_trailer should contain an IDR");
+        let mut non_idr = Vec::new();
+        for (i, &(_, _, t)) in r.iter().enumerate() {
+            if i > idr_i && (1..=4).contains(&t) {
+                non_idr.push(i);
+                if non_idr.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(non_idr.len(), 2, "need two non-IDR slices after the IDR");
+        // Warm-up input: SPS/PPS + IDR + two slices (the last one is held by
+        // the tail-hold rule until more data arrives).
+        let warm_end = r[non_idr[1]].1;
+
+        // Sanity: the decoder works — new() decodes the IDR + first slice and
+        // presents the IDR (overtaken by the second picture's POC).
+        let mut decoder = NvdecH264Decoder::new(data[..warm_end].to_vec())
+            .expect("Failed to create decoder");
+        let mut warm = 0;
+        loop {
+            match decoder.decode() {
+                Ok(Some(_)) => warm += 1,
+                Ok(None) => break,
+                Err(e) => panic!("Unexpected error before recovery: {:?}", e),
+            }
+        }
+        assert!(warm > 0, "expected a frame from the warm-up");
+
+        // Force the recovery path (what decode() does on any parse/decode
+        // error): reset + flag.
+        assert!(!decoder.take_recovered(), "no recovery before the error");
+        decoder
+            .recover_from_error(&NvdecError::DecodeFailed("synthetic test error".into()))
+            .expect("recovery reset should succeed");
+        assert!(decoder.take_recovered(), "take_recovered must report the recovered error");
+        assert!(!decoder.take_recovered(), "take_recovered must clear the flag");
+
+        // Resync: re-submit the stream head (SPS/PPS + keyframe) and verify
+        // decoding resumes on a freshly created decoder.
+        decoder.submit(&data[..warm_end]).expect("resync submit");
+        let mut resumed = 0;
+        for _ in 0..10 {
+            match decoder.decode() {
+                Ok(Some(_)) => resumed += 1,
+                Ok(None) => break,
+                Err(e) => panic!("Unexpected error after resync: {:?}", e),
+            }
+        }
+        assert!(resumed > 0, "Decoder must resume decoding after resync");
+    }
+}
+
+
