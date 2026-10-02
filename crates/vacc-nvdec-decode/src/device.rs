@@ -106,7 +106,7 @@ const _: () = {
 struct CudaFuncs {
     cu_init: unsafe extern "C" fn(u32) -> u32,
     cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> u32,
-    cu_ctx_create_v2: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> u32,
+    _cu_ctx_create_v2: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> u32,
     _cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> u32,
     _cu_device_primary_ctx_release: unsafe extern "C" fn(i32) -> u32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
@@ -118,6 +118,13 @@ struct CudaFuncs {
     cu_stream_create: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32) -> u32,
     cu_stream_synchronize: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_stream_destroy: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
+    cu_event_create: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32) -> u32,
+    cu_event_record: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> u32,
+    cu_event_query: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
+    cu_event_synchronize: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
+    cu_stream_wait_event:
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32) -> u32,
+    cu_event_destroy: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_mem_host_alloc: unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize, u32) -> u32,
     cu_mem_free_host: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     cu_mem_alloc_v2: unsafe extern "C" fn(*mut crate::ffi::CUdeviceptr, usize) -> u32,
@@ -260,12 +267,17 @@ fn init_cuda() -> NvdecResult<()> {
         )));
     }
 
-    // Create CUDA context
+    // Use the device's PRIMARY context, shared with every other CUDA user in
+    // this process (cudarc, ORT). A private context makes cross-context
+    // synchronization unreliable on current drivers: stream waits on foreign
+    // streams and enqueues against foreign streams can silently fail to
+    // order, which corrupts pipeline handoffs. Sharing the primary context
+    // makes all events/streams same-context and stream-ordered waits reliable.
     let mut ctx: *mut std::ffi::c_void = std::ptr::null_mut();
-    let result = unsafe { (funcs.cu_ctx_create_v2)(&mut ctx, 0, device) };
+    let result = unsafe { (funcs._cu_device_primary_ctx_retain)(&mut ctx, device) };
     if result != CUDA_SUCCESS {
         return Err(NvdecError::CudaError(format!(
-            "cuCtxCreate_v2 failed with error {}",
+            "cuDevicePrimaryCtxRetain failed with error {}",
             result
         )));
     }
@@ -392,6 +404,42 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
                 NvdecError::LibLoadError(format!("Failed to resolve cuStreamDestroy: {}", e))
             })?;
 
+        let cu_event_create = *lib
+            .get::<unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32) -> u32>(b"cuEventCreate\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuEventCreate: {}", e))
+            })?;
+
+        let cu_event_record = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> u32>(b"cuEventRecord\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuEventRecord: {}", e))
+            })?;
+
+        let cu_event_query = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(b"cuEventQuery\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuEventQuery: {}", e))
+            })?;
+
+        let cu_event_synchronize = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(b"cuEventSynchronize\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuEventSynchronize: {}", e))
+            })?;
+
+        let cu_stream_wait_event = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32) -> u32>(b"cuStreamWaitEvent\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuStreamWaitEvent: {}", e))
+            })?;
+
+        let cu_event_destroy = *lib
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(b"cuEventDestroy\0")
+            .map_err(|e| {
+                NvdecError::LibLoadError(format!("Failed to resolve cuEventDestroy: {}", e))
+            })?;
+
         let cu_mem_host_alloc = *lib
             .get::<unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize, u32) -> u32>(
                 b"cuMemHostAlloc\0",
@@ -427,7 +475,7 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
         let funcs = CudaFuncs {
             cu_init,
             cu_device_get,
-            cu_ctx_create_v2,
+            _cu_ctx_create_v2: cu_ctx_create_v2,
             _cu_device_primary_ctx_retain: cu_device_primary_ctx_retain,
             _cu_device_primary_ctx_release: cu_device_primary_ctx_release,
             cu_ctx_set_current,
@@ -438,6 +486,12 @@ fn load_cuda_lib() -> NvdecResult<(Library, CudaFuncs)> {
             cu_stream_create,
             cu_stream_synchronize,
             cu_stream_destroy,
+            cu_event_create,
+            cu_event_record,
+            cu_event_query,
+            cu_event_synchronize,
+            cu_stream_wait_event,
+            cu_event_destroy,
             cu_mem_host_alloc,
             cu_mem_free_host,
             cu_mem_alloc_v2,
@@ -962,6 +1016,113 @@ pub unsafe fn cu_stream_destroy(stream: *mut std::ffi::c_void) -> NvdecResult<u3
         .get()
         .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
     Ok(unsafe { (funcs.cu_stream_destroy)(stream) })
+}
+
+/// Event creation flag: no timing functionality. Required for an event to be
+/// waited on from a stream in a different CUDA context (e.g. a consumer
+/// pipeline that runs in its own context).
+pub const CU_EVENT_DISABLE_TIMING: u32 = 2;
+
+/// Result of [`cu_event_query`]: the event has not completed yet. Not an
+/// error condition — just "still pending".
+pub const CUDA_ERROR_NOT_READY: u32 = 600;
+
+/// Create a CUDA event with [`CU_EVENT_DISABLE_TIMING`] (cross-context use,
+/// no timing overhead).
+///
+/// # Errors
+///
+/// Returns [`NvdecError::CudaError`] if creation fails.
+pub fn cu_event_create() -> NvdecResult<*mut std::ffi::c_void> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    let mut event: *mut std::ffi::c_void = std::ptr::null_mut();
+    let result = unsafe { (funcs.cu_event_create)(&mut event, CU_EVENT_DISABLE_TIMING) };
+    if result != CUDA_SUCCESS {
+        return Err(NvdecError::CudaError(format!(
+            "cuEventCreate failed with error {}",
+            result
+        )));
+    }
+    Ok(event)
+}
+
+/// Record an event on a stream: it is signaled once all work enqueued before
+/// this call has completed. Re-recording an event resets it to the pending
+/// state immediately (at this host call), so a stream waiting on the event
+/// blocks until the NEW record completes.
+///
+/// # Safety
+///
+/// `event` and `stream` must be valid handles; the CUDA context must be
+/// current for this thread.
+pub unsafe fn cu_event_record(event: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_event_record)(event, stream) })
+}
+
+/// Query whether an event has completed without blocking.
+///
+/// Returns [`CUDA_SUCCESS`] when signaled, [`CUDA_ERROR_NOT_READY`] while
+/// still pending.
+///
+/// # Safety
+///
+/// `event` must be a valid event handle; the CUDA context must be current
+/// for this thread.
+pub unsafe fn cu_event_query(event: *mut std::ffi::c_void) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_event_query)(event) })
+}
+
+/// Block until the event is signaled.
+///
+/// # Safety
+///
+/// `event` must be a valid event handle; the CUDA context must be current
+/// for this thread.
+pub unsafe fn cu_event_synchronize(event: *mut std::ffi::c_void) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_event_synchronize)(event) })
+}
+
+/// Make a stream wait for an event recorded on (possibly another) stream.
+/// If the event is already signaled the call adds no dependency. The event
+/// must have been created with [`CU_EVENT_DISABLE_TIMING`] to be used across
+/// contexts.
+///
+/// # Safety
+///
+/// `stream` and `event` must be valid handles; the CUDA context must be
+/// current for this thread.
+pub unsafe fn cu_stream_wait_event(
+    stream: *mut std::ffi::c_void,
+    event: *mut std::ffi::c_void,
+) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_stream_wait_event)(stream, event, 0) })
+}
+
+/// Destroy a CUDA event.
+///
+/// # Safety
+///
+/// The `event` must be a valid handle returned by [`cu_event_create`] and
+/// must not be in use (no pending records/waits) when destroyed.
+pub unsafe fn cu_event_destroy(event: *mut std::ffi::c_void) -> NvdecResult<u32> {
+    let (_, funcs) = CUDA_LIB
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    Ok(unsafe { (funcs.cu_event_destroy)(event) })
 }
 
 /// Allocate pinned (page-locked) host memory.

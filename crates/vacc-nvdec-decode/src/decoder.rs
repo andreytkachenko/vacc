@@ -47,8 +47,12 @@ use vacc_core::{
 use vacc_parser::{BitstreamPacket, PacketFlags, ParseResult, VideoParser, h264::H264Parser};
 
 use crate::device::{
-    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, cu_ctx_set_current,
-    cu_ctx_synchronize, cu_mem_free_host, cu_mem_host_alloc, cu_memcpy_2d, get_funcs, init_nvdec,
+    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, NvdecFuncs, cu_ctx_set_current,
+    cu_event_create, cu_event_destroy, cu_event_record,
+    cu_event_synchronize,
+    cu_mem_free_host,
+    cu_mem_host_alloc, cu_memcpy_2d, cu_memcpy_2d_async, cu_stream_create, cu_stream_destroy,
+    cu_stream_synchronize, get_funcs, init_nvdec,
 };
 use crate::dpb::NvdecDpbManager;
 use crate::error::{NvdecError, NvdecResult};
@@ -60,6 +64,13 @@ use crate::ffi::{
 use crate::picparams::build_cuvid_picparams;
 use crate::poc::PocCalculator;
 use crate::{window_end, MAX_PICTURES_PER_PASS, PassOutcome, WINDOW_LIMIT};
+
+/// Depth of the per-decoder copy-done event pool. Each extraction records the
+/// next event in round-robin; a consumer that lags more than one full pool
+/// behind simply over-waits on a reused event (still correct: the reused
+/// record is ordered after the original copy on the same stream). 16 matches
+/// the typical PREFEED depth of packet-ahead decode pipelines.
+const COPY_EVENT_POOL: usize = 16;
 
 /// NVDEC H.264 Decoder using vacc-parser.
 ///
@@ -195,6 +206,49 @@ pub struct NvdecH264Decoder {
     /// and emitted as [`GpuFrame`](vacc_core::gpu::GpuFrame) instead of host
     /// `PixelData`.
     gpu_mode: bool,
+
+    /// Optional device buffers for direct frame extraction (NV12 at display
+    /// size). While set, [`extract_frame`] copies decoded frames into them
+    /// with device-to-device 2D memcpys and returns metadata-only frames —
+    /// no host staging. See
+    /// [`set_device_output_ring`](Self::set_device_output_ring).
+    /// `(buffers, next_index)`: frames are extracted round-robin over the
+    /// ring, so a single `decode()` call can present several frames (B-frame
+    /// bursts) without clobbering a frame that is still in flight; each
+    /// returned frame carries its buffer via `DecodedFrame::device_ptr`.
+    device_output_ring: Mutex<(Vec<CUdeviceptr>, usize)>,
+
+    /// Per-ring-slot wait events (same length as the ring, or empty). Before
+    /// copying into slot `i`, the private copy stream waits on every event in
+    /// `slot_waits[i]`. Callers use them to tell the decoder "this buffer is
+    /// still being read by my kernel": record the event on your own stream
+    /// after the reading work is enqueued, and the next copy into that buffer
+    /// is ordered after it. Events must be created with
+    /// `CU_EVENT_DISABLE_TIMING` (they are waited on from this decoder's
+    /// private context). See
+    /// [`set_device_output_ring_with_slot_waits`](Self::set_device_output_ring_with_slot_waits).
+    slot_wait_events: Mutex<Vec<Vec<*const std::ffi::c_void>>>,
+
+    /// Private stream for the device-output D2D copies. Created lazily on
+    /// first use. Copies are asynchronous: each extraction records a
+    /// copy-done event (see `copy_events`) that the returned frame carries,
+    /// and the mapped source surface is unmapped later, once its copy has
+    /// completed (see `pending_unmaps`).
+    copy_stream: Mutex<Option<*mut std::ffi::c_void>>,
+
+    /// Round-robin pool of copy-done events. One event is recorded per
+    /// extraction; the frame carries it via
+    /// [`DecodedFrame::device_copy_event`] so consumers can host-sync it
+    /// (`cuEventSynchronize`) before reading `device_ptr`. Created lazily on
+    /// first use.
+    copy_events: Mutex<(Vec<*mut std::ffi::c_void>, usize)>,
+
+    /// Mapped surfaces awaiting unmap: `(mapped dev ptr, frame seq,
+    /// copy-done event)`. Drained (blocking on each copy-done event, in the
+    /// decoder's own context) at the top of every extraction — by then the
+    /// copy is long finished, so this never stalls in steady state; flushed
+    /// on `reset`/drop.
+    pending_unmaps: Mutex<Vec<(u64, i32, *mut std::ffi::c_void)>>,
 }
 
 impl NvdecH264Decoder {
@@ -266,6 +320,11 @@ impl NvdecH264Decoder {
             sps_pps_fed: Mutex::new(false),
             pinned_cache: Mutex::new(None),
             gpu_mode,
+            device_output_ring: Mutex::new((Vec::new(), 0)),
+            slot_wait_events: Mutex::new(Vec::new()),
+            copy_stream: Mutex::new(None),
+            copy_events: Mutex::new((Vec::new(), 0)),
+            pending_unmaps: Mutex::new(Vec::new()),
         };
 
         // Parse all initial data
@@ -288,6 +347,83 @@ impl NvdecH264Decoder {
     /// the device buffer directly. Only 4:2:0 content is supported.
     pub fn new_gpu(data: Vec<u8>) -> NvdecResult<Self> {
         Self::new_impl(data, true)
+    }
+
+    /// Set the device buffer that decoded frames are extracted into.
+    ///
+    /// The buffer must hold `display_width * display_height * 3 / 2` bytes:
+    /// an NV12 image at display size (Y plane followed by the interleaved UV
+    /// plane). While set, [`Decoder::decode`] and [`Decoder::flush`] copy each
+    /// frame's Y and UV planes (cropped to the display area) into `dst` with
+    /// device-to-device 2D memcpys and return metadata-only frames
+    /// (`pixel_data: None`). The copies run on a private decoder-owned stream
+    /// and are synchronized before `decode()` returns, so the pixels are
+    /// guaranteed to have landed in `dst` by the time the frame is handed out
+    /// — no cross-stream ordering is required from the caller.
+    ///
+    /// Only 8-bit content is supported in this mode; 10/12-bit streams (P010/
+    /// P012) fall back to host extraction. Use
+    /// [`clear_device_output`](Self::clear_device_output) to switch back.
+    pub fn set_device_output(&self, dst: CUdeviceptr) {
+        *self.device_output_ring.lock().unwrap() = (vec![dst], 0);
+    }
+
+    /// Set a ring of device buffers that decoded frames are extracted into,
+    /// round-robin. Prefer this over [`set_device_output`](Self::set_device_output):
+    /// one `decode()` call can present several frames (B-frame bursts), and a
+    /// single buffer would be clobbered by the later copies of that burst.
+    /// Each returned frame carries the buffer it was copied into via
+    /// [`DecodedFrame::device_ptr`] and the copy-done event via
+    /// [`DecodedFrame::device_copy_event`]. Extraction is asynchronous:
+    /// `decode()` returns as soon as the copies are ENQUEUED, so order your
+    /// reads of `device_ptr` after `device_copy_event` (e.g.
+    /// `cuStreamWaitEvent`).
+    ///
+    /// Buffers are reused every `dsts.len()` frames. Without slot-wait
+    /// events (this setter) the caller must keep the ring deep enough that a
+    /// buffer's contents have been consumed before its reuse; with
+    /// [`set_device_output_ring_with_slot_waits`](Self::set_device_output_ring_with_slot_waits)
+    /// any depth is safe.
+    pub fn set_device_output_ring(&self, dsts: &[CUdeviceptr]) {
+        *self.device_output_ring.lock().unwrap() = (dsts.to_vec(), 0);
+        self.slot_wait_events.lock().unwrap().clear();
+    }
+
+    /// Like [`set_device_output_ring`](Self::set_device_output_ring), but
+    /// additionally arms per-slot reader barriers. `slot_waits[i]` is the
+    /// list of CUDA events (raw `CUevent` pointers, created with
+    /// `CU_EVENT_DISABLE_TIMING`) that must be signaled before the decoder
+    /// may copy into `dsts[i]` again: before each copy into slot `i`, the
+    /// private copy stream waits on every event in `slot_waits[i]`.
+    ///
+    /// Usage: after enqueuing the work that READS `dsts[i]` (e.g. a
+    /// preprocess kernel) on your own stream, record `slot_waits[i][j]` on
+    /// that same stream. The next decode copy into slot `i` is then ordered
+    /// after your reader — with this mechanism any ring depth (even 1) is
+    /// safe no matter how far the consumer lags. Each event must be in a
+    /// signaled state before the first copy into its slot (record it once on
+    /// your stream at setup), since waiting on a never-recorded event blocks
+    /// forever.
+    pub fn set_device_output_ring_with_slot_waits(
+        &self,
+        dsts: &[CUdeviceptr],
+        slot_waits: &[Vec<*const std::ffi::c_void>],
+    ) {
+        assert_eq!(slot_waits.len(), dsts.len(), "one wait list per ring buffer");
+        *self.device_output_ring.lock().unwrap() = (dsts.to_vec(), 0);
+        *self.slot_wait_events.lock().unwrap() = slot_waits.iter().map(|w| w.to_vec()).collect();
+    }
+
+    /// Clear the device output buffers; frames are extracted to host memory
+    /// again (the default behavior).
+    pub fn clear_device_output(&self) {
+        *self.device_output_ring.lock().unwrap() = (Vec::new(), 0);
+    }
+
+    /// The SPS parsed from the bitstream, if any — e.g. to read VUI flags
+    /// such as `video_full_range_flag` or timing info.
+    pub fn active_sps(&self) -> Option<&vacc_core::picture::H264Sps> {
+        self.parser.active_sps()
     }
 
     /// Parse pending data and decode up to [`MAX_PICTURES_PER_PASS`] pictures.
@@ -559,7 +695,43 @@ impl NvdecH264Decoder {
                         )));
                     }
 
-                    let _ = cu_ctx_synchronize();
+                    // Wait for THIS picture's decode to complete before its
+                    // surface is read (the extraction D2D copy / host staging
+                    // both read it). cuvidGetDecodeStatus polls just this
+                    // picture, so — unlike a full context sync — it does not
+                    // wait on unrelated work (other decoders, consumer-stream
+                    // kernels, inference), keeping the pipeline asynchronous.
+                    let mut status = crate::ffi::CUVIDGETDECODESTATUS {
+                        decodeStatus: crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Invalid,
+                        reserved: [0; 31],
+                        pReserved: [std::ptr::null_mut(); 8],
+                    };
+                    loop {
+                        let rc = unsafe {
+                            (funcs.get_decode_status)(decoder_handle, curr_pic_idx, &mut status)
+                        };
+                        if rc != CUDA_SUCCESS {
+                            return Err(NvdecError::DecodeFailed(format!(
+                                "cuvidGetDecodeStatus failed: {}",
+                                rc
+                            )));
+                        }
+                        match status.decodeStatus {
+                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Success
+                            | crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error_Concealed => {
+                                break;
+                            }
+                            crate::ffi::cuvidDecodeStatus::cuvidDecodeStatus_Error => {
+                                return Err(NvdecError::DecodeFailed(
+                                    "decode reported an error".into(),
+                                ));
+                            }
+                            _ => {
+                                // In progress: yield briefly.
+                                std::thread::sleep(std::time::Duration::from_micros(50));
+                            }
+                        }
+                    }
 
                     // Add current frame to DPB after decode
                     let is_reference = slh.nal_ref_idc > 0;
@@ -1037,6 +1209,14 @@ impl NvdecH264Decoder {
         };
         let _ = cu_ctx_set_current();
 
+        // Unmap surfaces whose device-output copies have completed. This
+        // runs BEFORE the map below so NVDEC can never be asked to reuse a
+        // surface we still hold mapped (a second mapping of the same
+        // surface fails with CUDA_ERROR_MAP_FAILED). Blocking on each
+        // copy-done event is a no-op in steady state: the copy is a small
+        // D2D that finished long before the next frame was decoded.
+        self.unmap_completed(decoder, &funcs);
+
         // Map the decoded frame
         let mut dev_ptr: CUdeviceptr = 0;
         let mut pitch: u32 = 0;
@@ -1064,7 +1244,10 @@ impl NvdecH264Decoder {
             (funcs.map_video_frame64)(decoder, pic_index, &mut dev_ptr, &mut pitch, &proc_params)
         };
         if map_result != CUDA_SUCCESS {
-            eprintln!("[NVDEC] cuvidMapVideoFrame64 failed: {}", map_result);
+            eprintln!(
+                "[NVDEC] cuvidMapVideoFrame64 failed: {} (seq={} pic_index={})",
+                map_result, seq, pic_index
+            );
             return None;
         }
 
@@ -1133,6 +1316,145 @@ impl NvdecH264Decoder {
                 rgb_pixels: None,
                 gpu: Some(gpu_frame),
             });
+        }
+
+        // Device output mode: copy Y + interleaved UV straight into the
+        // caller's device buffer (NV12 layout, cropped to the display size)
+        // with two D2D 2D memcpys and return a metadata-only frame — no host
+        // staging. 8-bit content only. The copies are asynchronous: the
+        // frame carries a copy-done event, and the source surface stays
+        // mapped until the copy completes (see `pending_unmaps`).
+        // Next ring buffer + slot index for this extraction (round-robin;
+        // None when no device output is configured — host staging below).
+        let dst: Option<(CUdeviceptr, usize)> = {
+            let mut ring = self.device_output_ring.lock().unwrap();
+            if ring.0.is_empty() {
+                None
+            } else {
+                let idx = ring.1 % ring.0.len();
+                ring.1 += 1;
+                Some((ring.0[idx], idx))
+            }
+        };
+        if bps == 1 {
+            if let Some((dst, slot_idx)) = dst {
+                // Private stream for the D2D copies.
+                let copy_stream = {
+                    let mut s = self.copy_stream.lock().unwrap();
+                    match *s {
+                        Some(st) => st,
+                        None => match cu_stream_create() {
+                            Ok(st) => {
+                                *s = Some(st);
+                                st
+                            }
+                            Err(e) => {
+                                eprintln!("[NVDEC] copy-stream create failed: {e}");
+                                let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                                return None;
+                            }
+                        },
+                    }
+                };
+                // Reader barrier: the caller's work that still reads this ring
+                // slot must be finished before we overwrite it. Host-sync the
+                // slot event instead of enqueuing a stream wait: an in-flight
+                // cuStreamWaitEvent node can execute before the caller's NEXT
+                // re-record of the same event is issued, in which case it only
+                // waits on the stale record and the copy races the new readers.
+                // Blocking here is a no-op in steady state (the reader work is
+                // long done by the time the ring wraps around).
+                {
+                    let waits = self.slot_wait_events.lock().unwrap();
+                    if let Some(list) = waits.get(slot_idx) {
+                        for ev in list {
+                            if let Err(e) = unsafe { cu_event_synchronize(*ev as *mut _) } {
+                                eprintln!("[NVDEC] device-output slot sync failed: {e}");
+                                let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                                return None;
+                            }
+                        }
+                    }
+                }
+                let copy_y = CUDA_MEMCPY2D {
+                    srcXInBytes: crop_left as u64,
+                    srcY: crop_top as u64,
+                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                    _reserved0: 0,
+                    srcHost: std::ptr::null(),
+                    srcDevice: dev_ptr,
+                    srcArray: 0,
+                    srcPitch: pitch as u64,
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: CU_MEMORYTYPE_DEVICE,
+                    _reserved1: 0,
+                    dstHost: std::ptr::null_mut(),
+                    dstDevice: dst,
+                    dstArray: 0,
+                    dstPitch: display_width as u64,
+                    WidthInBytes: display_width as u64,
+                    Height: display_height as u64,
+                };
+                let uv_dst =
+                    unsafe { (dst as *mut u8).add(display_width * display_height) as CUdeviceptr };
+                let coded_height = info.coded_size.height as u64;
+                let copy_uv = CUDA_MEMCPY2D {
+                    srcXInBytes: crop_left as u64,
+                    srcY: coded_height + (crop_top as u64) / 2,
+                    srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                    _reserved0: 0,
+                    srcHost: std::ptr::null(),
+                    srcDevice: dev_ptr,
+                    srcArray: 0,
+                    srcPitch: pitch as u64,
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: CU_MEMORYTYPE_DEVICE,
+                    _reserved1: 0,
+                    dstHost: std::ptr::null_mut(),
+                    dstDevice: uv_dst,
+                    dstArray: 0,
+                    dstPitch: display_width as u64,
+                    WidthInBytes: display_width as u64,
+                    Height: (display_height / 2) as u64,
+                };
+                match (
+                    unsafe { cu_memcpy_2d_async(&copy_y, copy_stream) },
+                    unsafe { cu_memcpy_2d_async(&copy_uv, copy_stream) },
+                ) {
+                    (Ok(CUDA_SUCCESS), Ok(CUDA_SUCCESS)) => {}
+                    _ => {
+                        eprintln!("[NVDEC] device-output cuMemcpy2DAsync failed");
+                        let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                        return None;
+                    }
+                }
+                // Record the copy-done event (round-robin pool) and defer the
+                // unmap until the copies have actually landed: the mapped
+                // surface must stay valid while they read it, and the caller
+                // reads `dst` from its own stream with no ordering against
+                // this one — hence the event carried by the frame.
+                let done_event = match self.record_copy_event(copy_stream) {
+                    Some(ev) => ev,
+                    None => {
+                        eprintln!("[NVDEC] device-output event record failed");
+                        let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                        return None;
+                    }
+                };
+                self.pending_unmaps
+                    .lock()
+                    .unwrap()
+                    .push((dev_ptr, seq, done_event));
+                return Some(self.build_frame(
+                    seq,
+                    &info,
+                    None,
+                    Some(dst as *const u8),
+                    Some(done_event as *const std::ffi::c_void),
+                ));
+            }
         }
 
         // Get (or grow) the cached pinned host buffer. One contiguous block
@@ -1296,6 +1618,92 @@ impl NvdecH264Decoder {
             buffer,
         });
 
+        // Create decoded frame
+        Some(self.build_frame(seq, &info, pixel_data, None, None))
+    }
+
+    /// Assemble the metadata of a [`DecodedFrame`] (frame index, POC and
+    /// reference flag from the DPB) shared by the host-extraction and
+    /// device-output paths.
+    /// Record the next copy-done event (round-robin pool, created lazily) on
+    /// `copy_stream`. Returns the recorded event handle.
+    fn record_copy_event(&self, copy_stream: *mut std::ffi::c_void) -> Option<*mut std::ffi::c_void> {
+        let mut pool = self.copy_events.lock().unwrap();
+        if pool.0.is_empty() {
+            let mut events = Vec::with_capacity(COPY_EVENT_POOL);
+            for _ in 0..COPY_EVENT_POOL {
+                match cu_event_create() {
+                    Ok(ev) => events.push(ev),
+                    Err(e) => {
+                        eprintln!("[NVDEC] copy-event create failed: {e}");
+                        break;
+                    }
+                }
+            }
+            if events.is_empty() {
+                return None;
+            }
+            pool.0 = events;
+        }
+        let ev = pool.0[pool.1 % pool.0.len()];
+        pool.1 += 1;
+        unsafe { cu_event_record(ev, copy_stream) }.ok()?;
+        Some(ev)
+    }
+
+    /// Wait for every pending device-output copy to land and unmap its
+    /// source surface. Called at the top of each extraction (in the
+    /// decoder's own context, where the events were recorded): a blocking
+    /// `cuEventSynchronize` on an already-signaled event returns
+    /// immediately, so this never stalls in steady state. Unmapping before
+    /// the new frame's map guarantees NVDEC can recycle any surface.
+    fn unmap_completed(&self, decoder: *mut std::ffi::c_void, funcs: &NvdecFuncs) {
+        let pending: Vec<(u64, i32, *mut std::ffi::c_void)> =
+            self.pending_unmaps.lock().unwrap().drain(..).collect();
+        for (ptr, seq, ev) in pending {
+            if let Err(e) = unsafe { cu_event_synchronize(ev) } {
+                eprintln!("[NVDEC] copy-done event sync failed: {e}");
+            }
+            let _ = unsafe { (funcs.unmap_video_frame64)(decoder, ptr) };
+            let mut dpb = self.dpb_manager.lock().unwrap();
+            dpb.mark_unmapped(seq);
+        }
+    }
+
+    /// Unmap every pending device-output surface, blocking until all copies
+    /// have completed. Used on `reset`/drop when no more extractions will
+    /// drain the queue.
+    fn flush_unmaps(&self) {
+        let decoder = *self.decoder.lock().unwrap();
+        if decoder.is_null() {
+            return;
+        }
+        let Ok(funcs) = get_funcs() else {
+            return;
+        };
+        let copy_stream = *self.copy_stream.lock().unwrap();
+        if let Some(st) = copy_stream {
+            // Block until every enqueued copy has landed, so the unmaps
+            // below cannot run while a copy still reads its surface.
+            let _ = unsafe { cu_stream_synchronize(st) };
+        }
+        let pending: Vec<(u64, i32, *mut std::ffi::c_void)> =
+            self.pending_unmaps.lock().unwrap().drain(..).collect();
+        for (ptr, seq, _ev) in pending {
+            let _ = unsafe { (funcs.unmap_video_frame64)(decoder, ptr) };
+            let mut dpb = self.dpb_manager.lock().unwrap();
+            dpb.mark_unmapped(seq);
+        }
+    }
+
+    fn build_frame(
+        &self,
+        seq: i32,
+        info: &DecoderInfo,
+        pixel_data: Option<PixelData>,
+        device_ptr: Option<*const u8>,
+        device_copy_event: Option<*const std::ffi::c_void>,
+    ) -> DecodedFrame {
         // Get frame index
         let frame_index = {
             let mut count = self.frame_count.lock().unwrap();
@@ -1314,8 +1722,7 @@ impl NvdecH264Decoder {
             }
         };
 
-        // Create decoded frame
-        Some(DecodedFrame {
+        DecodedFrame {
             frame_index,
             timestamp: 0,
             width: info.display_size.width,
@@ -1338,6 +1745,9 @@ impl NvdecH264Decoder {
             },
             sync_info: vacc_core::frame::FrameSyncInfo::default(),
             pixel_data,
+            device_ptr,
+            device_copy_event,
+            device_seq: device_copy_event.map(|_| seq),
             rgb_pixels: None,
             gpu: None,
         })
@@ -1451,6 +1861,10 @@ impl Decoder for NvdecH264Decoder {
         let _ = cu_ctx_set_current();
         let funcs = get_funcs()?;
 
+        // Release any still-mapped device-output surfaces before the decoder
+        // (and its surface pool) goes away; blocks until copies finish.
+        self.flush_unmaps();
+
         // Destroy old decoder
         let decoder_handle = {
             let d = self.decoder.lock().unwrap();
@@ -1522,6 +1936,26 @@ impl Drop for NvdecH264Decoder {
         // Ensure CUDA context is current for cleanup operations
         let _ = cu_ctx_set_current();
 
+        // Unmap all pending device-output surfaces (syncs the copy stream as
+        // part of it), then destroy the copy stream: destroying a stream with
+        // work in flight is undefined behavior.
+        self.flush_unmaps();
+        if let Some(stream) = self.copy_stream.lock().unwrap().take() {
+            let _ = unsafe { cu_stream_synchronize(stream) };
+            let _ = unsafe { cu_stream_destroy(stream) };
+        }
+
+        // Destroy the copy-done event pool. Callers must have synchronized any
+        // stream that waited on these events first (a pending wait on a
+        // destroyed event is undefined behavior).
+        let (events, _) = {
+            let mut pool = self.copy_events.lock().unwrap();
+            (std::mem::take(&mut pool.0), pool.1)
+        };
+        for ev in events {
+            let _ = unsafe { cu_event_destroy(ev) };
+        }
+
         // Destroy decoder
         let decoder_handle = {
             let d = self.decoder.lock().unwrap();
@@ -1534,5 +1968,3 @@ impl Drop for NvdecH264Decoder {
         }
     }
 }
-
-

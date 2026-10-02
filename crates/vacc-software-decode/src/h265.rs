@@ -708,6 +708,9 @@ impl SoftwareH265Decoder {
             },
             sync_info: Default::default(),
             pixel_data: Some(pixel_data),
+            device_ptr: None,
+            device_copy_event: None,
+            device_seq: None,
             rgb_pixels: None,
             gpu: None,
         })

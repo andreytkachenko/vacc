@@ -23,6 +23,31 @@ pub struct DecodedFrame {
     pub sync_info: FrameSyncInfo,
     /// Pixel data for the decoded frame (if available).
     pub pixel_data: Option<PixelData>,
+    /// Device pointer to NV12 pixel data when the backend was configured
+    /// for device output (e.g. the NVDEC decoder's `set_device_output_ring`).
+    /// When set, `pixel_data` is `None` and the pixels live at this device
+    /// address in tightly-packed NV12 layout (Y plane followed by the
+    /// interleaved UV plane) at `width x height`. The backing buffer belongs
+    /// to the caller's ring of device buffers; it stays valid until the
+    /// backend reuses it for a later frame.
+    pub device_ptr: Option<*const u8>,
+    /// CUDA event (`CUevent` as a raw pointer) that is signaled when the
+    /// device-to-device copy into [`device_ptr`](Self::device_ptr) has
+    /// completed. Device-output extraction is asynchronous: the backend
+    /// enqueues the copies and returns before they finish, so consumers must
+    /// complete the copy before reading `device_ptr`. The event belongs to
+    /// the backend's CUDA context; host-side `cuEventSynchronize` works from
+    /// any context. NOTE: a stream-ordered `cuStreamWaitEvent` on this event
+    /// from a *different* context is not reliable (observed to not order on
+    /// current NVIDIA drivers), so do not rely on it — host-sync instead, and
+    /// call the backend's copy-done notification (see [`device_seq`]).
+    pub device_copy_event: Option<*const std::ffi::c_void>,
+    /// DPB sequence id of the source surface for device-output frames. Pass
+    /// it back to the backend's copy-done notification once
+    /// [`device_copy_event`](Self::device_copy_event) has been host-synced,
+    /// so the backend can release (unmap) the mapped surface. `None` unless
+    /// `device_ptr` is set.
+    pub device_seq: Option<i32>,
     /// Packed RGB/RGBA pixel data. Populated when a backend (or the
     /// facade) converted the decoded frame to RGB, optionally after
     /// scaling. `None` unless image conversion was requested.
@@ -48,6 +73,9 @@ impl DecodedFrame {
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
+            device_ptr: None,
+            device_copy_event: None,
+            device_seq: None,
             rgb_pixels: None,
             gpu: None,
         }
@@ -77,6 +105,9 @@ impl Default for DecodedFrame {
             field_flags: FieldFlags::default(),
             sync_info: FrameSyncInfo::default(),
             pixel_data: None,
+            device_ptr: None,
+            device_copy_event: None,
+            device_seq: None,
             rgb_pixels: None,
             gpu: None,
         }

@@ -30,6 +30,12 @@ pub struct NvdecDpbEntry {
     /// A decode surface may only be reused once its occupant is extracted
     /// and no longer a valid reference.
     pub extracted: bool,
+    /// Whether the occupant's mapped surface has actually been unmapped.
+    /// Device-output extraction is asynchronous: the frame is extracted
+    /// (presented) before the D2D copy finishes and the surface is unmapped.
+    /// Until this is set, the surface must not be recycled for a new picture
+    /// even if `extracted` is already true.
+    pub unmapped: bool,
 }
 
 /// DPB manager for NVDEC H.264 decoding.
@@ -125,6 +131,7 @@ impl NvdecDpbManager {
             long_term_frame_idx,
             seq,
             extracted: false,
+            unmapped: false,
         });
 
         pic_index
@@ -146,14 +153,16 @@ impl NvdecDpbManager {
     fn choose_surface(&self) -> i32 {
         for idx in 0..self.max_decode_surfaces {
             if let Some(e) = self.occupant_of(idx) {
-                // Reusable only if already extracted AND not a valid reference.
-                if !e.extracted || (e.is_valid && e.is_reference) {
+                // Reusable only if already extracted, unmapped, and not a
+                // valid reference.
+                if !e.extracted || !e.unmapped || (e.is_valid && e.is_reference) {
                     continue;
                 }
             }
             return idx;
         }
-        self.next_pic_index % self.max_decode_surfaces
+        let fallback = self.next_pic_index % self.max_decode_surfaces;
+        fallback
     }
 
     /// The most recent entry occupying the given decode surface, if any.
@@ -172,6 +181,17 @@ impl NvdecDpbManager {
         for e in &mut self.entries {
             if e.seq == seq {
                 e.extracted = true;
+            }
+        }
+    }
+
+    /// Mark the entry with the given unique sequence id as unmapped: its
+    /// decode surface's mapping has been released and the surface may now be
+    /// recycled (see [`choose_surface`](Self::choose_surface)).
+    pub fn mark_unmapped(&mut self, seq: i32) {
+        for e in &mut self.entries {
+            if e.seq == seq {
+                e.unmapped = true;
             }
         }
     }
@@ -737,6 +757,7 @@ mod tests {
             long_term_frame_idx: Some(0),
             seq: 0,
             extracted: false,
+            unmapped: true,
         });
         dpb.entries.push(NvdecDpbEntry {
             pic_index: 1,
@@ -748,6 +769,7 @@ mod tests {
             long_term_frame_idx: Some(3),
             seq: 1,
             extracted: false,
+            unmapped: true,
         });
 
         // Op 9: unmark all long-term pictures with long_term_pic_num >= 3.
@@ -1136,6 +1158,7 @@ mod tests {
             long_term_frame_idx: Some(4),
             seq: 0,
             extracted: false,
+            unmapped: true,
         });
         dpb.entries.push(NvdecDpbEntry {
             pic_index: 1,
@@ -1147,6 +1170,7 @@ mod tests {
             long_term_frame_idx: Some(5),
             seq: 1,
             extracted: false,
+            unmapped: true,
         });
 
         let mmco = vec![DecRefPicMarkingEntry {
@@ -1177,6 +1201,7 @@ mod tests {
             long_term_frame_idx: Some(0),
             seq: 0,
             extracted: false,
+            unmapped: true,
         });
         dpb.entries.push(NvdecDpbEntry {
             pic_index: 1,
@@ -1188,6 +1213,7 @@ mod tests {
             long_term_frame_idx: Some(1),
             seq: 1,
             extracted: false,
+            unmapped: true,
         });
 
         // Op 3 with max_long_term_frame_idx_plus1=1: invalidate lt idx >= 1
@@ -1218,6 +1244,7 @@ mod tests {
             long_term_frame_idx: Some(3),
             seq: 0,
             extracted: false,
+            unmapped: true,
         });
 
         // Long-term picture with long_term_pic_num=7 (not yet a reference)
@@ -1231,6 +1258,7 @@ mod tests {
             long_term_frame_idx: Some(7),
             seq: 1,
             extracted: false,
+            unmapped: true,
         });
 
         // Mark long_term_pic_num=7 as a reference
@@ -1264,6 +1292,7 @@ mod tests {
                 long_term_frame_idx: Some(lt_idx),
                 seq: i as i32,
                 extracted: false,
+                unmapped: true,
             });
         }
 
