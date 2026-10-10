@@ -19,8 +19,9 @@ pub struct NvdecDpbEntry {
     pub is_reference: bool,
     pub is_long_term: bool,
     pub is_valid: bool,
-    /// Long-term frame index (long_term_pic_num) assigned by MMCO Op 3 or Op 6.
-    /// Only meaningful when is_long_term is true.
+    /// Long-term frame index (long_term_pic_num) assigned by MMCO op 3/op 4
+    /// or the IDR long_term_reference_flag. Only meaningful when
+    /// is_long_term is true.
     pub long_term_frame_idx: Option<u32>,
     /// Unique, non-wrapping picture id assigned at add_frame time.
     /// Unlike pic_index (which wraps at max_decode_surfaces), seq is
@@ -56,7 +57,9 @@ pub struct NvdecDpbManager {
     next_seq: i32,
     max_frame_num: u32,
     current_is_long_term: bool,
-    /// Long-term frame index to assign to the next picture added (from MMCO Op 9).
+    /// Long-term frame index to assign to the next picture added (set by
+    /// [`apply_idr_reset`](Self::apply_idr_reset) for IDRs with
+    /// long_term_reference_flag; per spec 8.2.5.1 that idx is always 0).
     current_long_term_frame_idx: Option<u32>,
     /// Maximum decode surfaces for CurrPicIdx wrapping.
     max_decode_surfaces: i32,
@@ -248,51 +251,56 @@ impl NvdecDpbManager {
     /// header. Must be called AFTER the current picture is added to the DPB,
     /// so the operations affect the DPB state seen by subsequent pictures.
     ///
-    /// Implements the H.264 spec 8.2.1 `memory_management_control_operation`
-    /// values:
-    ///   1 = unmark_short_term                 (value: difference_of_pic_nums_minus1)
-    ///   2 = unmark_long_term                  (value: long_term_pic_num)
-    ///   3 = set_num_long_term                 (value: max_long_term_frame_idx_plus1)
-    ///   4 = mark_short_term_frame_num         (value: difference_of_pic_nums_minus1)
-    ///   5 = mark_long_term_frame_num          (value: long_term_pic_num)
-    ///   6 = mark_future_short_term            (value: difference_of_pic_nums_minus1)
-    ///   7 = mark_future_long_term             (value: long_term_pic_num)
-    ///   8 = unmark_all_short_term             (no value)
-    ///   9 = unmark_all_long_term              (value: long_term_pic_num)
-    /// For ops 1, 4, 6: PicCntX = (frame_num - difference_of_pic_nums_minus1 - 1) mod MaxFrameNum.
+    /// Implements the H.264 spec 7.4.5 `memory_management_control_operation`
+    /// values (the parser emits these exact codes):
+    ///   1 = unmark short-term ref picNumX      (value: difference_of_pic_nums_minus1)
+    ///   2 = unmark long-term ref               (value: long_term_pic_num)
+    ///   3 = mark short-term ref picNumX as long-term
+    ///                                   (value: difference_of_pic_nums_minus1,
+    ///                                    value2: long_term_pic_num)
+    ///   4 = mark the CURRENT picture as long-term (value: long_term_pic_num)
+    ///   5 = set MaxLongTermFrameIdxPlus1       (value: max_long_term_frame_idx_plus1;
+    ///                                   no DPB marking change)
+    ///   6 = unmark ALL short-term refs         (no value)
+    /// Reserved codes (>= 7) are non-conforming and ignored.
+    /// For ops 1 and 3: picNumX = (frame_num - difference_of_pic_nums_minus1 - 1) mod MaxFrameNum.
     pub fn apply_mmco_ops(&mut self, frame_num: u32, slh: &SliceHeader) {
         for entry in &slh.dec_ref_pic_marking {
             // A `value` this large is never legitimate (difference_of_pic_nums_minus1
             // is bounded by MaxFrameNum in practice, long_term_pic_num by 16); it
             // indicates an upstream mis-parse. Treat the op as a no-op rather than
             // risk mis-evicting DPB state.
-            if entry.value > 1024 {
+            if entry.value > 1024 || entry.value2 > 16 {
                 log::debug!(
-                    "MMCO op {}: implausible value={} (frame_num={}); ignoring",
+                    "MMCO op {}: implausible value={}/{} (frame_num={}); ignoring",
                     entry.memory_management_control_operation,
                     entry.value,
+                    entry.value2,
                     frame_num
                 );
                 continue;
             }
             match entry.memory_management_control_operation {
-                // Op 1: unmark_short_term — invalidate the short-term picture
-                // with picNumX.
+                // Op 1: unmark the short-term reference with picNumX.
                 1 => {
                     let pic_num_x = self.compute_pic_num(frame_num, entry.value);
                     for e in &mut self.entries {
-                        if e.is_valid && !e.is_long_term && e.frame_num == pic_num_x {
+                        if e.is_valid
+                            && e.is_reference
+                            && !e.is_long_term
+                            && e.frame_num == pic_num_x
+                        {
                             e.is_valid = false;
                             e.is_reference = false;
                         }
                     }
                 }
 
-                // Op 2: unmark_long_term — invalidate the long-term picture with
-                // the given long_term_pic_num.
+                // Op 2: unmark the long-term reference with LongTermFrameIdx == value.
                 2 => {
                     for e in &mut self.entries {
                         if e.is_valid
+                            && e.is_reference
                             && e.is_long_term
                             && e.long_term_frame_idx == Some(entry.value)
                         {
@@ -302,98 +310,52 @@ impl NvdecDpbManager {
                     }
                 }
 
-                // Op 3: set_num_long_term — invalidate all long-term pictures
-                // with long_term_pic_num >= max_long_term_frame_idx_plus1.
+                // Op 3: mark the short-term reference with picNumX as a long-term
+                // reference with LongTermFrameIdx == value2.
                 3 => {
+                    let pic_num_x = self.compute_pic_num(frame_num, entry.value);
                     for e in &mut self.entries {
                         if e.is_valid
-                            && e.is_long_term
-                            && let Some(idx) = e.long_term_frame_idx
-                            && idx >= entry.value
+                            && e.is_reference
+                            && !e.is_long_term
+                            && e.frame_num == pic_num_x
                         {
-                            e.is_valid = false;
-                            e.is_reference = false;
+                            e.is_long_term = true;
+                            e.long_term_frame_idx = Some(entry.value2);
                         }
                     }
                 }
 
-                // Op 4: mark_short_term_frame_num — mark the short-term picture
-                // with picNumX as a reference.
+                // Op 4: mark the CURRENT picture as a long-term reference with
+                // LongTermFrameIdx == value. The current picture is the entry
+                // added immediately before this call (last_seq).
                 4 => {
-                    let pic_num_x = self.compute_pic_num(frame_num, entry.value);
+                    let cur_seq = self.last_seq();
                     for e in &mut self.entries {
-                        if e.is_valid && !e.is_long_term && e.frame_num == pic_num_x {
-                            e.is_reference = true;
+                        if e.seq == cur_seq && e.is_reference {
+                            e.is_long_term = true;
+                            e.long_term_frame_idx = Some(entry.value);
                         }
                     }
                 }
 
-                // Op 5: mark_long_term_frame_num — mark the long-term picture
-                // with the given long_term_pic_num as a reference.
-                5 => {
-                    for e in &mut self.entries {
-                        if e.is_valid
-                            && e.is_long_term
-                            && e.long_term_frame_idx == Some(entry.value)
-                        {
-                            e.is_reference = true;
-                        }
-                    }
-                }
+                // Op 5: set MaxLongTermFrameIdxPlus1. Constrains future op 3/4
+                // assignments; no DPB marking change itself.
+                5 => {}
 
-                // Op 6: mark_future_short_term — mark the short-term picture
-                // with picNumX as a reference.
+                // Op 6: unmark all short-term references (long-term refs survive).
                 6 => {
-                    let pic_num_x = self.compute_pic_num(frame_num, entry.value);
                     for e in &mut self.entries {
-                        if e.is_valid && !e.is_long_term && e.frame_num == pic_num_x {
-                            e.is_reference = true;
-                        }
-                    }
-                }
-
-                // Op 7: mark_future_long_term — mark the long-term picture with
-                // the given long_term_pic_num as a reference.
-                7 => {
-                    for e in &mut self.entries {
-                        if e.is_valid
-                            && e.is_long_term
-                            && e.long_term_frame_idx == Some(entry.value)
-                        {
-                            e.is_reference = true;
-                        }
-                    }
-                }
-
-                // Op 8: unmark_all_short_term — invalidate all short-term pictures.
-                8 => {
-                    for e in &mut self.entries {
-                        if e.is_valid && !e.is_long_term {
+                        if e.is_valid && e.is_reference && !e.is_long_term {
                             e.is_valid = false;
                             e.is_reference = false;
                         }
                     }
                 }
 
-                // Op 9: unmark_all_long_term — invalidate all long-term pictures
-                // with long_term_frame_idx >= long_term_pic_num.
-                9 => {
-                    for e in &mut self.entries {
-                        if e.is_valid
-                            && e.is_long_term
-                            && let Some(idx) = e.long_term_frame_idx
-                            && idx >= entry.value
-                        {
-                            e.is_valid = false;
-                            e.is_reference = false;
-                        }
-                    }
-                }
-
-                // Op 0: End of MMCO list (should not appear in parsed entries)
-                0 => {}
-
-                _ => {}
+                // Op 0: end of MMCO list (should not appear in parsed entries);
+                // reserved codes (>= 7): non-conforming, ignore.
+                0 | _ => {}
             }
         }
     }
@@ -712,8 +674,22 @@ mod tests {
         dpb.add_frame(5, 10, true);
         dpb.add_frame(10, 20, true);
 
+        // A long-term reference must survive op 6 (spec 7.4.5: short-term only).
+        dpb.entries.push(NvdecDpbEntry {
+            pic_index: 2,
+            frame_num: 3,
+            pic_order_cnt: 6,
+            is_reference: true,
+            is_long_term: true,
+            is_valid: true,
+            long_term_frame_idx: Some(0),
+            seq: 2,
+            extracted: false,
+            unmapped: true,
+        });
+
         let mmco = vec![DecRefPicMarkingEntry {
-            memory_management_control_operation: 8, // unmark_all_short_term
+            memory_management_control_operation: 6, // unmark all short-term
             value: 0,
             value2: 0,
         }];
@@ -722,6 +698,7 @@ mod tests {
 
         assert!(!dpb.entries[0].is_valid);
         assert!(!dpb.entries[1].is_valid);
+        assert!(dpb.entries[2].is_valid, "op 6 must keep long-term refs");
     }
 
     #[test]
@@ -748,44 +725,72 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_mmco_unmark_all_long_term() {
+    fn test_apply_mmco_op3_converts_short_to_long_term() {
         let mut dpb = NvdecDpbManager::new(16);
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 0,
-            frame_num: 0,
-            pic_order_cnt: 0,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(0),
-            seq: 0,
-            extracted: false,
-            unmapped: true,
-        });
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 1,
-            frame_num: 1,
-            pic_order_cnt: 2,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(3),
-            seq: 1,
-            extracted: false,
-            unmapped: true,
-        });
+        dpb.add_frame(5, 10, true);
+        dpb.add_frame(10, 20, true);
 
-        // Op 9: unmark all long-term pictures with long_term_pic_num >= 3.
+        // Current frame_num=10, diff_minus1=4 -> picNumX = 10 - (4+1) = 5.
+        // Op 3: mark that short-term ref as long-term with LongTermFrameIdx 2.
         let mmco = vec![DecRefPicMarkingEntry {
-            memory_management_control_operation: 9,
-            value: 3,
+            memory_management_control_operation: 3,
+            value: 4, // difference_of_pic_nums_minus1
+            value2: 2, // long_term_pic_num
+        }];
+        let slh = make_slice_header(mmco);
+        dpb.apply_mmco(10, &slh, false, false);
+
+        assert!(dpb.entries[0].is_long_term);
+        assert_eq!(dpb.entries[0].long_term_frame_idx, Some(2));
+        assert!(dpb.entries[0].is_reference);
+        assert!(!dpb.entries[1].is_long_term); // untouched
+    }
+
+    #[test]
+    fn test_apply_mmco_op4_marks_current_as_long_term() {
+        let mut dpb = NvdecDpbManager::new(16);
+        dpb.add_frame(5, 10, true);
+        // Current picture (frame 10) is added, THEN op 4 marks it as LT idx 1.
+        dpb.add_frame(10, 20, true);
+
+        let mmco = vec![DecRefPicMarkingEntry {
+            memory_management_control_operation: 4,
+            value: 1, // long_term_pic_num for the current picture
             value2: 0,
         }];
         let slh = make_slice_header(mmco);
-        dpb.apply_mmco(5, &slh, false, false);
+        dpb.apply_mmco(10, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 3, kept
-        assert!(!dpb.entries[1].is_valid); // lt_idx=3 >= 3, unmarked
+        assert!(dpb.entries[1].is_long_term);
+        assert_eq!(dpb.entries[1].long_term_frame_idx, Some(1));
+        assert!(!dpb.entries[0].is_long_term); // previous ref untouched
+    }
+
+    #[test]
+    fn test_apply_mmco_op5_and_reserved_are_noops() {
+        let mut dpb = NvdecDpbManager::new(16);
+        dpb.add_frame(5, 10, true);
+        dpb.add_frame(10, 20, true);
+
+        // Op 5 (set MaxLongTermFrameIdxPlus1) changes no DPB marking; reserved
+        // codes (>= 7) are non-conforming and ignored.
+        let mmco = vec![
+            DecRefPicMarkingEntry {
+                memory_management_control_operation: 5,
+                value: 3,
+                value2: 0,
+            },
+            DecRefPicMarkingEntry {
+                memory_management_control_operation: 9,
+                value: 0,
+                value2: 0,
+            },
+        ];
+        let slh = make_slice_header(mmco);
+        dpb.apply_mmco(15, &slh, false, false);
+
+        assert!(dpb.entries[0].is_valid && dpb.entries[0].is_reference);
+        assert!(dpb.entries[1].is_valid && dpb.entries[1].is_reference);
     }
 
     #[test]
@@ -1150,8 +1155,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mmco_op9_unmark_all_long_term() {
-        // Op 9: unmark all long-term pictures with long_term_pic_num >= value
+    fn test_mmco_reserved_ops_ignored() {
+        // Reserved codes (>= 7) are non-conforming and must not touch DPB state.
         let mut dpb = NvdecDpbManager::new(16);
         dpb.entries.push(NvdecDpbEntry {
             pic_index: 0,
@@ -1165,131 +1170,40 @@ mod tests {
             extracted: false,
             unmapped: true,
         });
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 1,
-            frame_num: 1,
-            pic_order_cnt: 2,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(5),
-            seq: 1,
-            extracted: false,
-            unmapped: true,
-        });
+        dpb.add_frame(5, 10, true);
 
-        let mmco = vec![DecRefPicMarkingEntry {
-            memory_management_control_operation: 9,
-            value: 5, // long_term_pic_num = 5
-            value2: 0,
-        }];
+        let mmco = vec![
+            DecRefPicMarkingEntry {
+                memory_management_control_operation: 7,
+                value: 4,
+                value2: 0,
+            },
+            DecRefPicMarkingEntry {
+                memory_management_control_operation: 8,
+                value: 0,
+                value2: 0,
+            },
+            DecRefPicMarkingEntry {
+                memory_management_control_operation: 9,
+                value: 4,
+                value2: 0,
+            },
+        ];
         let slh = make_slice_header(mmco);
-        dpb.apply_mmco(0, &slh, false, false);
+        dpb.apply_mmco(10, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid); // lt_idx=4 < 5, kept
-        assert!(!dpb.entries[1].is_valid); // lt_idx=5 >= 5, unmarked
+        assert!(dpb.entries[0].is_valid && dpb.entries[0].is_reference);
+        assert!(dpb.entries[1].is_valid && dpb.entries[1].is_reference);
     }
 
     #[test]
-    fn test_mmco_op3_set_num_long_term() {
-        // Op 3: set_num_long_term — invalidate all long-term pictures with
-        // long_term_pic_num >= max_long_term_frame_idx_plus1.
+    fn test_mmco_op5_keeps_all_refs() {
+        // Op 5 (set MaxLongTermFrameIdxPlus1) changes no DPB marking: all
+        // short- and long-term references survive.
         let mut dpb = NvdecDpbManager::new(16);
 
-        // Create long-term references with long_term_pic_num 0 and 1
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 0,
-            frame_num: 0,
-            pic_order_cnt: 0,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(0),
-            seq: 0,
-            extracted: false,
-            unmapped: true,
-        });
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 1,
-            frame_num: 1,
-            pic_order_cnt: 2,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(1),
-            seq: 1,
-            extracted: false,
-            unmapped: true,
-        });
-
-        // Op 3 with max_long_term_frame_idx_plus1=1: invalidate lt idx >= 1
-        let mmco = vec![DecRefPicMarkingEntry {
-            memory_management_control_operation: 3,
-            value: 1,
-            value2: 0,
-        }];
-        let slh = make_slice_header(mmco);
-        dpb.apply_mmco(2, &slh, false, false);
-
-        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 1, kept
-        assert!(!dpb.entries[1].is_valid); // lt_idx=1 >= 1, invalidated
-    }
-
-    #[test]
-    fn test_mmco_op7_mark_future_long_term() {
-        // Op 7: mark the long-term picture with long_term_pic_num as a reference
-        let mut dpb = NvdecDpbManager::new(16);
-
-        // Long-term picture with long_term_pic_num=3 (already a reference)
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 0,
-            frame_num: 0,
-            pic_order_cnt: 0,
-            is_reference: true,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(3),
-            seq: 0,
-            extracted: false,
-            unmapped: true,
-        });
-
-        // Long-term picture with long_term_pic_num=7 (not yet a reference)
-        dpb.entries.push(NvdecDpbEntry {
-            pic_index: 1,
-            frame_num: 1,
-            pic_order_cnt: 2,
-            is_reference: false,
-            is_long_term: true,
-            is_valid: true,
-            long_term_frame_idx: Some(7),
-            seq: 1,
-            extracted: false,
-            unmapped: true,
-        });
-
-        // Mark long_term_pic_num=7 as a reference
-        let mmco = vec![DecRefPicMarkingEntry {
-            memory_management_control_operation: 7,
-            value: 7,
-            value2: 0,
-        }];
-        let slh = make_slice_header(mmco);
-        dpb.apply_mmco(2, &slh, false, false);
-
-        assert!(dpb.entries[0].is_valid);
-        assert!(dpb.entries[0].is_reference); // long_term_pic_num=3 untouched
-        assert!(dpb.entries[1].is_valid);
-        assert!(dpb.entries[1].is_reference); // long_term_pic_num=7 now a reference
-    }
-
-    #[test]
-    fn test_mmco_op3_invalidate_above_max_idx() {
-        // Op 3: invalidate all long-term with long_term_pic_num >= value
-        let mut dpb = NvdecDpbManager::new(16);
-
-        // Add frames with long_term_pic_num 0, 3, 7
-        for (i, lt_idx) in [0u32, 3, 7].into_iter().enumerate() {
+        // Long-term references with LongTermFrameIdx 0 and 3
+        for (i, lt_idx) in [0u32, 3].into_iter().enumerate() {
             dpb.entries.push(NvdecDpbEntry {
                 pic_index: i as i32,
                 frame_num: i as u32,
@@ -1303,19 +1217,43 @@ mod tests {
                 unmapped: true,
             });
         }
+        dpb.add_frame(10, 20, true);
 
-        // Set max_long_term_frame_idx_plus1 = 4 (invalidate idx >= 4)
+        let mmco = vec![DecRefPicMarkingEntry {
+            memory_management_control_operation: 5,
+            value: 4, // max_long_term_frame_idx_plus1
+            value2: 0,
+        }];
+        let slh = make_slice_header(mmco);
+        dpb.apply_mmco(10, &slh, false, false);
+
+        for e in &dpb.entries {
+            assert!(e.is_valid && e.is_reference, "op 5 must not unmark refs");
+        }
+    }
+
+    #[test]
+    fn test_mmco_op3_convert_across_wraparound() {
+        // Op 3 (mark short-term picNumX as long-term) with picNumX computed
+        // across the frame_num wraparound boundary.
+        let mut dpb = NvdecDpbManager::new(16);
+        dpb.set_max_frame_num(64);
+
+        dpb.add_frame(60, 120, true); // previous generation
+        dpb.add_frame(62, 124, true);
+
+        // Current frame_num=3 (wrapped), diff_minus1=4: picNumX = 64 + 3 - 5 = 62.
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 3,
-            value: 4,
-            value2: 0,
+            value: 4, // difference_of_pic_nums_minus1
+            value2: 1, // long_term_pic_num
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(3, &slh, false, false);
 
-        assert!(dpb.entries[0].is_valid); // lt_idx=0 < 4, kept
-        assert!(dpb.entries[1].is_valid); // lt_idx=3 < 4, kept
-        assert!(!dpb.entries[2].is_valid); // lt_idx=7 >= 4, invalidated
+        assert!(dpb.entries[0].is_valid && !dpb.entries[0].is_long_term); // fn=60 untouched
+        assert!(dpb.entries[1].is_long_term); // fn=62 converted
+        assert_eq!(dpb.entries[1].long_term_frame_idx, Some(1));
     }
 
     #[test]
