@@ -812,15 +812,19 @@ impl SwH264Decoder {
             }
         }
 
-        // Reference planes for inter MC (C `t.samples_buffers`).
+        // Reference planes for inter MC (C `t.samples_buffers`). A slot with
+        // no storage (invalid streams may reference freed slots) falls back
+        // to slot 0, which is always allocated (see ensure_slot_storage(0)
+        // in frame setup) and doubles as the dummy buffer for missing refs.
+        let dummy = self
+            .slot_planes
+            .first()
+            .and_then(Option::as_ref)
+            .map_or(std::ptr::null(), |b| unsafe { b.as_ptr().add(PIXEL_MARGIN) });
         let ref_plane_bases: Vec<*const u8> = self
             .slot_planes
             .iter()
-            .map(|p| {
-                p.as_ref().map_or(std::ptr::null(), |b| unsafe {
-                    b.as_ptr().add(PIXEL_MARGIN)
-                })
-            })
+            .map(|p| p.as_ref().map_or(dummy, |b| unsafe { b.as_ptr().add(PIXEL_MARGIN) }))
             .collect();
 
         let mut ctx = SliceContext {

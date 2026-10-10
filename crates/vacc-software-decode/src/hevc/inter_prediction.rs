@@ -1029,6 +1029,9 @@ pub fn decode_prediction_unit_inter(
 /// mirroring C++ `perform_inter_prediction`. Writes `n_samples` = compW*compH
 /// values into `pred_samples`; `pred_l0`/`pred_l1` are caller-provided
 /// scratch of at least `n_samples` (all samples are written before use).
+/// Returns `false` when a referenced picture was missing the plane needed for
+/// this component (corrupted DPB): the affected list is then treated as
+/// absent and the caller must mark the slice segment failed.
 #[allow(clippy::too_many_arguments)]
 pub fn perform_inter_prediction(
     sps: &Sps,
@@ -1051,7 +1054,7 @@ pub fn perform_inter_prediction(
     pred_samples: &mut [i16],
     // MC scratch (>= interpolation::FIR_SCRATCH_MAX samples).
     fir_tmp: &mut [i16],
-) {
+) -> bool {
     let bit_depth = if c_idx == 0 { sps.bit_depth_y } else { sps.bit_depth_c };
 
     // Component dimensions and MV conversion
@@ -1062,6 +1065,7 @@ pub fn perform_inter_prediction(
     let n_samples = (comp_w * comp_h) as usize;
 
     // L0 prediction
+    let mut ok = true;
     let mut pred_flag_l0 = pred_flag_l0;
     if pred_flag_l0 {
         let ref_pic = if ref_idx_l0 >= 0 { dpb.ref_pic_list0(ref_idx_l0) } else { None };
@@ -1073,22 +1077,29 @@ pub fn perform_inter_prediction(
                     let y_int = y_pb + (mv_l0.y as i32 >> 2);
                     let x_frac = mv_l0.x as i32 & 3;
                     let y_frac = mv_l0.y as i32 & 3;
-                    let plane = ref_pic.planes[0].expect("luma plane");
-                    interpolate_luma(
-                        plane.data,
-                        plane.width,
-                        plane.height,
-                        plane.stride,
-                        x_int,
-                        y_int,
-                        x_frac,
-                        y_frac,
-                        comp_w as usize,
-                        comp_h as usize,
-                        bit_depth,
-                        pred_l0,
-                        fir_tmp,
-                    );
+                    match ref_pic.planes[0] {
+                        Some(plane) => interpolate_luma(
+                            plane.data,
+                            plane.width,
+                            plane.height,
+                            plane.stride,
+                            x_int,
+                            y_int,
+                            x_frac,
+                            y_frac,
+                            comp_w as usize,
+                            comp_h as usize,
+                            bit_depth,
+                            pred_l0,
+                            fir_tmp,
+                        ),
+                        // Picture without a luma plane (corrupted DPB): treat
+                        // the list as absent and flag the segment failed.
+                        None => {
+                            ok = false;
+                            pred_flag_l0 = false;
+                        }
+                    }
                 } else {
                     // §8.5.3.3.2: chroma MV derivation from luma MV. For 4:2:0
                     // the luma 1/4-pel value maps to chroma 1/8 pel.
@@ -1098,23 +1109,28 @@ pub fn perform_inter_prediction(
                     let y_int = y_pb_c + (mv_l0.y as i32 >> 3);
                     let x_frac = mv_l0.x as i32 & 7;
                     let y_frac = mv_l0.y as i32 & 7;
-                    let plane = ref_pic.planes[c_idx as usize].expect("chroma plane");
-                    interpolate_chroma(
-                        plane.data,
-                        c_idx,
-                        plane.width,
-                        plane.height,
-                        plane.stride,
-                        x_int,
-                        y_int,
-                        x_frac,
-                        y_frac,
-                        comp_w as usize,
-                        comp_h as usize,
-                        bit_depth,
-                        pred_l0,
-                        fir_tmp,
-                    );
+                    match ref_pic.planes[c_idx as usize] {
+                        Some(plane) => interpolate_chroma(
+                            plane.data,
+                            c_idx,
+                            plane.width,
+                            plane.height,
+                            plane.stride,
+                            x_int,
+                            y_int,
+                            x_frac,
+                            y_frac,
+                            comp_w as usize,
+                            comp_h as usize,
+                            bit_depth,
+                            pred_l0,
+                            fir_tmp,
+                        ),
+                        None => {
+                            ok = false;
+                            pred_flag_l0 = false;
+                        }
+                    }
                 }
             }
             // Nothing wrote predL0: uni/bi selection follows what the list
@@ -1134,22 +1150,27 @@ pub fn perform_inter_prediction(
                     let y_int = y_pb + (mv_l1.y as i32 >> 2);
                     let x_frac = mv_l1.x as i32 & 3;
                     let y_frac = mv_l1.y as i32 & 3;
-                    let plane = ref_pic.planes[0].expect("luma plane");
-                    interpolate_luma(
-                        plane.data,
-                        plane.width,
-                        plane.height,
-                        plane.stride,
-                        x_int,
-                        y_int,
-                        x_frac,
-                        y_frac,
-                        comp_w as usize,
-                        comp_h as usize,
-                        bit_depth,
-                        pred_l1,
-                        fir_tmp,
-                    );
+                    match ref_pic.planes[0] {
+                        Some(plane) => interpolate_luma(
+                            plane.data,
+                            plane.width,
+                            plane.height,
+                            plane.stride,
+                            x_int,
+                            y_int,
+                            x_frac,
+                            y_frac,
+                            comp_w as usize,
+                            comp_h as usize,
+                            bit_depth,
+                            pred_l1,
+                            fir_tmp,
+                        ),
+                        None => {
+                            ok = false;
+                            pred_flag_l1 = false;
+                        }
+                    }
                 } else {
                     let x_pb_c = x_pb / sub_w;
                     let y_pb_c = y_pb / sub_h;
@@ -1157,23 +1178,28 @@ pub fn perform_inter_prediction(
                     let y_int = y_pb_c + (mv_l1.y as i32 >> 3);
                     let x_frac = mv_l1.x as i32 & 7;
                     let y_frac = mv_l1.y as i32 & 7;
-                    let plane = ref_pic.planes[c_idx as usize].expect("chroma plane");
-                    interpolate_chroma(
-                        plane.data,
-                        c_idx,
-                        plane.width,
-                        plane.height,
-                        plane.stride,
-                        x_int,
-                        y_int,
-                        x_frac,
-                        y_frac,
-                        comp_w as usize,
-                        comp_h as usize,
-                        bit_depth,
-                        pred_l1,
-                        fir_tmp,
-                    );
+                    match ref_pic.planes[c_idx as usize] {
+                        Some(plane) => interpolate_chroma(
+                            plane.data,
+                            c_idx,
+                            plane.width,
+                            plane.height,
+                            plane.stride,
+                            x_int,
+                            y_int,
+                            x_frac,
+                            y_frac,
+                            comp_w as usize,
+                            comp_h as usize,
+                            bit_depth,
+                            pred_l1,
+                            fir_tmp,
+                        ),
+                        None => {
+                            ok = false;
+                            pred_flag_l1 = false;
+                        }
+                    }
                 }
             }
             None => pred_flag_l1 = false,
@@ -1186,7 +1212,7 @@ pub fn perform_inter_prediction(
         // The SPS allows bitDepth 16, where 1 << 15 overflows the i16 buffer.
         let grey = (1i32 << (bit_depth - 1)).min(32767);
         pred_samples.iter_mut().take(n_samples).for_each(|p| *p = grey as i16);
-        return;
+        return ok;
     }
 
     // §8.5.3.3.4.1: determine weightedPredFlag
@@ -1225,6 +1251,8 @@ pub fn perform_inter_prediction(
             pred_samples,
         );
     }
+
+    ok
 }
 
 /// Weight table type re-export for the slice header.

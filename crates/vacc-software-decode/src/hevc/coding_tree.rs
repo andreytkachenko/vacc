@@ -154,6 +154,11 @@ pub struct DecodingContext<'bs, 'a> {
     /// the C++ gate `thread_pool && num_workers > 1` (the oracle has no pool).
     pub wpp_enabled: bool,
 
+    /// Set when inter prediction references a picture that lacks the plane it
+    /// needs (corrupted DPB); the enclosing slice segment then reports
+    /// failure instead of panicking.
+    pub inter_pred_failed: bool,
+
     // Reusable MC scratch buffers (grow-only, never re-zeroed): every MC
     // consumer writes all samples of the block it fills (interpolation paths
     // cover the full PU; weighted prediction clips and covers the full block),
@@ -258,6 +263,7 @@ impl<'bs, 'a> DecodingContext<'bs, 'a> {
             wpp_saved_contexts: [CabacContext::default(); NUM_CABAC_CONTEXTS],
             wpp_contexts_available: false,
             wpp_enabled: false,
+            inter_pred_failed: false,
             mc_l0: Vec::new(),
             mc_l1: Vec::new(),
             mc_out: Vec::new(),
@@ -869,6 +875,7 @@ fn decode_wpp_row(
     start_row: i32,
     substream_byte_pos: &[usize],
     sync: &[RowSync],
+    failed: &std::sync::atomic::AtomicBool,
 ) -> usize {
     let sps = g.sps;
     let sh = g.sh;
@@ -938,6 +945,10 @@ fn decode_wpp_row(
     // Final notify for rows that might wait on the last column
     sync[row as usize].complete_col(num_cols - 1);
 
+    if row_ctx.inter_pred_failed {
+        failed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     // This row's reader is private (rows share only the read-only buffer);
     // its final position is where this substream's decode stopped. The max
     // over all rows is the true end of the slice segment. Read via the
@@ -958,10 +969,11 @@ fn decode_wpp_row(
 /// blocked row, its producer is therefore either running or finished — never
 /// queued behind blocked rows — so some worker is always free to make progress.
 ///
-/// Returns the final bit position of the slice segment (max over all rows'
-/// private readers — substreams are laid out sequentially, so only the last
-/// row can reach the true end).
-pub fn decode_wpp_parallel(g: &WppShared, substream_byte_pos: &[usize]) -> usize {
+/// Returns `(ok, final_bit_position)`: the bit position where the segment's
+/// decode stopped (max over all rows' private readers — substreams are laid
+/// out sequentially, so only the last row can reach the true end), and
+/// whether any row hit a corrupted reference plane.
+pub fn decode_wpp_parallel(g: &WppShared, substream_byte_pos: &[usize]) -> (bool, usize) {
     let sps = g.sps;
     let sh = g.sh;
 
@@ -973,23 +985,28 @@ pub fn decode_wpp_parallel(g: &WppShared, substream_byte_pos: &[usize]) -> usize
 
     let sync: Vec<RowSync> = (0..num_rows).map(|_| RowSync::new()).collect();
     let final_pos = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
 
     rayon::scope(|s| {
         let sync = &sync;
         let final_pos = &final_pos;
+        let failed = &failed;
         // Submit worker rows; run the first row on the current thread (same
         // shape as the C++ original: pool jobs + inline front row).
         for r in (start_row + 1)..end_row {
             s.spawn(move |_| {
-                let p = decode_wpp_row(g, r, start_row, substream_byte_pos, sync);
+                let p = decode_wpp_row(g, r, start_row, substream_byte_pos, sync, failed);
                 final_pos.fetch_max(p, std::sync::atomic::Ordering::Relaxed);
             });
         }
-        let p = decode_wpp_row(g, start_row, start_row, substream_byte_pos, sync);
+        let p = decode_wpp_row(g, start_row, start_row, substream_byte_pos, sync, failed);
         final_pos.fetch_max(p, std::sync::atomic::Ordering::Relaxed);
     });
 
-    final_pos.load(std::sync::atomic::Ordering::Relaxed)
+    (
+        !failed.load(std::sync::atomic::Ordering::Acquire),
+        final_pos.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 // ============================================================
@@ -1011,6 +1028,7 @@ pub fn decode_slice_segment_data(
     let sps = ctx.sps;
     let pps = ctx.pps;
     let sh = ctx.sh;
+    ctx.inter_pred_failed = false;
 
     // §7.3.8.1: compute RBSP byte positions of WPP/tile substreams.
     // entry_point_offsets are in bytes of the coded slice data (including EP
@@ -1051,7 +1069,8 @@ pub fn decode_slice_segment_data(
             // is guaranteed by the `&mut ctx` borrow held through `g`
             // (see the SAFETY invariant on WppShared).
             let g = wpp_shared_from_ctx(ctx);
-            return (true, decode_wpp_parallel(&g, &substream_byte_pos));
+            let (ok, pos) = decode_wpp_parallel(&g, &substream_byte_pos);
+            return (ok, pos);
         }
     }
 
@@ -1170,7 +1189,7 @@ pub fn decode_slice_segment_data(
 
     let final_bits = ctx.cabac.bitstream().bits_read();
 
-    (true, final_bits)
+    (!ctx.inter_pred_failed, final_bits)
 }
 
 /// Build a `WppShared` from the current context's references. Exclusive
@@ -1596,7 +1615,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
         let l1 = &mut ctx.mc_l1[..n];
         let out = &mut ctx.mc_out[..n];
         let ft = &mut ctx.fir_tmp[..FIR_SCRATCH_MAX];
-        perform_inter_prediction(
+        if !perform_inter_prediction(
             sps,
             ctx.pps,
             ctx.sh,
@@ -1616,7 +1635,9 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
             l1,
             out,
             ft,
-        );
+        ) {
+            ctx.inter_pred_failed = true;
+        }
         write_mc_block(ctx.pic, 0, x_pb, y_pb, n_pb_w, n_pb_h, out);
     }
     // Chroma (4:2:0)
@@ -1640,7 +1661,7 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
             let l0 = &mut ctx.mc_l0[..c_n];
             let l1 = &mut ctx.mc_l1[..c_n];
             let out = &mut ctx.mc_out[..c_n];
-            perform_inter_prediction(
+            if !perform_inter_prediction(
                 sps,
                 ctx.pps,
                 ctx.sh,
@@ -1660,7 +1681,9 @@ fn mc_write_block(ctx: &mut DecodingContext, x_pb: i32, y_pb: i32, n_pb_w: i32, 
                 l1,
                 out,
                 ft,
-            );
+            ) {
+                ctx.inter_pred_failed = true;
+            }
             write_mc_block(ctx.pic, c as usize, x_c, y_c, c_w, c_h, out);
         }
     }

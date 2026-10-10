@@ -352,6 +352,7 @@ fn decode_rust(
                 wpp_saved_contexts: wpp_saved,
                 wpp_contexts_available: wpp_avail,
                 wpp_enabled,
+                inter_pred_failed: false,
                 mc_l0: Vec::new(),
                 mc_l1: Vec::new(),
                 mc_out: Vec::new(),
