@@ -1,0 +1,16 @@
+[package]
+name = "vacc-vulkan-encode"
+description = "Vulkan Video H.264 encoder backend for vacc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+vacc-vulkan = { workspace = true }
+ash = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]

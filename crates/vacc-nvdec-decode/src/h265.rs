@@ -1477,3 +1477,9 @@ impl Drop for NvdecH265Decoder {
         }
     }
 }
+
+// SAFETY: all raw driver handles live behind `Mutex`es and are only used
+// after rebinding the primary CUDA context; the decoder is used from a
+// single owning thread (see [`NvdecH264Decoder`](crate::NvdecH264Decoder)
+// for the same reasoning), so moving it across threads is safe.
+unsafe impl Send for NvdecH265Decoder {}

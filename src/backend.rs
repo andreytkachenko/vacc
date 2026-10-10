@@ -17,9 +17,12 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// All backends in the default fallback order.
+    /// All backends in the default decode fallback order.
     pub const ALL: [Backend; 4] =
         [Backend::Vulkan, Backend::Nvdec, Backend::Vaapi, Backend::Software];
+
+    /// All encode-capable backends in the default encode fallback order.
+    pub const ENCODE_ALL: [Backend; 4] = [Backend::Vulkan, Backend::Nvdec, Backend::Vaapi, Backend::Software];
 
     /// Backend name (as used in logs and config strings).
     pub fn name(self) -> &'static str {

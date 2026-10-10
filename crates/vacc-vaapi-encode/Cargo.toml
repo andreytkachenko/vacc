@@ -1,0 +1,16 @@
+[package]
+name = "vacc-vaapi-encode"
+description = "VAAPI Video Encode implementation with Encoder trait"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+libva = { package = "cros-libva", git = "https://github.com/andreytkachenko/cros-libva.git", rev = "cd5759b72a2978b4d2d14282b196889636888b61" }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+pkg-config = "0.3"

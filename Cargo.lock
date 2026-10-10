@@ -1188,10 +1188,14 @@ dependencies = [
  "vacc-image",
  "vacc-npp",
  "vacc-nvdec-decode",
+ "vacc-nvenc-encode",
  "vacc-software-decode",
+ "vacc-software-encode",
  "vacc-vaapi-decode",
+ "vacc-vaapi-encode",
  "vacc-vkimage",
  "vacc-vulkan-decode",
+ "vacc-vulkan-encode",
 ]
 
 [[package]]
@@ -1262,6 +1266,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-nvenc-encode"
+version = "0.1.1"
+dependencies = [
+ "libloading",
+ "log",
+ "thiserror 2.0.20",
+ "vacc-core",
+]
+
+[[package]]
 name = "vacc-parser"
 version = "0.1.1"
 dependencies = [
@@ -1286,6 +1300,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-software-encode"
+version = "0.1.1"
+dependencies = [
+ "rayon",
+ "thiserror 2.0.20",
+ "vacc-core",
+ "vacc-parser",
+ "vacc-software-decode",
+]
+
+[[package]]
 name = "vacc-vaapi-decode"
 version = "0.1.1"
 dependencies = [
@@ -1297,6 +1322,17 @@ dependencies = [
  "vacc-core",
  "vacc-golden-tests",
  "vacc-parser",
+]
+
+[[package]]
+name = "vacc-vaapi-encode"
+version = "0.1.1"
+dependencies = [
+ "cros-libva",
+ "log",
+ "pkg-config",
+ "thiserror 2.0.20",
+ "vacc-core",
 ]
 
 [[package]]
@@ -1346,6 +1382,17 @@ dependencies = [
  "thiserror 2.0.20",
  "vacc-core",
  "vacc-golden-tests",
+ "vacc-vulkan",
+]
+
+[[package]]
+name = "vacc-vulkan-encode"
+version = "0.1.1"
+dependencies = [
+ "ash",
+ "log",
+ "thiserror 2.0.20",
+ "vacc-core",
  "vacc-vulkan",
 ]
 

@@ -6,15 +6,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Each decode backend is a compile-time feature (all on by default). Build
-# with a subset, e.g.:
+# Each GPU backend is a compile-time feature (all on by default); a backend
+# feature enables both its decode and encode crates. Build with a subset,
+# e.g.:
 #   cargo build -p vacc --no-default-features --features "vaapi sw"
 [features]
 default = ["vulkan", "nvdec", "vaapi", "sw"]
-vulkan = ["dep:vacc-vulkan-decode"]
-nvdec = ["dep:vacc-nvdec-decode"]
-vaapi = ["dep:vacc-vaapi-decode"]
-sw = ["dep:vacc-software-decode"]
+vulkan = ["dep:vacc-vulkan-decode", "dep:vacc-vulkan-encode"]
+nvdec = ["dep:vacc-nvdec-decode", "dep:vacc-nvenc-encode"]
+vaapi = ["dep:vacc-vaapi-decode", "dep:vacc-vaapi-encode"]
+sw = ["dep:vacc-software-decode", "dep:vacc-software-encode"]
 
 [dependencies]
 vacc-core = { workspace = true }
@@ -27,6 +28,10 @@ vacc-vulkan-decode = { workspace = true, optional = true }
 vacc-nvdec-decode = { workspace = true, optional = true }
 vacc-vaapi-decode = { workspace = true, optional = true }
 vacc-software-decode = { workspace = true, optional = true }
+vacc-software-encode = { workspace = true, optional = true }
+vacc-vulkan-encode = { workspace = true, optional = true }
+vacc-nvenc-encode = { workspace = true, optional = true }
+vacc-vaapi-encode = { workspace = true, optional = true }
 
 [workspace]
 members = [
@@ -40,7 +45,11 @@ members = [
     "crates/vacc-vulkan-common",
     "crates/vacc-examples",
     "crates/vacc-vaapi-decode",
+    "crates/vacc-vaapi-encode",
+    "crates/vacc-nvenc-encode",
+    "crates/vacc-vulkan-encode",
     "crates/vacc-software-decode",
+    "crates/vacc-software-encode",
     "crates/vacc-golden-tests",
     "crates/vacc-npp",
     "crates/vacc-vkimage",
@@ -64,7 +73,11 @@ vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.1" }
 vacc-parser = { path = "crates/vacc-parser", version = "0.1.1" }
 vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.1" }
 vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.1" }
+vacc-vaapi-encode = { path = "crates/vacc-vaapi-encode", version = "0.1.1" }
+vacc-nvenc-encode = { path = "crates/vacc-nvenc-encode", version = "0.1.1" }
+vacc-vulkan-encode = { path = "crates/vacc-vulkan-encode", version = "0.1.1" }
 vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.1" }
+vacc-software-encode = { path = "crates/vacc-software-encode", version = "0.1.1" }
 vacc-golden-tests = { path = "crates/vacc-golden-tests", version = "0.1.1" }
 vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.1" }
 vacc-vulkan-common = { path = "crates/vacc-vulkan-common", version = "0.1.1" }

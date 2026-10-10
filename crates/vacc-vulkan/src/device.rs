@@ -78,6 +78,7 @@ pub enum VideoCodec {
     DecodeH265,
     DecodeAv1,
     DecodeVp9,
+    EncodeH264,
 }
 
 impl VideoCodec {
@@ -89,6 +90,7 @@ impl VideoCodec {
             Self::DecodeVp9 => {
                 vk::VideoCodecOperationFlagsKHR::from_raw(vp9_vk_constants::DECODE_VP9)
             }
+            Self::EncodeH264 => vk::VideoCodecOperationFlagsKHR::ENCODE_H264,
         }
     }
 }
@@ -249,10 +251,14 @@ impl VideoDeviceBuilder {
             })
             .collect();
 
-        let mut instance_extensions: Vec<CString> = vec![
-            CString::new("VK_KHR_surface").unwrap(),
-            CString::new("VK_KHR_get_physical_device_properties2").unwrap(),
-        ];
+        // Enable only if the loader exposes them — headless/minimal loaders
+        // may not provide VK_KHR_surface (not needed for video encode/decode).
+        let mut instance_extensions: Vec<CString> = Vec::new();
+        for ext_name in ["VK_KHR_surface", "VK_KHR_get_physical_device_properties2"] {
+            if available_ext_names.iter().any(|n| n == ext_name) {
+                instance_extensions.push(CString::new(ext_name).unwrap());
+            }
+        }
         let mut layers: Vec<CString> = Vec::new();
         let mut has_validation = false;
         if builder.enable_validation {
@@ -377,7 +383,7 @@ impl VideoDeviceBuilder {
 
     fn select_physical_device(
         instance: &ash::Instance,
-        _builder: &VideoDeviceBuilder,
+        builder: &VideoDeviceBuilder,
     ) -> VideoResult<(vk::PhysicalDevice, QueueFamilies)> {
         let physical_devices = unsafe { instance.enumerate_physical_devices() }.map_err(|e| {
             VideoError::VulkanInit(format!("Failed to enumerate physical devices: {}", e))
@@ -435,6 +441,7 @@ impl VideoDeviceBuilder {
             }
 
             let mut decode_queue_family: Option<u32> = None;
+            let mut encode_queue_family: Option<u32> = None;
             let mut graphics_queue_family: Option<u32> = None;
             let mut transfer_queue_family: Option<u32> = None;
             let mut compute_queue_family: Option<u32> = None;
@@ -445,6 +452,11 @@ impl VideoDeviceBuilder {
                     && decode_queue_family.is_none()
                 {
                     decode_queue_family = Some(i);
+                }
+                if qf.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR)
+                    && encode_queue_family.is_none()
+                {
+                    encode_queue_family = Some(i);
                 }
                 if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                     && graphics_queue_family.is_none()
@@ -463,7 +475,15 @@ impl VideoDeviceBuilder {
                 }
             }
 
-            if let Some(decode_qf) = decode_queue_family {
+            let want_encode = builder
+                .video_codecs
+                .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264);
+            let has_required_queue = if want_encode {
+                encode_queue_family.is_some()
+            } else {
+                decode_queue_family.is_some()
+            };
+            if has_required_queue {
                 if diag {
                     let props = unsafe { instance.get_physical_device_properties(pd) };
                     let name: String = props
@@ -477,9 +497,11 @@ impl VideoDeviceBuilder {
                 let queue_families = QueueFamilies {
                     graphics: graphics_queue_family,
                     compute: compute_queue_family,
-                    transfer: transfer_queue_family.or(Some(decode_qf)),
+                    transfer: transfer_queue_family
+                        .or(decode_queue_family)
+                        .or(encode_queue_family),
                     video_decode: decode_queue_family,
-                    video_encode: None,
+                    video_encode: encode_queue_family,
                     present: None,
                 };
                 return Ok((pd, queue_families));
@@ -487,7 +509,14 @@ impl VideoDeviceBuilder {
         }
 
         Err(VideoError::VideoNotSupported(
-            "No physical device with video decode queue found".to_string(),
+            if builder
+                .video_codecs
+                .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+            {
+                "No physical device with video encode queue found".to_string()
+            } else {
+                "No physical device with video decode queue found".to_string()
+            },
         ))
     }
 
@@ -614,6 +643,23 @@ impl VideoDeviceBuilder {
             }
         }
 
+        // Encode extensions (VK_KHR_video_encode_queue is required for H.264 encode)
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+        {
+            for ext in ["VK_KHR_video_encode_queue", "VK_KHR_video_encode_h264"] {
+                if available_names.iter().any(|n| n.as_str() == ext) {
+                    extensions.push(ext);
+                } else {
+                    eprintln!(
+                        "[VideoDeviceBuilder] WARNING: {} not available (H.264 encode not supported)",
+                        ext
+                    );
+                }
+            }
+        }
+
         let c_extensions: Vec<CString> = extensions
             .iter()
             .map(|e| CString::new(*e).unwrap())
@@ -654,6 +700,18 @@ impl VideoDeviceBuilder {
                 vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(qf)
                     .queue_priorities(&queue_priorities),
+            );
+        }
+
+        // Encode queue (skip when the family already got a decode queue —
+        // Intel/NVIDIA video queue families usually carry both flags).
+        if let Some(qf) = queue_families.video_encode
+            && !queue_create_infos.iter().any(|ci| ci.queue_family_index == qf)
+        {
+            queue_create_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&[1.0f32]),
             );
         }
 
@@ -751,6 +809,11 @@ impl VulkanDevice {
         luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
         chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
     ) -> VideoResult<vk::VideoCapabilitiesKHR<'_>> {
+        if codec == VideoCodec::EncodeH264 {
+            return Err(VideoError::InvalidState(
+                "query_video_capabilities is decode-only; use query_video_encode_capabilities_h264".into(),
+            ));
+        }
         let codec_op = codec.to_vk_flag();
 
         // Build profile info chain - structs must live for entire function duration
@@ -791,6 +854,7 @@ impl VulkanDevice {
                 VideoCodec::DecodeH265 => &h265_profile as *const _ as *const _,
                 VideoCodec::DecodeAv1 => &av1_profile as *const _ as *const _,
                 VideoCodec::DecodeVp9 => &vp9_profile as *const _ as *const _,
+                VideoCodec::EncodeH264 => std::ptr::null(),
             },
             video_codec_operation: codec_op,
             chroma_subsampling,
@@ -851,6 +915,7 @@ impl VulkanDevice {
                     );
                     decode_caps.p_next = &mut vp9_caps as *mut _ as *mut _;
                 }
+                VideoCodec::EncodeH264 => {}
             }
 
             // Top-level capabilities: caps -> decode_caps
@@ -912,6 +977,82 @@ impl VulkanDevice {
         };
 
         Ok(caps)
+    }
+
+    /// Query H.264 **encode** capabilities for a given profile / chroma / bit depth.
+    ///
+    /// Returns the generic `VkVideoCapabilitiesKHR` plus the encode-specific
+    /// `VkVideoEncodeCapabilitiesKHR` and `VkVideoEncodeH264CapabilitiesKHR`.
+    pub fn query_video_encode_capabilities_h264(
+        &self,
+        profile_idc: u32,
+        chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    ) -> VideoResult<(
+        vk::VideoCapabilitiesKHR<'_>,
+        vk::VideoEncodeCapabilitiesKHR<'_>,
+        vk::VideoEncodeH264CapabilitiesKHR<'_>,
+    )> {
+        let h264_profile = vk::VideoEncodeH264ProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            std_profile_idc: profile_idc,
+            _marker: Default::default(),
+        };
+
+        let profile_info = vk::VideoProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+            p_next: &h264_profile as *const _ as *const _,
+            video_codec_operation: vk::VideoCodecOperationFlagsKHR::ENCODE_H264,
+            chroma_subsampling,
+            luma_bit_depth,
+            chroma_bit_depth,
+            _marker: Default::default(),
+        };
+        let profile_ptr: *const vk::VideoProfileInfoKHR = &profile_info;
+
+        let get_caps_fn = unsafe {
+            self.entry.get_instance_proc_addr(
+                self.instance.handle(),
+                c"vkGetPhysicalDeviceVideoCapabilitiesKHR".as_ptr(),
+            )
+        }
+        .ok_or_else(|| {
+            VideoError::CapabilityNotAvailable(
+                "vkGetPhysicalDeviceVideoCapabilitiesKHR not found".to_string(),
+            )
+        })?;
+
+        let (caps, encode_caps, h264_caps) = unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::PhysicalDevice,
+                *const vk::VideoProfileInfoKHR<'_>,
+                *mut vk::VideoCapabilitiesKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = std::mem::transmute(get_caps_fn);
+
+            // Chain: VideoCapabilitiesKHR -> VideoEncodeCapabilitiesKHR -> VideoEncodeH264CapabilitiesKHR
+            let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
+            let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+            encode_caps.s_type = vk::StructureType::VIDEO_ENCODE_CAPABILITIES_KHR;
+            encode_caps.p_next = &mut h264_caps as *mut _ as *mut _;
+
+            let mut caps = vk::VideoCapabilitiesKHR::default();
+            caps.p_next = &mut encode_caps as *mut _ as *mut _;
+
+            let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
+            if result != vk::Result::SUCCESS {
+                return Err(VideoError::CapabilityNotAvailable(format!(
+                    "vkGetPhysicalDeviceVideoCapabilitiesKHR (H.264 encode) failed: {:?}",
+                    result
+                )));
+            }
+
+            (caps, encode_caps, h264_caps)
+        };
+
+        Ok((caps, encode_caps, h264_caps))
     }
 
     /// Query supported video formats for a codec.

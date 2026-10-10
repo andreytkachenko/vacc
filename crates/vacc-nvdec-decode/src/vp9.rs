@@ -1908,3 +1908,8 @@ mod tests {
         assert_eq!(dpb.choose_output_slot(), 0);
     }
 }
+
+// SAFETY: all raw driver handles live behind `Mutex`es and are only used
+// after rebinding the primary CUDA context; the decoder is used from a
+// single owning thread, so moving it across threads is safe.
+unsafe impl Send for NvdecVp9Decoder {}

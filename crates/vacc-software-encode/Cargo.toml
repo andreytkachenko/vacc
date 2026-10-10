@@ -1,0 +1,16 @@
+[package]
+name = "vacc-software-encode"
+description = "Pure-Rust software H.264/AVC encoder: the `sw` encode backend (CABAC/CAVLC, B-frames, rate control)"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+vacc-software-decode = { workspace = true }
+vacc-parser = { workspace = true }

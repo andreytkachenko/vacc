@@ -5487,3 +5487,9 @@ fn vp9_segment_params(fd: &Vp9FrameData) -> [SegmentParameterVP9; 8] {
     }
     out
 }
+
+// SAFETY: the libva display/context handles are process-global and every
+// operation re-enters the VA API through its thread-safe entry points; the
+// decoder is used from a single owning decode thread, so moving it across
+// threads is safe.
+unsafe impl Send for VaapiDecoder {}

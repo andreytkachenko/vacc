@@ -26,15 +26,15 @@ fn format_failures(failures: &[BackendFailure]) -> String {
         .join("\n")
 }
 
-/// Errors from the unified decoder.
+/// Errors from the unified decode/encode API.
 #[derive(Debug, Error)]
 pub enum UnifiedError {
-    /// Every backend in the configured order failed to initialize the stream.
-    #[error("all configured backends failed to initialize the stream:\n{details}", details = format_failures(failures))]
+    /// Every backend in the configured order failed to initialize.
+    #[error("all configured backends failed to initialize:\n{details}", details = format_failures(failures))]
     AllBackendsFailed { failures: Vec<BackendFailure> },
 
     /// The configured backend list is empty.
-    #[error("decoder config contains no backends")]
+    #[error("config contains no backends")]
     EmptyBackendOrder,
 
     /// The input codec could not be detected (needed by backends that have
@@ -46,8 +46,8 @@ pub enum UnifiedError {
     #[error("{message}")]
     Unsupported { message: String },
 
-    /// A runtime error from the active backend (decode, flush, ...).
-    #[error("decoder backend error: {source}")]
+    /// A runtime error from the active backend (decode, encode, flush, ...).
+    #[error("backend error: {source}")]
     Backend { source: Box<dyn std::error::Error + Send + Sync> },
 
     /// Post-decode image processing (scale / Y'CbCr -> RGB) failed.

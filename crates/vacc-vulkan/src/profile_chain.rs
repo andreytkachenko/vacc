@@ -220,6 +220,7 @@ fn create_image_with_profile_chain(
     let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default();
     let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default();
     let mut vp9_profile = super::vp9::VideoDecodeVP9ProfileInfoKHR::default();
+    let mut h264_encode_profile = vk::VideoEncodeH264ProfileInfoKHR::default();
 
     let profile_next: *const std::ffi::c_void = match codec {
         VideoCodec::DecodeH264 => {
@@ -246,6 +247,12 @@ fn create_image_with_profile_chain(
             vp9_profile.p_next = std::ptr::null();
             vp9_profile.std_profile = profile_idc;
             &vp9_profile as *const _ as *const std::ffi::c_void
+        }
+        VideoCodec::EncodeH264 => {
+            h264_encode_profile.s_type = vk::StructureType::VIDEO_ENCODE_H264_PROFILE_INFO_KHR;
+            h264_encode_profile.p_next = std::ptr::null();
+            h264_encode_profile.std_profile_idc = profile_idc;
+            &h264_encode_profile as *const _ as *const std::ffi::c_void
         }
     };
 

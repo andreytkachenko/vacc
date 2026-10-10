@@ -23,7 +23,7 @@
 //! via [`cu_ctx_set_current()`], which must be called before each CUDA API
 //! invocation on a given thread.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
@@ -203,6 +203,10 @@ unsafe impl Sync for CtxPtr {}
 
 static CUDA_CTX: OnceLock<CtxPtr> = OnceLock::new();
 
+/// Device index of the shared primary context (needed to re-retain it after
+/// an in-process reset, see [`heal_primary_ctx`]).
+static CUDA_DEVICE: OnceLock<i32> = OnceLock::new();
+
 /// Serializes one-time library/context initialization so concurrent
 /// initializers don't race the `OnceLock::set` calls.
 static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -210,20 +214,7 @@ static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Bind the shared CUDA context to the calling thread (contexts are
 /// thread-local). Errors if initialization has not completed.
 fn bind_current_context() -> NvdecResult<()> {
-    let ctx = CUDA_CTX
-        .get()
-        .ok_or_else(|| NvdecError::LibLoadError("CUDA context not initialized".into()))?;
-    let (_, funcs) = CUDA_LIB
-        .get()
-        .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
-    let result = unsafe { (funcs.cu_ctx_set_current)(ctx.0) };
-    if result != CUDA_SUCCESS {
-        return Err(NvdecError::CudaError(format!(
-            "cuCtxSetCurrent failed with error {}",
-            result
-        )));
-    }
-    Ok(())
+    bind_primary_ctx()
 }
 
 /// Initialize CUDA driver API (idempotent; thread-safe).
@@ -266,6 +257,7 @@ fn init_cuda() -> NvdecResult<()> {
             result
         )));
     }
+    CUDA_DEVICE.set(device).ok();
 
     // Use the device's PRIMARY context, shared with every other CUDA user in
     // this process (cudarc, ORT). A private context makes cross-context
@@ -643,8 +635,10 @@ fn load_nvdec_lib() -> NvdecResult<(Library, NvdecFuncs)> {
     // Try common paths for libnvcuvid.so
     let lib_paths = [
         "libnvcuvid.so",
+        "libnvcuvid.so.1",
         "/usr/lib/libnvcuvid.so",
         "/usr/lib/x86_64-linux-gnu/libnvcuvid.so",
+        "/usr/lib/x86_64-linux-gnu/libnvcuvid.so.1",
         "/usr/local/cuda/lib64/stubs/libnvcuvid.so",
     ];
 
@@ -839,7 +833,62 @@ pub fn cu_ctx_set_current() -> NvdecResult<u32> {
     let (_, funcs) = CUDA_LIB
         .get()
         .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
+    let code = unsafe { (funcs.cu_ctx_set_current)(ctx.0) };
+    if code == CUDA_ERROR_DEINITIALIZED {
+        return heal_primary_ctx(funcs);
+    }
+    Ok(code)
+}
+
+/// Re-activate the shared primary context after another in-process CUDA user
+/// reset it, then re-bind it on the calling thread.
+///
+/// Observed failure: with NVDEC decoders running and an ORT TensorRT session
+/// being created concurrently (device-resident inference pool), the shared
+/// primary context can end up inactive — `cuCtxSetCurrent` then fails with
+/// [`CUDA_ERROR_DEINITIALIZED`] and every subsequent driver call on vacc
+/// resources fails (`cuvidMapVideoFrame64: 208`, event syncs, ...). The
+/// primary context handle is stable across retain/release cycles, so a plain
+/// re-retain + re-bind restores the binding. NOTE: if the context was truly
+/// RESET (not merely deactivated), resources created before the reset are
+/// gone; they will then fail with invalid-handle errors, which is loud and
+/// diagnosable rather than a silent hang.
+fn heal_primary_ctx(funcs: &CudaFuncs) -> NvdecResult<u32> {
+    let ctx = CUDA_CTX
+        .get()
+        .ok_or_else(|| NvdecError::LibLoadError("CUDA context not initialized".into()))?;
+    let device = CUDA_DEVICE.get().copied().unwrap_or_else(|| {
+        let mut d: i32 = 0;
+        if unsafe { (funcs.cu_device_get)(&mut d, 0) } != CUDA_SUCCESS {
+            0
+        } else {
+            d
+        }
+    });
+    eprintln!(
+        "[NVDEC] shared primary CUDA context inactive (reset by another in-process CUDA user); re-retaining device {device}"
+    );
+    let mut healed: *mut std::ffi::c_void = std::ptr::null_mut();
+    let code = unsafe { (funcs._cu_device_primary_ctx_retain)(&mut healed, device) };
+    if code != CUDA_SUCCESS {
+        return Err(NvdecError::CudaError(format!(
+            "primary ctx re-retain failed with error {code}"
+        )));
+    }
     Ok(unsafe { (funcs.cu_ctx_set_current)(ctx.0) })
+}
+
+/// Bind the shared primary context to the calling thread, self-healing an
+/// inactive (reset) context on the way. Shared by [`bind_current_context`]
+/// and [`ensure_ctx`].
+fn bind_primary_ctx() -> NvdecResult<()> {
+    match cu_ctx_set_current() {
+        Ok(code) if code == CUDA_SUCCESS => Ok(()),
+        Ok(code) => Err(NvdecError::CudaError(format!(
+            "cuCtxSetCurrent failed with error {code}"
+        ))),
+        Err(e) => Err(e),
+    }
 }
 
 /// Check if NVDEC is available on the system.
@@ -1026,6 +1075,10 @@ pub const CU_EVENT_DISABLE_TIMING: u32 = 2;
 /// Result of [`cu_event_query`]: the event has not completed yet. Not an
 /// error condition — just "still pending".
 pub const CUDA_ERROR_NOT_READY: u32 = 600;
+
+/// `cuCtxSetCurrent` on a context that was deactivated/reset by another
+/// in-process CUDA user (e.g. an ORT TensorRT session init/teardown).
+pub const CUDA_ERROR_DEINITIALIZED: u32 = 4;
 
 /// Create a CUDA event with [`CU_EVENT_DISABLE_TIMING`] (cross-context use,
 /// no timing overhead).
@@ -1251,4 +1304,394 @@ pub unsafe fn cu_memcpy_dtoh(
         .get()
         .ok_or_else(|| NvdecError::LibLoadError("CUDA not initialized".into()))?;
     Ok(unsafe { (funcs.cu_memcpy_dtoh)(dst, src, size) })
+}
+
+// ---------------------------------------------------------------------------
+// Safe RAII handles
+//
+// The raw `cu_*` functions above take/return raw driver handles and several
+// of them are `unsafe`. These wrappers own their handles, confine every
+// unsafe driver call to this crate, and are `Send + Sync` so they can be
+// shared across threads (decode thread -> inference pool -> frame drop on
+// any worker) without `unsafe impl`s at the call sites.
+// ---------------------------------------------------------------------------
+
+/// Bind the process-wide primary CUDA context to the calling thread.
+///
+/// Driver calls require a current context; frames and their handles may be
+/// dropped on any thread, so every public method in this section binds it
+/// first. Errors are propagated (a missing library means CUDA never
+/// initialized) — `Drop` impls below treat them as best-effort.
+fn ensure_ctx() -> NvdecResult<()> {
+    bind_primary_ctx()
+}
+
+/// Owning CUDA stream handle (RAII).
+///
+/// The stream is destroyed on drop, after a best-effort synchronize:
+/// destroying a stream with work in flight is undefined behavior.
+pub struct CuStream {
+    ptr: *mut std::ffi::c_void,
+}
+
+// Raw driver handle; the stream is only ever touched through this type's
+// methods (which bind the context) or by name via [`CuStream::raw`].
+unsafe impl Send for CuStream {}
+unsafe impl Sync for CuStream {}
+
+impl CuStream {
+    /// Create a new default stream.
+    pub fn new() -> NvdecResult<Self> {
+        cu_stream_create().map(|ptr| Self { ptr })
+    }
+
+    /// Raw `CUstream` handle (interop with other CUDA toolkits). Valid while
+    /// this stream is alive.
+    pub const fn raw(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Block until all work enqueued on this stream has completed.
+    pub fn synchronize(&self) -> NvdecResult<()> {
+        ensure_ctx()?;
+        unsafe { cu_stream_synchronize(self.ptr) }.map(|_| ())
+    }
+
+    /// Enqueue a stream-ordered wait on an event recorded elsewhere.
+    pub fn wait_event(&self, event: &CuEvent) -> NvdecResult<()> {
+        ensure_ctx()?;
+        unsafe { cu_stream_wait_event(self.ptr, event.ptr) }.map(|_| ())
+    }
+
+    /// Record an event on this stream: it is signaled once all work enqueued
+    /// before this call has completed.
+    pub fn record_event(&self, event: &CuEvent) -> NvdecResult<()> {
+        ensure_ctx()?;
+        unsafe { cu_event_record(event.ptr, self.ptr) }.map(|_| ())
+    }
+}
+
+impl Drop for CuStream {
+    fn drop(&mut self) {
+        let _ = ensure_ctx();
+        let _ = unsafe { cu_stream_synchronize(self.ptr) };
+        let _ = unsafe { cu_stream_destroy(self.ptr) };
+    }
+}
+
+/// Owning CUDA event handle (RAII). Created with [`CU_EVENT_DISABLE_TIMING`]
+/// so it can be waited on across contexts.
+pub struct CuEvent {
+    ptr: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for CuEvent {}
+unsafe impl Sync for CuEvent {}
+
+impl CuEvent {
+    /// Create a new event.
+    pub fn new() -> NvdecResult<Self> {
+        cu_event_create().map(|ptr| Self { ptr })
+    }
+
+    /// Raw `CUevent` handle (interop with other CUDA toolkits). Valid while
+    /// this event is alive.
+    pub const fn raw(&self) -> *const std::ffi::c_void {
+        self.ptr as *const std::ffi::c_void
+    }
+
+    /// Record on a stream: signaled once all work enqueued before this call
+    /// has completed. Re-recording resets the event to pending immediately.
+    pub fn record(&self, stream: &CuStream) -> NvdecResult<()> {
+        ensure_ctx()?;
+        unsafe { cu_event_record(self.ptr, stream.ptr) }.map(|_| ())
+    }
+
+    /// Block the host until the event is signaled.
+    pub fn synchronize(&self) -> NvdecResult<()> {
+        ensure_ctx()?;
+        unsafe { cu_event_synchronize(self.ptr) }.map(|_| ())
+    }
+
+    /// Non-blocking check: `true` once the event is signaled.
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            ensure_ctx().and_then(|()| unsafe { cu_event_query(self.ptr) }),
+            Ok(CUDA_SUCCESS)
+        )
+    }
+
+    /// A non-owning shared view of this event for
+    /// [`vacc_core::gpu::GpuFrame`]s. The frame clones do not extend the
+    /// lifetime of the underlying handle: it stays owned by this `CuEvent`.
+    pub fn view(&self) -> vacc_core::gpu::GpuEvent {
+        vacc_core::gpu::GpuEvent::wrap(Arc::new(CuEventView(self.ptr)))
+    }
+}
+
+impl Drop for CuEvent {
+    fn drop(&mut self) {
+        // Callers must have ordered any stream that waited on this event
+        // (a pending wait on a destroyed event is undefined behavior).
+        let _ = ensure_ctx();
+        let _ = unsafe { cu_event_destroy(self.ptr) };
+    }
+}
+
+/// Non-owning view over a live `CUevent` implementing the backend-agnostic
+/// [`vacc_core::gpu::EventHandle`] interface. The event itself is owned by a
+/// [`CuEvent`] (e.g. a ring slot barrier or a decoder's copy-event pool).
+pub struct CuEventView(*const std::ffi::c_void);
+
+impl CuEventView {
+    /// A view over a live `CUevent` owned elsewhere (e.g. an event from a
+    /// decoder's copy-event pool). The handle must outlive every use of the
+    /// resulting view.
+    pub const fn new(event: *const std::ffi::c_void) -> Self {
+        Self(event)
+    }
+}
+
+unsafe impl Send for CuEventView {}
+unsafe impl Sync for CuEventView {}
+
+impl vacc_core::gpu::EventHandle for CuEventView {
+    fn synchronize(&self) -> Result<(), String> {
+        ensure_ctx().map_err(|e| e.to_string())?;
+        unsafe { cu_event_synchronize(self.0 as *mut std::ffi::c_void) }
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            ensure_ctx().and_then(|()| unsafe { cu_event_query(self.0 as *mut std::ffi::c_void) }),
+            Ok(CUDA_SUCCESS)
+        )
+    }
+
+    fn raw(&self) -> *const std::ffi::c_void {
+        self.0
+    }
+
+    fn wait_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String> {
+        ensure_ctx().map_err(|e| e.to_string())?;
+        unsafe { cu_stream_wait_event(stream as *mut std::ffi::c_void, self.0 as *mut std::ffi::c_void) }
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn record_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String> {
+        ensure_ctx().map_err(|e| e.to_string())?;
+        unsafe { cu_event_record(self.0 as *mut std::ffi::c_void, stream as *mut std::ffi::c_void) }
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Owning device memory allocation (RAII). Freed on drop after binding the
+/// primary context; the free is best-effort (CUDA may already be torn down
+/// by then).
+pub struct DeviceBuffer {
+    ptr: crate::ffi::CUdeviceptr,
+    len: usize,
+}
+
+unsafe impl Send for DeviceBuffer {}
+unsafe impl Sync for DeviceBuffer {}
+
+impl DeviceBuffer {
+    /// Allocate `len` bytes of device memory.
+    pub fn alloc(len: usize) -> NvdecResult<Self> {
+        cu_mem_alloc_device(len).map(|ptr| Self { ptr, len })
+    }
+
+    /// Device pointer of the allocation (`CUdeviceptr`). Valid while this
+    /// buffer is alive.
+    pub const fn ptr(&self) -> u64 {
+        self.ptr as u64
+    }
+
+    /// Allocation size in bytes.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Copy the whole allocation to host memory (synchronous).
+    pub fn read_to_host(&self, dst: &mut [u8]) -> NvdecResult<()> {
+        assert!(dst.len() >= self.len, "host buffer too small");
+        copy_device_to_host(&mut dst[..self.len], self.ptr())
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        let _ = ensure_ctx();
+        let _ = unsafe { cu_mem_free_device(self.ptr) };
+    }
+}
+
+/// Owning pinned (page-locked) host memory allocation (RAII).
+pub struct PinnedHostBuffer {
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+}
+
+unsafe impl Send for PinnedHostBuffer {}
+unsafe impl Sync for PinnedHostBuffer {}
+
+impl PinnedHostBuffer {
+    /// Allocate `len` bytes of pinned host memory (portable across contexts).
+    pub fn alloc(len: usize) -> NvdecResult<Self> {
+        cu_mem_host_alloc(len).map(|ptr| Self { ptr, len })
+    }
+
+    /// Allocation size in bytes.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The allocation as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+
+    /// The allocation as a mutable byte slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        let _ = ensure_ctx();
+        let _ = unsafe { cu_mem_free_host(self.ptr) };
+    }
+}
+
+/// Synchronous device-to-host linear copy (binds the primary context first,
+/// so it may run on any thread).
+pub fn copy_device_to_host(dst: &mut [u8], src: u64) -> NvdecResult<()> {
+    ensure_ctx()?;
+    let code = unsafe { cu_memcpy_dtoh(dst.as_mut_ptr().cast(), src as crate::ffi::CUdeviceptr, dst.len()) }?;
+    if code == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(NvdecError::CudaError(format!(
+            "cuMemcpyDtoH failed with error {code}"
+        )))
+    }
+}
+
+/// Synchronous device-to-host copy of pitched rows: `rows` rows of
+/// `row_bytes` bytes each, taken from device memory at `src` with row stride
+/// `src_pitch` (binds the primary context first). `dst` must hold at least
+/// `rows * row_bytes` bytes and receives the rows tightly packed.
+pub fn copy_device_to_host_pitched(
+    dst: &mut [u8],
+    src: u64,
+    src_pitch: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> NvdecResult<()> {
+    assert!(dst.len() >= rows * row_bytes, "host buffer too small");
+    ensure_ctx()?;
+    let params = CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        _reserved0: 0,
+        srcHost: std::ptr::null(),
+        srcDevice: src,
+        srcArray: 0,
+        srcPitch: src_pitch as u64,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: CU_MEMORYTYPE_HOST,
+        _reserved1: 0,
+        dstHost: dst.as_mut_ptr().cast(),
+        dstDevice: 0,
+        dstArray: 0,
+        dstPitch: row_bytes as u64,
+        WidthInBytes: row_bytes as u64,
+        Height: rows as u64,
+    };
+    let code = unsafe { cu_memcpy_2d(&params) }?;
+    if code == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(NvdecError::CudaError(format!(
+            "cuMemcpy2D (device->host) failed with error {code}"
+        )))
+    }
+}
+
+/// A fixed-size ring of device buffers with per-slot reader barriers.
+///
+/// For asynchronous producers (decoders): the producer copies into slots
+/// round-robin; before overwriting slot `i` it host-syncs
+/// [`barrier(i)`](Self::barrier), and consumers record that event after
+/// their last read of the slot. A never-recorded event blocks forever, so
+/// every barrier is armed (recorded + synchronized once) at construction.
+pub struct DeviceRing {
+    buffers: Vec<DeviceBuffer>,
+    barriers: Vec<CuEvent>,
+}
+
+impl DeviceRing {
+    /// Allocate `slots` buffers of `frame_bytes` each and arm every slot's
+    /// reader barrier.
+    pub fn new(slots: usize, frame_bytes: usize) -> NvdecResult<Self> {
+        let mut buffers = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            buffers.push(DeviceBuffer::alloc(frame_bytes)?);
+        }
+
+        let mut barriers = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            let ev = CuEvent::new()?;
+            // Arm: record once on a temporary stream and wait for it, so the
+            // first reuse of the slot does not block on a stale record.
+            let st = CuStream::new()?;
+            ev.record(&st)?;
+            st.synchronize()?;
+            barriers.push(ev);
+        }
+
+        Ok(Self { buffers, barriers })
+    }
+
+    /// Number of slots.
+    pub fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
+    }
+
+    /// Device pointer of every slot (round-robin order).
+    pub fn ptrs(&self) -> Vec<u64> {
+        self.buffers.iter().map(|b| b.ptr()).collect()
+    }
+
+    /// Slot index for a ring device pointer.
+    pub fn slot_of(&self, ptr: u64) -> Option<usize> {
+        self.buffers.iter().position(|b| b.ptr() == ptr)
+    }
+
+    /// Reader barrier of a slot (shared view; record it after the last read
+    /// of the slot so the producer may reuse it).
+    pub fn barrier(&self, slot: usize) -> vacc_core::gpu::GpuEvent {
+        self.barriers[slot].view()
+    }
+
+    /// Raw `CUevent` per slot (for the decoder's slot-wait protocol).
+    pub fn slot_waits_raw(&self) -> Vec<Vec<*const std::ffi::c_void>> {
+        self.barriers.iter().map(|e| vec![e.raw()]).collect()
+    }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "vacc-nvenc-encode"
+description = "NVIDIA NVENC H.264 encoder backend for vacc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vacc-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+libloading = { workspace = true }
+
+[dev-dependencies]

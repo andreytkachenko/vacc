@@ -4305,6 +4305,11 @@ fn create_video_session(
             },
             "VK_STD_vulkan_video_codec_h265_decode",
         ),
+        VideoCodec::EncodeH264 => {
+            return Err(VideoError::InvalidState(
+                "decode session path cannot handle encode codec".to_string(),
+            ));
+        }
         VideoCodec::DecodeVp9 => (
             CodecProfileInfo::Vp9 {
                 std_profile: parsed.profile_idc,

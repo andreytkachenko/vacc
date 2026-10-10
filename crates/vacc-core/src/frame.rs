@@ -59,6 +59,13 @@ pub struct DecodedFrame {
     pub gpu: Option<crate::gpu::GpuFrame>,
 }
 
+// The raw device handles (`device_ptr`, `device_copy_event`) are carried as
+// metadata: a frame is only valid while its producer (decoder ring / event
+// pool) is alive, and consumers order access via the fences it carries.
+// Sharing the descriptor across threads is safe.
+unsafe impl Send for DecodedFrame {}
+unsafe impl Sync for DecodedFrame {}
+
 impl DecodedFrame {
     /// Create a new decoded frame.
     pub fn new(frame_index: u32, timestamp: i64, width: u32, height: u32, skipped: bool) -> Self {

@@ -1702,4 +1702,9 @@ fn bit_depth_component(bit_depth: u8) -> ComponentBitDepth {
     }
 }
 
+// SAFETY: all raw driver handles live behind `Mutex`es and are only used
+// after rebinding the primary CUDA context; the decoder is used from a
+// single owning thread, so moving it across threads is safe.
+unsafe impl Send for NvdecAv1Decoder {}
+
 

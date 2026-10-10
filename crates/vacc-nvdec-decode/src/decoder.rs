@@ -35,19 +35,21 @@
 //! to extract all pending frames in POC order.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use vacc_core::{
     codec::VideoCodec,
     decoder::{Decoder, DecoderInfo},
     format::{ChromaSubsampling, ComponentBitDepth, VideoFormat},
     frame::{DecodedFrame, FieldFlags, PixelData, PixelPlane},
+    gpu::{GpuDevice, GpuEvent, GpuFrame, GpuPixelFormat},
     session::Extent2D,
 };
 use vacc_parser::{BitstreamPacket, PacketFlags, ParseResult, VideoParser, h264::H264Parser};
 
 use crate::device::{
-    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, NvdecFuncs, cu_ctx_set_current,
+    CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, CuEventView, DeviceRing, NvdecFuncs,
+    cu_ctx_set_current,
     cu_event_create, cu_event_destroy, cu_event_record,
     cu_event_synchronize,
     cu_mem_free_host,
@@ -80,9 +82,14 @@ const COPY_EVENT_POOL: usize = 16;
 ///
 /// # Thread Safety
 ///
-/// This type is **not** `Send` or `Sync`. Use from a single thread only.
-/// The internal CUDA context must be set as current before calling decode
-/// methods.
+/// This type is `Send` but not `Sync`: move it to the owning decode thread
+/// and keep it there. Every raw driver handle (NVDEC decoder, copy stream,
+/// event pool, pinned cache) lives behind a `Mutex` and is only ever used
+/// after rebinding the primary CUDA context, so moving the struct between
+/// threads is safe; concurrent use is not (the NVDEC API is not
+/// thread-safe), which is why `Sync` is not implemented. Pipeline code that
+/// shares the decoder wraps it in its own `Mutex` (see the zero-copy decode
+/// keepalive in the video-decoder crate).
 ///
 /// # Resource Management
 ///
@@ -248,7 +255,7 @@ pub struct NvdecH264Decoder {
     /// decoder's own context) at the top of every extraction — by then the
     /// copy is long finished, so this never stalls in steady state; flushed
     /// on `reset`/drop.
-    pending_unmaps: Mutex<Vec<(u64, i32, *mut std::ffi::c_void)>>,
+    pending_unmaps: Mutex<Vec<(u64, i32, GpuEvent)>>,
 
     /// Set when a decode error was recovered by resetting the decoder (see
     /// `decode`). All buffered input was dropped and the NVDEC handle will be
@@ -256,6 +263,11 @@ pub struct NvdecH264Decoder {
     /// [`take_recovered`](Self::take_recovered).
     recovered: Mutex<bool>,
 }
+
+// SAFETY: all raw driver handles are stored behind `Mutex`es and only used
+// after rebinding the primary CUDA context (see the type docs); the decoder
+// is used from a single owning thread, so moving it across threads is safe.
+unsafe impl Send for NvdecH264Decoder {}
 
 impl NvdecH264Decoder {
     /// Create a new NVDEC H.264 decoder.
@@ -443,6 +455,15 @@ impl NvdecH264Decoder {
         assert_eq!(slot_waits.len(), dsts.len(), "one wait list per ring buffer");
         *self.device_output_ring.lock().unwrap() = (dsts.to_vec(), 0);
         *self.slot_wait_events.lock().unwrap() = slot_waits.iter().map(|w| w.to_vec()).collect();
+    }
+
+    /// Safe RAII form of [`set_device_output_ring_with_slot_waits`](Self::set_device_output_ring_with_slot_waits):
+    /// configure the device-output ring from a [`DeviceRing`] (buffers +
+    /// armed per-slot reader barriers owned by the caller).
+    pub fn set_device_ring(&self, ring: &DeviceRing) {
+        assert!(!ring.is_empty(), "empty device ring");
+        *self.device_output_ring.lock().unwrap() = (ring.ptrs(), 0);
+        *self.slot_wait_events.lock().unwrap() = ring.slot_waits_raw();
     }
 
     /// Clear the device output buffers; frames are extracted to host memory
@@ -1480,14 +1501,43 @@ impl NvdecH264Decoder {
                 self.pending_unmaps
                     .lock()
                     .unwrap()
-                    .push((dev_ptr, seq, done_event));
-                return Some(self.build_frame(
+                    .push((dev_ptr, seq, done_event.clone()));
+                // Generic device frame describing this ring slot: tight-NV12
+                // geometry, the copy-done fence from the pool, and the slot's
+                // reader barrier (when armed). The slot memory is owned by
+                // the caller's ring — the frame is borrowed.
+                let barrier = {
+                    let waits = self.slot_wait_events.lock().unwrap();
+                    waits
+                        .get(slot_idx)
+                        .and_then(|list| list.first())
+                        .map(|ev| GpuEvent::wrap(Arc::new(CuEventView::new(*ev))))
+                };
+                let mut gpu = GpuFrame::new_borrowed(
+                    GpuDevice::Cuda { index: 0 },
+                    GpuPixelFormat::Nv12,
+                    display_width as u32,
+                    display_height as u32,
+                    display_width as usize,
+                    (display_width as usize) * (display_height as usize),
+                    dst as usize,
+                    None,
+                );
+                if let Some(b) = barrier {
+                    gpu = gpu.with_consume_barrier(b);
+                }
+                // The legacy raw-pointer fields stay populated for consumers
+                // that predate the generic `gpu` frame.
+                let mut frame = self.build_frame(
                     seq,
                     &info,
                     None,
                     Some(dst as *const u8),
-                    Some(done_event as *const std::ffi::c_void),
-                ));
+                    Some(done_event.raw()),
+                );
+                gpu = gpu.with_copy_done(done_event);
+                frame.gpu = Some(gpu);
+                return Some(frame);
             }
         }
 
@@ -1661,7 +1711,10 @@ impl NvdecH264Decoder {
     /// device-output paths.
     /// Record the next copy-done event (round-robin pool, created lazily) on
     /// `copy_stream`. Returns the recorded event handle.
-    fn record_copy_event(&self, copy_stream: *mut std::ffi::c_void) -> Option<*mut std::ffi::c_void> {
+    /// Record the next copy-done event from the round-robin pool and return
+    /// a shared (non-owning) view of it for the emitted frame. The event
+    /// itself stays owned by the pool.
+    fn record_copy_event(&self, copy_stream: *mut std::ffi::c_void) -> Option<GpuEvent> {
         let mut pool = self.copy_events.lock().unwrap();
         if pool.0.is_empty() {
             let mut events = Vec::with_capacity(COPY_EVENT_POOL);
@@ -1682,7 +1735,7 @@ impl NvdecH264Decoder {
         let ev = pool.0[pool.1 % pool.0.len()];
         pool.1 += 1;
         unsafe { cu_event_record(ev, copy_stream) }.ok()?;
-        Some(ev)
+        Some(GpuEvent::wrap(Arc::new(CuEventView::new(ev))))
     }
 
     /// Wait for every pending device-output copy to land and unmap its
@@ -1692,10 +1745,10 @@ impl NvdecH264Decoder {
     /// immediately, so this never stalls in steady state. Unmapping before
     /// the new frame's map guarantees NVDEC can recycle any surface.
     fn unmap_completed(&self, decoder: *mut std::ffi::c_void, funcs: &NvdecFuncs) {
-        let pending: Vec<(u64, i32, *mut std::ffi::c_void)> =
+        let pending: Vec<(u64, i32, GpuEvent)> =
             self.pending_unmaps.lock().unwrap().drain(..).collect();
         for (ptr, seq, ev) in pending {
-            if let Err(e) = unsafe { cu_event_synchronize(ev) } {
+            if let Err(e) = ev.synchronize() {
                 eprintln!("[NVDEC] copy-done event sync failed: {e}");
             }
             let _ = unsafe { (funcs.unmap_video_frame64)(decoder, ptr) };
@@ -1721,7 +1774,7 @@ impl NvdecH264Decoder {
             // below cannot run while a copy still reads its surface.
             let _ = unsafe { cu_stream_synchronize(st) };
         }
-        let pending: Vec<(u64, i32, *mut std::ffi::c_void)> =
+        let pending: Vec<(u64, i32, GpuEvent)> =
             self.pending_unmaps.lock().unwrap().drain(..).collect();
         for (ptr, seq, _ev) in pending {
             let _ = unsafe { (funcs.unmap_video_frame64)(decoder, ptr) };
@@ -2069,6 +2122,10 @@ mod recovery_tests {
     /// point of view every error looks the same.
     #[test]
     fn test_decode_error_recovery_resyncs_at_next_keyframe() {
+        if !crate::device::is_available() {
+            eprintln!("skipping: no NVDEC-capable GPU on this host");
+            return;
+        }
         let data = load_born_trailer();
 
         // Locate the first IDR and the non-IDR slices that follow it.

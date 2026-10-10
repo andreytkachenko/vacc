@@ -1,11 +1,14 @@
 //! # vacc
 //!
-//! One streaming decoder for every backend: [`VaccDecoder`] accepts a
-//! [`DecoderConfig`] with a preferred backend order (Vulkan, NVDEC, VAAPI,
-//! software) and falls back to the next backend in the list whenever the
-//! previous one is unavailable or cannot decode the stream.
+//! One video codec library for every backend: [`VaccDecoder`] decodes and
+//! [`VaccEncoder`] encodes, each accepting a config with a preferred backend
+//! order (Vulkan, NVDEC/NVENC, VAAPI, software) and falling back to the next
+//! backend in the list whenever the previous one is unavailable or cannot
+//! handle the stream.
 //!
-//! The API is streaming-only: construct from an initial chunk of the
+//! ## Decoding
+//!
+//! The decode API is streaming-only: construct from an initial chunk of the
 //! bitstream, feed the rest with [`vacc_core::decoder::Decoder::submit`],
 //! and pull frames one at a time with [`vacc_core::decoder::Decoder::decode`].
 //! Nothing in the public API takes or returns the whole stream, so memory
@@ -63,6 +66,8 @@
 //!
 //! ## Backends and codecs
 //!
+//! Decode support:
+//!
 //! | Backend    | H.264 | H.265 | VP9 | AV1 |
 //! |------------|-------|-------|-----|-----|
 //! | `vulkan`   | yes   | yes   | yes | yes |
@@ -70,9 +75,48 @@
 //! | `vaapi`    | yes   | yes   | yes | yes |
 //! | `software` | yes   | yes   | -   | -   |
 //!
+//! Encode support (H.264 CQP, NV12 in / Annex B out):
+//!
+//! | Backend  | H.264   |
+//! |----------|---------|
+//! | `vulkan` | planned |
+//! | `nvdec`  | planned |
+//! | `vaapi`  | yes     |
+//!
 //! Each backend is an optional crate feature (`vulkan`, `nvdec`, `vaapi`,
-//! `sw`, all on by default), so you can build a distribution without any
-//! given GPU dependency.
+//! `sw`, all on by default); a backend feature enables both its decode and
+//! encode crates, so you can build a distribution without any given GPU
+//! dependency.
+//!
+//! ## Encoding
+//!
+//! [`VaccEncoder`] takes an [`EncoderConfig`] (core parameters plus a
+//! preferred backend order) and encodes NV12 frames one at a time:
+//!
+//! ```no_run
+//! use std::io::Write;
+//! use vacc_core::encoder::{Encoder, EncoderConfig as CoreCfg, InputFrame};
+//! use vacc::{EncoderConfig, VaccEncoder};
+//!
+//! let params = CoreCfg { width: 320, height: 240, ..Default::default() };
+//! let config = EncoderConfig::new(params); // vulkan -> nvdec -> vaapi
+//! let mut enc = VaccEncoder::new(&config).unwrap();
+//! println!("using backend: {}", enc.backend());
+//!
+//! let mut out = Vec::new();
+//! for i in 0..30u32 {
+//!     let y = vec![i as u8; 320 * 240];
+//!     let uv = vec![128u8; 320 * 120];
+//!     let frame = InputFrame::packed(320, 240, &y, &uv);
+//!     let au = enc.encode(&frame, (i as i64) * 33_333_333).unwrap();
+//!     out.extend_from_slice(&au.data);
+//! }
+//! for au in enc.flush().unwrap() {
+//!     out.extend_from_slice(&au.data);
+//! }
+//! let mut f = std::fs::File::create("out.h264").unwrap();
+//! f.write_all(&out).unwrap();
+//! ```
 //!
 //! ## Image pipeline
 //!
@@ -100,17 +144,24 @@ pub mod backend;
 pub mod codec;
 pub mod config;
 pub mod decoder;
+pub mod encoder;
 pub mod error;
 mod transform;
 
 pub use backend::Backend;
 pub use codec::detect_codec;
-pub use config::DecoderConfig;
+pub use config::{DecoderConfig, EncoderConfig};
 pub use decoder::VaccDecoder;
+pub use encoder::VaccEncoder;
 pub use error::{BackendFailure, UnifiedError, UnifiedResult};
 
 // Re-export the core API so a user only needs this crate for the common path.
-pub use vacc_core::{decoder::Decoder, frame::DecodedFrame, DecoderInfo, VideoCodec};
+pub use vacc_core::{
+    decoder::Decoder,
+    encoder::{EncodedFrame, Encoder, EncoderInfo, InputFrame},
+    frame::DecodedFrame,
+    DecoderInfo, VideoCodec,
+};
 
 // GPU decode track types (device-resident frames).
 pub use vacc_core::gpu::{GpuDevice, GpuFrame, GpuPixelFormat};

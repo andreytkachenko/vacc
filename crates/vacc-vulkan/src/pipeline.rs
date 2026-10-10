@@ -139,6 +139,11 @@ impl VideoPipeline {
                     self.device.clone(), self.instance.clone(),
                 ))
             }
+            VideoCodec::EncodeH264 => {
+                return Err(VideoError::InvalidState(
+                    "decode pipeline does not support encode codecs".to_string(),
+                ));
+            }
         });
 
         // Link session to decoder
@@ -248,6 +253,7 @@ impl VideoPipeline {
             }
             VideoCodec::DecodeAv1 => {}
             VideoCodec::DecodeVp9 => {}
+            VideoCodec::EncodeH264 => {}
         }
 
         Ok(())

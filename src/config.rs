@@ -1,7 +1,8 @@
-//! Decoder backend configuration: preferred order with fallback.
+//! Decoder/encoder backend configuration: preferred order with fallback.
 
 use std::fmt;
 
+use vacc_core::encoder::EncoderConfig as CoreEncoderConfig;
 use vacc_image::ImageConfig;
 
 use crate::backend::Backend;
@@ -124,6 +125,85 @@ impl fmt::Display for DecoderConfig {
             f.write_str(" [gpu]")?;
         }
         Ok(())
+    }
+}
+
+/// Encoder backend configuration: the core encoder parameters plus an
+/// ordered list of backends to try when creating a
+/// [`VaccEncoder`](crate::VaccEncoder).
+///
+/// The first backend that successfully initializes is used; the rest are
+/// fallbacks. Duplicates are dropped, order is preserved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncoderConfig {
+    params: CoreEncoderConfig,
+    order: Vec<Backend>,
+}
+
+impl EncoderConfig {
+    /// Build a config from the core encoder parameters, using the default
+    /// encode fallback chain (`vulkan -> nvdec -> vaapi`).
+    pub fn new(params: CoreEncoderConfig) -> Self {
+        Self { params, order: Backend::ENCODE_ALL.to_vec() }
+    }
+
+    /// Set the backend order (e.g. `[Backend::Nvdec, Backend::Vaapi]`).
+    /// Duplicates are dropped, preserving first-seen order.
+    pub fn with_backends(mut self, order: impl IntoIterator<Item = Backend>) -> Self {
+        let mut seen = [false; 4];
+        let mut out = Vec::new();
+        for b in order {
+            let idx = match b {
+                Backend::Vulkan => 0,
+                Backend::Nvdec => 1,
+                Backend::Vaapi => 2,
+                Backend::Software => 3,
+            };
+            if !seen[idx] {
+                seen[idx] = true;
+                out.push(b);
+            }
+        }
+        self.order = out;
+        self
+    }
+
+    /// A config with a single backend and no fallback.
+    pub fn only(backend: Backend, params: CoreEncoderConfig) -> Self {
+        Self::new(params).with_backends([backend])
+    }
+
+    /// The core encoder parameters (codec, size, QP, ...).
+    pub const fn params(&self) -> &CoreEncoderConfig {
+        &self.params
+    }
+
+    /// Consume the config, returning the core encoder parameters.
+    pub fn into_params(self) -> CoreEncoderConfig {
+        self.params
+    }
+
+    /// The backend order (preferred first).
+    pub fn order(&self) -> &[Backend] {
+        &self.order
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
+impl Default for EncoderConfig {
+    /// Default core parameters with the default encode chain.
+    fn default() -> Self {
+        Self::new(CoreEncoderConfig::default())
+    }
+}
+
+impl fmt::Display for EncoderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.order.iter().map(|b| b.name()).collect();
+        write!(f, "{} ({}x{} qp={} {}fps)", names.join(" -> "), self.params.width, self.params.height, self.params.qp, self.params.fps_num)
     }
 }
 

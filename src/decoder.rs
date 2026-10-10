@@ -35,7 +35,12 @@ fn be(e: impl std::error::Error + Send + Sync + 'static) -> UnifiedError {
 }
 
 /// Type-erased backend decoder.
-pub trait AnyDecode {
+///
+/// `Send` so a [`VaccDecoder`] can be moved between threads (stream
+/// pipelines own one decoder per worker task). Backends hold raw driver
+/// handles behind mutexes and are used from a single owning decode thread;
+/// each backend documents its `Send` impl accordingly.
+pub trait AnyDecode: Send {
     fn info(&self) -> DecoderInfo;
     fn submit(&mut self, data: &[u8]) -> UnifiedResult<()>;
     fn decode(&mut self) -> UnifiedResult<Option<DecodedFrame>>;
@@ -102,6 +107,12 @@ struct VulkanAdapter {
     /// valid while the owning `VulkanDecoder` lives).
     decoder: Option<vacc_vulkan_decode::VulkanDecoder>,
 }
+
+// SAFETY: the Vulkan device handles are process-global and the Vulkan API is
+// thread-safe; this adapter is used from a single owning decode thread, so
+// moving it across threads is safe.
+#[cfg(feature = "vulkan")]
+unsafe impl Send for VulkanAdapter {}
 
 #[cfg(feature = "vulkan")]
 impl VulkanAdapter {

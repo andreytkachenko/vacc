@@ -801,6 +801,7 @@ impl VideoSessionParameters {
             VideoCodec::DecodeVp9 => {
                 // VP9 doesn't need codec-specific session parameters create info
             }
+            VideoCodec::EncodeH264 => {}
         }
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR {
@@ -810,6 +811,7 @@ impl VideoSessionParameters {
                 VideoCodec::DecodeH265 => &h265_params as *const _ as *const _,
                 VideoCodec::DecodeAv1 => &av1_params as *const _ as *const _,
                 VideoCodec::DecodeVp9 => std::ptr::null(),
+                VideoCodec::EncodeH264 => std::ptr::null(),
             },
             flags: vk::VideoSessionParametersCreateFlagsKHR::empty(),
             video_session: session,

@@ -77,6 +77,75 @@ impl GpuPixelFormat {
     }
 }
 
+/// A backend completion signal (fence/event) shared across threads.
+///
+/// This is a non-owning view: the underlying backend handle (a CUDA event, a
+/// Vulkan semaphore, ...) is created and destroyed by its owner (e.g. a
+/// decoder's event pool or a ring of per-slot reader barriers); dropping the
+/// last [`GpuEvent`] clone does not destroy it.
+#[derive(Clone)]
+pub struct GpuEvent(Arc<dyn EventHandle>);
+
+/// Backend-specific implementation of a GPU completion signal.
+///
+/// Implementations wrap a live backend handle and must be `Send + Sync` so a
+/// [`GpuEvent`] can cross threads (decode thread -> inference pool -> frame
+/// drop on any worker). All methods are safe: the unsafe driver calls stay
+/// inside the implementation.
+pub trait EventHandle: Send + Sync {
+    /// Block the host until this event is signaled.
+    fn synchronize(&self) -> Result<(), String>;
+
+    /// Non-blocking check: `true` once the event is signaled.
+    fn is_complete(&self) -> bool;
+
+    /// Raw backend handle (e.g. `CUevent`) for interop with other toolkits.
+    /// Valid while the owning backend object is alive.
+    fn raw(&self) -> *const std::ffi::c_void;
+
+    /// Enqueue a stream-ordered wait on this event. `stream` is a raw
+    /// backend stream handle (e.g. `CUstream`) from any toolkit sharing the
+    /// same device.
+    fn wait_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String>;
+
+    /// Record this event on a stream: it is signaled once all work enqueued
+    /// before this call has completed. `stream` is a raw backend stream
+    /// handle (e.g. `CUstream`).
+    fn record_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String>;
+}
+
+impl GpuEvent {
+    /// Wrap an existing backend handle (non-owning).
+    pub fn wrap(handle: Arc<dyn EventHandle>) -> Self {
+        Self(handle)
+    }
+
+    /// Block the host until this event is signaled.
+    pub fn synchronize(&self) -> Result<(), String> {
+        self.0.synchronize()
+    }
+
+    /// Non-blocking check: `true` once the event is signaled.
+    pub fn is_complete(&self) -> bool {
+        self.0.is_complete()
+    }
+
+    /// Raw backend handle (e.g. `CUevent`) for interop with other toolkits.
+    pub fn raw(&self) -> *const std::ffi::c_void {
+        self.0.raw()
+    }
+
+    /// Enqueue a stream-ordered wait on this event (raw backend stream).
+    pub fn wait_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String> {
+        self.0.wait_on_stream(stream)
+    }
+
+    /// Record this event on a stream (raw backend stream).
+    pub fn record_on_stream(&self, stream: *const std::ffi::c_void) -> Result<(), String> {
+        self.0.record_on_stream(stream)
+    }
+}
+
 /// Owning handle for device memory; frees it when the last clone drops.
 ///
 /// The free closure is backend-provided (e.g. a synchronous `cuMemFree`), so
@@ -127,6 +196,16 @@ pub struct GpuFrame {
     /// 0 for RGB formats. For Vulkan frames this is a byte offset within the
     /// buffer (planes are not pointer-addressable like CUDA memory).
     pub chroma_offset: usize,
+    /// Signaled once the producer has fully written the pixel data at
+    /// [`ptr`](Self::ptr). Set for asynchronously produced frames (e.g. a
+    /// decoder's device-to-device copy); consumers must wait on it
+    /// (host-side or stream-ordered) before reading. `None` when the data is
+    /// ready synchronously.
+    pub copy_done: Option<GpuEvent>,
+    /// Reader barrier for reusable ring slots: consumers record it after
+    /// their last read of [`ptr`](Self::ptr); the producer waits on it before
+    /// overwriting the slot. `None` unless this frame occupies a ring slot.
+    pub consume_barrier: Option<GpuEvent>,
     owner: Option<Arc<Owner>>,
 }
 
@@ -152,10 +231,42 @@ impl GpuFrame {
             width,
             height,
             pitch,
+            chroma_offset,
             ptr,
             memory,
-            chroma_offset,
+            copy_done: None,
+            consume_barrier: None,
             owner: Some(Arc::new(Owner { ptr, free: Some(free) })),
+        }
+    }
+
+    /// Create a handle that does NOT own its device memory (e.g. a frame
+    /// occupying a slot in a caller-managed ring; the ring's owner releases
+    /// the memory). No release action runs when the last clone drops unless
+    /// one is attached with [`with_release`](Self::with_release).
+    #[allow(clippy::too_many_arguments)] // flat descriptor of a device plane layout
+    pub fn new_borrowed(
+        device: GpuDevice,
+        format: GpuPixelFormat,
+        width: u32,
+        height: u32,
+        pitch: usize,
+        chroma_offset: usize,
+        ptr: usize,
+        memory: Option<usize>,
+    ) -> Self {
+        Self {
+            device,
+            format,
+            width,
+            height,
+            pitch,
+            chroma_offset,
+            ptr,
+            memory,
+            copy_done: None,
+            consume_barrier: None,
+            owner: None,
         }
     }
 
@@ -165,6 +276,27 @@ impl GpuFrame {
     /// is alive.
     pub const fn device_ptr(&self) -> usize {
         self.ptr
+    }
+
+    /// Attach the producer-ready fence: consumers must wait on it before
+    /// reading [`ptr`](Self::ptr).
+    pub fn with_copy_done(mut self, event: GpuEvent) -> Self {
+        self.copy_done = Some(event);
+        self
+    }
+
+    /// Attach the reader barrier of the ring slot this frame occupies.
+    pub fn with_consume_barrier(mut self, event: GpuEvent) -> Self {
+        self.consume_barrier = Some(event);
+        self
+    }
+
+    /// Attach a one-shot release action run exactly once, when the last clone
+    /// of this frame drops (e.g. returning a ring slot to its owner so it may
+    /// be reused). Replaces any previous ownership.
+    pub fn with_release(mut self, release: Box<dyn FnOnce(usize) + Send + Sync>) -> Self {
+        self.owner = Some(Arc::new(Owner { ptr: self.ptr, free: Some(release) }));
+        self
     }
 
     /// Device pointer of the chroma plane (YUV formats only; panics for RGB

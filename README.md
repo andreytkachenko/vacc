@@ -9,7 +9,10 @@ the **hevc.js** kernels). The root `vacc` crate ties them together into a single
 
 Supports **H.264/AVC**, **H.265/HEVC**, **VP9**, and **AV1** decoding — see the
 [Decode Support Matrix](#decode-support-matrix) for what each GPU/driver actually decodes
-byte-exact (verified against FFmpeg, 300 frames per sample).
+byte-exact (verified against FFmpeg, 300 frames per sample). Encoding covers **H.264/AVC**
+on all three GPU backends (**Vulkan Video**, **NVENC**, **VAAPI**) behind the same facade
+([`VaccEncoder`](src/encoder.rs)); HEVC encode is planned — see the
+[Encode Support Matrix](#encode-support-matrix).
 
 An optional **post-decode image pipeline** can scale frames and convert Y'CbCr to packed
 RGB in one pass, on the fastest available backend: NVIDIA NPP, Vulkan compute (any GPU),
@@ -43,6 +46,24 @@ let config = DecoderConfig::default().with_image(ImageConfig {
     ..Default::default()
 });
 let decoder = VaccDecoder::new(&data, &config).unwrap();
+```
+
+Encoding uses the same fallback model — construct from core parameters, feed NV12 frames,
+drain in-flight output at end of stream:
+
+```rust
+use vacc::{EncoderConfig, VaccEncoder};
+use vacc_core::encoder::{Encoder as _, EncoderConfig as CoreCfg, InputFrame};
+
+let params = CoreCfg { width: 320, height: 240, qp: 26, ..Default::default() };
+let mut enc = VaccEncoder::new_auto(&params).unwrap(); // vulkan -> nvdec -> vaapi
+for (i, (y, uv)) in frames.iter().enumerate() {
+    let au = enc.encode(&InputFrame::packed(320, 240, y, uv), i as i64 * 33_333_333).unwrap();
+    file.write_all(&au.data)?; // one Annex B access unit per frame
+}
+for tail in enc.flush().unwrap() {
+    file.write_all(&tail.data)?;
+}
 ```
 
 ### Zero-copy GPU track
@@ -83,8 +104,10 @@ vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
 ┌────────────────────────────────────────────────────────────────────┐
 │                        vacc (workspace)                            │
 │                                                                    │
-│   vacc               unified decoder: VaccDecoder + fallback       │
-│                        chain vulkan → nvdec → vaapi → sw, plus     │
+│   vacc               unified decoder (VaccDecoder) + encoder       │
+│                        (VaccEncoder); fallback chains              │
+│                        decode: vulkan → nvdec → vaapi → sw,        │
+│                        encode: vulkan → nvdec → vaapi → sw, plus   │
 │                        optional post-decode image pipeline         │
 │                                                                    │
 │   vacc-core          shared types, traits, errors                  │
@@ -99,6 +122,9 @@ vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
 │     vacc-vulkan-decode   Decoder-trait wrapper over vacc-vulkan    │
 │     vacc-nvdec-decode    NVIDIA NVDEC via libnvcuvid (cuvid)       │
 │     vacc-vaapi-decode    VAAPI stateless decode                    │
+│     vacc-vulkan-encode   Vulkan Video H.264 encode                 │
+│     vacc-nvenc-encode    NVIDIA NVENC via libnvidia-encode         │
+│     vacc-vaapi-encode    VAAPI H.264 encode (packed headers)       │
 │     vacc-software-decode CPU H.264 (edge264 port) +                │
 │                          CPU H.265 (hevc.js port), pure Rust       │
 │                                                                    │
@@ -120,8 +146,12 @@ The unified decoder:
 - `DecoderConfig` — custom fallback order (`new([Backend…])`, `only(…)`, `default_order()`)
   and the optional post-decode image pipeline (`with_image(ImageConfig)`)
 - `detect_codec()` — H.264/H.265/VP9/AV1 bitstream detection
-- Per-backend features (`vulkan`, `nvdec`, `vaapi`, `sw`); if every configured backend
-  fails, the returned error lists each per-backend failure so callers can report *why*
+- `VaccEncoder` / `new_auto()` — unified H.264 encoder over the GPU backends; fallback
+  chain `vulkan → nvdec → vaapi` (no software encode backend)
+- `EncoderConfig` — encode parameters (size, QP, GOP, fps) + custom backend order
+- Per-backend features (`vulkan`, `nvdec`, `vaapi`, `sw`); the GPU features enable both the
+  decode and encode crates; if every configured backend fails, the returned error lists each
+  per-backend failure so callers can report *why*
 - PTS normalization: frames carry monotonic presentation timestamps (synthetic 1/30 s
   steps when a backend's PTS is invalid or goes backwards under B-frame reordering)
 - Optional post-decode image pipeline — see [Image Pipeline](#image-pipeline-scale--rgb-conversion)
@@ -172,6 +202,33 @@ VAAPI stateless decode on any libva driver (verified with Intel iHD):
   pipeline is NV12-only) instead of mid-decode driver errors
 - Bindings via the `cros-libva` git dependency
 
+### `vacc-vulkan-encode`
+Vulkan Video H.264 encode on any driver exposing `VK_KHR_video_encode_h264` (verified on
+NVIDIA 575-series):
+- The app serializes SPS/PPS itself (byte-verified against the project parser oracle); the
+  driver does motion estimation internally and manages the DPB via reference-slot lists
+- Constant QP (rate control disabled, per-slice `constantQp`), IDR + P GOP
+- Coded size recovered by scanning the bitstream buffer (the encode feedback query is
+  unreliable on NVIDIA drivers)
+
+### `vacc-nvenc-encode`
+NVIDIA NVENC H.264 via `libnvidia-encode.so` (loaded dynamically with `libloading`, same
+pattern as NVDEC): CQP rate control, low-latency preset, IDR + P GOP. See the
+[Encode Support Matrix](#encode-support-matrix) for runtime validation status.
+
+### `vacc-vaapi-encode`
+VAAPI H.264 encode on any libva driver (verified with Intel iHD):
+- Packed SPS/PPS/slice-header buffers (`VAEncPackedHeaders`); per-MB configuration left to
+  the driver's internal VME (`macroblock_info = VA_INVALID_ID`)
+- CQP rate control, IDR + P GOP; coded buffer read back as Annex B segments
+  
+### `vacc-software-encode`
+Pure-Rust H.264 encoder (port of the filmcraft h264enc core, see [Reference](#reference)):
+- Baseline / Main / High profiles; CAVLC + CABAC; I/P/B frames (up to 3 B), up to 4 slices
+- Rate control: constant QP, CRF, 1-pass ABR (VBV), 2-pass VBR; AQ + scenecut lookahead
+- Hexagon integer + sub-pel motion estimation, deblocking, SEI / avcC output, recon capture
+- Verified against FFmpeg (strict decode, bit-exact reconstruction round-trip, PSNR + bitrate gates)
+  
 ### `vacc-software-decode`
 The CPU backends — see [Software (CPU) Backends](#software-cpu-backends--b-sw).
 
@@ -233,8 +290,8 @@ Behavior:
 
 ## Software (CPU) Backends (`-b sw`)
 
-`sw` decodes on CPU only and needs **nothing but a CPU — both cores are pure Rust**
-(no C/C++ toolchain). The codec is auto-detected: H.264 → edge264 port, H.265 → hevc.js
+`sw` decodes and encodes on CPU only and needs **nothing but a CPU — the cores are
+pure Rust** (no C/C++ toolchain). The codec is auto-detected: H.264 → edge264 port, H.265 → hevc.js
 port. Both keep the *control plane* (bitstream parsing, DPB, POC, ref lists, display-order
 reordering) on the shared `vacc-parser` state; only pixel reconstruction is codec-specific.
 
@@ -256,8 +313,17 @@ reordering) on the shared `vacc-parser` state; only pixel reconstruction is code
   interpolation; WPP parallel pipeline over CTU rows
 - Verified byte-exact: Main / Main 10 4:2:0, including CRA open-GOP and multi-slice WPP
   streams; outputs pinned to SHA-256 goldens
-
-Threading: WPP CTU rows run on the rayon global pool (tune with `RAYON_NUM_THREADS`).
+ 
+### H.264 encode (`vacc-software-encode`)
+- Pure-Rust port of the filmcraft h264enc core (MIT OR Apache-2.0): Baseline/Main/High,
+  CAVLC + CABAC, I/P/B frames (up to 3 B), up to 4 slices
+- Rate control: QP / CRF / 1-pass ABR (VBV) / 2-pass VBR; AQ + scenecut lookahead;
+  rayon slice parallelism
+- Verified against FFmpeg: strict decode of every stream, encode→decode round-trip
+  bit-identical to the encoder's own reconstruction, PSNR and bitrate-target gates
+ 
+Threading: WPP CTU rows (decode) and slices (encode) run on the rayon global pool
+(tune with `RAYON_NUM_THREADS`).
 
 Verification: golden-hash unit tests + full-stream pixel oracles
 (`cargo test -p vacc-software-decode`), plus byte-exact agreement with the FFmpeg
@@ -375,6 +441,30 @@ samples are rejected up front (the edge264 port targets 8-bit 4:2:0 progressive)
 - Diagnostics: `VACC_PROBE_CUVID=1` dumps the full cuvid decoder-caps table; `VACC_VA_DUMP=1`
   dumps the exact VA-API picture/slice parameter buffers.
 
+## Encode Support Matrix
+
+Encoding covers **H.264/AVC only** today: 8-bit 4:2:0 progressive, width/height multiples of
+16. The GPU backends do constant QP with an IDR + P GOP; the software backend adds B frames
+(up to 3), up to 4 slices, and CRF / ABR / 2-pass VBR rate control. HEVC encode is planned.
+All four backends expose the same frame-based API: feed NV12 with `Encoder::encode`
+(0..=1+n Annex B access units per call when B frames are in flight), drain in-flight
+output with `Encoder::flush`.
+
+| Backend (crate) | H.264 encode | Verified on |
+|---|---|---|
+| Vulkan Video (`vacc-vulkan-encode`) | ✅ verified | NVIDIA A10, driver 575.57.08 — SPS/PPS byte-verified against the project parser oracle; FFmpeg decodes every frame (IDR + P chain with correct reference lists); encode→decode round-trip content verified (~0.99 correlation on the synthetic test pattern) |
+| VAAPI (`vacc-vaapi-encode`) | ✅ verified | Intel Meteor Lake-P iGPU (iHD driver) — FFmpeg decodes the output with zero errors; oracle parses 10/10 pictures (IDR + 9 P, correct L0 refs) |
+| Software (`vacc-software-encode`) | ✅ verified | Any CPU, pure Rust — FFmpeg strict-decode oracle over every profile/preset/rate-control combination (zero diagnostics); encode→decode round-trip bit-identical to the encoder's own reconstruction via the project's SW decoder; 1080p CRF20 PSNR ≥ 40 dB; ABR and 2-pass VBR within 10% of target; B-frame display order verified with ffprobe |
+| NVENC (`vacc-nvenc-encode`) | ⚠️ code complete, runtime validation blocked | `libnvidia-encode.so.575.57.08` (official runfile copy, md5-verified) loads and links cleanly and all FFI paths are unit-tested. On the only available NVIDIA test host the driver reports **zero** video capabilities to the standalone API libraries (NVENC `NvEncOpenEncodeSessionEx` → status 15 `NV_ERR_NO_SUPPORTED_ENCS`, cuvid caps all-zero) while the Vulkan Video path encodes fine in the same container — an environment-level driver inconsistency (frankendriver: kernel 575 + userspace 525), not an FFI bug. Needs a consistent full-driver install to validate. |
+
+Notes:
+
+- The software backend is last in the default encode chain (`vulkan → nvdec → vaapi → sw`);
+  a failing GPU backend falls through to the next one, and `sw` needs nothing but a CPU.
+- Vulkan requires a device exposing `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264`
+  (the NVIDIA 575-series driver does; Mesa ANV currently exposes no VK Video encode support).
+- The `vulkan`, `nvdec`, `vaapi`, and `sw` features each enable both the decode and encode crates.
+
 ## Test Samples
 
 The single master source is `assets/big_buck_bunney.h265` (Big Buck Bunny, 1920x1080,
@@ -442,6 +532,21 @@ cargo run -p vacc --example unified -- -i <file> [options]
 Per-frame lines hash whatever the frame carries after the image pipeline ran (`rgb` when
 `--rgb24`/`--rgb32` is active, `yuv` otherwise).
 
+The root package also ships an `encode` example that encodes synthetic NV12 frames and
+writes Annex B (verify the output with the parser oracle or FFmpeg):
+
+```bash
+cargo run -p vacc --example encode -- [options]
+
+  -o, --order    <csv>     backend order, e.g. "nvdec,vaapi" (default: vulkan,nvdec,vaapi)
+  -n, --frames   <num>     number of frames to encode (default: 30)
+  -w, --width    <px>      frame width, multiple of 16 (default: 320)
+  -H, --height   <px>      frame height, multiple of 16 (default: 240)
+  -q, --qp       <n>       constant QP 0-51 (default: 26)
+  -I, --intra    <n>       IDR period in frames (default: 30)
+  -O, --out      <file>    output bitstream (default: /tmp/vacc_encode.h264)
+```
+
 ## Vulkan Extensions Required
 
 - `VK_KHR_video_decode_queue` - Video decode queue family
@@ -449,6 +554,8 @@ Per-frame lines hash whatever the frame carries after the image pipeline ran (`r
 - `VK_EXT_video_decode_h265` - H.265 decode support
 - `VK_EXT_video_decode_av1` - AV1 decode support
 - `VK_KHR_sampler_ycbcr_conversion` - YCbCr sampling
+- `VK_KHR_video_encode_queue` - Video encode queue family (H.264 encode)
+- `VK_KHR_video_encode_h264` - H.264 encode support
 
 ## Dependencies
 
@@ -475,8 +582,9 @@ Backend requirements: Vulkan Video device (VAAPI also works on the same stack), 
 `libnvcuvid.so`, and libva + a VAAPI driver (iHD/Mesa) respectively. `sw` needs nothing but a CPU —
 both cores are pure Rust.
 
-Each backend of the root `vacc` package is a cargo feature (all on by default), as are the
-backends of the `decode` example, so a build can be trimmed to the backends you need:
+Each backend of the root `vacc` package is a cargo feature (all on by default; the GPU
+features enable both the decode and encode crates), as are the backends of the `decode`
+example, so a build can be trimmed to the backends you need:
 
 ```bash
 cargo build -p vacc --no-default-features --features "vaapi sw"          # root library subset
@@ -494,8 +602,9 @@ This library is based on the [Vulkan-Video-Samples](https://github.com/KhronosGr
 - [Vulkan Video Deep Dive](https://www.khronos.org/assets/uploads/apis/Vulkan-Video-Deep-Dive-Apr21.pdf)
 - [Vulkan Video Extensions Spec](https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/vkspec.html)
 - [NVIDIA Vulkan Video Driver](https://developer.nvidia.com/vulkan-driver)
-- Software cores: the H.264 data plane is a bit-exact port of the edge264 decoder core; the
-  H.265 data plane is a port of the [hevc.js](https://github.com/lid-labs/hevc.js) kernels (MIT).
+- Software cores: the H.264 decode data plane is a bit-exact port of the edge264 decoder core;
+  the H.265 data plane is a port of the [hevc.js](https://github.com/lid-labs/hevc.js) kernels (MIT);
+  the H.264 encoder is a port of the [filmcraft h264enc](https://github.com/storytold/filmcraft) core (MIT OR Apache-2.0).
 
 ## License
 

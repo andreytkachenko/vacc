@@ -19,9 +19,11 @@
 //! +-------------------+     +-------------------+
 //! ```
 
+pub mod bitstream;
 pub mod codec;
 pub mod decoder;
 pub mod device;
+pub mod encoder;
 pub mod error;
 pub mod format;
 pub mod frame;
@@ -29,8 +31,10 @@ pub mod gpu;
 pub mod picture;
 pub mod session;
 
+pub use bitstream::{BitWriter, escape_rbsp, unescape_rbsp};
 pub use codec::{VideoCodec, VideoCodecFlagBits, VideoCodecOperation};
 pub use decoder::{Decoder, DecoderInfo};
+pub use encoder::{EncodedFrame, Encoder, EncoderConfig, EncoderInfo, FrameKind, InputFrame};
 pub use device::{DecodeCapabilities, DecoderDevice};
 pub use error::{VideoError, VideoResult};
 pub use format::{ChromaSubsampling, ComponentBitDepth, VideoFormat, VideoProfile};

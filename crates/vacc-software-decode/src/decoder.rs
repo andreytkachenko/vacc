@@ -70,6 +70,10 @@ impl Drop for AlignedBuf {
     }
 }
 
+// SAFETY: plain aligned memory with no thread-affinity; the pointer is only
+// ever dereferenced through this type's own accessors.
+unsafe impl Send for AlignedBuf {}
+
 /// Error type for the software decoder.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
