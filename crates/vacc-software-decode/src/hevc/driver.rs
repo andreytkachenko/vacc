@@ -231,12 +231,6 @@ pub fn decode_picture(
     let mut wpp_saved = [CabacContext::default(); NUM_CABAC_CONTEXTS];
     let mut wpp_avail = false;
 
-    eprintln!(
-        "DBG decode_picture poc={} nslices={} slice_addrs={:?}",
-        cur_poc,
-        slices.len(),
-        slices.iter().map(|s| s.sh.slice_segment_address).collect::<Vec<_>>()
-    );
     for (s, seg) in slices.iter().enumerate() {
         let sh = &seg.sh;
         // C++ NalParser extracts RBSP from the NAL payload (after the 2-byte

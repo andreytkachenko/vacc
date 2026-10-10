@@ -608,8 +608,8 @@ fn derive_qp_y(ctx: &DecodingContext, x_cb: i32, y_cb: i32) -> i32 {
     let q = (qp_pred + ctx.cu_qp_delta_val + 52 + 2 * sps.qp_bd_offset_y) % (52 + sps.qp_bd_offset_y)
         - sps.qp_bd_offset_y;
     if !((0..=63).contains(&q)) {
-        eprintln!(
-            "DBG derive_qp_y OUT: cu=({}, {}) qg=({}, {}) a={} b={} pred={} delta={} bdoff={:?} -> {}",
+        log::warn!(
+            "derive_qp_y out of range: cu=({}, {}) qg=({}, {}) a={} b={} pred={} delta={} bdoff={:?} -> {}",
             x_cb, y_cb, x_qg, y_qg, qp_pred_a, qp_pred_b, qp_pred, ctx.cu_qp_delta_val, sps.qp_bd_offset_y, q
         );
     }
@@ -870,13 +870,6 @@ fn decode_wpp_row(
     substream_byte_pos: &[usize],
     sync: &[RowSync],
 ) -> usize {
-    eprintln!(
-        "DBG wpp_row row={} start_row={} substreams={:?} tid={:?}",
-        row,
-        start_row,
-        substream_byte_pos,
-        std::thread::current().id()
-    );
     let sps = g.sps;
     let sh = g.sh;
     let num_cols = sps.pic_width_in_ctbs_y;
@@ -1018,19 +1011,6 @@ pub fn decode_slice_segment_data(
     let sps = ctx.sps;
     let pps = ctx.pps;
     let sh = ctx.sh;
-
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
-            "DBG slice_seg n={} slice_addr={} ep_offs={} tid={:?}",
-            n,
-            sh.slice_segment_address,
-            sh.num_entry_point_offsets,
-            std::thread::current().id()
-        );
-    }
 
     // §7.3.8.1: compute RBSP byte positions of WPP/tile substreams.
     // entry_point_offsets are in bytes of the coded slice data (including EP
