@@ -560,11 +560,9 @@ impl H264Parser {
                     }
                 }
                 _ => {
-                    // Invalid slice_group_map_type, but continue parsing
-                    eprintln!(
-                        "[PPS] Invalid slice_group_map_type: {}",
-                        slice_group_map_type
-                    );
+                    // Reserved slice_group_map_type (spec allows 0-5):
+                    // non-conforming stream, refuse the PPS.
+                    return Err(ParserError::InvalidBitstream);
                 }
             }
         }
@@ -1396,9 +1394,10 @@ impl VideoParser for H264Parser {
                             self.processed_up_to = off + sz;
                             i += 1;
                         }
-                        Err(_) => {
-                            i += 1;
-                        }
+                        // A complete NAL that fails to parse is corrupt; skipping
+                        // it would leave stale parameter sets active (silent
+                        // misdecode) or make the next slice fail opaquely.
+                        Err(e) => return Err(e),
                     }
                 }
                 Some(H264NalUnitType::Pps) => {
@@ -1422,9 +1421,7 @@ impl VideoParser for H264Parser {
                             self.processed_up_to = off + sz;
                             i += 1;
                         }
-                        Err(_) => {
-                            i += 1;
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 Some(H264NalUnitType::Sei) => {

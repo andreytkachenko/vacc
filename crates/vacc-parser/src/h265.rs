@@ -2265,10 +2265,15 @@ impl VideoParser for H265Parser {
                     // Copy the NAL data out so the borrow of self.cached_nals
                     // ends before the &mut self calls below.
                     let nal_data = nal.data.clone();
-                    if let Ok(_vps) = self.parse_vps(&nal_data) {
-                        result_vps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                            self.active_vps.clone().unwrap(),
-                        ));
+                    match self.parse_vps(&nal_data) {
+                        Ok(_vps) => {
+                            result_vps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                                self.active_vps.clone().unwrap(),
+                            ));
+                        }
+                        // A complete NAL that fails to parse is corrupt; see the
+                        // H.264 SPS/PPS arms for why we error instead of skipping.
+                        Err(e) => return Err(e),
                     }
                     i += 1;
                 }
@@ -2277,7 +2282,8 @@ impl VideoParser for H265Parser {
                         break;
                     }
                     let nal_data = nal.data.clone();
-                    if let Ok(sps) = self.parse_sps(&nal_data) {
+                    match self.parse_sps(&nal_data) {
+                        Ok(sps) => {
                         {
                             result_sps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
                                 self.active_sps.clone().unwrap(),
@@ -2322,6 +2328,8 @@ impl VideoParser for H265Parser {
                             self.detected_format.codec_profile = sps.profile_idc as u32;
                             self.detected_format.progressive_sequence = !sps.vui.field_seq_flag;
                         }
+                        }
+                        Err(e) => return Err(e),
                     }
                     i += 1;
                 }
@@ -2330,10 +2338,13 @@ impl VideoParser for H265Parser {
                         break;
                     }
                     let nal_data = nal.data.clone();
-                    if let Ok(_pps) = self.parse_pps(&nal_data) {
-                        result_pps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
-                            self.active_pps.clone().unwrap(),
-                        ));
+                    match self.parse_pps(&nal_data) {
+                        Ok(_pps) => {
+                            result_pps = Some(vacc_core::picture::BoxedPictureParametersSet::new(
+                                self.active_pps.clone().unwrap(),
+                            ));
+                        }
+                        Err(e) => return Err(e),
                     }
                     i += 1;
                 }
