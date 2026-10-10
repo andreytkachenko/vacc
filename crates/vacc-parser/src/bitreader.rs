@@ -337,45 +337,52 @@ impl<'a> BitReader<'a> {
     /// (at or past the trailing bit and trailing zeros).
     ///
     /// RBSP format: data bits + one trailing bit (1) + zero or more padding bits (0).
-    /// We need to detect when remaining bits are just the trailing bit + padding.
+    /// The remaining bits are "just the tail" iff the first remaining bit is 1
+    /// and every bit after it is 0; any deviation means real data remains.
     pub fn has_more_rsbp_data(&self) -> bool {
-        // If we've consumed all bytes, no more data
-        if self.pos >= self.data.len() && self.bits_left == 0 {
-            return false;
+        // Scan forward bit by bit, mirroring `load_byte`'s EPB handling so the
+        // check sees RBSP bits (an EPB 0x03 in the raw tail is not a data bit).
+        // The scan stops at the first 0, the second 1, or end of data, so it
+        // is bounded by the stream and cannot overflow.
+        let mut curr_byte = self.curr_byte;
+        let mut bits_left = self.bits_left;
+        let mut pos = self.pos;
+        let mut prev_two = self.prev_two_bytes;
+
+        let mut first = true;
+        loop {
+            if bits_left == 0 {
+                if pos >= self.data.len() {
+                    return false; // nothing left: at (or past) the tail
+                }
+                let byte = self.data[pos];
+                pos += 1;
+                if self.remove_epb && prev_two == 0 && byte == 0x03 {
+                    if pos >= self.data.len() {
+                        return false; // dangling EPB: no meaningful data beyond it
+                    }
+                    let actual = self.data[pos];
+                    pos += 1;
+                    prev_two = (0x03u16 << 8) | actual as u16;
+                    curr_byte = actual;
+                } else {
+                    prev_two = (prev_two << 8) | byte as u16;
+                    curr_byte = byte;
+                }
+                bits_left = 8;
+            }
+
+            let bit = (curr_byte >> (bits_left - 1)) & 1;
+            bits_left -= 1;
+            if first {
+                if bit == 0 {
+                    return true; // data continues before the stop bit
+                }
+                first = false;
+            } else if bit == 1 {
+                return true; // a second 1: not a pure trailing pattern
+            }
         }
-
-        // Collect all remaining bits from current position to end of data
-        // to check if they match the RBSP ending pattern: 1 followed by all 0s
-        let mut remaining_value: u64 = 0;
-        let mut remaining_bits: u32 = 0;
-
-        // Bits remaining in current byte
-        if self.bits_left > 0 {
-            let mask = ((1u16 << self.bits_left) - 1) as u8;
-            remaining_value = (self.curr_byte & mask) as u64;
-            remaining_bits = self.bits_left as u32;
-        }
-
-        // Include all subsequent bytes
-        for &byte in &self.data[self.pos..] {
-            remaining_value = (remaining_value << 8) | (byte as u64);
-            remaining_bits += 8;
-        }
-
-        if remaining_bits == 0 {
-            return false;
-        }
-
-        // RBSP ending pattern: 1 followed by all 0s
-        // This means: remaining_value should be a power of 2 (single bit set at the top)
-        // Example: 10000000 (trailing bit + 7 padding bits) = 0x80 = power of 2
-        // Example: 1000000 (trailing bit + 6 padding bits) = 0x40 = power of 2
-        if remaining_value > 0 && (remaining_value & (remaining_value - 1)) == 0 {
-            // Remaining bits are just trailing bit + padding zeros
-            return false;
-        }
-
-        true
     }
 
     /// Load the next byte into curr_byte, handling EPB if enabled.
@@ -754,5 +761,87 @@ mod tests {
             "pq_code={} ps_code={} cq_code={}",
             pq_code, ps_code, cq_code
         );
+    }
+
+    #[test]
+    fn test_has_more_rsbp_data_tail_only() {
+        // Stop bit + padding zeros: no more data.
+        let r = BitReader::new(&[0b1000_0000], false);
+        assert!(!r.has_more_rsbp_data());
+
+        // Mid-byte start: 3 data bits already consumed, remainder is the tail.
+        let mut r = BitReader::new(&[0b0111_0000], false);
+        r.read_bits(3).unwrap();
+        assert!(!r.has_more_rsbp_data());
+
+        // Fully consumed reader: no more data.
+        let mut r = BitReader::new(&[0xFF], false);
+        r.read_bits(8).unwrap();
+        assert!(!r.has_more_rsbp_data());
+
+        // Fresh reader on an empty tail byte with nothing else.
+        let r = BitReader::new(&[0x80, 0x00, 0x00], false);
+        assert!(!r.has_more_rsbp_data());
+    }
+
+    #[test]
+    fn test_has_more_rsbp_data_data_remains() {
+        // A 0 before the stop bit: real data remains.
+        let mut r = BitReader::new(&[0b0100_0000], false);
+        assert!(r.has_more_rsbp_data());
+
+        // A second 1 after the stop bit: real data remains.
+        let mut r = BitReader::new(&[0b1010_0000], false);
+        assert!(r.has_more_rsbp_data());
+
+        // Mid-byte start with a pending 0 data bit before the tail.
+        let mut r = BitReader::new(&[0b1010_0000], false);
+        r.read_bits(1).unwrap();
+        assert!(r.has_more_rsbp_data());
+
+        // Mid-byte start where the remainder is exactly the tail.
+        let mut r = BitReader::new(&[0b1100_0000], false);
+        r.read_bits(1).unwrap();
+        assert!(!r.has_more_rsbp_data());
+    }
+
+    #[test]
+    fn test_has_more_rsbp_data_long_tail_no_overflow() {
+        // Regression: the old implementation accumulated remaining bytes into a
+        // u64 and overflowed (debug panic / release wrap) past 8 bytes.
+        let mut data = [0u8; 24];
+        data[0] = 0x80;
+        let r = BitReader::new(&data, false);
+        assert!(!r.has_more_rsbp_data());
+
+        let mut data = [0u8; 24];
+        data[0] = 0b0100_0000;
+        let r = BitReader::new(&data, false);
+        assert!(r.has_more_rsbp_data());
+    }
+
+    #[test]
+    fn test_has_more_rsbp_data_epb_aware() {
+        // RBSP: 00 00 80 00 (two data bytes, then stop bit + padding).
+        // Raw with EPB: 00 00 03 80 00. After consuming the two data bytes the
+        // remaining RBSP is just the tail — but the raw tail contains an EPB,
+        // which the old raw-byte scan misread as data bits.
+        let raw = [0x00, 0x00, 0x03, 0x80, 0x00];
+        let mut r = BitReader::new(&raw, true);
+        r.read_bits(16).unwrap();
+        assert!(!r.has_more_rsbp_data());
+
+        // Same stream with a pending data bit before the tail: the EPB must not
+        // mask the leading 0.
+        let raw = [0x00, 0x00, 0x03, 0x40, 0x00];
+        let mut r = BitReader::new(&raw, true);
+        r.read_bits(15).unwrap();
+        assert!(r.has_more_rsbp_data());
+
+        // Dangling EPB at end of data: no meaningful data beyond it.
+        let raw = [0x00, 0x00, 0x03];
+        let mut r = BitReader::new(&raw, true);
+        r.read_bits(16).unwrap();
+        assert!(!r.has_more_rsbp_data());
     }
 }
