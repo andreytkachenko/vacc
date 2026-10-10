@@ -50,9 +50,10 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn mmco_vec(mmco: &[(u32, u32)]) -> Vec<H264MmcoCommand> {
+fn mmco_vec(mmco: &[(u32, u32, u32)]) -> Vec<H264MmcoCommand> {
     mmco.iter()
-        .map(|(op, value)| match *op {
+        .filter(|(op, _, _)| *op <= 6)
+        .map(|(op, value, value2)| match *op {
             1 => H264MmcoCommand::UnmarkShortTerm {
                 difference_of_pic_nums_minus1: *value,
             },
@@ -60,17 +61,17 @@ fn mmco_vec(mmco: &[(u32, u32)]) -> Vec<H264MmcoCommand> {
                 long_term_frame_idx: *value,
             },
             3 => H264MmcoCommand::AssignLongTerm {
-                difference_of_pic_nums_minus1: 0,
+                difference_of_pic_nums_minus1: *value,
+                long_term_frame_idx: *value2,
+            },
+            4 => H264MmcoCommand::AssignLongTermToCurrent {
                 long_term_frame_idx: *value,
             },
-            4 => H264MmcoCommand::SetMaxLongTermFrameIdx {
+            5 => H264MmcoCommand::SetMaxLongTermFrameIdx {
                 max_long_term_frame_idx_plus1: *value,
             },
-            5 => H264MmcoCommand::UnmarkAll,
-            6 => H264MmcoCommand::AssignLongTermToCurrent {
-                long_term_frame_idx: *value,
-            },
-            _ => H264MmcoCommand::UnmarkAll,
+            6 => H264MmcoCommand::UnmarkAll,
+            _ => unreachable!(),
         })
         .collect()
 }
@@ -155,10 +156,10 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                     dpb = Some(H264Dpb::new(16, 16, num_ref_frames, sps.max_frame_num));
                 }
                 let poc = poc_calc.calculate(&sps, slh, is_ref);
-                let mmco: Vec<(u32, u32)> = slh
+                let mmco: Vec<(u32, u32, u32)> = slh
                     .dec_ref_pic_marking
                     .iter()
-                    .map(|e| (e.memory_management_control_operation, e.value))
+                    .map(|e| (e.memory_management_control_operation, e.value, e.value2))
                     .collect();
                 let cmds = mmco_vec(&mmco);
                 let no_output = slh.no_output_of_prior_pics_flag;
@@ -169,6 +170,7 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                     poc,
                     is_ref,
                     is_idr,
+                    slh.long_term_reference,
                     no_output,
                     !cmds.is_empty(),
                     cmds,
@@ -211,7 +213,10 @@ fn dump_h264(data: &[u8], max_frames: usize) {
                         .collect();
                     eprintln!("SLOTS pic{pic}: {}", slots.join(""));
                 }
-                let mmco_s: Vec<String> = mmco.iter().map(|(o, v)| format!("{o}:{v}")).collect();
+                let mmco_s: Vec<String> = mmco
+                    .iter()
+                    .map(|(o, v, v2)| if *o == 3 { format!("{o}:{v}+{v2}") } else { format!("{o}:{v}") })
+                    .collect();
                 println!(
                     "PIC {pic}\n  fn={} poc={} slt={} pps={} idr={} poc_lsb={} nal_ref={} \
                      nr0={} nr1={} nopp={} mmco=[{}] rplm0=[{}] rplm1=[{}] hbs={}\n  L0 [{}]\n  L1 [{}]",

@@ -796,6 +796,7 @@ impl VaapiDecoder {
             bottom_field,
             idr_pic_id,
             no_output_of_prior_pics_flag,
+            long_term_reference,
             frame_num,
             slice_type,
             mmco,
@@ -811,6 +812,7 @@ impl VaapiDecoder {
                 h264_slh.bottom_field,
                 h264_slh.idr_pic_id,
                 h264_slh.no_output_of_prior_pics_flag,
+                h264_slh.long_term_reference,
                 h264_slh.frame_num,
                 h264_slh.slice_type % 5,
                 &h264_slh.dec_ref_pic_marking[..],
@@ -826,6 +828,7 @@ impl VaapiDecoder {
                 false,
                 false,
                 0,
+                false,
                 false,
                 0,
                 2,
@@ -856,8 +859,16 @@ impl VaapiDecoder {
 
         // Build the current picture's VA flags. FFmpeg's fill_vaapi_pic sets
         // SHORT_TERM_REFERENCE for every non-droppable picture (pic->reference
-        // = picture_structure, h264_slice.c), regardless of nal_ref_idc.
-        let mut flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+        // = picture_structure, h264_slice.c), regardless of nal_ref_idc — but
+        // LONG_TERM_REFERENCE when the picture is marked long-term (IDR
+        // long_term_reference_flag or MMCO op 4).
+        let mut flags = if mmco.iter().any(|o| o.memory_management_control_operation == 4)
+            || (is_idr && long_term_reference)
+        {
+            VA_PICTURE_H264_LONG_TERM_REFERENCE
+        } else {
+            VA_PICTURE_H264_SHORT_TERM_REFERENCE
+        };
         if field_pic_flag {
             if bottom_field {
                 flags |= VA_PICTURE_H264_BOTTOM_FIELD;
@@ -867,28 +878,32 @@ impl VaapiDecoder {
         }
 
         // Convert the slice header's dec_ref_pic_marking into common-DPB MMCO
-        // commands (H.264 8.2.5).
+        // commands (H.264 8.2.5.1). Op numbers are the bitstream's
+        // memory_management_control_operation: 1 unmark short picNumX /
+        // 2 unmark long / 3 assign long to picNumX / 4 mark current as long /
+        // 5 set MaxLongTermFrameIdxPlus1 / 6 unmark all short. Reserved codes
+        // (>= 7) are non-conforming: ignore them rather than unmark refs.
         let mmco_commands: Vec<H264MmcoCommand> = mmco
             .iter()
-            .map(|op| match op.memory_management_control_operation {
-                1 => H264MmcoCommand::UnmarkShortTerm {
+            .filter_map(|op| match op.memory_management_control_operation {
+                1 => Some(H264MmcoCommand::UnmarkShortTerm {
                     difference_of_pic_nums_minus1: op.value,
-                },
-                2 => H264MmcoCommand::UnmarkLongTerm {
+                }),
+                2 => Some(H264MmcoCommand::UnmarkLongTerm {
                     long_term_frame_idx: op.value,
-                },
-                3 => H264MmcoCommand::AssignLongTerm {
-                    difference_of_pic_nums_minus1: 0,
+                }),
+                3 => Some(H264MmcoCommand::AssignLongTerm {
+                    difference_of_pic_nums_minus1: op.value,
+                    long_term_frame_idx: op.value2,
+                }),
+                4 => Some(H264MmcoCommand::AssignLongTermToCurrent {
                     long_term_frame_idx: op.value,
-                },
-                4 => H264MmcoCommand::SetMaxLongTermFrameIdx {
+                }),
+                5 => Some(H264MmcoCommand::SetMaxLongTermFrameIdx {
                     max_long_term_frame_idx_plus1: op.value,
-                },
-                5 => H264MmcoCommand::UnmarkAll,
-                6 => H264MmcoCommand::AssignLongTermToCurrent {
-                    long_term_frame_idx: op.value,
-                },
-                _ => H264MmcoCommand::UnmarkAll,
+                }),
+                6 => Some(H264MmcoCommand::UnmarkAll),
+                _ => None,
             })
             .collect();
 
@@ -906,6 +921,7 @@ impl VaapiDecoder {
             poc,
             is_ref,
             is_idr,
+            long_term_reference,
             no_output_of_prior_pics_flag,
             !mmco_commands.is_empty(),
             mmco_commands,

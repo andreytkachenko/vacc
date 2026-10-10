@@ -1220,31 +1220,28 @@ impl H264Parser {
                     if memory_management_control_operation == 0 {
                         break;
                     }
-                    // H.264 spec 7.4.5: each op has a specific number of ue(v) values.
-                    // Reading the wrong count desyncs the bit reader for the rest of
-                    // the slice header (and subsequent slices). We store the primary
-                    // value in `value`; op 3's second value (long_term_pic_num) is
-                    // read for bit-reader sync but not stored (DecRefPicMarkingEntry
-                    // has a single value field).
-                    let value = match memory_management_control_operation {
-                        1 => r.read_ue()?, // difference_of_pic_nums_minus1
-                        2 => r.read_ue()?, // long_term_pic_num
-                        3 => {
-                            let diff = r.read_ue()?; // difference_of_pic_nums_minus1
-                            let _lt = r.read_ue()?; // long_term_pic_num (sync only)
-                            diff
-                        }
-                        4 => r.read_ue()?, // max_long_term_frame_idx_plus1
-                        5 => 0,            // no value
-                        6 => r.read_ue()?, // long_term_pic_num
-                        7 => r.read_ue()?, // long_term_pic_num
-                        8 => 0,            // no value
-                        9 => r.read_ue()?, // long_term_pic_num
-                        _ => 0,
+                    // H.264 spec 7.4.5: each op has a specific number of ue(v)
+                    // values; reading the wrong count desyncs the bit reader for
+                    // the rest of the slice header (and subsequent slices):
+                    //   op 1: difference_of_pic_nums_minus1
+                    //   op 2: long_term_pic_num
+                    //   op 3: difference_of_pic_nums_minus1, long_term_pic_num
+                    //   op 4: long_term_pic_num (mark current picture as long-term)
+                    //   op 5: max_long_term_frame_idx_plus1
+                    //   op 6: no parameters (unmark all short-term references)
+                    // Reserved codes (>= 7) are non-conforming; read no values.
+                    let (value, value2) = match memory_management_control_operation {
+                        1 => (r.read_ue()?, 0),
+                        2 => (r.read_ue()?, 0),
+                        3 => (r.read_ue()?, r.read_ue()?),
+                        4 => (r.read_ue()?, 0),
+                        5 => (r.read_ue()?, 0),
+                        _ => (0, 0),
                     };
                     marking.push(DecRefPicMarkingEntry {
                         memory_management_control_operation,
                         value,
+                        value2,
                     });
                 }
             }
@@ -1618,10 +1615,13 @@ pub struct RefPicListModificationEntry {
 /// Decoded reference picture marking operation (H.264 spec 7.4.5).
 #[derive(Debug, Clone)]
 pub struct DecRefPicMarkingEntry {
-    /// memory_management_control_operation value.
+    /// memory_management_control_operation value (1-6 per spec 7.4.5).
     pub memory_management_control_operation: u32,
-    /// Associated value depending on operation type.
+    /// Primary associated value: op 1/3 difference_of_pic_nums_minus1, op 2/4
+    /// long_term_pic_num, op 5 max_long_term_frame_idx_plus1; 0 for op 6.
     pub value: u32,
+    /// Secondary value, only meaningful for op 3: long_term_pic_num.
+    pub value2: u32,
 }
 
 #[derive(Debug, Clone)]

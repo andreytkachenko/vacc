@@ -543,7 +543,10 @@ impl SwH264Decoder {
         }
         let poc = self.poc_calc.calculate(sps, first_slh, is_ref);
 
-        // Convert dec_ref_pic_marking into common-DPB MMCO commands (8.2.5).
+        // Convert dec_ref_pic_marking into common-DPB MMCO commands (8.2.5.1).
+        // Op numbers are the bitstream's memory_management_control_operation:
+        //   1 unmark short picNumX / 2 unmark long / 3 assign long to picNumX
+        //   4 mark current as long / 5 set MaxLongTermFrameIdxPlus1 / 6 unmark all short
         let mmco_commands: Vec<H264MmcoCommand> = first_slh
             .dec_ref_pic_marking
             .iter()
@@ -555,16 +558,16 @@ impl SwH264Decoder {
                     long_term_frame_idx: op.value,
                 },
                 3 => H264MmcoCommand::AssignLongTerm {
-                    difference_of_pic_nums_minus1: 0,
+                    difference_of_pic_nums_minus1: op.value,
+                    long_term_frame_idx: op.value2,
+                },
+                4 => H264MmcoCommand::AssignLongTermToCurrent {
                     long_term_frame_idx: op.value,
                 },
-                4 => H264MmcoCommand::SetMaxLongTermFrameIdx {
+                5 => H264MmcoCommand::SetMaxLongTermFrameIdx {
                     max_long_term_frame_idx_plus1: op.value,
                 },
-                5 => H264MmcoCommand::UnmarkAll,
-                6 => H264MmcoCommand::AssignLongTermToCurrent {
-                    long_term_frame_idx: op.value,
-                },
+                6 => H264MmcoCommand::UnmarkAll,
                 _ => H264MmcoCommand::UnmarkAll,
             })
             .collect();
@@ -575,6 +578,7 @@ impl SwH264Decoder {
             poc,
             is_ref,
             is_idr,
+            first_slh.long_term_reference,
             first_slh.no_output_of_prior_pics_flag,
             !mmco_commands.is_empty(),
             mmco_commands,

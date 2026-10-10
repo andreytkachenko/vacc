@@ -696,6 +696,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 1, // unmark_short_term
             value: 4,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(20, &slh, false, false);
@@ -714,6 +715,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 8, // unmark_all_short_term
             value: 0,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(15, &slh, false, false);
@@ -736,6 +738,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 2,
             value: 0,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(15, &slh, false, false);
@@ -776,6 +779,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 9,
             value: 3,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(5, &slh, false, false);
@@ -1136,6 +1140,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 1, // unmark_short_term
             value: 4,                               // difference_of_pic_nums_minus1=4, diff=5
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(3, &slh, false, false);
@@ -1176,6 +1181,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 9,
             value: 5, // long_term_pic_num = 5
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(0, &slh, false, false);
@@ -1220,6 +1226,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 3,
             value: 1,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(2, &slh, false, false);
@@ -1265,6 +1272,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 7,
             value: 7,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(2, &slh, false, false);
@@ -1300,6 +1308,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 3,
             value: 4,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(3, &slh, false, false);
@@ -1341,6 +1350,7 @@ mod tests {
         let mmco = vec![DecRefPicMarkingEntry {
             memory_management_control_operation: 1,
             value: 1 << 30,
+            value2: 0,
         }];
         let slh = make_slice_header(mmco);
         dpb.apply_mmco(10, &slh, false, false);

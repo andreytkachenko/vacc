@@ -22,22 +22,25 @@ use crate::h264_reflist::{DpbRefState, RefPicLists, build_ref_pic_lists};
 /// H.264 Memory Management Control Operation (MMCO) command.
 /// See H.264 spec 8.2.5.4 for details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Adaptive reference picture marking operations (H.264 spec 8.2.5.1).
+/// Op numbers are the bitstream's memory_management_control_operation values.
 pub enum H264MmcoCommand {
-    /// MMCO 1: Unmark short-term reference with difference_of_pic_nums_minus1
+    /// MMCO 1: unmark short-term reference with PicNum == picNumX
     UnmarkShortTerm { difference_of_pic_nums_minus1: u32 },
-    /// MMCO 2: Unmark long-term reference with long_term_frame_idx
+    /// MMCO 2: unmark long-term reference with LongTermFrameIdx
     UnmarkLongTerm { long_term_frame_idx: u32 },
-    /// MMCO 3: Assign LongTermFrameIdx to short-term reference
+    /// MMCO 3: assign LongTermFrameIdx to the short-term reference with
+    /// PicNum == picNumX (it becomes a long-term reference)
     AssignLongTerm {
         difference_of_pic_nums_minus1: u32,
         long_term_frame_idx: u32,
     },
-    /// MMCO 4: Set MaxLongTermFrameIdx
-    SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: u32 },
-    /// MMCO 5: Unmark all references
-    UnmarkAll,
-    /// MMCO 6: Assign LongTermFrameIdx to current picture
+    /// MMCO 4: mark the current picture as a long-term reference
     AssignLongTermToCurrent { long_term_frame_idx: u32 },
+    /// MMCO 5: set MaxLongTermFrameIdxPlus1 (constrains future ops only; no DPB state change)
+    SetMaxLongTermFrameIdx { max_long_term_frame_idx_plus1: u32 },
+    /// MMCO 6: unmark all short-term reference pictures
+    UnmarkAll,
 }
 
 /// Slot is not a reference picture.
@@ -58,6 +61,8 @@ pub struct H264DpbSlot {
     pub poc: i32,
     /// MARKING_UNUSED / MARKING_SHORT / MARKING_LONG.
     pub marking: u8,
+    /// LongTermFrameIdx (meaningful only when `marking == MARKING_LONG`).
+    pub long_term_frame_idx: u32,
     pub needed_for_output: bool,
 }
 
@@ -69,6 +74,7 @@ impl H264DpbSlot {
             frame_num_wrap: 0,
             poc: 0,
             marking: MARKING_UNUSED,
+            long_term_frame_idx: 0,
             needed_for_output: false,
         }
     }
@@ -101,6 +107,9 @@ struct CurrentPic {
     poc: i32,
     is_ref: bool,
     is_idr: bool,
+    /// IDR slice header's long_term_reference_flag (8.2.5.1): the picture is
+    /// committed as a long-term reference with LongTermFrameIdx 0.
+    long_term_reference: bool,
     no_output_of_prior_pics: bool,
     mmco: bool,
     mmco_commands: Vec<H264MmcoCommand>,
@@ -160,6 +169,7 @@ impl H264Dpb {
         poc: i32,
         is_ref: bool,
         is_idr: bool,
+        long_term_reference: bool,
         no_output_of_prior_pics: bool,
         mmco: bool,
         mmco_commands: Vec<H264MmcoCommand>,
@@ -170,6 +180,7 @@ impl H264Dpb {
             poc,
             is_ref,
             is_idr,
+            long_term_reference,
             no_output_of_prior_pics,
             mmco,
             mmco_commands,
@@ -269,6 +280,29 @@ impl H264Dpb {
         // all wraps on the next picture_start call. We store frame_num directly to match
         // the C++ oracle which doesn't pre-compute a persistent FrameNumWrap.
         let frame_num_wrap = cur.frame_num as i32;
+        // 8.2.5.1: the current picture is committed as a long-term reference
+        // when (a) it is an IDR with long_term_reference_flag (LongTermFrameIdx
+        // is always 0 for IDRs), or (b) MMCO 4 assigned it a LongTermFrameIdx.
+        let mut lt_idx = 0u32;
+        let lt_assigned = cur
+            .mmco_commands
+            .iter()
+            .find_map(|c| match c {
+                H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx } => {
+                    lt_idx = *long_term_frame_idx;
+                    Some(())
+                }
+                _ => None,
+            })
+            .is_some();
+        let marking = if !cur.is_ref {
+            MARKING_UNUSED
+        } else if cur.long_term_reference || lt_assigned {
+            MARKING_LONG
+        } else {
+            MARKING_SHORT
+        };
+
         if slot < self.slots.len() {
             let s = &mut self.slots[slot];
             *s = H264DpbSlot {
@@ -276,11 +310,8 @@ impl H264Dpb {
                 frame_num: cur.frame_num,
                 frame_num_wrap,
                 poc: cur.poc,
-                marking: if cur.is_ref {
-                    MARKING_SHORT
-                } else {
-                    MARKING_UNUSED
-                },
+                marking,
+                long_term_frame_idx: lt_idx,
                 needed_for_output: true,
             };
         }
@@ -343,22 +374,28 @@ impl H264Dpb {
         // (generate_sliding_window_mmcos: `short_ref_count >= ref_frame_count`
         // before the current picture is added to the list). Verified against
         // `ffmpeg -debug mmco` on h264_baseline: refs grow to max_num_ref_frames
-        // (3) before the oldest is evicted.
+        // (3) before the oldest is evicted. Eviction targets SHORT-TERM refs
+        // only (8.2.5.3); long-term refs are never slid out.
         let num_refs = self.slots.iter().filter(|s| s.is_ref()).count();
         if (num_refs as u32) >= self.num_ref_frames {
-            let mut imin = 0usize;
+            let mut imin = None;
             let mut min_wrap = i32::MAX;
             for (i, s) in self.slots.iter().enumerate() {
-                if s.is_ref() && s.frame_num_wrap < min_wrap {
+                if s.marking == MARKING_SHORT && s.frame_num_wrap < min_wrap {
                     min_wrap = s.frame_num_wrap;
-                    imin = i;
+                    imin = Some(i);
                 }
             }
-            self.slots[imin].marking = MARKING_UNUSED;
+            if let Some(i) = imin {
+                self.slots[i].marking = MARKING_UNUSED;
+            }
         }
     }
 
     /// Adaptive (MMCO) decoded reference picture marking (H.264 8.2.5.1).
+    ///
+    /// MMCO 4 (assign long-term index to the CURRENT picture) cannot be applied
+    /// here — the current picture has no slot yet; `commit_current` applies it.
     fn apply_mmco(&mut self, cur: &CurrentPic) {
         for cmd in &cur.mmco_commands {
             match cmd {
@@ -367,20 +404,50 @@ impl H264Dpb {
                 } => {
                     let pic_num_x = self.pic_num_x(cur.frame_num, *difference_of_pic_nums_minus1);
                     for s in &mut self.slots {
-                        if s.is_ref() && s.frame_num == pic_num_x {
+                        if s.is_ref() && s.marking == MARKING_SHORT && s.frame_num == pic_num_x {
                             s.marking = MARKING_UNUSED;
                         }
                     }
                 }
-                H264MmcoCommand::UnmarkLongTerm { .. }
-                | H264MmcoCommand::AssignLongTerm { .. }
-                | H264MmcoCommand::SetMaxLongTermFrameIdx { .. }
-                | H264MmcoCommand::AssignLongTermToCurrent { .. } => {
-                    // Long-term reference ops: not needed for these progressive samples.
+                H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx } => {
+                    for s in &mut self.slots {
+                        if s.state != 0
+                            && s.marking == MARKING_LONG
+                            && s.long_term_frame_idx == *long_term_frame_idx
+                        {
+                            s.marking = MARKING_UNUSED;
+                        }
+                    }
+                }
+                H264MmcoCommand::AssignLongTerm {
+                    difference_of_pic_nums_minus1,
+                    long_term_frame_idx,
+                } => {
+                    let pic_num_x = self.pic_num_x(cur.frame_num, *difference_of_pic_nums_minus1);
+                    for s in &mut self.slots {
+                        if s.is_ref()
+                            && s.marking == MARKING_SHORT
+                            && s.frame_num == pic_num_x
+                        {
+                            s.marking = MARKING_LONG;
+                            s.long_term_frame_idx = *long_term_frame_idx;
+                        }
+                    }
+                }
+                H264MmcoCommand::SetMaxLongTermFrameIdx { .. } => {
+                    // 8.2.5.1 op 5: sets MaxLongTermFrameIdxPlus1, which only
+                    // constrains future long_term_pic_num values — no DPB state change.
+                }
+                H264MmcoCommand::AssignLongTermToCurrent { .. } => {
+                    // Applied in commit_current (the current picture is not in a slot yet).
                 }
                 H264MmcoCommand::UnmarkAll => {
+                    // 8.2.5.1 op 6: unmarks all SHORT-TERM references; long-term
+                    // references are untouched.
                     for s in &mut self.slots {
-                        s.marking = MARKING_UNUSED;
+                        if s.marking == MARKING_SHORT {
+                            s.marking = MARKING_UNUSED;
+                        }
                     }
                 }
             }
@@ -425,7 +492,7 @@ impl H264Dpb {
                 } else {
                     s.marking
                 },
-                long_term_frame_idx: 0, // long-term refs are not tracked by this DPB yet
+                long_term_frame_idx: s.long_term_frame_idx,
             })
             .collect();
         let curr_fn = self.cur.as_ref().map(|c| c.frame_num).unwrap_or(0);
@@ -441,5 +508,196 @@ impl H264Dpb {
             curr_poc,
             self.max_frame_num,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DPB with 8 slots, max 3 short-term refs, MaxFrameNum 64.
+    fn dpb() -> H264Dpb {
+        H264Dpb::new(8, 8, 3, 64)
+    }
+
+    fn slot(frame_num: u32, poc: i32, marking: u8, lt_idx: u32) -> H264DpbSlot {
+        H264DpbSlot {
+            state: 3,
+            frame_num,
+            frame_num_wrap: frame_num as i32,
+            poc,
+            marking,
+            long_term_frame_idx: lt_idx,
+            needed_for_output: false,
+        }
+    }
+
+    /// Commit a plain short-term reference picture into `slot`.
+    fn commit_short_ref(dpb: &mut H264Dpb, slot: usize, frame_num: u32, poc: i32) {
+        dpb.picture_start(frame_num, poc, true, false, false, false, false, Vec::new());
+        dpb.commit_current(slot);
+    }
+
+    #[test]
+    fn mmco_op3_assigns_long_term_idx_to_picnumx() {
+        let mut dpb = dpb();
+        commit_short_ref(&mut dpb, 0, 4, 8);
+
+        // Current frame_num=10, diff_minus1=5 -> picNumX = 10 - 6 = 4 (slot 0).
+        dpb.picture_start(
+            10,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            vec![H264MmcoCommand::AssignLongTerm {
+                difference_of_pic_nums_minus1: 5,
+                long_term_frame_idx: 2,
+            }],
+        );
+        dpb.prepare_current_avoiding(&[]);
+
+        assert_eq!(dpb.slots[0].marking, MARKING_LONG);
+        assert_eq!(dpb.slots[0].long_term_frame_idx, 2);
+    }
+
+    #[test]
+    fn mmco_op2_unmarks_long_term() {
+        let mut dpb = dpb();
+        dpb.slots[0] = slot(1, 2, MARKING_LONG, 3);
+
+        dpb.picture_start(
+            10,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            vec![H264MmcoCommand::UnmarkLongTerm { long_term_frame_idx: 3 }],
+        );
+        dpb.prepare_current_avoiding(&[]);
+
+        assert_eq!(dpb.slots[0].marking, MARKING_UNUSED);
+    }
+
+    #[test]
+    fn mmco_op6_unmarks_short_only() {
+        let mut dpb = dpb();
+        dpb.slots[0] = slot(1, 2, MARKING_SHORT, 0);
+        dpb.slots[1] = slot(2, 4, MARKING_LONG, 0);
+
+        dpb.picture_start(
+            10,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            vec![H264MmcoCommand::UnmarkAll],
+        );
+        dpb.prepare_current_avoiding(&[]);
+
+        assert_eq!(dpb.slots[0].marking, MARKING_UNUSED);
+        assert_eq!(dpb.slots[1].marking, MARKING_LONG, "op 6 must keep long-term refs");
+    }
+
+    #[test]
+    fn mmco_op4_marks_current_as_long_term() {
+        let mut dpb = dpb();
+        dpb.picture_start(
+            1,
+            2,
+            true,
+            false,
+            false,
+            false,
+            true,
+            vec![H264MmcoCommand::AssignLongTermToCurrent { long_term_frame_idx: 3 }],
+        );
+        let s = dpb.prepare_current_avoiding(&[]);
+        dpb.commit_current(s);
+
+        assert_eq!(dpb.slots[s].marking, MARKING_LONG);
+        assert_eq!(dpb.slots[s].long_term_frame_idx, 3);
+    }
+
+    #[test]
+    fn idr_long_term_reference_flag_commits_lt_idx_zero() {
+        let mut dpb = dpb();
+        // Keep the previous ref pending output so it is not freed before the IDR
+        // (with the default max_num_reorder_frames=0 every frame displays at once).
+        dpb.max_num_reorder_frames = 4;
+        commit_short_ref(&mut dpb, 0, 4, 8);
+
+        dpb.picture_start(8, 16, true, /* is_idr */ true, /* lt_ref */ true, false, false, Vec::new());
+        let s = dpb.prepare_current_avoiding(&[]);
+        dpb.commit_current(s);
+
+        assert_eq!(dpb.slots[s].marking, MARKING_LONG);
+        assert_eq!(dpb.slots[s].long_term_frame_idx, 0);
+        // IDR unmarked the previous short-term ref.
+        assert_eq!(dpb.slots[0].marking, MARKING_UNUSED);
+    }
+
+    #[test]
+    fn ref_lists_append_long_term_in_ascending_idx() {
+        let mut dpb = dpb();
+        dpb.slots[0] = slot(1, 2, MARKING_LONG, 2);
+        dpb.slots[1] = slot(2, 4, MARKING_LONG, 1);
+        dpb.slots[2] = slot(5, 10, MARKING_SHORT, 0);
+
+        // P slice: L0 = short-term (descending PicNum) then long-term
+        // (ascending LongTermFrameIdx). active=3 so the list is exact (no
+        // backfill padding).
+        let lists = dpb.build_ref_lists(0, 2, 0, &[], &[]);
+        assert_eq!(
+            lists.l0.iter().map(|r| r.slot).collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "ST first, then LT idx 1 before idx 2"
+        );
+        assert!(!lists.l0[0].is_long_term);
+        assert!(lists.l0[1].is_long_term && lists.l0[2].is_long_term);
+    }
+
+    #[test]
+    fn sliding_window_never_evicts_long_term() {
+        let mut dpb = dpb();
+        // 3 refs total (>= max_num_ref_frames=3) triggers eviction.
+        dpb.slots[0] = slot(1, 2, MARKING_SHORT, 0);
+        dpb.slots[1] = slot(2, 4, MARKING_SHORT, 0);
+        dpb.slots[2] = slot(3, 6, MARKING_LONG, 0);
+
+        dpb.picture_start(10, 20, true, false, false, false, false, Vec::new());
+        dpb.prepare_current_avoiding(&[]);
+
+        assert_eq!(dpb.slots[0].marking, MARKING_UNUSED, "oldest short-term evicted");
+        assert_eq!(dpb.slots[1].marking, MARKING_SHORT);
+        assert_eq!(dpb.slots[2].marking, MARKING_LONG, "long-term ref must survive");
+    }
+
+    #[test]
+    fn mmco_op1_does_not_touch_long_term_with_same_framenum() {
+        let mut dpb = dpb();
+        dpb.slots[0] = slot(4, 8, MARKING_LONG, 0);
+
+        // Current frame_num=10, diff_minus1=5 -> picNumX = 4. The only slot with
+        // that FrameNum is a LONG-TERM ref: op 1 unmarks short-term refs only.
+        dpb.picture_start(
+            10,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            vec![H264MmcoCommand::UnmarkShortTerm { difference_of_pic_nums_minus1: 5 }],
+        );
+        dpb.prepare_current_avoiding(&[]);
+
+        assert_eq!(dpb.slots[0].marking, MARKING_LONG);
     }
 }
