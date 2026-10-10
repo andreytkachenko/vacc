@@ -216,9 +216,10 @@ impl Vp9Decoder {
         // Build reference slots for BeginVideoCoding (setup + references)
         // Per Vulkan spec: DPB slots become active when used in BeginVideoCodingKHR.
         // This happens DURING the call, so the first frame can activate its own slot.
-        // IMPORTANT: These must be heap-allocated to survive function return since
-        // their pointers are recorded in the command buffer and used at execution time.
-        let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> = dpb_ref_pictures
+        // The pointers only need to stay valid through the recording calls below
+        // (the driver copies what it needs at call time), so stack-locals of this
+        // function suffice — no heap allocation, no leaks.
+        let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR> = dpb_ref_pictures
             .iter()
             .zip(dpb_ref_slot_indices.iter())
             .map(|(res, &slot_idx)| vk::VideoReferenceSlotInfoKHR {
@@ -229,15 +230,8 @@ impl Vp9Decoder {
                 _marker: Default::default(),
             })
             .collect();
-        // Leak to ensure pointers stay valid (driver may dereference at exec time)
-        let ref_slots_ptr = if ref_slots.is_empty() {
-            std::ptr::null()
-        } else {
-            Box::leak(ref_slots.into_boxed_slice()).as_ptr()
-        };
 
         // Setup slot (current frame output) - use actual DPB slot index
-        // Heap-allocate to ensure pointer stays valid for p_setup_reference_slot
         let setup_slot_info = dpb_setup_picture
             .as_ref()
             .map(|res| vk::VideoReferenceSlotInfoKHR {
@@ -247,44 +241,28 @@ impl Vp9Decoder {
                 p_picture_resource: res as *const _,
                 _marker: Default::default(),
             });
-        let has_setup_slot = setup_slot_info.is_some();
-        let setup_slot_ptr = if has_setup_slot {
-            Box::leak(Box::new(setup_slot_info.unwrap())) as *const _
-        } else {
-            std::ptr::null()
-        };
-
         // Build all_slots for BeginVideoCoding: setup slot first, then reference slots.
         // The setup slot MUST be included so its picture resource is "bound" for
         // vkCmdDecodeVideoKHR's pSetupReferenceSlot (VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07149).
-        // Heap-allocate to ensure pointers stay valid
-        let mut all_slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> = Vec::new();
-        if has_setup_slot {
+        let mut all_slots: Vec<vk::VideoReferenceSlotInfoKHR> = Vec::new();
+        if let Some(setup) = &setup_slot_info {
             // CRITICAL (same fix as H264/H265, VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239):
             // BeginVideoCoding declares the output slot with slot_index=-1 — at Begin
             // execution time the slot is INACTIVE; the decode's pSetupReferenceSlot
-            // (setup_slot_ptr, real index) then associates it. Declaring the actual
+            // (setup_slot_info, real index) then associates it. Declaring the actual
             // (inactive) index makes the NVIDIA driver trap in vkCmdDecodeVideoKHR.
-            let mut setup_for_begin: vk::VideoReferenceSlotInfoKHR<'static> =
-                unsafe { *setup_slot_ptr };
+            let mut setup_for_begin = *setup;
             setup_for_begin.slot_index = -1;
             all_slots.push(setup_for_begin);
         }
-        if !ref_slots_ptr.is_null() {
-            let ref_slice =
-                unsafe { std::slice::from_raw_parts(ref_slots_ptr, dpb_ref_pictures.len()) };
-            all_slots.extend_from_slice(ref_slice);
-        }
+        all_slots.extend_from_slice(&ref_slots);
+
         let all_slots_ptr = if all_slots.is_empty() {
             std::ptr::null()
         } else {
-            Box::leak(all_slots.into_boxed_slice()).as_ptr()
+            all_slots.as_ptr()
         };
-        let all_slots_count = if all_slots_ptr.is_null() {
-            0
-        } else {
-            has_setup_slot as u32 + dpb_ref_pictures.len() as u32
-        };
+        let all_slots_count = all_slots.len() as u32;
 
         unsafe {
             // Begin command buffer
@@ -461,9 +439,15 @@ impl Vp9Decoder {
                 src_buffer_offset: bitstream_offset,
                 src_buffer_range: bitstream_range,
                 dst_picture_resource,
-                p_setup_reference_slot: setup_slot_ptr,
+                p_setup_reference_slot: setup_slot_info
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _),
                 reference_slot_count: dpb_ref_pictures.len() as u32,
-                p_reference_slots: ref_slots_ptr,
+                p_reference_slots: if ref_slots.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ref_slots.as_ptr()
+                },
                 _marker: Default::default(),
             };
 

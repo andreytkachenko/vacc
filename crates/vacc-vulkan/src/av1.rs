@@ -770,14 +770,16 @@ impl Av1Decoder {
                 );
             }
         }
+        // All slot structs below are stack-locals of this function; the
+        // recording calls (BeginVideoCoding, DecodeVideo) happen inside it and
+        // the driver copies what it needs at call time, so no leaks.
         let ref_std_infos_ptr = if ref_std_infos.is_empty() {
             std::ptr::null()
         } else {
-            Box::leak(ref_std_infos.into_boxed_slice()).as_ptr()
+            ref_std_infos.as_ptr()
         };
 
-        let ref_slot_infos: Vec<vk::VideoDecodeAV1DpbSlotInfoKHR<'static>> = (0..dpb_ref_pictures
-            .len())
+        let ref_slot_infos: Vec<vk::VideoDecodeAV1DpbSlotInfoKHR> = (0..dpb_ref_pictures.len())
             .map(|i| vk::VideoDecodeAV1DpbSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR,
                 p_next: std::ptr::null(),
@@ -788,7 +790,7 @@ impl Av1Decoder {
         let ref_slot_infos_ptr = if ref_slot_infos.is_empty() {
             std::ptr::null()
         } else {
-            Box::leak(ref_slot_infos.into_boxed_slice()).as_ptr()
+            ref_slot_infos.as_ptr()
         };
 
         // Build a SINGLE contiguous slots array, exactly like the C++ reference
@@ -799,8 +801,7 @@ impl Av1Decoder {
         let num_refs = dpb_ref_pictures.len();
         let has_setup_slot = dpb_setup_picture.is_some();
         let total_slots = num_refs + has_setup_slot as usize;
-        let mut slots: Vec<vk::VideoReferenceSlotInfoKHR<'static>> =
-            Vec::with_capacity(total_slots);
+        let mut slots: Vec<vk::VideoReferenceSlotInfoKHR> = Vec::with_capacity(total_slots);
 
         // Fill reference slots first
         for (i, (res, &slot_idx)) in dpb_ref_pictures
@@ -828,7 +829,7 @@ impl Av1Decoder {
         // the setup slot's StdVideoDecodeAV1ReferenceInfo with the current frame's
         // OrderHint / SavedOrderHints / flags. Omitting it made the driver reject the
         // decode (all-zero output).
-        let setup_std_info_ptr: *mut ash::vk::native::StdVideoDecodeAV1ReferenceInfo =
+        let setup_std_info: Option<ash::vk::native::StdVideoDecodeAV1ReferenceInfo> =
             if dpb_setup_picture.is_some() {
                 let mut info = unsafe {
                     std::mem::zeroed::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>()
@@ -857,14 +858,14 @@ impl Av1Decoder {
                         .flags
                         .segmentation_enabled(),
                 );
-                Box::leak(Box::new(info))
+                Some(info)
             } else {
-                std::ptr::null_mut()
+                None
             };
         // DEBUG (iteration 28): dump the setup slot's StdVideoDecodeAV1ReferenceInfo
         // (mirrors C++ [CPP-REFINFO] SETUP line, VulkanAV1Decoder.cpp:358-363).
-        if self.frame_count < 16 && !setup_std_info_ptr.is_null() && super::vacc_debug() {
-            let info = unsafe { &*setup_std_info_ptr };
+        if self.frame_count < 16 && setup_std_info.is_some() && super::vacc_debug() {
+            let info = setup_std_info.as_ref().unwrap();
             eprintln!(
                 "[RUST-REFINFO]   SETUP: OrderHint={} RefFrameSignBias={:02x} SavedOH=[{},{},{},{},{},{},{},{}]",
                 info.OrderHint,
@@ -880,18 +881,13 @@ impl Av1Decoder {
             );
         }
 
-        let setup_slot_info_khr_ptr: *mut vk::VideoDecodeAV1DpbSlotInfoKHR<'static> =
-            if dpb_setup_picture.is_some() {
-                let info = vk::VideoDecodeAV1DpbSlotInfoKHR {
-                    s_type: vk::StructureType::VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR,
-                    p_next: std::ptr::null(),
-                    p_std_reference_info: setup_std_info_ptr as *const _,
-                    _marker: Default::default(),
-                };
-                Box::leak(Box::new(info))
-            } else {
-                std::ptr::null_mut()
-            };
+        let setup_slot_info_khr: Option<vk::VideoDecodeAV1DpbSlotInfoKHR> =
+            setup_std_info.as_ref().map(|std_info| vk::VideoDecodeAV1DpbSlotInfoKHR {
+                s_type: vk::StructureType::VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR,
+                p_next: std::ptr::null(),
+                p_std_reference_info: std_info as *const _,
+                _marker: Default::default(),
+            });
 
         // Append setup slot to the end of the single array (C++ reference pattern).
         //
@@ -900,13 +896,10 @@ impl Av1Decoder {
         // execution time the slot is INACTIVE; the decode's pSetupReferenceSlot
         // (real index) then associates it. Declaring the actual (inactive) index
         // makes the NVIDIA driver trap in vkCmdDecodeVideoKHR. Matches FFmpeg.
-        let setup_slot_decode_ptr: *const vk::VideoReferenceSlotInfoKHR<'static> = if has_setup_slot
-        {
-            let setup_p_next = if setup_slot_info_khr_ptr.is_null() {
-                std::ptr::null()
-            } else {
-                setup_slot_info_khr_ptr as *const _
-            };
+        // Separate copy with the actual index for decode's pSetupReferenceSlot.
+        let setup_slot_decode: Option<vk::VideoReferenceSlotInfoKHR> = if has_setup_slot {
+            let setup_p_next =
+                setup_slot_info_khr.as_ref().map_or(std::ptr::null(), |s| s as *const _ as *const _);
             slots.push(vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                 p_next: setup_p_next,
@@ -914,23 +907,21 @@ impl Av1Decoder {
                 p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
                 _marker: Default::default(),
             });
-            // Separate copy with the actual index for decode's pSetupReferenceSlot.
-            Box::leak(Box::new(vk::VideoReferenceSlotInfoKHR {
+            Some(vk::VideoReferenceSlotInfoKHR {
                 s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                 p_next: setup_p_next,
                 slot_index: output_slot_index,
                 p_picture_resource: dpb_setup_picture.as_ref().unwrap() as *const _,
                 _marker: Default::default(),
-            }))
+            })
         } else {
-            std::ptr::null()
+            None
         };
 
-        // Finalize: leak the single array for Vulkan's raw pointer usage
         let slots_ptr = if slots.is_empty() {
             std::ptr::null()
         } else {
-            Box::leak(slots.into_boxed_slice()).as_ptr()
+            slots.as_ptr()
         };
         let all_slots_count = total_slots as u32;
 
@@ -1035,24 +1026,15 @@ impl Av1Decoder {
             }
             eprintln!(
                 "[RUST-DEC-F3]   SETUP std_info: OrderHint={} SavedOrderHints={:?} RefFrameSignBias={:#04x}",
-                unsafe {
-                    setup_std_info_ptr
-                        .as_ref()
-                        .map(|s| s.OrderHint)
-                        .unwrap_or(0)
-                },
-                unsafe {
-                    setup_std_info_ptr
-                        .as_ref()
-                        .map(|s| s.SavedOrderHints)
-                        .unwrap_or([0; 8])
-                },
-                unsafe {
-                    setup_std_info_ptr
-                        .as_ref()
-                        .map(|s| s.RefFrameSignBias)
-                        .unwrap_or(0)
-                }
+                setup_std_info.as_ref().map(|s| s.OrderHint).unwrap_or(0),
+                setup_std_info
+                    .as_ref()
+                    .map(|s| s.SavedOrderHints)
+                    .unwrap_or([0; 8]),
+                setup_std_info
+                    .as_ref()
+                    .map(|s| s.RefFrameSignBias)
+                    .unwrap_or(0)
             );
             eprintln!(
                 "[RUST-DEC-F3]   all_slots: {:?}",
@@ -1260,8 +1242,7 @@ impl Av1Decoder {
             }
 
             // 3. Setup StdVideoDecodeAV1ReferenceInfo
-            if !setup_std_info_ptr.is_null() {
-                let si = unsafe { &*setup_std_info_ptr };
+            if let Some(si) = setup_std_info.as_ref() {
                 let si_ptr = si as *const _ as *const u8;
                 let si_size =
                     std::mem::size_of::<ash::vk::native::StdVideoDecodeAV1ReferenceInfo>();
@@ -1524,7 +1505,9 @@ impl Av1Decoder {
                 src_buffer_offset: bitstream_offset,
                 src_buffer_range: bitstream_range,
                 dst_picture_resource,
-                p_setup_reference_slot: setup_slot_decode_ptr,
+                p_setup_reference_slot: setup_slot_decode
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const _),
                 reference_slot_count: num_refs as u32,
                 p_reference_slots: if num_refs == 0 {
                     std::ptr::null()

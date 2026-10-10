@@ -347,34 +347,35 @@ impl H264Decoder {
             // Setup must be adjacent to refs in memory (driver reads count elements from ptr)
             //
             // CRITICAL: All structs must stay alive until after cmd_begin_video_coding!
-            // We use Box::leak to ensure pointers remain valid.
+            // They are stack-locals of this scope, and the call happens below inside
+            // it, so no heap allocation is needed.
 
-            // Build setup DPB info (leaked to ensure pointer validity)
-            let setup_ref_info: *const StdVideoDecodeH264ReferenceInfo =
-                if dpb_setup_picture.is_some() {
-                    let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
-                    info.FrameNum = (effective_frame_num % max_frame_num) as u16;
-                    info.PicOrderCnt = effective_poc;
-                    // Frame reference: both field flags must be clear.
-                    Box::leak(Box::new(info))
-                } else {
-                    std::ptr::null()
-                };
+            // Build setup DPB info (stack-local; valid through the
+            // cmd_begin_video_coding call in this scope).
+            let setup_ref_info = if dpb_setup_picture.is_some() {
+                let mut info = unsafe { std::mem::zeroed::<StdVideoDecodeH264ReferenceInfo>() };
+                info.FrameNum = (effective_frame_num % max_frame_num) as u16;
+                info.PicOrderCnt = effective_poc;
+                // Frame reference: both field flags must be clear.
+                Some(info)
+            } else {
+                None
+            };
 
-            let setup_dpb_slot_info: *const vk::VideoDecodeH264DpbSlotInfoKHR =
-                if !setup_ref_info.is_null() {
+            let setup_dpb_slot_info = match &setup_ref_info {
+                Some(ref_info) => {
                     let dpb_info = vk::VideoDecodeH264DpbSlotInfoKHR::default()
-                        .std_reference_info(unsafe { &*setup_ref_info });
-                    Box::leak(Box::new(dpb_info))
-                } else {
-                    std::ptr::null()
-                };
+                        .std_reference_info(ref_info);
+                    Some(dpb_info)
+                }
+                None => None,
+            };
 
             // Build setup slot info (if setup picture exists)
-            let setup_slot_info = if !setup_dpb_slot_info.is_null() {
-                Some(vk::VideoReferenceSlotInfoKHR {
+            let setup_slot_info = match &setup_dpb_slot_info {
+                Some(dpb_info) => Some(vk::VideoReferenceSlotInfoKHR {
                     s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
-                    p_next: setup_dpb_slot_info as *const _ as *const _,
+                    p_next: dpb_info as *const _ as *const _,
                     // Begin declares the setup/output slot with slot_index=-1
                     // (bound without an associated DPB slot); the decode's
                     // pSetupReferenceSlot carries the real index and
@@ -384,9 +385,8 @@ impl H264Decoder {
                         .as_ref()
                         .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
                     _marker: Default::default(),
-                })
-            } else {
-                None
+                }),
+                None => None,
             };
 
             // Build combined slots array for BeginVideoCoding
