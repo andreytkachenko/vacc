@@ -303,6 +303,19 @@ impl AnyDecode for VulkanAdapter {
     }
 
     fn reset(&mut self) -> UnifiedResult<()> {
+        // Whole-stream backend: `start()` decodes everything at once and is
+        // one-shot. Reset restores the pre-decode state so a fresh stream can
+        // be submitted and decoded (trait contract: invalidate state, prepare
+        // for a new stream or seek). Queued frames and buffered data are
+        // discarded; in GPU mode the decoder's device memory goes with them —
+        // frames already handed to the caller are invalidated by the reset.
+        if let Some(dec) = self.decoder.take() {
+            vacc_vkimage::forget_device(dec.device());
+        }
+        self.queue.clear();
+        self.data.clear();
+        self.next_index = 0;
+        self.started = false;
         Ok(())
     }
 }
@@ -978,6 +991,42 @@ mod tests {
                     g.frame_index
                 );
             }
+        }
+    }
+
+    /// The whole-stream Vulkan adapter must come back from `reset()`: decode
+    /// one stream to the end, then reset() + submit() a different stream —
+    /// the new stream's frames must come out (before the fix reset was a
+    /// no-op: submit() errored and decode() returned None forever).
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_reset_allows_new_stream() {
+        let data = sample("h264_main.h264");
+        let config = DecoderConfig::only(Backend::Vulkan);
+        let mut dec = match VaccDecoder::new(&data, &config) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skip: vulkan unavailable: {e}");
+                return;
+            }
+        };
+        let first = drain(&mut dec);
+        assert!(!first.is_empty());
+
+        let second_data = sample("h264_baseline.h264");
+        dec.reset().unwrap();
+        Decoder::submit(&mut dec, &second_data).unwrap();
+        let second = drain(&mut dec);
+
+        // The reset decoder must produce exactly what a fresh one does.
+        let mut fresh = VaccDecoder::new(&second_data, &config).unwrap();
+        let reference = drain(&mut fresh);
+        assert_eq!(second.len(), reference.len());
+        for (fa, fb) in second.iter().zip(&reference) {
+            assert_eq!((fa.width, fa.height), (fb.width, fb.height));
+            let pa = fa.pixel_data.as_ref().unwrap();
+            let pb = fb.pixel_data.as_ref().unwrap();
+            assert_eq!(pa.buffer, pb.buffer);
         }
     }
 }
