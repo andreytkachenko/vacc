@@ -152,7 +152,19 @@ impl SoftwareH265Decoder {
 
     /// Apply a newly parsed SPS: set up the picture layout and (re)create the
     /// Rust DPB.
-    fn on_sps(&mut self, sps: &H265Sps) {
+    fn on_sps(&mut self, sps: &H265Sps) -> Result<()> {
+        // The reconstruction pipeline is monochrome/4:2:0 only; reject wider
+        // chroma instead of misdecoding it silently (cf. the AVC SPS handler).
+        if sps.separate_colour_plane_flag {
+            return Err(Error::Unsupported("separate colour plane".into()));
+        }
+        match sps.chroma_format_idc {
+            0 | 1 => {} // monochrome / 4:2:0
+            2 => return Err(Error::Unsupported("4:2:2 chroma subsampling".into())),
+            3 => return Err(Error::Unsupported("4:4:4 chroma subsampling".into())),
+            _ => return Err(Error::Unsupported("unknown chroma_format_idc".into())),
+        }
+
         let changed = self
             .sps
             .as_ref()
@@ -216,6 +228,7 @@ impl SoftwareH265Decoder {
 
         self.sps = Some(sps.clone());
         self.layout_ready = true;
+        Ok(())
     }
 
     /// Unwrap the raw POC into a monotonic value across POC periods.
@@ -521,7 +534,7 @@ impl SoftwareH265Decoder {
                     if let Some(b) = sps
                         && let Some(s) = b.downcast_ref::<H265Sps>()
                     {
-                        self.on_sps(s);
+                        self.on_sps(s)?;
                     }
                     if let Some(b) = pps
                         && let Some(p) = b.downcast_ref::<H265Pps>()
