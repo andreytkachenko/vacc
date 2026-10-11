@@ -2513,15 +2513,6 @@ impl Av1Parser {
         self.detected_format.film_grain_used = sps.film_grain_params_present;
         self.detected_format.progressive_sequence = true;
     }
-
-    /// Check if the data looks like an AV1 bitstream.
-    pub fn is_av1(data: &[u8]) -> bool {
-        if data.len() < 4 {
-            return false;
-        }
-        // AV1 start code is 0x9E or 0x80 for the first frame
-        data[data.len() - 1] == 0x9E || (data.len() >= 2 && data[data.len() - 2] == 0x80)
-    }
 }
 
 impl VideoParser for Av1Parser {
