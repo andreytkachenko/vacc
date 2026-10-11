@@ -1347,7 +1347,7 @@ impl H265Parser {
                         + 3
                         + sps_t.log2_diff_max_min_luma_coding_block_size as u32);
                 let ctb_w = sps_t.pic_width_in_luma_samples as u32 / ctb_size;
-                let ctb_h = (sps_t.pic_height_in_luma_samples as u32 + ctb_size - 1) / ctb_size;
+                let ctb_h = (sps_t.pic_height_in_luma_samples as u32).div_ceil(ctb_size);
                 let ntc_total = pps.num_tile_columns_minus1 as usize + 1;
                 let ntr_total = pps.num_tile_rows_minus1 as usize + 1;
                 if pps.uniform_spacing_flag {

@@ -1045,7 +1045,7 @@ pub fn copy_decoded_image_to_device(
             format
         )));
     }
-    if display_width % 2 != 0 || display_height % 2 != 0 {
+    if !display_width.is_multiple_of(2) || !display_height.is_multiple_of(2) {
         return Err(VideoError::DecoderInit(
             "GPU mode requires an even display extent".to_string(),
         ));

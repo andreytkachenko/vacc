@@ -372,8 +372,8 @@ impl H264Decoder {
             };
 
             // Build setup slot info (if setup picture exists)
-            let setup_slot_info = match &setup_dpb_slot_info {
-                Some(dpb_info) => Some(vk::VideoReferenceSlotInfoKHR {
+            let setup_slot_info = setup_dpb_slot_info.as_ref().map(|dpb_info| {
+                vk::VideoReferenceSlotInfoKHR {
                     s_type: vk::StructureType::VIDEO_REFERENCE_SLOT_INFO_KHR,
                     p_next: dpb_info as *const _ as *const _,
                     // Begin declares the setup/output slot with slot_index=-1
@@ -385,9 +385,8 @@ impl H264Decoder {
                         .as_ref()
                         .map_or(std::ptr::null(), |s| &s.picture_resource as *const _),
                     _marker: Default::default(),
-                }),
-                None => None,
-            };
+                }
+            });
 
             // Build combined slots array for BeginVideoCoding
             // MUST keep this alive until after cmd_begin_video_coding is called!

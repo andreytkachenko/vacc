@@ -732,7 +732,7 @@ impl VideoDecoder {
     /// oversized AU write is an out-of-bounds memcpy, so grow the buffer here
     /// where the actual access units are known.
     fn ensure_bs_buffer_capacity(&mut self, needed_bytes: usize) -> VideoResult<()> {
-        let align = self.bs_buffer_size_alignment.max(1) as u64;
+        let align = self.bs_buffer_size_alignment.max(1);
         let needed = ((needed_bytes as u64 + align - 1) & !(align - 1)).max(align);
         if needed <= self.bs_buffer.size() {
             return Ok(());

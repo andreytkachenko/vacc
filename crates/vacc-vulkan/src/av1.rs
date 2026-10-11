@@ -864,8 +864,10 @@ impl Av1Decoder {
             };
         // DEBUG (iteration 28): dump the setup slot's StdVideoDecodeAV1ReferenceInfo
         // (mirrors C++ [CPP-REFINFO] SETUP line, VulkanAV1Decoder.cpp:358-363).
-        if self.frame_count < 16 && setup_std_info.is_some() && super::vacc_debug() {
-            let info = setup_std_info.as_ref().unwrap();
+        if self.frame_count < 16
+            && super::vacc_debug()
+            && let Some(info) = setup_std_info.as_ref()
+        {
             vkdbg!(
                 "[RUST-REFINFO]   SETUP: OrderHint={} RefFrameSignBias={:02x} SavedOH=[{},{},{},{},{},{},{},{}]",
                 info.OrderHint,
