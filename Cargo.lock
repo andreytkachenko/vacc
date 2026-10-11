@@ -1365,16 +1365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vacc-vulkan-common"
-version = "0.1.1"
-dependencies = [
- "ash",
- "log",
- "thiserror 2.0.20",
- "vacc-core",
-]
-
-[[package]]
 name = "vacc-vulkan-decode"
 version = "0.1.1"
 dependencies = [
