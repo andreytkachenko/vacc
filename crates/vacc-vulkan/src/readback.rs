@@ -138,7 +138,7 @@ pub fn readback_decoded_image(
 ) -> Result<DecodedPixels, VideoError> {
     let (sample_size, chroma_width, chroma_height, layout) = classify_format(format, width, height)
         .ok_or_else(|| {
-            eprintln!(
+            vkdbg!(
                 "[READBACK] WARNING: unknown decode format {:?}, falling back to NV12 layout",
                 format
             );

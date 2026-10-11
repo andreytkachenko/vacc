@@ -673,7 +673,7 @@ impl Av1Decoder {
         // TEMP DIAGNOSTIC (iteration 18): confirm session params + key decode fields
         // for EVERY frame (was frame-0-only). Prints the ACTUAL src_buffer_range.
         if self.frame_count < 16 && super::vacc_debug() {
-            eprintln!(
+            vkdbg!(
                 "[AV1-DIAG] frame{}: bitstream=[{}..{}) range={} frame_header_offset={}, ref_name_slots={:?}, ref_slot_indices={:?}, coded_extent={}x{}, output_slot={}",
                 self.frame_count,
                 bitstream_offset,
@@ -704,7 +704,7 @@ impl Av1Decoder {
                   if let Some(&ref_slot) = dpb_ref_slot_indices.get(i) {
                       let fb_opt = dpb.frame_buffer_for_slot(ref_slot);
                       if self.frame_count < 8 && super::vacc_debug() {
-                          eprintln!("[FB-LOOKUP] fc={} ref[i={}] slot={} -> fb={:?}",
+                          vkdbg!("[FB-LOOKUP] fc={} ref[i={}] slot={} -> fb={:?}",
                               self.frame_count, i, ref_slot, fb_opt);
                       }
                       if let Some(fb) = fb_opt {
@@ -721,7 +721,7 @@ impl Av1Decoder {
                               fb_state.segmentation_enabled as u32,
                           );
                           if self.frame_count < 8 && super::vacc_debug() {
-                              eprintln!(
+                              vkdbg!(
                                   "[GET_FB-REFINFO] fc={} GET ref[i={}] fb={} slot={}: OrderHint={}, frame_type={}, SavedOH=[{},{},{},{},{},{},{},{}], Bias={:02x}",
                                   self.frame_count, i, fb, ref_slot,
                                   info.OrderHint, fb_state.frame_type,
@@ -733,7 +733,7 @@ impl Av1Decoder {
                               );
                           }
                       } else if self.frame_count < 8 && super::vacc_debug() {
-                          eprintln!(
+                          vkdbg!(
                               "[GET_FB-REFINFO] fc={} GET ref[i={}] slot={} -> NO REF INFO (stale!)",
                               self.frame_count, i, ref_slot
                           );
@@ -745,12 +745,12 @@ impl Av1Decoder {
         // DEBUG (iteration 28): dump the FULL StdVideoDecodeAV1ReferenceInfo for
         // every reference (mirrors C++ [CPP-REFINFO], VulkanAV1Decoder.cpp:337-366).
         if self.frame_count < 16 && super::vacc_debug() {
-            eprintln!(
+            vkdbg!(
                 "[RUST-REFINFO] frame{}: refNameIdx={:?} ref_slots={:?}",
                 self.frame_count, av1_decode_info.reference_name_slot_indices, dpb_ref_slot_indices,
             );
             for (i, info) in ref_std_infos.iter().enumerate() {
-                eprintln!(
+                vkdbg!(
                     "[RUST-REFINFO]   ref[{}] slot={}: OrderHint={} RefFrameSignBias={:02x} frame_type={} dcdf={} seg={} SavedOH=[{},{},{},{},{},{},{},{}]",
                     i,
                     dpb_ref_slot_indices.get(i).copied().unwrap_or(-1),
@@ -866,7 +866,7 @@ impl Av1Decoder {
         // (mirrors C++ [CPP-REFINFO] SETUP line, VulkanAV1Decoder.cpp:358-363).
         if self.frame_count < 16 && setup_std_info.is_some() && super::vacc_debug() {
             let info = setup_std_info.as_ref().unwrap();
-            eprintln!(
+            vkdbg!(
                 "[RUST-REFINFO]   SETUP: OrderHint={} RefFrameSignBias={:02x} SavedOH=[{},{},{},{},{},{},{},{}]",
                 info.OrderHint,
                 info.RefFrameSignBias,
@@ -927,7 +927,7 @@ impl Av1Decoder {
 
         // DEBUG (iteration 10): dump decode command params for frame 1
         if self.frame_count == 1 && super::vacc_debug() {
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC] frame1: output_slot={} output_old_layout={:?} ref_slots={:?} ref_layouts={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
                 output_slot_index,
                 output_slot_old_layout,
@@ -955,7 +955,7 @@ impl Av1Decoder {
             (0, 0)
         };
         if super::vacc_debug() {
-            eprintln!(
+            vkdbg!(
                 "[RUST-REF] fc={} out_slot={} ref_slots={:?} refNameIdx={:?} tile=[{}..{}) fh_off={}",
                 self.frame_count,
                 output_slot_index,
@@ -975,7 +975,7 @@ impl Av1Decoder {
         // against the C++ reference's [CPP-DEC]/[CPP-PI] output.
         if self.frame_count < 16 && super::vacc_debug() {
             let setup = dpb_setup_picture.as_ref();
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3] frame3: output_slot={} output_old_layout={:?} bitstream=[{}..{}) coded_extent={}x{} all_slots_count={} dpb_use_image_array={}",
                 output_slot_index,
                 output_slot_old_layout,
@@ -987,7 +987,7 @@ impl Av1Decoder {
                 dpb_use_image_array
             );
             if let Some(sp) = setup {
-                eprintln!(
+                vkdbg!(
                     "[RUST-DEC-F3]   SETUP picture: view={:#x} base_array_layer={} coded_offset=({},{}) coded_extent={}x{}",
                     sp.image_view_binding.as_raw(),
                     sp.base_array_layer,
@@ -997,11 +997,11 @@ impl Av1Decoder {
                     sp.coded_extent.height
                 );
             } else {
-                eprintln!("[RUST-DEC-F3]   SETUP picture: NONE");
+                vkdbg!("[RUST-DEC-F3]   SETUP picture: NONE");
             }
             for (i, rp) in dpb_ref_pictures.iter().enumerate() {
                 let slot = dpb_ref_slot_indices.get(i).copied().unwrap_or(-1);
-                eprintln!(
+                vkdbg!(
                     "[RUST-DEC-F3]   REF[{}] picture: view={:#x} base_array_layer={} slot_index={} coded_extent={}x{}",
                     i,
                     rp.image_view_binding.as_raw(),
@@ -1013,7 +1013,7 @@ impl Av1Decoder {
             }
             for i in 0..dpb_ref_pictures.len() {
                 let ri = unsafe { &*ref_std_infos_ptr.add(i) };
-                eprintln!(
+                vkdbg!(
                     "[RUST-DEC-F3]   REF[{}] std_info: OrderHint={} SavedOrderHints={:?} RefFrameSignBias={:#04x} frame_type={} disable_cdf={} seg={}",
                     i,
                     ri.OrderHint,
@@ -1024,7 +1024,7 @@ impl Av1Decoder {
                     ri.flags.segmentation_enabled()
                 );
             }
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3]   SETUP std_info: OrderHint={} SavedOrderHints={:?} RefFrameSignBias={:#04x}",
                 setup_std_info.as_ref().map(|s| s.OrderHint).unwrap_or(0),
                 setup_std_info
@@ -1036,18 +1036,18 @@ impl Av1Decoder {
                     .map(|s| s.RefFrameSignBias)
                     .unwrap_or(0)
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3]   all_slots: {:?}",
                 (0..all_slots_count)
                     .map(|i| unsafe { (*slots_ptr.add(i as usize)).slot_index })
                     .collect::<Vec<_>>()
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3]   decode p_reference_slots: {:?} count={}",
                 dpb_ref_slot_indices,
                 dpb_ref_pictures.len()
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3]   referenceNameSlotIndices={:?} ref_slot_indices={:?}",
                 av1_decode_info.reference_name_slot_indices, dpb_ref_slot_indices
             );
@@ -1061,7 +1061,7 @@ impl Av1Decoder {
             } else {
                 (0, 0)
             };
-            eprintln!(
+            vkdbg!(
                 "[RUST-DEC-F3]   frame_header_offset={} tile_count={} tile_offsets[0]={} tile_sizes[0]={}",
                 av1_decode_info.frame_header_offset, av1_decode_info.tile_count, t_off, t_size
             );
@@ -1072,7 +1072,7 @@ impl Av1Decoder {
         if self.frame_count < 8 && super::vacc_debug() {
             let pi = &picture_info_container.std_picture_info;
             let fl = &pi.flags;
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] fc={} type={} oh={} primref={} refresh={:08x} interp={} txmode={} dqres={} dlres={} coded_denom={}",
                 self.frame_count,
                 pi.frame_type,
@@ -1085,7 +1085,7 @@ impl Av1Decoder {
                 pi.delta_lf_res,
                 pi.coded_denom
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} grain={}",
                 fl.use_superres(),
                 fl.render_and_frame_size_different(),
@@ -1110,12 +1110,12 @@ impl Av1Decoder {
                 fl.segmentation_update_data(),
                 fl.apply_grain()
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] skipModeFrame=[{},{}] orderHints={:?} expectedFrameId={:?}",
                 pi.SkipModeFrame[0], pi.SkipModeFrame[1], pi.OrderHints, pi.expectedFrameId
             );
             let q = &picture_info_container.quantization;
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] quant: using_qmatrix={} diff_uv_delta={} base_q={} dQYdc={} dQUdc={} dQUac={} dQVdc={} dQVac={} qm_y={} qm_u={} qm_v={}",
                 q.flags.using_qmatrix(),
                 q.flags.diff_uv_delta(),
@@ -1130,7 +1130,7 @@ impl Av1Decoder {
                 q.qm_v
             );
             let lf = &picture_info_container.loop_filter;
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] lf: delta_en={} delta_upd={} level=[{},{},{},{}] sharp={} updrefd={} updmodes={} moded=[{},{}]",
                 lf.flags.loop_filter_delta_enabled(),
                 lf.flags.loop_filter_delta_update(),
@@ -1144,7 +1144,7 @@ impl Av1Decoder {
                 lf.loop_filter_mode_deltas[0],
                 lf.loop_filter_mode_deltas[1]
             );
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] lf refd=[{},{},{},{},{},{},{},{}]",
                 lf.loop_filter_ref_deltas[0],
                 lf.loop_filter_ref_deltas[1],
@@ -1156,7 +1156,7 @@ impl Av1Decoder {
                 lf.loop_filter_ref_deltas[7]
             );
             let c = &picture_info_container.cdef;
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] cdef: damping={} bits={} ypri=[{},{},{},{}] ysec=[{},{},{},{}] uvprim=[{},{},{},{}] uvsec=[{},{},{},{}]",
                 c.cdef_damping_minus_3,
                 c.cdef_bits,
@@ -1178,7 +1178,7 @@ impl Av1Decoder {
                 c.cdef_uv_sec_strength[3]
             );
             let lr = &picture_info_container.loop_restoration;
-            eprintln!(
+            vkdbg!(
                 "[RUST-PI-F3] lr: type=[{},{},{}] size=[{},{},{}]",
                 { lr.FrameRestorationType[0] },
                 { lr.FrameRestorationType[1] },
@@ -1188,9 +1188,9 @@ impl Av1Decoder {
                 lr.LoopRestorationSize[2]
             );
             let gm = &picture_info_container.global_motion;
-            eprintln!("[RUST-PI-F3] gm: type={:?}", gm.GmType);
+            vkdbg!("[RUST-PI-F3] gm: type={:?}", gm.GmType);
             for i in 0..8 {
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-F3] gm_params[{}]=[{},{},{},{},{},{}]",
                     i,
                     gm.gm_params[i][0],
@@ -1206,7 +1206,7 @@ impl Av1Decoder {
             for i in 0..8 {
                 seg_en.push_str(&format!("{}", sg.FeatureEnabled[i]));
             }
-            eprintln!("[RUST-PI-F3] seg: enabled=[{}]", seg_en);
+            vkdbg!("[RUST-PI-F3] seg: enabled=[{}]", seg_en);
         }
 
         // ===== BYTE-LEVEL DUMP for fc2 (iteration 12) =====
@@ -1216,7 +1216,7 @@ impl Av1Decoder {
                 if !ptr.is_null() && len > 0 {
                     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
                     let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
-                    eprintln!("[RUST-BYTES] {}: {} bytes: {}", label, len, hex.join(" "));
+                    vkdbg!("[RUST-BYTES] {}: {} bytes: {}", label, len, hex.join(" "));
                 }
             };
 
@@ -1278,7 +1278,7 @@ impl Av1Decoder {
             // 8. VkVideoBeginCodingInfoKHR (built below, dump after construction)
             // We'll dump this after begin_coding_info is constructed (see below)
 
-            eprintln!("[RUST-BYTES] === fc2 byte dump complete ===");
+            vkdbg!("[RUST-BYTES] === fc2 byte dump complete ===");
         }
 
         unsafe {
@@ -1309,7 +1309,7 @@ impl Av1Decoder {
                 let bci_size = std::mem::size_of::<vk::VideoBeginCodingInfoKHR>();
                 let slice = std::slice::from_raw_parts(bci_ptr, bci_size);
                 let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
-                eprintln!(
+                vkdbg!(
                     "[RUST-BYTES] VkVideoBeginCodingInfoKHR: {} bytes: {}",
                     bci_size,
                     hex.join(" ")
@@ -1442,7 +1442,7 @@ impl Av1Decoder {
                 };
                 image_barriers.push(ref_barrier);
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[DPB-ITER8]   REF barrier: img={:#x} base_array_layer={} old_layout={:?} new_layout={:?}",
                         ref_barrier.image.as_raw(),
                         ref_barrier.subresource_range.base_array_layer,
@@ -1454,7 +1454,7 @@ impl Av1Decoder {
 
             if super::vacc_debug() {
                 if !image_barriers.is_empty() {
-                    eprintln!(
+                    vkdbg!(
                         "[DPB-ITER8]   OUTPUT barrier: img={:#x} base_array_layer={} old_layout={:?} new_layout={:?}",
                         image_barriers[0].image.as_raw(),
                         image_barriers[0].subresource_range.base_array_layer,
@@ -1462,7 +1462,7 @@ impl Av1Decoder {
                         image_barriers[0].new_layout,
                     );
                 } else {
-                    eprintln!("[DPB-ITER8]   No image barriers needed (all layouts correct)");
+                    vkdbg!("[DPB-ITER8]   No image barriers needed (all layouts correct)");
                 }
             }
 
@@ -1519,19 +1519,19 @@ impl Av1Decoder {
 
             // DEBUG: verify s_type value
             if self.frame_count == 2 && super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[S-TYPE-CHECK] VIDEO_DECODE_INFO_KHR raw value = {}",
                     vk::StructureType::VIDEO_DECODE_INFO_KHR.as_raw()
                 );
-                eprintln!(
+                vkdbg!(
                     "[S-TYPE-CHECK] decode_info.s_type raw value = {}",
                     decode_info.s_type.as_raw()
                 );
-                eprintln!(
+                vkdbg!(
                     "[S-TYPE-CHECK] VIDEO_PICTURE_RESOURCE_INFO_KHR raw value = {}",
                     vk::StructureType::VIDEO_PICTURE_RESOURCE_INFO_KHR.as_raw()
                 );
-                eprintln!(
+                vkdbg!(
                     "[S-TYPE-CHECK] VIDEO_DECODE_AV1_PICTURE_INFO_KHR raw value = {}",
                     vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR.as_raw()
                 );
@@ -1544,12 +1544,12 @@ impl Av1Decoder {
                 let di_size = std::mem::size_of::<vk::VideoDecodeInfoKHR>();
                 let di_slice = std::slice::from_raw_parts(di_ptr, di_size);
                 let di_hex: Vec<String> = di_slice.iter().map(|b| format!("{:02x}", b)).collect();
-                eprintln!(
+                vkdbg!(
                     "[RAW-DEC-INFO] fc2: VkVideoDecodeInfoKHR size={} bytes:",
                     di_size
                 );
                 for chunk in di_hex.chunks(32) {
-                    eprintln!("  {}", chunk.join(" "));
+                    vkdbg!("  {}", chunk.join(" "));
                 }
                 // Dump pNext chain (VideoDecodeAV1PictureInfoKHR + StdVideoDecodeAV1PictureInfo)
                 if !decode_info.p_next.is_null() {
@@ -1558,12 +1558,12 @@ impl Av1Decoder {
                     let pnext_slice = std::slice::from_raw_parts(pnext, pnext_size as usize);
                     let pnext_hex: Vec<String> =
                         pnext_slice.iter().map(|b| format!("{:02x}", b)).collect();
-                    eprintln!(
+                    vkdbg!(
                         "[RAW-PNEXT] fc2: first {} bytes of pNext chain:",
                         pnext_size
                     );
                     for chunk in pnext_hex.chunks(32) {
-                        eprintln!("  {}", chunk.join(" "));
+                        vkdbg!("  {}", chunk.join(" "));
                     }
                 }
             }

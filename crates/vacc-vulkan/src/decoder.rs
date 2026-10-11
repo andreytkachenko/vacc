@@ -366,7 +366,7 @@ impl VideoDecoder {
             parsed.luma_bit_depth,
             parsed.chroma_bit_depth,
         )?;
-        eprintln!("[Decoder] Video capabilities queried successfully");
+        vkdbg!("[Decoder] Video capabilities queried successfully");
 
         // Validate stream dimensions against hardware limits
         if coded_extent.width > caps.max_coded_extent.width
@@ -416,7 +416,7 @@ impl VideoDecoder {
             av1_sps.as_ref(),
             output_format,
         )?;
-        eprintln!("[Decoder] Video session created successfully");
+        vkdbg!("[Decoder] Video session created successfully");
 
         // H.264/H.265: the bitstream buffer only ever receives ONE access unit
         // at a time (see decode_stream_h26x), so size it for the largest AU —
@@ -449,17 +449,17 @@ impl VideoDecoder {
             parsed.chroma_bit_depth,
             decode_queue_family,
         )?;
-        eprintln!(
+        vkdbg!(
             "[Decoder] Bitstream buffer created (size={} bytes, max_au={})",
             bs_buffer.size(),
             max_frame_size
         );
 
         let command_pool = create_command_pool(&vulkan.device, decode_queue_family)?;
-        eprintln!("[Decoder] Command pool created");
+        vkdbg!("[Decoder] Command pool created");
 
         let fence = create_fence(&vulkan.device)?;
-        eprintln!("[Decoder] Fence created");
+        vkdbg!("[Decoder] Fence created");
 
         let mut dpb_views = Vec::new();
         let mut dpb_images = Vec::new();
@@ -483,7 +483,7 @@ impl VideoDecoder {
         let supports_separate_reference_images = caps
             .flags
             .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
-        eprintln!(
+        vkdbg!(
             "[Decoder] Creating {} DPB slots ({}x{} aligned to granularity), separate_reference_images={}",
             session_dpb_slots,
             session_coded_extent.width,
@@ -506,17 +506,17 @@ impl VideoDecoder {
                 decode_queue_family,
                 session_dpb_slots,
             )?;
-            eprintln!(
+            vkdbg!(
                 "[Decoder] DPB image array created ({} layers, single image)",
                 session_dpb_slots
             );
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[DPB-ITER8] dpb_use_image_array=true, shared_image={:#x}",
                     img.as_raw()
                 );
                 for (idx, view) in views.iter().enumerate() {
-                    eprintln!(
+                    vkdbg!(
                         "[DPB-ITER8]   slot {}: view={:#x} (subresource: base_array_layer={}, layer_count=1)",
                         idx,
                         view.as_raw(),
@@ -532,7 +532,7 @@ impl VideoDecoder {
             dpb_use_image_array = true;
         } else {
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[DPB-ITER8] dpb_use_image_array=false, separate images (supports_separate={})",
                     supports_separate_reference_images
                 );
@@ -552,7 +552,7 @@ impl VideoDecoder {
                     decode_queue_family,
                 )?;
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[DPB-ITER8]   slot {}: view={:#x} img={:#x} (separate, base_array_layer=0)",
                         i,
                         view.as_raw(),
@@ -748,7 +748,7 @@ impl VideoDecoder {
             self.parsed.chroma_bit_depth,
             self.decode_queue_family,
         )?;
-        eprintln!(
+        vkdbg!(
             "[Decoder] Bitstream buffer grown {} -> {} bytes",
             self.bs_buffer.size(),
             bs_buffer.size()
@@ -962,7 +962,7 @@ impl VideoDecoder {
                     self.bs_buffer.flush_range(0, aligned_size).ok();
 
                     if super::vacc_debug() {
-                        eprintln!(
+                        vkdbg!(
                             "[AU-DIAG] au#{} data.len={} slice_offsets={:?} first4={:02x?}",
                             access_unit_count - 1,
                             au.data.len(),
@@ -1016,7 +1016,7 @@ impl VideoDecoder {
 
                         if super::vacc_debug() && info.curr_pic_order_cnt_val != au.pic_order_cnt[0]
                         {
-                            eprintln!(
+                            vkdbg!(
                                 "[H265] au#{idx}: POC mismatch common={} au={}; using common parser value",
                                 info.curr_pic_order_cnt_val, au.pic_order_cnt[0]
                             );
@@ -1028,7 +1028,7 @@ impl VideoDecoder {
                         let rps_slots = dpb.match_rps_slots();
 
                         if super::vacc_debug() {
-                            eprintln!(
+                            vkdbg!(
                                 "[H265] au#{} poc={} slot={} l0={:?} l1={:?} rps=({:?},{:?},{:?}) strps_bits={} slice_type={} nr0={} nr1={} mod0={:?} mod1={:?}",
                                 idx,
                                 info.curr_pic_order_cnt_val,
@@ -1102,7 +1102,7 @@ impl VideoDecoder {
                             .iter()
                             .filter(|e| e.is_valid)
                             .count();
-                        eprintln!(
+                        vkdbg!(
                             "[H264-SLOT] au#{} poc={} slot={} valid={}",
                             access_unit_count - 1,
                             au.pic_order_cnt[0],
@@ -1443,7 +1443,7 @@ impl VideoDecoder {
             let output_slot = vp9_dpb.choose_output_slot();
 
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[VP9-DBG] f{} key={} intra={} show={} refresh={:02x} ref_fb={:?} ref_slots={:?} out_slot={}",
                     frame_idx,
                     is_key_frame,
@@ -1663,7 +1663,7 @@ impl VideoDecoder {
         // out in decode order, so no reorder buffer is needed).
         let mut display_count: usize = 0;
 
-        eprintln!(
+        vkdbg!(
             "[AV1] session_params present: {}, handle_is_null: {}",
             self.session_params.is_some(),
             self.session_params
@@ -1693,7 +1693,7 @@ impl VideoDecoder {
                 ) {
                     Ok(fh) => fh,
                     Err(e) => {
-                        eprintln!("[AV1] Failed to parse frame {} header: {:?}", frame_idx, e);
+                        vkdbg!("[AV1] Failed to parse frame {} header: {:?}", frame_idx, e);
                         // Skip this frame
                         continue;
                     }
@@ -1706,7 +1706,7 @@ impl VideoDecoder {
             };
 
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[AV1] Frame {} (disp#{}): type={:?}, show_frame={}, show_existing={}, show_map_idx={}, order_hint={}, primary_ref={}, refresh_flags={:08b}, ref_idx={:?}, payload_start={}",
                     frame_idx,
                     display_count,
@@ -1734,7 +1734,7 @@ impl VideoDecoder {
                 let frame_buffer_idx = fh.frame_to_show_map_idx as usize;
                 let pic_idx = self.av1_dpb().slot_of_frame_buffer(frame_buffer_idx);
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[AV1]   show_existing: frame_buffer_idx={} -> dpb_slot={}",
                         frame_buffer_idx, pic_idx
                     );
@@ -1770,7 +1770,7 @@ impl VideoDecoder {
                             .map(|&b| b as u32)
                             .sum::<u32>() as f64
                             / n as f64;
-                        eprintln!(
+                        vkdbg!(
                             "[PUSH-DIAG] frame_idx={} display_count={} poc={} show_existing=1 map_idx={} pic_idx={} meanY1k={:.1}",
                             frame_idx, display_count, frame_count, frame_buffer_idx, pic_idx, my
                         );
@@ -1827,13 +1827,13 @@ impl VideoDecoder {
             let aligned_size = ((actual_size + bs_align - 1) & !(bs_align - 1)).max(bs_align);
             // TEMP DIAGNOSTIC (iteration 5): dump first bytes of frame 0 bitstream
             if frame_idx == 0 && super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[AV1-DIAG] frame0 bitstream: size={}, first32={:02x?} frame_header_offset={}",
                     actual_size,
                     &av1_frame.data[..av1_frame.data.len().min(32)],
                     find_av1_frame_header_offset(&av1_frame.data),
                 );
-                eprintln!(
+                vkdbg!(
                     "[FH-DIAG] frame0: frame_type={} frame_w={}x{} tile_cols_log2={} tile_rows_log2={} order_hint={} refresh_flags={:08b} primary_ref={} base_q={} interp_filter={} tx_mode={} superres={} render_diff={} film_grain={} enable_order_hint_sps={}",
                     fh.frame_type,
                     fh.frame_width,
@@ -1851,7 +1851,7 @@ impl VideoDecoder {
                     fh.apply_grain,
                     0
                 );
-                eprintln!(
+                vkdbg!(
                     "[AV1-TILE-DIAG] frame0: frame_header_offset={} frame_header_size={} tile_offset={} tile_size={} frame_obu_payload_len={}",
                     find_av1_frame_header_offset(&av1_frame.data),
                     fh.frame_header_size,
@@ -1862,7 +1862,7 @@ impl VideoDecoder {
             }
             // DEBUG (iteration 10): picture-info GAP fields for frames 1-2
             if (frame_idx == 1 || frame_idx == 2 || frame_idx == 3) && super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[AV1-TILE-DBG] frame{}: uniform_tile_spacing={} tile_count={} tile_cols={} tile_rows={} tile_cols_log2={} tile_rows_log2={} tile_size_bytes_minus_1={} context_update_tile_id={} diff_uv_delta={} separate_uv_delta_q={} base_q={} using_qmatrix={} w_sbs={:?} h_sbs={:?} mi_col={:?} mi_row={:?}",
                     frame_idx,
                     fh.uniform_tile_spacing_flag,
@@ -1885,7 +1885,7 @@ impl VideoDecoder {
                     &fh.tile_mi_col_starts[..fh.tile_cols.min(64) as usize],
                     &fh.tile_mi_row_starts[..fh.tile_rows.min(64) as usize],
                 );
-                eprintln!(
+                vkdbg!(
                     "[AV1-LF-DBG] frame{}: lf_delta_enabled={} lf_delta_update={} lf_ref_deltas={:?} lf_mode_deltas={:?} lf_level=[{},{},{},{}] lf_sharp={} primary_ref={} ref_idx={:?} frss={} order_hint={}",
                     frame_idx,
                     fh.loop_filter_delta_enabled,
@@ -1915,7 +1915,7 @@ impl VideoDecoder {
             };
 
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[AV1]   reference_name_slot_indices={:?}",
                     reference_name_slot_indices
                 );
@@ -2004,181 +2004,181 @@ impl VideoDecoder {
                 use ash::vk::native;
                 let once_cell = std::sync::Once::new();
                 once_cell.call_once(|| {
-                    eprintln!("=== STRUCT SIZE CHECK (iter 11) ===");
-                    eprintln!(
+                    vkdbg!("=== STRUCT SIZE CHECK (iter 11) ===");
+                    vkdbg!(
                         "StdVideoDecodeAV1PictureInfo: size={} align={} (expected 136/8)",
                         std::mem::size_of::<native::StdVideoDecodeAV1PictureInfo>(),
                         std::mem::align_of::<native::StdVideoDecodeAV1PictureInfo>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoDecodeAV1ReferenceInfo: size={} align={} (expected 16/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1ReferenceInfo>(),
                         std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfo>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1TileInfo: size={} align={} (expected 48/8)",
                         std::mem::size_of::<native::StdVideoAV1TileInfo>(),
                         std::mem::align_of::<native::StdVideoAV1TileInfo>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1Quantization: size={} align={} (expected 16/4)",
                         std::mem::size_of::<native::StdVideoAV1Quantization>(),
                         std::mem::align_of::<native::StdVideoAV1Quantization>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1Segmentation: size={} align={} (expected 128/2)",
                         std::mem::size_of::<native::StdVideoAV1Segmentation>(),
                         std::mem::align_of::<native::StdVideoAV1Segmentation>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1LoopFilter: size={} align={} (expected 24/4)",
                         std::mem::size_of::<native::StdVideoAV1LoopFilter>(),
                         std::mem::align_of::<native::StdVideoAV1LoopFilter>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1CDEF: size={} align={} (expected 34/1)",
                         std::mem::size_of::<native::StdVideoAV1CDEF>(),
                         std::mem::align_of::<native::StdVideoAV1CDEF>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1LoopRestoration: size={} align={} (expected 20/4)",
                         std::mem::size_of::<native::StdVideoAV1LoopRestoration>(),
                         std::mem::align_of::<native::StdVideoAV1LoopRestoration>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1GlobalMotion: size={} align={} (expected 200/4)",
                         std::mem::size_of::<native::StdVideoAV1GlobalMotion>(),
                         std::mem::align_of::<native::StdVideoAV1GlobalMotion>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoAV1FilmGrain: size={} align={} (expected 136/4)",
                         std::mem::size_of::<native::StdVideoAV1FilmGrain>(),
                         std::mem::align_of::<native::StdVideoAV1FilmGrain>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoDecodeAV1PictureInfoFlags: size={} align={} (expected 4/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1PictureInfoFlags>(),
                         std::mem::align_of::<native::StdVideoDecodeAV1PictureInfoFlags>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "StdVideoDecodeAV1ReferenceInfoFlags: size={} align={} (expected 4/4)",
                         std::mem::size_of::<native::StdVideoDecodeAV1ReferenceInfoFlags>(),
                         std::mem::align_of::<native::StdVideoDecodeAV1ReferenceInfoFlags>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "Av1PictureInfoContainer: size={}",
                         std::mem::size_of::<Av1PictureInfoContainer>()
                     );
                     // Test A: VkVideoDecodeInfoKHR layout verification
-                    eprintln!("=== TEST A: VkVideoDecodeInfoKHR Layout ===");
-                    eprintln!(
+                    vkdbg!("=== TEST A: VkVideoDecodeInfoKHR Layout ===");
+                    vkdbg!(
                         "VideoDecodeInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoDecodeInfoKHR>(),
                         std::mem::align_of::<vk::VideoDecodeInfoKHR>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  s_type offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, s_type)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_next offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_next)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  flags offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, flags)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  src_buffer offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  src_buffer_offset offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_offset)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  src_buffer_range offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, src_buffer_range)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  dst_picture_resource offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, dst_picture_resource)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_setup_reference_slot offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_setup_reference_slot)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  reference_slot_count offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, reference_slot_count)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_reference_slots offset={}",
                         std::mem::offset_of!(vk::VideoDecodeInfoKHR, p_reference_slots)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "VideoPictureResourceInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoPictureResourceInfoKHR>(),
                         std::mem::align_of::<vk::VideoPictureResourceInfoKHR>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  s_type offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, s_type)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_next offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, p_next)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  coded_offset offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_offset)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  coded_extent offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, coded_extent)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  base_array_layer offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, base_array_layer)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  image_view_binding offset={}",
                         std::mem::offset_of!(vk::VideoPictureResourceInfoKHR, image_view_binding)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "VideoReferenceSlotInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoReferenceSlotInfoKHR>(),
                         std::mem::align_of::<vk::VideoReferenceSlotInfoKHR>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  s_type offset={}",
                         std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, s_type)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_next offset={}",
                         std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_next)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  slot_index offset={}",
                         std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, slot_index)
                     );
-                    eprintln!(
+                    vkdbg!(
                         "  p_picture_resource offset={}",
                         std::mem::offset_of!(vk::VideoReferenceSlotInfoKHR, p_picture_resource)
                     );
                     // Test B: VideoDecodeAV1PictureInfoKHR layout verification
-                    eprintln!("=== TEST B: VideoDecodeAV1PictureInfoKHR Layout ===");
-                    eprintln!(
+                    vkdbg!("=== TEST B: VideoDecodeAV1PictureInfoKHR Layout ===");
+                    vkdbg!(
                         "Local VideoDecodeAV1PictureInfoKHR: size={} align={}",
                         std::mem::size_of::<VideoDecodeAV1PictureInfoKHR>(),
                         std::mem::align_of::<VideoDecodeAV1PictureInfoKHR>()
                     );
-                    eprintln!(
+                    vkdbg!(
                         "Ash VideoDecodeAV1PictureInfoKHR: size={} align={}",
                         std::mem::size_of::<vk::VideoDecodeAV1PictureInfoKHR>(),
                         std::mem::align_of::<vk::VideoDecodeAV1PictureInfoKHR>()
                     );
-                    eprintln!("=== END STRUCT SIZE CHECK ===");
+                    vkdbg!("=== END STRUCT SIZE CHECK ===");
                 });
             } // if vacc_debug
 
@@ -2329,7 +2329,7 @@ impl VideoDecoder {
                 }
             }
             if frame_idx < 8 && super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[OH-DBG] fc={} OrderHints after pop={:?} eff_rfi={:?} raw_rfi={:?} frss={}",
                     frame_idx,
                     pic_info.OrderHints,
@@ -2523,7 +2523,7 @@ impl VideoDecoder {
             if super::vacc_debug() {
                 let pi = &picture_info_container.std_picture_info;
                 let f = &pi.flags;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL] fc={} type={} oh={} primref={} refresh={:08x} refidx={:?}",
                     frame_idx,
                     { pi.frame_type },
@@ -2532,7 +2532,7 @@ impl VideoDecoder {
                     pi.refresh_frame_flags,
                     fh.ref_frame_idx
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   flags: superres={} renderdiff={} screencontent={} filterswitch={} intmv={} intrabc={} frss={} highprec={} mmodesw={} refrf_mvs={} warp={} reductx={} refsel={} skipmode={} deltaq={} delf={} delfmulti={} segen={} segmap={} segtemp={} segdata={} useslr={} chromalr={} grain={}",
                     f.use_superres(),
                     f.render_and_frame_size_different(),
@@ -2559,19 +2559,19 @@ impl VideoDecoder {
                     f.usesChromaLr(),
                     f.apply_grain()
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   flags2: errres={} discdf={} fso={} brt={}",
                     f.error_resilient_mode(),
                     f.disable_cdf_update(),
                     f.frame_size_override_flag(),
                     f.buffer_removal_time_present_flag()
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   interp={} txmode={} deltaqres={} delfres={}",
                     pi.interpolation_filter, pi.TxMode, pi.delta_q_res, pi.delta_lf_res
                 );
                 let q = &picture_info_container.quantization;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   quant: using_qmatrix={} diff_uv_delta={} base_q={} dQYdc={} dQUdc={} dQUac={} dQVdc={} dQVac={} qm_y={} qm_u={} qm_v={}",
                     q.flags.using_qmatrix(),
                     q.flags.diff_uv_delta(),
@@ -2586,7 +2586,7 @@ impl VideoDecoder {
                     q.qm_v
                 );
                 let lf = &picture_info_container.loop_filter;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   lf: delta_en={} delta_upd={} level=[{},{},{},{}] sharp={} updrefd={} refd=[{},{},{},{},{},{},{},{}] updmodes={} moded=[{},{}]",
                     lf.flags.loop_filter_delta_enabled(),
                     lf.flags.loop_filter_delta_update(),
@@ -2609,7 +2609,7 @@ impl VideoDecoder {
                     lf.loop_filter_mode_deltas[1]
                 );
                 let c = &picture_info_container.cdef;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   cdef: damping={} bits={} ypri={:?} ysec={:?} uvprim={:?} uvsec={:?}",
                     c.cdef_damping_minus_3,
                     c.cdef_bits,
@@ -2619,7 +2619,7 @@ impl VideoDecoder {
                     c.cdef_uv_sec_strength
                 );
                 let lr = &picture_info_container.loop_restoration;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   lr: type=[{},{},{}] size=[{},{},{}]",
                     lr.FrameRestorationType[0],
                     lr.FrameRestorationType[1],
@@ -2629,7 +2629,7 @@ impl VideoDecoder {
                     lr.LoopRestorationSize[2]
                 );
                 let gm = &picture_info_container.global_motion;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   gm: type=[{},{},{},{},{},{},{},{}]",
                     gm.GmType[0],
                     gm.GmType[1],
@@ -2641,7 +2641,7 @@ impl VideoDecoder {
                     gm.GmType[7]
                 );
                 for i in 0..8 {
-                    eprintln!(
+                    vkdbg!(
                         "[RUST-PI-ALL]   gm_params[{}]=[{},{},{},{},{},{}]",
                         i,
                         gm.gm_params[i][0],
@@ -2653,7 +2653,7 @@ impl VideoDecoder {
                     );
                 }
                 let sg = &picture_info_container.segmentation;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   seg: enabled=[{},{},{},{},{},{},{},{}]",
                     sg.FeatureEnabled[0],
                     sg.FeatureEnabled[1],
@@ -2665,7 +2665,7 @@ impl VideoDecoder {
                     sg.FeatureEnabled[7]
                 );
                 for i in 0..8 {
-                    eprintln!(
+                    vkdbg!(
                         "[RUST-PI-ALL]   segdata[{}]=[{},{},{},{},{},{},{},{}]",
                         i,
                         sg.FeatureData[i][0],
@@ -2678,11 +2678,11 @@ impl VideoDecoder {
                         sg.FeatureData[i][7]
                     );
                 }
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   refNameSlotIndices={:?} tileCount=1",
                     reference_name_slot_indices
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   orderHints={:?} expectedFrameId={:?} skipModeFrame={:?} coded_denom={} current_frame_id={}",
                     pi.OrderHints,
                     pi.expectedFrameId,
@@ -2690,12 +2690,12 @@ impl VideoDecoder {
                     pi.coded_denom,
                     pi.current_frame_id
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   tile: tileOffsets[0]={} tileSizes[0]={}",
                     picture_info_container.tile_offsets[0], picture_info_container.tile_sizes[0]
                 );
                 let ti = &picture_info_container.tile_info;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   tileinfo: uniform={} cols={} rows={} ctxid={} tsbm1={}",
                     ti.flags.uniform_tile_spacing_flag(),
                     ti.TileCols,
@@ -2703,14 +2703,14 @@ impl VideoDecoder {
                     ti.context_update_tile_id,
                     ti.tile_size_bytes_minus_1
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   tilewidth_sbs_m1={:?} tileheight_sbs_m1={:?}",
                     &picture_info_container.tile_width_in_sbs_minus_1
                         [..picture_info_container.tile_cols_count],
                     &picture_info_container.tile_height_in_sbs_minus_1
                         [..picture_info_container.tile_rows_count]
                 );
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   tilemicol={:?} tilerow={:?}",
                     &picture_info_container.tile_mi_col_starts
                         [..picture_info_container.tile_cols_count],
@@ -2719,7 +2719,7 @@ impl VideoDecoder {
                 );
                 // DEBUG (iteration 4): film grain dump
                 let fg = &picture_info_container.film_grain;
-                eprintln!(
+                vkdbg!(
                     "[RUST-PI-ALL]   filmgrain: chroma_scale_luma={} overlap={} clip_restricted={} update_grain={} grain_scaling_m8={} ar_coeff_lag={} ar_coeff_shift_m6={} grain_scale_shift={} grain_seed={} ref_idx={} num_y={} num_cb={} num_cr={} cb_mult={} cb_luma_mult={} cb_offset={} cr_mult={} cr_luma_mult={} cr_offset={}",
                     fg.flags.chroma_scaling_from_luma(),
                     fg.flags.overlap_flag(),
@@ -2744,13 +2744,13 @@ impl VideoDecoder {
                 // DEBUG (iteration 4): bitstream bytes dump for fc2
                 if frame_idx == 6 {
                     let bytes_to_dump = bs_data.len().min(64);
-                    eprintln!(
+                    vkdbg!(
                         "[RUST-BS-DUMP] fc=2 bitstream: total_size={} dump_len={} bytes={:02x?}",
                         bs_data.len(),
                         bytes_to_dump,
                         &bs_data[..bytes_to_dump]
                     );
-                    eprintln!(
+                    vkdbg!(
                         "[RUST-BS-DUMP]   tile_offset={} tile_size={} frame_header_offset={} payload_start={} payload_size={}",
                         tile_offset,
                         tile_size,
@@ -2758,7 +2758,7 @@ impl VideoDecoder {
                         av1_frame.payload_start,
                         av1_frame.payload_size
                     );
-                    eprintln!(
+                    vkdbg!(
                         "[RUST-BS-DUMP]   fh.frame_header_size={} fh.tile_count={} fh.tile_cols={} fh.tile_rows={}",
                         fh.frame_header_size, fh.tile_count, fh.tile_cols, fh.tile_rows
                     );
@@ -2819,7 +2819,7 @@ impl VideoDecoder {
                     let hash: u64 = hash_input
                         .iter()
                         .fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
-                    eprintln!(
+                    vkdbg!(
                         "[TEST-B-DPB] slot={} written to {} ({} bytes) Y[0..256] hash={:016x} first16Y={:02x?}",
                         slot,
                         path,
@@ -2874,7 +2874,7 @@ impl VideoDecoder {
             // Submit
             unsafe {
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[FENCE-DBG] frame{}: before reset_fences (fence={:#x})",
                         frame_idx,
                         self.fence.as_raw()
@@ -2885,7 +2885,7 @@ impl VideoDecoder {
                     .reset_fences(&[self.fence])
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[FENCE-DBG] frame{}: after reset_fences (unsignaled)",
                         frame_idx
                     );
@@ -2903,7 +2903,7 @@ impl VideoDecoder {
                     )
                     .map_err(|e| VideoError::QueueSubmission(e.to_string()))?;
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[FENCE-DBG] frame{}: after queue_submit (waiting...)",
                         frame_idx
                     );
@@ -2913,7 +2913,7 @@ impl VideoDecoder {
                     .wait_for_fences(&[self.fence], true, u64::MAX)
                     .map_err(|e| VideoError::FenceWait(e.to_string()))?;
                 if super::vacc_debug() {
-                    eprintln!(
+                    vkdbg!(
                         "[FENCE-DBG] frame{}: after wait_for_fences (signaled, decode complete)",
                         frame_idx
                     );
@@ -2962,7 +2962,7 @@ impl VideoDecoder {
                 .commit_decoded(output_slot, &fh, cur_ohb);
             if frame_idx < 8 && super::vacc_debug() {
                 let dpb = self.av1_dpb();
-                eprintln!(
+                vkdbg!(
                     "[AV1-COMMIT] frame{}: slot={} refresh={:08b} fb->slot={:?}",
                     frame_idx,
                     output_slot,
@@ -3005,7 +3005,7 @@ impl VideoDecoder {
                 .set_slot_layout(output_slot, post_decode_layout);
 
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[SYNC-FIX-ITER14] frame{}: output_slot={} post_decode_layout={:?} (setup={})",
                     frame_idx,
                     output_slot,
@@ -3025,7 +3025,7 @@ impl VideoDecoder {
                     let slot = self.av1_dpb().slot_of_frame_buffer(i);
                     fb_state.push_str(&format!("{}:{}, ", i, slot));
                 }
-                eprintln!(
+                vkdbg!(
                     "[DPB] after frame {} (out_slot={}): {}",
                     frame_idx, output_slot, fb_state
                 );
@@ -3060,7 +3060,7 @@ impl VideoDecoder {
                     .map(|&b| b as u32)
                     .sum::<u32>() as f64
                     / n as f64;
-                eprintln!(
+                vkdbg!(
                     "[PUSH-DIAG] frame_idx={} display_count={} poc={} show_existing=0 map_idx=- pic_idx={} meanY1k={:.1}",
                     frame_idx, display_count, frame_count, output_slot, my
                 );
@@ -3321,7 +3321,7 @@ impl VideoDecoder {
                     slh.slice_beta_offset_div2 * 2,
                     slh.header_bit_size,
                 ));
-                eprintln!(
+                vkdbg!(
                     "{}
 ",
                     line.trim_end()
@@ -3339,7 +3339,7 @@ impl VideoDecoder {
                             if r.is_long_term { "Y" } else { "N" }
                         ));
                     }
-                    eprintln!("{}]", rl);
+                    vkdbg!("{}]", rl);
                 }
             }
             lists
@@ -3719,7 +3719,7 @@ fn detect_codec_from_data(data: &[u8]) -> AccessUnitCodec {
         }
         let nal_type = data[start] & 0x1F;
         if std::env::var("DETECT_DBG").is_ok() && i < 64 {
-            eprintln!(
+            vkdbg!(
                 "DBG2 i={} start={} byte={:#04x} nal_type={}",
                 i, start, data[start], nal_type
             );
@@ -4191,12 +4191,12 @@ fn select_h264_picture_format(
             ))
         })?;
     if !preferred.contains(&chosen) {
-        eprintln!(
+        vkdbg!(
             "[Decoder] NOTE: using non-preferred H264 decode format 0x{:x}",
             chosen.as_raw()
         );
     }
-    eprintln!(
+    vkdbg!(
         "[Decoder] H264 decode output format: {:?} (device supports {})",
         chosen,
         supported.len()
@@ -4265,12 +4265,12 @@ fn select_h265_picture_format(
             ))
         })?;
     if !preferred.contains(&chosen) {
-        eprintln!(
+        vkdbg!(
             "[Decoder] NOTE: using non-preferred H265 decode format 0x{:x}",
             chosen.as_raw()
         );
     }
-    eprintln!(
+    vkdbg!(
         "[Decoder] H265 decode output format: {:?} (device supports {})",
         chosen,
         supported.len()
@@ -4349,14 +4349,14 @@ fn create_video_session(
 
     let std_header_version = build_std_header_version(std_header_name);
 
-    eprintln!("[Session] Creating video session...");
+    vkdbg!("[Session] Creating video session...");
     let (session, session_memories) = VideoSession::create(
         &vulkan.instance,
         &vulkan.device,
         &session_params,
         &std_header_version,
     )?;
-    eprintln!("[Session] Video session created, binding memory...");
+    vkdbg!("[Session] Video session created, binding memory...");
 
     // Extract SPS/PPS/VPS for session parameters creation
     let h264_sps = match codec {
@@ -4399,7 +4399,7 @@ fn create_video_session(
     let session_parameters = if codec == VideoCodec::DecodeVp9 {
         None
     } else {
-        eprintln!("[Session] Creating session parameters...");
+        vkdbg!("[Session] Creating session parameters...");
         let params = VideoSessionParameters::create(
             &vulkan.instance,
             &vulkan.device,
@@ -4412,14 +4412,14 @@ fn create_video_session(
             h265_pps,
             av1_sps,
         )?;
-        eprintln!("[Session] Session parameters created, updating session...");
+        vkdbg!("[Session] Session parameters created, updating session...");
         // Initialize the session with the session parameters via vkUpdateVideoSessionKHR
         params.update_session(session.handle())?;
-        eprintln!("[Session] Session updated");
+        vkdbg!("[Session] Session updated");
         Some(params)
     };
 
-    eprintln!("[Session] create_video_session completed");
+    vkdbg!("[Session] create_video_session completed");
 
     Ok((session, session_parameters, session_memories))
 }
@@ -4540,7 +4540,7 @@ fn extract_max_au_size(
             max = Some(max.map(|m| m.max(au.data.len())).unwrap_or(au.data.len()));
         }
     }
-    eprintln!(
+    vkdbg!(
         "[Decoder] extract_max_au_size: {} AUs, max={} bytes",
         count,
         max.unwrap_or(0)
@@ -4722,7 +4722,7 @@ fn parse_av1_init(
 
     // TEMP DIAGNOSTIC (iteration 5): print parsed SPS fields
     if let Some(ref s) = sps {
-        eprintln!(
+        vkdbg!(
             "[SPS-DIAG] profile={} high_bitdepth={} twelve_bit={} max_w={} max_h={} mono_chrome={} subsampling_x={} subsampling_y={}",
             s.profile,
             s.high_bitdepth,
@@ -4734,7 +4734,7 @@ fn parse_av1_init(
             s.subsampling_y
         );
     } else {
-        eprintln!("[SPS-DIAG] SPS parse FAILED");
+        vkdbg!("[SPS-DIAG] SPS parse FAILED");
     }
 
     let (coded_width, coded_height, profile, bit_depth) = if let Some(ref s) = sps {
@@ -4872,190 +4872,190 @@ fn parse_av1_sps_from_data(
             if let Some(ref sps) = result
                 && super::vacc_debug()
             {
-                eprintln!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
-                eprintln!(
+                vkdbg!("[SPS-PARSE] ===== Av1Sps (raw parsed) =====");
+                vkdbg!(
                     "[SPS-PARSE] profile                               = {}",
                     sps.profile
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] level                                 = {}",
                     sps.level
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] still_picture                         = {}",
                     sps.still_picture
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] reduced_still_picture_header          = {}",
                     sps.reduced_still_picture_header
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] use_128x128_superblock                = {}",
                     sps.use_128x128_superblock
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_filter_intra                   = {}",
                     sps.enable_filter_intra
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_intra_edge_filter              = {}",
                     sps.enable_intra_edge_filter
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_interintra_compound            = {}",
                     sps.enable_interintra_compound
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_masked_compound                = {}",
                     sps.enable_masked_compound
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_warped_motion                  = {}",
                     sps.enable_warped_motion
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_dual_filter                    = {}",
                     sps.enable_dual_filter
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_order_hint                     = {}",
                     sps.enable_order_hint
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_jnt_motion                     = {}",
                     sps.enable_jnt_motion
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_ref_frame_mvs                  = {}",
                     sps.enable_ref_frame_mvs
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] seq_force_screen_content_tools        = {} (SELECT=2)",
                     sps.seq_force_screen_content_tools
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] seq_force_integer_mv                  = {} (SELECT=2)",
                     sps.seq_force_integer_mv
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] separate_uv_delta_q                   = {}",
                     sps.separate_uv_delta_q
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_superres                       = {}",
                     sps.enable_superres
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_cdef                           = {}",
                     sps.enable_cdef
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] enable_restoration                    = {}",
                     sps.enable_restoration
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] film_grain_params_present             = {}",
                     sps.film_grain_params_present
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] timing_info_present_flag              = {}",
                     sps.timing_info_present_flag
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] initial_display_delay_present_flag    = {}",
                     sps.initial_display_delay_present_flag
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] frame_width_bits                      = {} (-> minus_1={})",
                     sps.frame_width_bits,
                     sps.frame_width_bits.saturating_sub(1)
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] frame_height_bits                     = {} (-> minus_1={})",
                     sps.frame_height_bits,
                     sps.frame_height_bits.saturating_sub(1)
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] max_frame_width_minus_1               = {}",
                     sps.max_frame_width_minus_1
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] max_frame_height_minus_1              = {}",
                     sps.max_frame_height_minus_1
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] frame_id_numbers_present_flag         = {}",
                     sps.frame_id_numbers_present_flag
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] delta_frame_id_length_minus2          = {}",
                     sps.delta_frame_id_length_minus2
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] additional_frame_id_length_minus1     = {}",
                     sps.additional_frame_id_length_minus1
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] order_hint_bits_minus1                = {}",
                     sps.order_hint_bits_minus1
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] high_bitdepth                         = {}",
                     sps.high_bitdepth
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] twelve_bit                            = {}",
                     sps.twelve_bit
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] mono_chrome                           = {}",
                     sps.mono_chrome
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] color_description_present             = {}",
                     sps.color_description_present
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] color_primaries                       = {}",
                     sps.color_primaries
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] transfer_characteristics              = {}",
                     sps.transfer_characteristics
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] matrix_coefficients                   = {}",
                     sps.matrix_coefficients
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] color_range                           = {}",
                     sps.color_range
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] subsampling_x                         = {}",
                     sps.subsampling_x
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] subsampling_y                         = {}",
                     sps.subsampling_y
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] chroma_sample_position                = {}",
                     sps.chroma_sample_position
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] num_units_in_display_tick             = {}",
                     sps.num_units_in_display_tick
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] time_scale                            = {}",
                     sps.time_scale
                 );
-                eprintln!(
+                vkdbg!(
                     "[SPS-PARSE] equal_picture_interval                = {}",
                     sps.equal_picture_interval
                 );
-                eprintln!("[SPS-PARSE] ============================================");
+                vkdbg!("[SPS-PARSE] ============================================");
             }
             result
         }
@@ -5191,7 +5191,7 @@ fn build_av1_dpb_picture_resources(
                     active_str.push_str(&format!("{} ", slot));
                 }
             }
-            eprintln!(
+            vkdbg!(
                 "[DPB-DIAG] ref_frame_idx={:?} fb→slot=[{}] active_refs=[{}]",
                 ref_frame_idx, fb_map, active_str
             );
@@ -5236,7 +5236,7 @@ fn build_av1_dpb_picture_resources(
                 _marker: Default::default(),
             };
             if super::vacc_debug() {
-                eprintln!(
+                vkdbg!(
                     "[DPB-ITER8]   AV1 REF picture[fb={}]: slot_idx={} view={:#x} base_array_layer={}",
                     fb,
                     slot_idx,
@@ -5260,7 +5260,7 @@ fn build_av1_dpb_picture_resources(
     };
 
     if super::vacc_debug() {
-        eprintln!(
+        vkdbg!(
             "[DPB-ITER8]   AV1 SETUP picture: output_slot={} view={:#x} base_array_layer=0",
             output_slot,
             dpb_views[output_slot as usize].as_raw()
@@ -5385,7 +5385,7 @@ mod detect_tests {
         files.sort();
         for f in &files {
             let d = std::fs::read(format!("{base}{f}")).expect("read sample");
-            eprintln!("PROBE detect({f}) = {:?}", detect_codec_from_data(&d));
+            vkdbg!("PROBE detect({f}) = {:?}", detect_codec_from_data(&d));
         }
     }
 }

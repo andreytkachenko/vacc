@@ -169,7 +169,7 @@ pub fn create_dpb_image_array_with_profile(
 
         // DEBUG (iteration 10): print exact VkImageViewCreateInfo for DPB views
         if slot == 0 {
-            eprintln!(
+            vkdbg!(
                 "[DPB-IV-CREATE] slot=0: image={:#x} viewType={:?} format={:?} subresourceRange={{ aspectMask={:?} baseMipLevel={} levelCount={} baseArrayLayer={} layerCount={} }}",
                 image.as_raw(),
                 view_create_info.view_type,
@@ -180,7 +180,7 @@ pub fn create_dpb_image_array_with_profile(
                 view_create_info.subresource_range.base_array_layer,
                 view_create_info.subresource_range.layer_count,
             );
-            eprintln!(
+            vkdbg!(
                 "[DPB-IV-CREATE]   image extent: {}x{}x{} arrayLayers={} flags={:?}",
                 width,
                 height,
@@ -307,7 +307,7 @@ fn create_image_with_profile_chain(
 
     // DEBUG (iteration 10): print image creation parameters
     if array_layers > 1 {
-        eprintln!(
+        vkdbg!(
             "[DPB-IMG-CREATE] format={:?} extent={{ {}x{}x1 }} arrayLayers={} flags={:?} usage={:?} queueFamilyIdx={}",
             format,
             width,
@@ -317,7 +317,7 @@ fn create_image_with_profile_chain(
             image_create_info.usage,
             queue_family_index
         );
-        eprintln!(
+        vkdbg!(
             "[DPB-IMG-CREATE]   profile={{ codecOp={:?} chromaSubsampling={:?} lumaBitDepth={:?} chromaBitDepth={:?} }}",
             profile_info.video_codec_operation,
             profile_info.chroma_subsampling,

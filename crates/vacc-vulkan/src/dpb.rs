@@ -132,7 +132,7 @@ impl DpbManager {
         current_slot_index: u32,
         mmco_commands: &[H264MmcoCommand],
     ) {
-        eprintln!(
+        vkdbg!(
             "[DEBUG] DPB::apply_mmco: current_frame_num={}, current_slot={}, commands={}",
             current_frame_num,
             current_slot_index,
@@ -140,7 +140,7 @@ impl DpbManager {
         );
 
         for cmd in mmco_commands {
-            eprintln!("[DEBUG]   MMCO command: {:?}", cmd);
+            vkdbg!("[DEBUG]   MMCO command: {:?}", cmd);
         }
 
         for cmd in mmco_commands {
@@ -152,11 +152,11 @@ impl DpbManager {
                 } => {
                     let pic_num_x =
                         self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
-                    eprintln!("[DEBUG]   MMCO 1: unmark short-term picNumX={}", pic_num_x);
+                    vkdbg!("[DEBUG]   MMCO 1: unmark short-term picNumX={}", pic_num_x);
                     for entry in &mut self.entries {
                         if entry.is_valid && entry.frame_num == pic_num_x {
                             entry.is_valid = false;
-                            eprintln!(
+                            vkdbg!(
                                 "[DEBUG]     invalidated slot {} (frame_num={})",
                                 entry.slot_index, entry.frame_num
                             );
@@ -169,7 +169,7 @@ impl DpbManager {
                 H264MmcoCommand::UnmarkLongTerm {
                     long_term_frame_idx,
                 } => {
-                    eprintln!(
+                    vkdbg!(
                         "[DEBUG]   MMCO 2: unmark long-term long_term_frame_idx={} (not fully tracked)",
                         long_term_frame_idx
                     );
@@ -183,7 +183,7 @@ impl DpbManager {
                 } => {
                     let pic_num_x =
                         self.compute_pic_num(current_frame_num, *difference_of_pic_nums_minus1);
-                    eprintln!(
+                    vkdbg!(
                         "[DEBUG]   MMCO 3: assign LongTermFrameIdx={} to picNumX={} (not fully tracked)",
                         long_term_frame_idx, pic_num_x
                     );
@@ -194,7 +194,7 @@ impl DpbManager {
                 H264MmcoCommand::SetMaxLongTermFrameIdx {
                     max_long_term_frame_idx_plus1,
                 } => {
-                    eprintln!(
+                    vkdbg!(
                         "[DEBUG]   MMCO 4: set MaxLongTermFrameIdx={} (not fully tracked)",
                         max_long_term_frame_idx_plus1
                     );
@@ -203,7 +203,7 @@ impl DpbManager {
 
                 // MMCO 5: Unmark all references
                 H264MmcoCommand::UnmarkAll => {
-                    eprintln!("[DEBUG]   MMCO 5: unmark ALL references");
+                    vkdbg!("[DEBUG]   MMCO 5: unmark ALL references");
                     for entry in &mut self.entries {
                         if entry.is_valid {
                             entry.is_valid = false;
@@ -215,7 +215,7 @@ impl DpbManager {
                 H264MmcoCommand::AssignLongTermToCurrent {
                     long_term_frame_idx,
                 } => {
-                    eprintln!(
+                    vkdbg!(
                         "[DEBUG]   MMCO 6: assign LongTermFrameIdx={} to current (slot {}) (not fully tracked)",
                         long_term_frame_idx, current_slot_index
                     );

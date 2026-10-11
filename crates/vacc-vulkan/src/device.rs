@@ -168,7 +168,7 @@ impl VideoDeviceBuilder {
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         if std::env::var("VACC_DEBUG").is_ok() {
             for (i, mt) in memory_properties.memory_types.iter().enumerate() {
-                eprintln!(
+                vkdbg!(
                     "[MEMTYPE] type={} flags=0x{:x}",
                     i,
                     mt.property_flags.as_raw()
@@ -268,7 +268,7 @@ impl VideoDeviceBuilder {
                 layers.push(CString::new(validation_layer).unwrap());
                 has_validation = true;
             } else {
-                eprintln!(
+                vkdbg!(
                     "[VideoDeviceBuilder] WARNING: Validation layer {} not available",
                     validation_layer
                 );
@@ -279,7 +279,7 @@ impl VideoDeviceBuilder {
             if available_ext_names.contains(&debug_ext.to_string()) {
                 instance_extensions.push(CString::new(debug_ext).unwrap());
             } else {
-                eprintln!(
+                vkdbg!(
                     "[VideoDeviceBuilder] WARNING: Debug extension {} not available",
                     debug_ext
                 );
@@ -349,7 +349,7 @@ impl VideoDeviceBuilder {
                 "GEN"
             };
 
-            eprintln!(
+            vkdbg!(
                 "[Vulkan Validation] [{}] [{}] {}",
                 severity, msg_type, message
             );
@@ -434,7 +434,7 @@ impl VideoDeviceBuilder {
                     .collect();
                 let has_av1 = ext_names.iter().any(|n| n == "VK_KHR_video_decode_av1");
                 let has_decode = ext_names.iter().any(|n| n == "VK_KHR_video_decode_queue");
-                eprintln!(
+                vkdbg!(
                     "[DEV-DIAG] candidate: {} | decode_queue_ext={} av1={}",
                     name, has_decode, has_av1
                 );
@@ -492,7 +492,7 @@ impl VideoDeviceBuilder {
                         .take_while(|&&b| b != 0)
                         .map(|b| *b as u8 as char)
                         .collect();
-                    eprintln!("[DEV-DIAG] SELECTED: {}", name);
+                    vkdbg!("[DEV-DIAG] SELECTED: {}", name);
                 }
                 let queue_families = QueueFamilies {
                     graphics: graphics_queue_family,
@@ -547,10 +547,10 @@ impl VideoDeviceBuilder {
             .collect();
 
         if std::env::var("VACC_DEV_DIAG").is_ok() {
-            eprintln!("[VideoDeviceBuilder] Available video extensions:");
+            vkdbg!("[VideoDeviceBuilder] Available video extensions:");
             for name in &available_names {
                 if name.contains("video") {
-                    eprintln!("  - {}", name);
+                    vkdbg!("  - {}", name);
                 }
             }
         }
@@ -572,7 +572,7 @@ impl VideoDeviceBuilder {
             if available_names.iter().any(|n| n.as_str() == *ext) {
                 extensions.push(ext);
             } else {
-                eprintln!(
+                vkdbg!(
                     "[VideoDeviceBuilder] WARNING: Required extension {} not available",
                     ext
                 );
@@ -586,7 +586,7 @@ impl VideoDeviceBuilder {
         {
             extensions.push("VK_KHR_video_maintenance2");
         } else {
-            eprintln!(
+            vkdbg!(
                 "[VideoDeviceBuilder] WARNING: VK_KHR_video_maintenance2 not available (NULL session params invalid for AV1 decode)"
             );
         }
@@ -620,7 +620,7 @@ impl VideoDeviceBuilder {
             {
                 extensions.push("VK_KHR_video_decode_av1");
             } else {
-                eprintln!(
+                vkdbg!(
                     "[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_av1 not available (AV1 decode not supported)"
                 );
             }
@@ -637,7 +637,7 @@ impl VideoDeviceBuilder {
             {
                 extensions.push("VK_KHR_video_decode_vp9");
             } else {
-                eprintln!(
+                vkdbg!(
                     "[VideoDeviceBuilder] WARNING: VK_KHR_video_decode_vp9 not available (VP9 decode not supported)"
                 );
             }
@@ -652,7 +652,7 @@ impl VideoDeviceBuilder {
                 if available_names.iter().any(|n| n.as_str() == ext) {
                     extensions.push(ext);
                 } else {
-                    eprintln!(
+                    vkdbg!(
                         "[VideoDeviceBuilder] WARNING: {} not available (H.264 encode not supported)",
                         ext
                     );
@@ -767,10 +767,10 @@ impl VideoDeviceBuilder {
             _marker: Default::default(),
         };
 
-        eprintln!("[VideoDeviceBuilder] Creating device...");
+        vkdbg!("[VideoDeviceBuilder] Creating device...");
         let device = unsafe { instance.create_device(*physical_device, &device_create_info, None) }
             .map_err(|e| VideoError::DeviceCreation(e.to_string()))?;
-        eprintln!("[VideoDeviceBuilder] Device created successfully");
+        vkdbg!("[VideoDeviceBuilder] Device created successfully");
 
         let ext_names: Vec<String> = c_extensions
             .iter()
@@ -931,47 +931,47 @@ impl VulkanDevice {
             }
 
             // DEBUG (iteration 17): print capabilities
-            eprintln!("[CAPABILITIES] ===== VkVideoCapabilitiesKHR =====");
-            eprintln!(
+            vkdbg!("[CAPABILITIES] ===== VkVideoCapabilitiesKHR =====");
+            vkdbg!(
                 "[CAPABILITIES]   flags                          = {:?}",
                 caps.flags
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   minCodedExtent                 = {}x{}",
                 caps.min_coded_extent.width, caps.min_coded_extent.height
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   maxCodedExtent                 = {}x{}",
                 caps.max_coded_extent.width, caps.max_coded_extent.height
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   pictureAccessGranularity       = {}x{}",
                 caps.picture_access_granularity.width, caps.picture_access_granularity.height
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   maxDpbSlots                    = {}",
                 caps.max_dpb_slots
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   maxActiveReferencePictures     = {}",
                 caps.max_active_reference_pictures
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   minBitstreamBufferOffsetAlignment = {}",
                 caps.min_bitstream_buffer_offset_alignment
             );
-            eprintln!(
+            vkdbg!(
                 "[CAPABILITIES]   minBitstreamBufferSizeAlignment   = {}",
                 caps.min_bitstream_buffer_size_alignment
             );
             // Print decode capabilities (p_next chain)
             if !decode_caps.p_next.is_null() {
-                eprintln!(
+                vkdbg!(
                     "[CAPABILITIES]   VkVideoDecodeCapabilitiesKHR: flags = {:?}",
                     decode_caps.flags
                 );
             }
-            eprintln!("[CAPABILITIES] ===========================================");
+            vkdbg!("[CAPABILITIES] ===========================================");
 
             caps
         };
@@ -1070,12 +1070,12 @@ impl VulkanDevice {
         ];
 
         let mut formats = Vec::new();
-        eprintln!(
+        vkdbg!(
             "[VideoDeviceBuilder] Querying supported video formats for codec {:?}",
             codec_op
         );
         for fmt in candidate_formats {
-            eprintln!("  Trying format: {:?}", fmt);
+            vkdbg!("  Trying format: {:?}", fmt);
             let format_props = self.get_physical_device_video_format_properties(
                 codec_op,
                 vk::ImageTiling::OPTIMAL,
@@ -1162,7 +1162,7 @@ impl VulkanDevice {
 
             props.truncate(count as usize);
             for p in &props {
-                eprintln!(
+                vkdbg!(
                     "    Supported: format={:?}, usage={:?}",
                     p.format, p.image_usage_flags
                 );

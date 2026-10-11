@@ -844,7 +844,7 @@ pub fn extract_all_access_units(
                     {
                         if std::env::var("VACC_DBG_AU").is_ok() {
                             let raw_fss = nal_data.len() >= 3 && ((nal_data[2] >> 7) & 1) == 1;
-                            eprintln!(
+                            vkdbg!(
                                 "[H265-AU-NAL] off={} nal={} irap={} raw_fss={}",
                                 start, nal_unit_type, is_irap, raw_fss
                             );
@@ -917,7 +917,7 @@ pub fn extract_all_access_units(
                                 current_no_output_of_prior_pics_flag =
                                     slice_no_output_of_prior_pics_flag;
                                 if std::env::var("VACC_DBG_AU").is_ok() {
-                                    eprintln!(
+                                    vkdbg!(
                                         "[H265-AU] nal={} poc={} lsb={} msb={} stype={} idr={} ref={} ref_pocs={:?}",
                                         nal_unit_type,
                                         poc[0],
@@ -959,7 +959,7 @@ pub fn extract_all_access_units(
                                 || current_slice_offsets.is_empty()
                                 || first_slice_segment;
                             if std::env::var("VACC_DBG_AU").is_ok() {
-                                eprintln!(
+                                vkdbg!(
                                     "[H265-AU-NAL] off={} nal={} parse=None raw_fss={} is_new={}",
                                     start, nal_unit_type, first_slice_segment, is_new_frame
                                 );
@@ -1497,7 +1497,7 @@ pub fn extract_av1_frames(data: &[u8], max_frames: usize) -> Vec<Av1Frame> {
     for (pkt_idx, packet) in raw_packets.iter().enumerate() {
         let n_obus = extract_frame_obus_from_packet(packet);
         if frame_count < 16 && crate::vacc_debug() {
-            eprintln!(
+            vkdbg!(
                 "[AV1-EXTRACT] pkt{}: size={} frame_obus={} (extracted frame{}..{})",
                 pkt_idx,
                 packet.len(),

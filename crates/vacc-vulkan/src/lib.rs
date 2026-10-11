@@ -7,6 +7,9 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::field_reassign_with_default)]
 
+// Declared first so `vkdbg!` (via `#[macro_use]`) is in scope for every module below.
+#[macro_use]
+pub mod debug;
 pub mod access_unit;
 pub mod av1;
 pub mod buffer;

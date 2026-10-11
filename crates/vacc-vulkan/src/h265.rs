@@ -182,7 +182,7 @@ impl H265Decoder {
         let pic_info = self.build_picture_info(coded_extent, h265_info, rps_slots);
 
         if super::vacc_debug() && !dpb_ref_pictures.is_empty() {
-            eprintln!(
+            vkdbg!(
                 "[PIC-INFO] sps_vps_id={} pps_sps_id={} pps_id={} numDeltaPocsRefRpsIdx={} numBitsStrpsInSlice={} poc={} stBefore=[{:02x?}] stAfter=[{:02x?}] ltCurr=[{:02x?}] irap={} idr={} isref={} strps_sps_flag={}",
                 pic_info.sps_video_parameter_set_id,
                 pic_info.pps_seq_parameter_set_id,
@@ -198,7 +198,7 @@ impl H265Decoder {
                 pic_info.flags.IsReference(),
                 pic_info.flags.short_term_ref_pic_set_sps_flag()
             );
-            eprintln!(
+            vkdbg!(
                 "[PIC-INFO] begin_slots: setup={} refs={:?}",
                 dpb_setup_picture
                     .as_ref()
@@ -653,7 +653,7 @@ impl H265Decoder {
                 f(cmd_buffer, query_pool, first_query, query_count);
             }
         } else if super::vacc_debug() {
-            eprintln!("[H265] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
+            vkdbg!("[H265] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
         }
     }
 
@@ -695,7 +695,7 @@ impl H265Decoder {
                 let f: FnType = std::mem::transmute(ptr);
                 let rc = f(cmd_buffer, info);
                 if std::env::var("VACC_DBG_H265").is_ok() {
-                    eprintln!("[H265-DEC] vkCmdBeginVideoCodingKHR rc={rc} (0x{rc:x})");
+                    vkdbg!("[H265-DEC] vkCmdBeginVideoCodingKHR rc={rc} (0x{rc:x})");
                 }
             }
         }
@@ -715,7 +715,7 @@ impl H265Decoder {
                 let f: FnType = std::mem::transmute(ptr);
                 let rc = f(cmd_buffer, info);
                 if std::env::var("VACC_DBG_H265").is_ok() {
-                    eprintln!("[H265-DEC] vkCmdDecodeVideoKHR rc={rc} (0x{rc:x})");
+                    vkdbg!("[H265-DEC] vkCmdDecodeVideoKHR rc={rc} (0x{rc:x})");
                 }
             }
         }
@@ -742,10 +742,10 @@ impl H265Decoder {
                 f(cmd_buffer, &coding_control_info);
             }
             if super::vacc_debug() {
-                eprintln!("[H265] issued codec RESET (vkCmdControlVideoCodingKHR)");
+                vkdbg!("[H265] issued codec RESET (vkCmdControlVideoCodingKHR)");
             }
         } else {
-            eprintln!(
+            vkdbg!(
                 "[H265] WARNING: vkCmdControlVideoCodingKHR not found; skipping mandatory reset"
             );
         }
@@ -772,7 +772,7 @@ impl H265Decoder {
                 let f: FnType = std::mem::transmute(ptr);
                 let r = f(cmd_buffer, &end_coding_info);
                 if std::env::var("VACC_DBG_H265").is_ok() {
-                    eprintln!("[H265-DEC] vkCmdEndVideoCodingKHR rc={r} (0x{r:x})");
+                    vkdbg!("[H265-DEC] vkCmdEndVideoCodingKHR rc={r} (0x{r:x})");
                 }
             }
         }
@@ -799,7 +799,7 @@ fn h265_level_idc_to_vulkan(raw_level_idc: u8) -> StdVideoH265LevelIdc {
         183 => StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_1,
         186 => StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_2,
         _ => {
-            eprintln!(
+            vkdbg!(
                 "[H265] WARNING: Unknown level_idc={}, defaulting to 5.1",
                 raw_level_idc
             );

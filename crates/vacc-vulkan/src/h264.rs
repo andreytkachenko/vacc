@@ -803,7 +803,7 @@ impl H264Decoder {
                 f(cmd_buffer, query_pool, first_query, query_count);
             }
         } else {
-            eprintln!("[H264] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
+            vkdbg!("[H264] WARNING: vkCmdResetQueryPool not found; queries may be invalid");
         }
     }
 
@@ -864,7 +864,7 @@ fn h264_level_idc_to_vulkan(raw_level_idc: u8, constraint_set3_flag: bool) -> St
         61 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_1,
         62 => StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2,
         _ => {
-            eprintln!(
+            vkdbg!(
                 "[H264] WARNING: Unknown level_idc={}, defaulting to 6.2",
                 raw_level_idc
             );
@@ -1000,8 +1000,8 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
     };
 
     if std::env::var("VACC_DEBUG").is_ok() {
-        eprintln!("[H264-SESS-DUMP] ===== StdVideoH264SequenceParameterSet =====");
-        eprintln!(
+        vkdbg!("[H264-SESS-DUMP] ===== StdVideoH264SequenceParameterSet =====");
+        vkdbg!(
             "[H264-SESS-DUMP] flags: sep_colour={} qpprime_bypass={} frame_mbs_only={} direct_8x8={} crop={} vui={}",
             out.flags.separate_colour_plane_flag(),
             out.flags.qpprime_y_zero_transform_bypass_flag(),
@@ -1010,18 +1010,18 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
             out.flags.frame_cropping_flag(),
             out.flags.vui_parameters_present_flag()
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] profile_idc={} level_idc={} chroma_format_idc={} sps_id={}",
             out.profile_idc, out.level_idc, out.chroma_format_idc, out.seq_parameter_set_id
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] bit_depth_luma_minus8={} bit_depth_chroma_minus8={} log2_max_frame_num_minus4={} poc_type={}",
             out.bit_depth_luma_minus8,
             out.bit_depth_chroma_minus8,
             out.log2_max_frame_num_minus4,
             out.pic_order_cnt_type
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] offset_non_ref={} offset_top_bottom={} log2_max_poc_lsb={} num_ref_frames_in_cycle={} max_num_ref_frames={}",
             out.offset_for_non_ref_pic,
             out.offset_for_top_to_bottom_field,
@@ -1029,7 +1029,7 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
             out.num_ref_frames_in_pic_order_cnt_cycle,
             out.max_num_ref_frames
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] w_mbs_minus1={} h_map_units_minus1={} crop=(L={},R={},T={},B={})",
             out.pic_width_in_mbs_minus1,
             out.pic_height_in_map_units_minus1,
@@ -1038,7 +1038,7 @@ pub fn convert_h264_sps(sps: &vacc_core::picture::H264Sps) -> StdVideoH264Sequen
             out.frame_crop_top_offset,
             out.frame_crop_bottom_offset
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] pOffsetForRefFrame={:?} pScalingLists={:?} pVui={:?}",
             out.pOffsetForRefFrame.is_null(),
             out.pScalingLists.is_null(),
@@ -1098,8 +1098,8 @@ pub fn convert_h264_pps(pps: &vacc_core::picture::H264Pps) -> StdVideoH264Pictur
     };
 
     if std::env::var("VACC_DEBUG").is_ok() {
-        eprintln!("[H264-SESS-DUMP] ===== StdVideoH264PictureParameterSet =====");
-        eprintln!(
+        vkdbg!("[H264-SESS-DUMP] ===== StdVideoH264PictureParameterSet =====");
+        vkdbg!(
             "[H264-SESS-DUMP] flags: entropy_coding_mode={} weighted_pred={} bottom_field_poc={} deblock_present={} constrained_intra={} redundant_pic_cnt={} transform_8x8={} pic_scaling_matrix={}",
             out.flags.entropy_coding_mode_flag(),
             out.flags.weighted_pred_flag(),
@@ -1110,7 +1110,7 @@ pub fn convert_h264_pps(pps: &vacc_core::picture::H264Pps) -> StdVideoH264Pictur
             out.flags.transform_8x8_mode_flag(),
             out.flags.pic_scaling_matrix_present_flag()
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] pps_id={} sps_id={} nrl0={} nrl1={} weighted_bipred_idc={} pic_init_qp={} pic_init_qs={}",
             out.pic_parameter_set_id,
             out.seq_parameter_set_id,
@@ -1120,7 +1120,7 @@ pub fn convert_h264_pps(pps: &vacc_core::picture::H264Pps) -> StdVideoH264Pictur
             out.pic_init_qp_minus26,
             out.pic_init_qs_minus26
         );
-        eprintln!(
+        vkdbg!(
             "[H264-SESS-DUMP] chroma_qp_index_offset={} second_chroma_qp_index_offset={} pScalingLists={:?}",
             out.chroma_qp_index_offset,
             out.second_chroma_qp_index_offset,
