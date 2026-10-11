@@ -118,7 +118,6 @@ vacc = { path = ".", default-features = false, features = ["vaapi", "sw"] }
 │                                                                    │
 │   Backends:                                                        │
 │     vacc-vulkan          Vulkan Video core (ash)                   │
-│     vacc-vulkan-common   device init / queue management            │
 │     vacc-vulkan-decode   Decoder-trait wrapper over vacc-vulkan    │
 │     vacc-nvdec-decode    NVIDIA NVDEC via libnvcuvid (cuvid)       │
 │     vacc-vaapi-decode    VAAPI stateless decode                    │
@@ -180,9 +179,8 @@ Bitstream parsing for each codec:
 Code shared by the H.264/H.265 software decoders: golden-hash test infrastructure,
 deterministic test PRNGs, saturation helpers.
 
-### `vacc-vulkan` / `vacc-vulkan-common` / `vacc-vulkan-decode`
+### `vacc-vulkan` / `vacc-vulkan-decode`
 Vulkan Video implementation using `ash`:
-- `vacc-vulkan-common` - shared device initialization, queue management, debug messenger
 - `vacc-vulkan` - low-level pipeline: `VideoSession` (`VkVideoSessionKHR`),
   `BitstreamBuffer`, DPB images, codec-specific decoders (H.264 / H.265 / VP9 / AV1)
   and readback

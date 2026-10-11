@@ -42,7 +42,6 @@ members = [
     "crates/vacc-vulkan",
     "crates/vacc-nvdec-decode",
     "crates/vacc-vulkan-decode",
-    "crates/vacc-vulkan-common",
     "crates/vacc-examples",
     "crates/vacc-vaapi-decode",
     "crates/vacc-vaapi-encode",
@@ -80,7 +79,6 @@ vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.1"
 vacc-software-encode = { path = "crates/vacc-software-encode", version = "0.1.1" }
 vacc-golden-tests = { path = "crates/vacc-golden-tests", version = "0.1.1" }
 vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.1" }
-vacc-vulkan-common = { path = "crates/vacc-vulkan-common", version = "0.1.1" }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
