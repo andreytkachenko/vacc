@@ -2,6 +2,7 @@
 name = "vacc-nvdec-decode"
 description = "NVDEC (NVIDIA Video Decode) backend for vacc"
 license.workspace = true
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 

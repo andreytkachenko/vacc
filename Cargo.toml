@@ -56,33 +56,36 @@ members = [
     "crates/vacc-golden-tests",
     "crates/vacc-npp",
     "crates/vacc-vkimage",
+    "crates/vacc-libva",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Vulkan Video Decoder library in Rust"
 repository = "https://github.com/andreytkachenko/vacc"
 
 [workspace.dependencies]
-vacc-core = { path = "crates/vacc-core", version = "0.1.1" }
-vacc-common = { path = "crates/vacc-common", version = "0.1.1" }
-vacc-image = { path = "crates/vacc-image", version = "0.1.1" }
-vacc-npp = { path = "crates/vacc-npp", version = "0.1.1" }
-vacc-vkimage = { path = "crates/vacc-vkimage", version = "0.1.1" }
-vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.1" }
-vacc-parser = { path = "crates/vacc-parser", version = "0.1.1" }
-vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.1" }
-vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.1" }
-vacc-vaapi-encode = { path = "crates/vacc-vaapi-encode", version = "0.1.1" }
-vacc-nvenc-encode = { path = "crates/vacc-nvenc-encode", version = "0.1.1" }
-vacc-vulkan-encode = { path = "crates/vacc-vulkan-encode", version = "0.1.1" }
-vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.1" }
-vacc-software-encode = { path = "crates/vacc-software-encode", version = "0.1.1" }
-vacc-golden-tests = { path = "crates/vacc-golden-tests", version = "0.1.1" }
-vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.1" }
+vacc-core = { path = "crates/vacc-core", version = "0.1.2" }
+vacc-common = { path = "crates/vacc-common", version = "0.1.2" }
+vacc-image = { path = "crates/vacc-image", version = "0.1.2" }
+vacc-npp = { path = "crates/vacc-npp", version = "0.1.2" }
+vacc-vkimage = { path = "crates/vacc-vkimage", version = "0.1.2" }
+vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.2" }
+vacc-parser = { path = "crates/vacc-parser", version = "0.1.2" }
+vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.2" }
+vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.2" }
+vacc-vaapi-encode = { path = "crates/vacc-vaapi-encode", version = "0.1.2" }
+vacc-nvenc-encode = { path = "crates/vacc-nvenc-encode", version = "0.1.2" }
+vacc-vulkan-encode = { path = "crates/vacc-vulkan-encode", version = "0.1.2" }
+vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.2" }
+vacc-software-encode = { path = "crates/vacc-software-encode", version = "0.1.2" }
+vacc-golden-tests = { path = "crates/vacc-golden-tests", version = "0.1.2" }
+vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.2" }
+# Vendored cros-libva fork (see crates/vacc-libva); lib target keeps the name `libva`.
+libva = { package = "vacc-libva", path = "crates/vacc-libva", version = "0.1.0" }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"

@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 vacc-core = { workspace = true }
 vacc-parser = { workspace = true }
-libva = { package = "cros-libva", git = "https://github.com/andreytkachenko/cros-libva.git", rev = "cd5759b72a2978b4d2d14282b196889636888b61" }
+libva = { workspace = true }
 bitflags = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

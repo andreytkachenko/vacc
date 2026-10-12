@@ -189,16 +189,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cros-libva"
-version = "0.0.13"
-source = "git+https://github.com/andreytkachenko/cros-libva.git?rev=cd5759b72a2978b4d2d14282b196889636888b61#cd5759b72a2978b4d2d14282b196889636888b61"
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
- "bindgen",
- "bitflags",
- "log",
- "pkg-config",
- "regex",
- "thiserror 1.0.69",
+ "cfg-if",
 ]
 
 [[package]]
@@ -1180,7 +1176,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vacc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "thiserror 2.0.20",
@@ -1200,11 +1196,11 @@ dependencies = [
 
 [[package]]
 name = "vacc-common"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "vacc-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "bitflags",
@@ -1215,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-examples"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "vacc-core",
  "vacc-nvdec-decode",
@@ -1227,14 +1223,14 @@ dependencies = [
 
 [[package]]
 name = "vacc-golden-tests"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "vacc-core",
 ]
 
 [[package]]
 name = "vacc-image"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "rayon",
@@ -1242,8 +1238,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacc-libva"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "bitflags",
+ "crc32fast",
+ "log",
+ "pkg-config",
+ "regex",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "vacc-npp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libloading",
  "thiserror 2.0.20",
@@ -1253,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-nvdec-decode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "libloading",
@@ -1267,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-nvenc-encode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libloading",
  "log",
@@ -1277,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-parser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -1288,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-software-decode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "rayon",
@@ -1301,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-software-encode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rayon",
  "thiserror 2.0.20",
@@ -1312,32 +1321,32 @@ dependencies = [
 
 [[package]]
 name = "vacc-vaapi-decode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bitflags",
- "cros-libva",
  "log",
  "pkg-config",
  "thiserror 2.0.20",
  "vacc-core",
  "vacc-golden-tests",
+ "vacc-libva",
  "vacc-parser",
 ]
 
 [[package]]
 name = "vacc-vaapi-encode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
- "cros-libva",
  "log",
  "pkg-config",
  "thiserror 2.0.20",
  "vacc-core",
+ "vacc-libva",
 ]
 
 [[package]]
 name = "vacc-vkimage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "log",
@@ -1349,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-vulkan"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "bitflags",
@@ -1366,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-vulkan-decode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "thiserror 2.0.20",
@@ -1377,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "vacc-vulkan-encode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ash",
  "log",
