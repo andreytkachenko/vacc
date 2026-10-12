@@ -13,14 +13,18 @@ repository.workspace = true
 [features]
 default = ["vulkan", "nvdec", "vaapi", "sw"]
 vulkan = ["dep:vacc-vulkan-decode", "dep:vacc-vulkan-encode"]
-nvdec = ["dep:vacc-nvdec-decode", "dep:vacc-nvenc-encode"]
+# NVDEC device-resident frames need NPP for GPU transforms + readback.
+nvdec = ["dep:vacc-nvdec-decode", "dep:vacc-nvenc-encode", "npp"]
+# NVIDIA Performance Primitives image pipeline. Links libcuda, so it is
+# opt-in: CPU-only consumers build without it and stay driver-free.
+npp = ["dep:vacc-npp"]
 vaapi = ["dep:vacc-vaapi-decode", "dep:vacc-vaapi-encode"]
 sw = ["dep:vacc-software-decode", "dep:vacc-software-encode"]
 
 [dependencies]
 vacc-core = { workspace = true }
 vacc-image = { workspace = true }
-vacc-npp = { workspace = true }
+vacc-npp = { workspace = true, optional = true }
 vacc-vkimage = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

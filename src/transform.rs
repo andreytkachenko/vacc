@@ -75,12 +75,19 @@ pub(crate) fn apply(frame: &mut DecodedFrame, cfg: &ImageConfig) -> UnifiedResul
 /// uses the host pipeline).
 fn gpu_pipeline(src: &GpuFrame, cfg: &ImageConfig) -> Option<GpuFrame> {
     let result = match src.device {
+        #[cfg(feature = "npp")]
         GpuDevice::Cuda { .. } => {
             if !vacc_npp::Npp::is_available() {
                 log::warn!("cuda gpu frame but NPP unavailable; falling back to readback + host pipeline");
                 return None;
             }
             vacc_npp::process_gpu(src, cfg)
+        }
+        #[cfg(not(feature = "npp"))]
+        GpuDevice::Cuda { .. } => {
+            // Unreachable without nvdec (which implies npp); fail soft.
+            log::warn!("cuda gpu frame but the NPP backend is not compiled in; falling back to readback + host pipeline");
+            return None;
         }
         GpuDevice::Vulkan { .. } => vacc_vkimage::process_device(src, cfg),
     };
@@ -99,7 +106,18 @@ fn gpu_pipeline(src: &GpuFrame, cfg: &ImageConfig) -> Option<GpuFrame> {
 fn readback_into_pixel_data(frame: &mut DecodedFrame) -> UnifiedResult<()> {
     let src = frame.gpu.take().expect("gpu checked by caller");
     let buf = match src.device {
-        GpuDevice::Cuda { .. } => vacc_npp::readback(&src),
+        GpuDevice::Cuda { .. } => {
+            #[cfg(feature = "npp")]
+            {
+                vacc_npp::readback(&src)
+            }
+            #[cfg(not(feature = "npp"))]
+            {
+                return Err(UnifiedError::ImageProcessing {
+                    message: "cuda frame readback requires the NPP backend (vacc feature `npp`)".to_string(),
+                });
+            }
+        }
         GpuDevice::Vulkan { .. } => vacc_vkimage::readback(&src),
     }
     .map_err(|e| UnifiedError::ImageProcessing { message: e.to_string() })?;
@@ -236,15 +254,31 @@ fn planar_u16_view(buf: &[u8], w: usize, h: usize) -> YuvImage<'_> {
     YuvImage::planar(y, w * 2, u, cw * 2, v, cw * 2, w, h, 10)
 }
 
-/// Run the pipeline: NPP on NVIDIA hosts, Vulkan compute otherwise (any
-/// GPU), software as the last resort.
+/// Try the NPP pipeline when it is compiled in and available at runtime;
+/// `None` falls through to the Vulkan/software paths.
+#[cfg(feature = "npp")]
+fn try_npp(img: &YuvImage, cfg: &ImageConfig) -> Option<vacc_image::ImageResult<ProcessedFrame>> {
+    if !vacc_npp::Npp::is_available() {
+        return None;
+    }
+    Some(vacc_npp::process(img, cfg))
+}
+
+#[cfg(not(feature = "npp"))]
+fn try_npp(_img: &YuvImage, _cfg: &ImageConfig) -> Option<vacc_image::ImageResult<ProcessedFrame>> {
+    None
+}
+
+/// Run the pipeline: NPP on NVIDIA hosts (when built with `npp`), Vulkan
+/// compute otherwise (any GPU), software as the last resort.
 fn run_pipeline(img: &YuvImage, cfg: &ImageConfig) -> vacc_image::ImageResult<ProcessedFrame> {
-    if vacc_npp::Npp::is_available() {
-        match vacc_npp::process(img, cfg) {
+    if let Some(res) = try_npp(img, cfg) {
+        match res {
             Ok(p) => return Ok(p),
             Err(e) => log::warn!("npp pipeline failed ({e}); using fallback"),
         }
-    } else if vacc_vkimage::is_available() {
+    }
+    if vacc_vkimage::is_available() {
         match vacc_vkimage::process(img, cfg) {
             Ok(p) => return Ok(p),
             Err(e) => log::warn!("vulkan image pipeline failed ({e}); using software fallback"),
