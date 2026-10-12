@@ -85,6 +85,7 @@ SAMPLES = [
 
 # backend -> supported codecs (all use the single unified `decode` binary)
 BACKENDS = {
+    "sw":     {"h264", "hevc"},  # CPU decoders (edge264 / hevc.js ports)
     "vulkan": {"h264", "hevc", "vp9", "av1"},
     "vaapi":  {"h264", "hevc", "vp9", "av1"},
     "nvdec":  {"h264", "hevc", "vp9", "av1"},
@@ -130,6 +131,16 @@ HW_UNSUPPORTED = {
     ("av1_professional.ivf", "vaapi"),
 }
 
+# (sample, backend) cells the backend does not implement BY DESIGN — not a
+# bug. The SW H.264 core is a vendored 8-bit 4:2:0 frame-coded subset of
+# edge264 and rejects other formats up front with a clear error (see
+# vacc-software-decode/src/decoder.rs::init_sequence).
+SW_UNSUPPORTED = {
+    ("h264_high10.h264", "sw"),
+    ("h264_high422.h264", "sw"),
+    ("h264_high444.h264", "sw"),
+}
+
 # pix_fmt -> (bytes per frame / (w*h), bytes per sample, semi-planar UV?)
 # NOTE: ffmpeg's yuv420pNNle are PLANAR (Y, U, V separate planes); only the
 # p0NNle names are semi-planar (Y + interleaved UV).
@@ -155,6 +166,16 @@ def probe(path):
         capture_output=True, text=True)
     w,h = r.stdout.strip().split(",")[:2]
     return int(w), int(h)
+
+def probe_frame_count(path):
+    """Total frames in the stream (some samples are shorter than max-frames)."""
+    r = subprocess.run(["ffprobe","-v","error","-count_frames","-select_streams","v:0",
+        "-show_entries","stream=nb_read_frames","-of","csv=p=0",str(path)],
+        capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
 
 def fnv1a64(data: bytes) -> int:
     h = 0xcbf29ce484222325
@@ -190,9 +211,12 @@ def run_backend(sample_path, backend, nframes):
     binp = EX / "decode"
     if not binp.exists():
         return None, "binary missing (run: cargo build --release --examples)"
-    r = subprocess.run([str(binp), "-b", backend, "-i", str(sample_path),
-                        "-n", str(nframes)],
-                       capture_output=True, text=True, timeout=600)
+    try:
+        r = subprocess.run([str(binp), "-b", backend, "-i", str(sample_path),
+                            "-n", str(nframes)],
+                           capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return None, "timeout after 600s (decoder hang?)"
     if r.returncode != 0:
         tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
         return None, "rc=%d: %s" % (r.returncode, " | ".join(tail))
@@ -234,23 +258,27 @@ def compare_one(sample, codec, pixfmt, backend, nframes):
     sample_path = SAMPLES_DIR / sample
     if not sample_path.exists():
         return dict(status="MISSING_SAMPLE")
-    if (sample, backend) in HW_UNSUPPORTED:
+    if (sample, backend) in HW_UNSUPPORTED or (sample, backend) in SW_UNSUPPORTED:
         return dict(status="HW_UNSUPPORTED")
     if pixfmt not in PXFMT:
         return dict(status="SKIP_NO_REF_FMT", detail=pixfmt)
 
     w, h = probe(sample_path)
     fsize = frame_size(pixfmt, w, h)
+    # Expected frame count: the stream may be shorter than max-frames
+    # (e.g. the 30-frame tile test streams); decode all of it.
+    stream_len = probe_frame_count(sample_path)
+    expected = nframes if stream_len is None else min(nframes, stream_len)
 
     frames, err = run_backend(sample_path, backend, nframes)
     if err:
         return dict(status="BACKEND_FAIL", detail=err[:160])
 
-    ref, rerr = get_reference(sample_path, pixfmt, nframes, w, h)
+    ref, rerr = get_reference(sample_path, pixfmt, expected, w, h)
     if rerr:
         return dict(status="REF_FAIL", detail=" ".join(rerr)[:160])
 
-    count = min(len(frames), nframes)
+    count = min(len(frames), expected)
     exact = 0
     first_diff_frame = None
     for i in range(count):
@@ -274,7 +302,7 @@ def compare_one(sample, codec, pixfmt, backend, nframes):
             first_diff_frame = (i, "pixel hash mismatch")
 
     got = len(frames)
-    short = got < nframes
+    short = got < expected
     if count == 0:
         return dict(status="NO_FRAMES")
     if short:
@@ -283,7 +311,7 @@ def compare_one(sample, codec, pixfmt, backend, nframes):
         status = "PASS"
     else:
         status = "FAIL"
-    res = dict(status=status, exact=exact, total=nframes, got=got)
+    res = dict(status=status, exact=exact, total=expected, got=got)
     if first_diff_frame:
         res["first_diff"] = "frame %d: %s" % first_diff_frame
     return res
@@ -336,7 +364,7 @@ def main():
             elif st in ("FAIL", "SHORT") and "exact" in res:
                 c = f"{res['exact']}/{res['total']}"
             elif st == "HW_UNSUPPORTED":
-                c = "hw-unsuppt"[:11]
+                c = "unsuppt"[:11]
             else:
                 c = st[:11]
             cells.append(f"{c:>12}")
