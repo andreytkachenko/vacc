@@ -1756,9 +1756,15 @@ impl Decoder for VaapiDecoder {
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         // End of stream: the window tail NAL is provably complete, so decode
-        // any remaining input before draining buffered frames.
+        // any remaining input before draining buffered frames. Frames released
+        // by the drain loop (popped from the reorder buffer as `exhausted`
+        // turns true) must be collected — dropping them loses the stream's
+        // trailing B-frames (observed: 3-5 short per H.264/H.265 stream).
         self.eos = true;
-        while self.decode()?.is_some() {}
+        let mut frames = Vec::new();
+        while let Some(frame) = self.decode()? {
+            frames.push(frame);
+        }
 
         // Sync all Pending surfaces to make them Ready
         for i in 0..self.surface_pool.entries.len() {
@@ -1808,8 +1814,9 @@ impl Decoder for VaapiDecoder {
         self.pending_data.clear();
         self.stable_packet = None;
 
-        // Return any buffered frames in display order (key, frame) -> frame
-        let frames = self.pending_frames.drain(..).map(|(_, f)| f).collect();
+        // Append any still-buffered frames. Pops always take the buffer front
+        // (smallest display key first), so `frames` + remainder is display order.
+        frames.extend(self.pending_frames.drain(..).map(|(_, f)| f));
         Ok(frames)
     }
 
