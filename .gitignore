@@ -8,3 +8,6 @@
 
 # upstream reference checkouts (nested git repos); vendored copies live in crates/*
 third_party/
+
+# local cargo-vendor dir for offline builds (e.g. vegman sync source)
+vendor-tmp/
