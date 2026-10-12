@@ -1303,6 +1303,16 @@ impl NvdecH264Decoder {
             return None;
         }
 
+        // Release the DPB surface hold as soon as THIS path's unmap actually
+        // completes. choose_surface only recycles a surface whose occupant is
+        // extracted AND unmapped; without this, host staging (which unmaps
+        // inline, never via pending_unmaps) would recycle nothing and every
+        // decode after the surfaces fill would fall back to round-robin,
+        // overwriting live reference pictures.
+        let release_surface = |seq: i32| {
+            self.dpb_manager.lock().unwrap().mark_unmapped(seq);
+        };
+
         // Get display area (cropping offsets)
         let display_area = {
             let d = self.display_area.lock().unwrap();
@@ -1313,7 +1323,8 @@ impl NvdecH264Decoder {
         // Zero-copy mode: copy the surface into an owned device buffer and
         // skip all host staging. The helper unmaps the surface.
         if self.gpu_mode {
-            let gpu_frame = crate::gpu::extract_gpu_surface(
+            // The helper unmaps the surface synchronously on every path.
+            let gpu_frame = match crate::gpu::extract_gpu_surface(
                 decoder,
                 funcs,
                 dev_ptr,
@@ -1325,7 +1336,14 @@ impl NvdecH264Decoder {
                 crop_top,
                 info.coded_size.height as i32,
                 true,
-            )?;
+            ) {
+                Some(f) => f,
+                None => {
+                    release_surface(seq);
+                    return None;
+                }
+            };
+            release_surface(seq);
 
             let frame_index = {
                 let mut count = self.frame_count.lock().unwrap();
@@ -1406,6 +1424,7 @@ impl NvdecH264Decoder {
                             Err(e) => {
                                 eprintln!("[NVDEC] copy-stream create failed: {e}");
                                 let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                                release_surface(seq);
                                 return None;
                             }
                         },
@@ -1426,6 +1445,7 @@ impl NvdecH264Decoder {
                             if let Err(e) = unsafe { cu_event_synchronize(*ev as *mut _) } {
                                 eprintln!("[NVDEC] device-output slot sync failed: {e}");
                                 let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                                release_surface(seq);
                                 return None;
                             }
                         }
@@ -1482,6 +1502,7 @@ impl NvdecH264Decoder {
                     _ => {
                         eprintln!("[NVDEC] device-output cuMemcpy2DAsync failed");
                         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                        release_surface(seq);
                         return None;
                     }
                 }
@@ -1495,6 +1516,7 @@ impl NvdecH264Decoder {
                     None => {
                         eprintln!("[NVDEC] device-output event record failed");
                         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                        release_surface(seq);
                         return None;
                     }
                 };
@@ -1561,6 +1583,7 @@ impl NvdecH264Decoder {
                         }
                         Err(_) => {
                             let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                            release_surface(seq);
                             return None;
                         }
                     }
@@ -1596,6 +1619,7 @@ impl NvdecH264Decoder {
             other => {
                 eprintln!("[NVDEC] cuMemcpy2D(Y) failed: {:?}", other);
                 let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                release_surface(seq);
                 return None;
             }
         }
@@ -1628,12 +1652,14 @@ impl NvdecH264Decoder {
             other => {
                 eprintln!("[NVDEC] cuMemcpy2D(UV) failed: {:?}", other);
                 let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+                release_surface(seq);
                 return None;
             }
         }
 
-        // Unmap the frame
+        // Unmap the frame (synchronous: the D2H copies above completed).
         let _ = unsafe { (funcs.unmap_video_frame64)(decoder, dev_ptr) };
+        release_surface(seq);
 
         // Copy from pinned memory to owned buffers (the pinned buffer is
         // cached and reused, so it is not freed here).
