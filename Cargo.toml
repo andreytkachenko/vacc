@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Ship only the library; keep the repo's test assets, samples and dev scripts
+# out of the published crate (assets/ alone is ~134MB).
+exclude = [
+    "assets/**",
+    "*.py",
+    "issues.md",
+]
 
 # Each GPU backend is a compile-time feature (all on by default); a backend
 # feature enables both its decode and encode crates. Build with a subset,
