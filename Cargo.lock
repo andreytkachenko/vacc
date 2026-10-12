@@ -189,15 +189,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32fast"
-version = "1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1240,10 +1231,11 @@ dependencies = [
 [[package]]
 name = "vacc-libva"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8f187a1bc26ff08ca80edbabde62bdc2f05935f49e54ab5ad4dc36d91d004ae"
 dependencies = [
  "bindgen",
  "bitflags",
- "crc32fast",
  "log",
  "pkg-config",
  "regex",

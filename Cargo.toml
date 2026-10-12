@@ -63,7 +63,6 @@ members = [
     "crates/vacc-golden-tests",
     "crates/vacc-npp",
     "crates/vacc-vkimage",
-    "crates/vacc-libva",
 ]
 resolver = "2"
 
@@ -91,8 +90,10 @@ vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.2"
 vacc-software-encode = { path = "crates/vacc-software-encode", version = "0.1.2" }
 vacc-golden-tests = { path = "crates/vacc-golden-tests", version = "0.1.2" }
 vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.2" }
-# Vendored cros-libva fork (see crates/vacc-libva); lib target keeps the name `libva`.
-libva = { package = "vacc-libva", path = "crates/vacc-libva", version = "0.1.0" }
+# Interim cros-libva fork with VAAPI-decoder fixes, published as vacc-libva
+# until the fixes merge upstream (then switch back to cros-libva). The lib
+# target keeps the name `libva`, so code is unchanged.
+libva = { package = "vacc-libva", version = "0.1.0" }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
