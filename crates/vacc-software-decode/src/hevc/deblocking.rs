@@ -15,7 +15,7 @@ pub(crate) use self::tests::golden_entries;
 
 use crate::hevc::coding_tree::CuInfo;
 use crate::hevc::picture::PuMotionInfo;
-use crate::hevc::types::{clip3, Mv, Plane, PredMode, Tiles};
+use crate::hevc::types::{clip3, Plane, PredMode, Tiles};
 
 /// Table 8-12: beta' from Q (spec §8.7.2.5.3).
 const BETA_TABLE: [i32; 52] = [
@@ -818,6 +818,7 @@ pub fn apply_deblocking(ctx: &DeblockCtx, planes: &mut [Plane]) {
 mod tests {
     use super::*;
     use crate::hevc::goldens;
+    use crate::hevc::types::Mv;
 
     use vacc_common::rng::SplitMix64;
 

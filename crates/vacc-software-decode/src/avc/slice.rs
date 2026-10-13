@@ -154,18 +154,47 @@ impl RustMb {
         s
     }
 
-    /// Read the `mvs` field reinterpreted as `int32_t mvs_s[32]` (packed
-    /// i16 pairs), mirroring C `mb->mvs_s[idx]`. `idx` may be negative (a
-    /// neighbour offset); this is raw pointer arithmetic into the contiguous
-    /// macroblock buffer, exactly as the C code does.
-    ///
-    /// # Safety
-    /// `idx` must stay within the allocated macroblock buffer (neighbour
-    /// offsets only), as with every C `mvs_s[idx]` access.
-    #[inline]
-    pub unsafe fn mvs_s(&self, idx: isize) -> i32 {
-        let base = unsafe { (self as *const RustMb).cast::<u8>().add(176) };
-        unsafe { *(base.cast::<i32>().offset(idx)) }
+    /// Serialize the full 304-byte record (little-endian, matching the C
+    /// `memcpy` of the `#[repr(C)]` struct on x86). Used by the per-MB parse
+    /// record dump (`print_mb`). Field order follows the verified layout
+    /// (see `layout_tests`); the struct has no padding.
+    pub fn to_bytes(&self) -> [u8; 304] {
+        let mut s = [0u8; 304];
+        s[0] = self.error_probability as u8;
+        s[1] = self.recovery_bits as u8;
+        s[2] = self.mbIsInterFlag as u8;
+        s[3] = self.filter_edges as u8;
+        s[4..8].copy_from_slice(&self.QP);
+        s[8..12].copy_from_slice(&self.bits[0].to_le_bytes());
+        s[12..16].copy_from_slice(&self.bits[1].to_le_bytes());
+        for (i, v) in s[16..32].iter_mut().enumerate() {
+            *v = self.Intra4x4PredMode[i] as u8;
+        }
+        for (i, v) in s[32..80].iter_mut().enumerate() {
+            *v = self.nC[i] as u8;
+        }
+        s[80..144].copy_from_slice(&self.absMvd);
+        let f = &self.f;
+        s[144] = f.mb_field_decoding_flag as u8;
+        s[145] = f.mb_skip_flag as u8;
+        s[146] = f.mb_type_I_NxN as u8;
+        s[147] = f.mb_type_B_Direct as u8;
+        s[148] = f.transform_size_8x8_flag as u8;
+        s[149] = f.intra_chroma_pred_mode_non_zero as u8;
+        s[150] = f.CodedBlockPatternChromaDC as u8;
+        s[151] = f.CodedBlockPatternChromaAC as u8;
+        s[152..156].copy_from_slice(&f.coded_block_flags_16x16);
+        s[156..160].copy_from_slice(&f.inter_eqs);
+        for (i, v) in s[160..168].iter_mut().enumerate() {
+            *v = self.refIdx[i] as u8;
+        }
+        for (i, v) in s[168..176].iter_mut().enumerate() {
+            *v = self.refPic[i] as u8;
+        }
+        for i in 0..64 {
+            s[176 + 2 * i..178 + 2 * i].copy_from_slice(&self.mvs[i].to_le_bytes());
+        }
+        s
     }
 }
 
@@ -181,23 +210,20 @@ pub struct SliceContext<'a> {
     pub is_cabac: bool,
 
     // macroblock storage (stride = pic_width_in_mbs + 1)
-    pub mb_buffer: *mut RustMb,
+    pub mb_buffer: &'a mut [RustMb],
     pub mb_pos: usize,
-    /// Collocated macroblock for B-slice direct mode (nullptr unless B).
-    pub mb_col: *const RustMb,
-    /// Collocated frame's mb array (non-null only for B slices; C
-    /// `t.mbCol_buffer`).
-    pub mb_col_buffer: *const RustMb,
-    /// Per-MB parse-state dump target (C `t.test_mb_dump`); null = disabled.
-    pub mb_dump: *mut u8,
+    /// Collocated frame's mb array (present only for B slices; C
+    /// `t.mbCol_buffer`). Indexed by `mb_pos` (same raster layout).
+    pub mb_col: Option<&'a [RustMb]>,
+    /// Per-MB parse-state dump target (C `t.test_mb_dump`); None = disabled.
+    pub mb_dump: Option<&'a mut [u8]>,
     pub mb_dump_off: usize,
-    pub mb_dump_cap: usize,
-    /// Spatial neighbours (set per-MB in `parse_slice_data`); point at
-    /// `UNAVAIL_MB` when unavailable.
-    pub mb_a: *const RustMb,
-    pub mb_b: *const RustMb,
-    pub mb_c: *const RustMb,
-    pub mb_d: *const RustMb,
+    /// Spatial neighbours (set per-MB in `parse_slice_data`); `None` when
+    /// unavailable (readers substitute `UNAVAIL_MB`).
+    pub nb_a: Option<usize>,
+    pub nb_b: Option<usize>,
+    pub nb_c: Option<usize>,
+    pub nb_d: Option<usize>,
 
     // picture geometry / task fields
     pub pic_width_in_mbs: i16,
@@ -281,10 +307,9 @@ pub struct SliceContext<'a> {
 
     // pixel plane access (C `t.samples_buffers[currPic]`, `t.stride[iYCbCr]`,
     // `t.plane_size_Y`)
-    /// Start of the Rust pixel buffer's leading margin (`PIXEL_MARGIN` bytes
-    /// before `samples_base`; see `plane_slice`).
-    pub pixel_margin_base: *mut u8,
-    pub samples_base: *mut u8,
+    /// The current frame's pixel plane (leading margin + Y + C) as one mutable
+    /// slice; `samples_mb` are byte offsets into it (margin-relative).
+    pub plane: &'a mut [u8],
     /// Row strides in sample units: luma (`t.stride[0]`) and chroma
     /// (`t.stride[1]`; the Cr row sits at +stride/2 within each chroma row).
     pub stride: [u16; 2],
@@ -296,12 +321,13 @@ pub struct SliceContext<'a> {
     pub coded_w: u32,
     pub coded_h: u32,
     /// Current macroblock pixel positions (C `ctx->samples_mb[0..3]`): luma,
-    /// Cb, Cr — top-left of the current MB's 16x16 / 8x8 chroma blocks.
-    pub samples_mb: [*mut u8; 3],
-    /// Rust reference planes (C `t.samples_buffers`): Y-plane base (after
-    /// `PIXEL_MARGIN`) of each DPB slot, indexed by `mb->refPic`. Null for
-    /// empty slots. All buffers share the same stride/plane layout.
-    pub ref_plane_bases: Vec<*const u8>,
+    /// Cb, Cr — byte offsets into `plane` (margin-relative), top-left of the
+    /// current MB's 16x16 / 8x8 chroma blocks.
+    pub samples_mb: [usize; 3],
+    /// Rust reference planes (C `t.samples_buffers`): Y-plane start (after
+    /// `PIXEL_MARGIN`) of each DPB slot, indexed by `mb->refPic`. Empty slice
+    /// for unused slots. All buffers share the same stride/plane layout.
+    pub ref_plane_bases: Vec<&'a [u8]>, 
     /// Luma MC neighborhood scratch for non-interior (edge) blocks: 21 rows x
     /// 32 fixed stride = 672 bytes (C `edge_buf` semantics, `sstride_Y = 32`).
     /// The SSE kernel loads up to 16 bytes per row starting at block-relative
@@ -334,44 +360,108 @@ pub struct SliceContext<'a> {
 }
 
 impl<'a> SliceContext<'a> {
-    /// Address of the current macroblock in the buffer.
+    /// Mutable borrow of the current macroblock record. Keep it in a narrow
+    /// scope: do not hold it across other `&mut self` method calls (entropy,
+    /// nested parsers) — re-borrow after those instead.
     #[inline]
-    pub fn mb(&self) -> *mut RustMb {
-        unsafe { self.mb_buffer.add(self.mb_pos) }
+    fn mb_mut(&mut self) -> &mut RustMb {
+        &mut self.mb_buffer[self.mb_pos]
     }
+
+    /// Shared borrow of the current macroblock record.
+    #[inline]
+    fn mb_ref(&self) -> &RustMb {
+        &self.mb_buffer[self.mb_pos]
+    }
+
+    /// Resolve a neighbour-field element read to `(mb_index, wbyte)`, where
+    /// `wbyte` is the byte offset of the target element within the 304-byte
+    /// MB record. `base_byte` is the byte offset of the field within an MB,
+    /// `elem` its element size in bytes, and `off` the element-unit offset
+    /// relative to the current MB's field start (negative reaches a neighbour
+    /// MB). Returns `None` when the target falls before the buffer start
+    /// (unavailable neighbour -> readers substitute 0 / `UNAVAIL_MB`, matching
+    /// C's effective behaviour) or is not element-aligned.
+    #[inline]
+    fn nb_pos(&self, base_byte: usize, elem: usize, off: isize) -> Option<(usize, usize)> {
+        let abs = self.mb_pos as isize * 304 + base_byte as isize + off as isize * elem as isize;
+        if abs < 0 {
+            return None;
+        }
+        let tmb = (abs / 304) as usize;
+        let wbyte = (abs % 304) as usize;
+        if wbyte < base_byte || (wbyte - base_byte) % elem != 0 {
+            return None;
+        }
+        Some((tmb, wbyte))
+    }
+
+    /// C `*((int8_t *)mb-><field> + off)` — read a neighbour i8 at element
+    /// offset `off` from the field starting at byte `base_byte` (16 =
+    /// `Intra4x4PredMode`, 32/48/64 = an `nC` component). Returns 0 when the
+    /// target is before the buffer start (unavailable neighbour).
+    #[inline]
+    fn nb_i8(&self, base_byte: usize, off: isize) -> i32 {
+        let Some((tmb, wbyte)) = self.nb_pos(base_byte, 1, off) else {
+            return 0;
+        };
+        let m = match self.mb_buffer.get(tmb) {
+            Some(m) => m,
+            None => return 0,
+        };
+        let v = if (16..32).contains(&wbyte) {
+            m.Intra4x4PredMode[wbyte - 16]
+        } else if (32..80).contains(&wbyte) {
+            m.nC[wbyte - 32]
+        } else {
+            return 0;
+        };
+        v as i32
+    }
+
     /// C `mb->mvs_s[k]` (packed i16 pairs reinterpreted as i32); `k` may be a
-    /// negative neighbour offset.
-    ///
-    /// # Safety
-    /// `k` must stay within the allocated macroblock buffer (neighbour
-    /// offsets only).
+    /// negative neighbour offset. Returns 0 when the target is before the
+    /// buffer start (unavailable neighbour).
     #[inline]
-    pub unsafe fn read_mvs_s(&self, k: isize) -> i32 {
-        let base = unsafe { (self.mb() as *const u8).add(176) };
-        unsafe { *(base.cast::<i32>().offset(k)) }
-    }
-    /// C `*(mb + byte_off)` — read a raw i8 at a neighbour byte offset.
-    ///
-    /// # Safety
-    /// `byte_off` must stay within the allocated macroblock buffer (neighbour
-    /// offsets only).
-    #[inline]
-    pub unsafe fn read_i8_at(&self, byte_off: isize) -> i8 {
-        unsafe { *((self.mb() as *const i8).offset(byte_off)) }
+    fn read_mvs_s(&self, k: isize) -> i32 {
+        let Some((tmb, wbyte)) = self.nb_pos(176, 4, k) else {
+            return 0;
+        };
+        let m = match self.mb_buffer.get(tmb) {
+            Some(m) => m,
+            None => return 0,
+        };
+        let e = (wbyte - 176) / 4;
+        pack_mv(m.mvs[2 * e], m.mvs[2 * e + 1])
     }
 
-    /// The whole Rust pixel-plane region (leading margin + Y plane + C plane)
-    /// as one mutable slice. Intra kernels index it with offsets relative to
-    /// the Y plane start (see `plane_off`), mirroring C's raw pointer reads.
-    fn plane_slice(&mut self) -> &mut [u8] {
-        let len = PIXEL_MARGIN + self.plane_size_y as usize + self.plane_size_c as usize;
-        unsafe { std::slice::from_raw_parts_mut(self.pixel_margin_base, len) }
+    /// A spatial neighbour macroblock by `Option` index: the buffer entry, or
+    /// `UNAVAIL_MB` (zeroed data) when unavailable / out of range.
+    #[inline]
+    fn nb_mb(&self, idx: Option<usize>) -> &RustMb {
+        match idx {
+            Some(i) => self.mb_buffer.get(i).unwrap_or(&UNAVAIL_MB),
+            None => &UNAVAIL_MB,
+        }
     }
 
-    /// Offset within `plane_slice` for a plane-relative pointer.
+    /// C `*(mb->absMvd + off)` — read a neighbour `absMvd` byte (unsigned) at
+    /// element offset `off` from the field starting at byte `base_byte` (80 or
+    /// 112 for L0/L1). Returns 0 when before the buffer start.
     #[inline]
-    fn plane_off(&self, p: *const u8) -> usize {
-        (p as usize - self.samples_base as usize) + PIXEL_MARGIN
+    fn nb_absmvd(&self, base_byte: usize, off: isize) -> i32 {
+        let Some((tmb, wbyte)) = self.nb_pos(base_byte, 1, off) else {
+            return 0;
+        };
+        let m = match self.mb_buffer.get(tmb) {
+            Some(m) => m,
+            None => return 0,
+        };
+        if (80..144).contains(&wbyte) {
+            m.absMvd[wbyte - 80] as i32
+        } else {
+            0
+        }
     }
 }
 
@@ -379,10 +469,10 @@ impl<'a> SliceContext<'a> {
 /// (width `swide`) into `dst`, clamping at the picture edges (columns 0 /
 /// swide-1) — the per-row form of the neighborhood gather's per-pixel clamp.
 #[inline]
-fn copy_clamped_row(dst: &mut [u8], src_row: *const u8, x0: i32, swide: i32, n: usize) {
+fn copy_clamped_row(dst: &mut [u8], src_row: &[u8], x0: i32, swide: i32, n: usize) {
     let mut c = 0usize;
     while c < n && (x0 + c as i32) < 0 {
-        dst[c] = unsafe { *src_row };
+        dst[c] = src_row[0];
         c += 1;
     }
     let mut end = n;
@@ -390,17 +480,11 @@ fn copy_clamped_row(dst: &mut [u8], src_row: *const u8, x0: i32, swide: i32, n: 
         end -= 1;
     }
     if end > c {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_row.add((x0 + c as i32) as usize),
-                dst.as_mut_ptr().add(c),
-                end - c,
-            );
-        };
+        dst[c..end].copy_from_slice(&src_row[(x0 + c as i32) as usize..(x0 + end as i32) as usize]);
         c = end;
     }
     while c < n {
-        dst[c] = unsafe { *src_row.add((swide - 1) as usize) };
+        dst[c] = src_row[swide as usize - 1];
         c += 1;
     }
 }
@@ -424,8 +508,8 @@ fn mc_weight(p: u8, q: u8, wq: i32, wp: i32, oy: i32, sh: u32, chroma: bool) -> 
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn mc_int_row(
-    dst_row: *mut u8,
-    src_row: *const u8,
+    dst_row: &mut [u8],
+    src_row: &[u8],
     x0: i32,
     swide: i32,
     n: usize,
@@ -438,8 +522,8 @@ fn mc_int_row(
     let weighted = !(wq == 0 && wp == 1 && oy == 0 && sh == 0);
     let mut c = 0usize;
     while c < n && (x0 + c as i32) < 0 {
-        let p = unsafe { *src_row };
-        unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+        let p = src_row[0];
+        dst_row[c] = mc_weight(p, dst_row[c], wq, wp, oy, sh, chroma);
         c += 1;
     }
     let mut end = n;
@@ -448,25 +532,20 @@ fn mc_int_row(
     }
     if end > c {
         if !weighted {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_row.add((x0 + c as i32) as usize),
-                    dst_row.add(c),
-                    end - c,
-                );
-            };
+            dst_row[c..end]
+                .copy_from_slice(&src_row[(x0 + c as i32) as usize..(x0 + end as i32) as usize]);
         } else {
             while c < end {
-                let p = unsafe { *src_row.add((x0 + c as i32) as usize) };
-                unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+                let p = src_row[(x0 + c as i32) as usize];
+                dst_row[c] = mc_weight(p, dst_row[c], wq, wp, oy, sh, chroma);
                 c += 1;
             }
         }
         c = end;
     }
     while c < n {
-        let p = unsafe { *src_row.add((swide - 1) as usize) };
-        unsafe { *dst_row.add(c) = mc_weight(p, *dst_row.add(c), wq, wp, oy, sh, chroma) };
+        let p = src_row[swide as usize - 1];
+        dst_row[c] = mc_weight(p, dst_row[c], wq, wp, oy, sh, chroma);
         c += 1;
     }
 }
@@ -479,13 +558,13 @@ impl SliceContext<'_> {
     /// `i`, L1 at `i + 16`); the second call combines over the first's output
     /// through the wod q-term, so no dst prefill is ever needed.
     fn decode_inter(&mut self, i: usize, w: u32, h: u32) {
-        let m = unsafe { &*self.mb() };
-        let x = m.mvs[i * 2] as i32;
-        let y = m.mvs[i * 2 + 1] as i32;
+        let cur = self.mb_ref();
+        let x = cur.mvs[i * 2] as i32;
+        let y = cur.mvs[i * 2 + 1] as i32;
         let i8x8 = i >> 2;
         let i4x4 = i & 15;
-        let ref_base = self.ref_plane_bases[m.refPic[i8x8] as usize];
-        debug_assert!(!ref_base.is_null(), "inter MC into an empty DPB slot");
+        let ref_base = &self.ref_plane_bases[cur.refPic[i8x8] as usize];
+        debug_assert!(!ref_base.is_empty(), "inter MC into an empty DPB slot");
         let x_int_y = self.mbx as i32 * 16 + X444[i4x4] as i32 + (x >> 2);
         let x_int_c = self.mbx as i32 * 8 + (X444[i4x4] as i32 >> 1) + (x >> 3);
         let y_int_y = self.mby as i32 * 16 + Y444[i4x4] as i32 + (y >> 2);
@@ -498,8 +577,8 @@ impl SliceContext<'_> {
         // prediction coeffs {wY, oY, logWD_Y, logWD_C, wCb, wCr, oCb, oCr}
         let pack_w = |w0: i32, w1: i32| -> i16 { ((w1 << 8) | (w0 & 255)) as i16 };
         let mut wod: [i16; 8] = inter::WOD_NO_WEIGHT; // no_weight
-        let ref_idx = m.refIdx[i8x8] as i32;
-        let ref_idx_x = m.refIdx[i8x8 ^ 4] as i32;
+        let ref_idx = cur.refIdx[i8x8] as i32;
+        let ref_idx_x = cur.refIdx[i8x8 ^ 4] as i32;
         if self.weighted_bipred_idc != 1 {
             if (((i8x8 as i32) - 4) | ref_idx_x) >= 0 {
                 if self.weighted_bipred_idc == 0 {
@@ -617,21 +696,15 @@ impl SliceContext<'_> {
         let hu = h as usize;
         let cw = wu / 2;
         // chroma prediction first (C order; the dst regions don't overlap)
-        let off_c = self.plane_off(self.samples_mb[1])
+        let off_c = self.samples_mb[1]
             + (Y444[i4x4] as usize >> 1) * stride_c
             + (X444[i4x4] as usize >> 1);
         let len_c = (hu - 1) * (stride_c / 2) + cw;
         // luma prediction
-        let off_y = self.plane_off(self.samples_mb[0])
+        let off_y = self.samples_mb[0]
             + Y444[i4x4] as usize * stride_y
             + X444[i4x4] as usize;
         let len_y = (hu - 1) * stride_y + wu;
-        // Raw pointers for the plane region and the MC neighborhood scratch:
-        // the writes below would otherwise fight the borrow checker over
-        // `plane_slice()`'s `&mut self`.
-        let base = self.pixel_margin_base;
-        let src_y = self.mc_y.as_mut_ptr();
-        let src_c = self.mc_c.as_mut_ptr();
 
         // Integer-pel fast path: a clamped byte copy — C's SIMD row-copy
         // path. Edge clamping is per-row, not per-pixel; the no-weight case is
@@ -653,8 +726,8 @@ impl SliceContext<'_> {
                     let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
                     let soff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
                     mc_int_row(
-                        unsafe { base.add(off_c + (2 * k + pi) * (stride_c / 2)) },
-                        unsafe { ref_base.add(soff + pi * (stride_c / 2)) },
+                        &mut self.plane[off_c + (2 * k + pi) * (stride_c / 2)..],
+                        &ref_base[soff + pi * (stride_c / 2)..],
                         x_int_c,
                         width_y / 2,
                         cw,
@@ -681,15 +754,15 @@ impl SliceContext<'_> {
                     let ry = (y_int_c + k as i32).clamp(0, height_y / 2 - 1);
                     let roff = (ry * stride_c as i32) as usize + self.plane_size_y as usize;
                     copy_clamped_row(
-                        unsafe { std::slice::from_raw_parts_mut(src_c.add(2 * k * 16), 9) },
-                        unsafe { ref_base.add(roff) },
+                        &mut self.mc_c[2 * k * 16..2 * k * 16 + 9],
+                        &ref_base[roff..roff + width_y as usize / 2],
                         x_int_c,
                         width_y / 2,
                         9,
                     );
                     copy_clamped_row(
-                        unsafe { std::slice::from_raw_parts_mut(src_c.add((2 * k + 1) * 16), 9) },
-                        unsafe { ref_base.add(roff + stride_c / 2) },
+                        &mut self.mc_c[(2 * k + 1) * 16..(2 * k + 1) * 16 + 9],
+                        &ref_base[roff + stride_c / 2..roff + stride_c / 2 + width_y as usize / 2],
                         x_int_c,
                         width_y / 2,
                         9,
@@ -701,19 +774,13 @@ impl SliceContext<'_> {
                 // xInt_C..xInt_C+8 at the real stride — inside the ref plane
                 // by `interior_c` (unused overread bytes may cross into the
                 // next row, exactly like C).
-                unsafe {
-                    std::slice::from_raw_parts(
-                        ref_base.add((y_int_c * stride_c as i32 + x_int_c) as usize
-                            + self.plane_size_y as usize),
-                        (hu + 1) * stride_c / 2 + 16,
-                    )
-                }
+                &ref_base[(y_int_c * stride_c as i32 + x_int_c) as usize + self.plane_size_y as usize..]
             } else {
-                unsafe { std::slice::from_raw_parts(src_c, (hu + 2) * 16) }
+                &self.mc_c[..(hu + 2) * 16]
             };
             inter::inter_chroma(
                 src_chroma,
-                unsafe { std::slice::from_raw_parts_mut(base.add(off_c), len_c) },
+                &mut self.plane[off_c..off_c + len_c],
                 wu,
                 hu,
                 (x & 7) as u32,
@@ -733,8 +800,8 @@ impl SliceContext<'_> {
             for r in 0..hu {
                 let ry = (y_int_y + r as i32).clamp(0, height_y - 1);
                 mc_int_row(
-                    unsafe { base.add(off_y + r * stride_y) },
-                    unsafe { ref_base.add((ry * stride_y as i32) as usize) },
+                    &mut self.plane[off_y + r * stride_y..],
+                    &ref_base[(ry * stride_y as i32) as usize..],
                     x_int_y,
                     width_y,
                     wu,
@@ -763,8 +830,8 @@ impl SliceContext<'_> {
                 for r in 0..hu + 5 {
                     let ry = (y_int_y - 2 + r as i32).clamp(0, height_y - 1);
                     copy_clamped_row(
-                        unsafe { std::slice::from_raw_parts_mut(src_y.add(r * 32), 32) },
-                        unsafe { ref_base.add((ry * stride_y as i32) as usize) },
+                        &mut self.mc_y[r * 32..r * 32 + 32],
+                        &ref_base[(ry * stride_y as i32) as usize..(ry * stride_y as i32) as usize + width_y as usize],
                         x_int_y - 2,
                         width_y,
                         32,
@@ -774,18 +841,13 @@ impl SliceContext<'_> {
             let src_luma = if interior {
                 // Full read extent: rows yInt-2..yInt+h+1, cols xInt-2..xInt+w+2
                 // at the real stride — inside the ref plane by `interior`.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        ref_base.add(((y_int_y - 2) * stride_y as i32 + (x_int_y - 2)) as usize),
-                        (hu + 4) * stride_y + wu + 5,
-                    )
-                }
+                &ref_base[((y_int_y - 2) * stride_y as i32 + (x_int_y - 2)) as usize..]
             } else {
-                unsafe { std::slice::from_raw_parts(src_y, (hu + 5) * 32) }
+                &self.mc_y[..(hu + 5) * 32]
             };
             inter::inter_luma(
                 src_luma,
-                unsafe { std::slice::from_raw_parts_mut(base.add(off_y), len_y) },
+                &mut self.plane[off_y..off_y + len_y],
                 wu,
                 hu,
                 // C mode encoding: width base (w<<1 & 48) + yFrac*4 + xFrac —
@@ -804,7 +866,7 @@ impl SliceContext<'_> {
     /// current MB's own state. The pixel window is copied out of the real
     /// planes, filtered by `deblock_mb_inplace`, and copied back.
     fn deblock_mb_at(&mut self, pos: usize) {
-        let m = unsafe { *self.mb_buffer.add(pos) };
+        let m = self.mb_buffer[pos];
         let fe = m.filter_edges as i32;
         if fe == 0 {
             return; // deblock_mb returns early
@@ -813,10 +875,9 @@ impl SliceContext<'_> {
         let left_pos = if fe & 1 != 0 { pos - 1 } else { pos };
         let top_pos = if fe & 2 != 0 { pos - (width + 1) } else { pos };
         let mut mb_state = [0u8; 606];
-        mb_state[0..202]
-            .copy_from_slice(&unsafe { *self.mb_buffer.add(top_pos) }.serialize_deblock());
+        mb_state[0..202].copy_from_slice(&self.mb_buffer[top_pos].serialize_deblock());
         mb_state[202..404]
-            .copy_from_slice(&unsafe { *self.mb_buffer.add(left_pos) }.serialize_deblock());
+            .copy_from_slice(&self.mb_buffer[left_pos].serialize_deblock());
         mb_state[404..606].copy_from_slice(&m.serialize_deblock());
 
         let mby = pos / (width + 1);
@@ -843,14 +904,9 @@ impl SliceContext<'_> {
         let off_b = self.filter_offset_b;
         let plane_size_y = self.plane_size_y as usize;
 
-        // plane_slice via the raw base pointer (same as the helper): keeps
-        // these borrows disjoint from `dblk_y`/`dblk_c` below.
-        let region = unsafe {
-            std::slice::from_raw_parts_mut(
-                self.pixel_margin_base,
-                PIXEL_MARGIN + self.plane_size_y as usize + self.plane_size_c as usize,
-            )
-        };
+        // The full pixel plane (margin + Y + C); the split below keeps these
+        // borrows disjoint from `dblk_y`/`dblk_c`.
+        let region = &mut self.plane[..PIXEL_MARGIN + plane_size_y + self.plane_size_c as usize];
         let (y_plane, c_plane) = {
             let (_, rest) = region.split_at_mut(PIXEL_MARGIN);
             rest.split_at_mut(plane_size_y)
@@ -884,9 +940,9 @@ impl SliceContext<'_> {
     }
 
     /// C `initialize_context` (vacc_sw264.c): per-slice context setup. Must be
-    /// called after the task fields, `mb_buffer`, `mb_col_buffer` and (for CABAC)
-    /// nothing else are filled; it positions `mb_pos`/`mb_col` at the slice's
-    /// first macroblock and initialises the offset/QP/residual tables.
+    /// called after the task fields, `mb_buffer`, `mb_col` and (for CABAC)
+    /// nothing else are filled; it positions `mb_pos` at the slice's first
+    /// macroblock and initialises the offset/QP/residual tables.
     pub fn initialize_context(&mut self) {
         let w = self.pic_width_in_mbs;
         self.curr_mb_addr = self.first_mb_in_slice as i32;
@@ -894,23 +950,21 @@ impl SliceContext<'_> {
         self.mbx = (self.first_mb_in_slice % w as u32) as i16;
         let mb_offset = self.mbx as usize + self.mby as usize * (w as usize + 1);
         self.mb_pos = mb_offset;
-        unsafe {
-            self.mb_col = if self.mb_col_buffer.is_null() {
-                self.mb_buffer.add(mb_offset) as *const RustMb
-            } else {
-                self.mb_col_buffer.add(mb_offset)
-            };
-        }
+        // `mb_col` holds the collocated buffer's base (set at construction);
+        // `mvpred_state` indexes it by `mb_pos`.
         // C `initialize_context` L760-762: first MB's pixel positions.
         let mbx = self.mbx as i64;
         let mby = self.mby as i64;
-        let off0 = ((mbx + mby * self.stride[0] as i64) * 16) as usize;
-        let off1 = ((mbx + mby * self.stride[1] as i64) * 8 + self.plane_size_y as i64) as usize;
-        unsafe {
-            self.samples_mb[0] = self.samples_base.add(off0);
-            self.samples_mb[1] = self.samples_base.add(off1);
-            self.samples_mb[2] = self.samples_mb[1].add((self.stride[1] >> 1) as usize);
-        }
+        // Offsets are relative to `plane`'s start (the leading margin), so the
+        // first luma sample sits at PIXEL_MARGIN. C's `samples_mb` pointed at the
+        // Y plane and `plane_off` added the margin when indexing the full buffer.
+        let off0 = (PIXEL_MARGIN as i64 + (mbx + mby * self.stride[0] as i64) * 16) as usize;
+        let off1 = (PIXEL_MARGIN as i64
+            + (mbx + mby * self.stride[1] as i64) * 8
+            + self.plane_size_y as i64) as usize;
+        self.samples_mb[0] = off0;
+        self.samples_mb[1] = off1;
+        self.samples_mb[2] = off1 + (self.stride[1] >> 1) as usize;
         self.a4x4_int8 = [0, 0, 2, 2, 1, 4, 3, 6, 8, 8, 10, 10, 9, 12, 11, 14];
         self.b4x4_int8 = [0, 1, 0, 1, 4, 5, 4, 5, 2, 3, 8, 9, 6, 7, 12, 13];
         if self.chroma_array_type == 1 {
@@ -1523,10 +1577,7 @@ impl<'a> SliceContext<'a> {
             self.bits.refill();
         }
         if coeff_token != 0 {
-            let mb = self.mb();
-            unsafe {
-                (*mb).nC[i4x4 as usize] = (coeff_token >> 2) as i8;
-            }
+            self.mb_mut().nC[i4x4 as usize] = (coeff_token >> 2) as i8;
             self.parse_residual_coeffs_cavlc(start_idx, 15, coeff_token & 3, coeff_token >> 2);
             true
         } else {
@@ -1889,54 +1940,44 @@ impl<'a> SliceContext<'a> {
     /// Build the mvpred input state from the live parse context (neighbours are
     /// set per-MB in `parse_slice_data`).
     fn mvpred_state(&self) -> mvpred::State {
-        let mb = unsafe { &*self.mb() };
-        // C leaves edge-adjacent neighbour pointers as raw (before the buffer
-        // start) when the decoded counter marks them "available" but unavail4x4
-        // marks them unavailable; its mvpred ops guard on unavail4x4 and never
-        // read them. We dereference all four eagerly, so substitute UNAVAIL_MB
-        // (zeroed data) for any pointer that falls before the buffer — the only
-        // OOB direction, since every neighbour sits at a lower index than the
-        // current MB. This matches C's effective behaviour (unavailable == 0).
-        let base = self.mb_buffer as usize;
-        let nb_ref = |p: *const RustMb| -> &RustMb {
-            if (p as usize) >= base {
-                unsafe { &*p }
-            } else {
-                &UNAVAIL_MB
-            }
-        };
-        let a = nb_ref(self.mb_a);
-        let b = nb_ref(self.mb_b);
-        let c = nb_ref(self.mb_c);
-        let d = nb_ref(self.mb_d);
-        let col = if self.mb_col.is_null() {
-            mvpred::Col {
+        // Neighbours are set per-MB in `parse_slice_data` as buffer indices;
+        // `None` (or an out-of-range index) means unavailable, and we substitute
+        // UNAVAIL_MB (zeroed data), matching C's effective behaviour
+        // (unavailable == 0).
+        let cur = self.mb_ref();
+        let a = self.nb_mb(self.nb_a);
+        let b = self.nb_mb(self.nb_b);
+        let c = self.nb_mb(self.nb_c);
+        let d = self.nb_mb(self.nb_d);
+        let col = match self.mb_col {
+            None => mvpred::Col {
                 ref_idx_s: [0; 2],
                 ref_pic_s: [0; 2],
                 mvs: [0; 64],
                 inter_eqs: 0,
-            }
-        } else {
-            let p = unsafe { &*self.mb_col };
-            // C reads mbCol->refIdx_s/refPic_s as packed little-endian byte
-            // quads ([LX][i8x8]); replicate the exact 4-byte packing. Bytes
-            // must be zero-extended (a plain `i8 as u32` sign-extends and
-            // poisons the higher bytes after the shift).
-            let pack4 = |v: &[i8]| {
-                (((v[0] as u8) as u32)
-                    | (((v[1] as u8) as u32) << 8)
-                    | (((v[2] as u8) as u32) << 16)
-                    | (((v[3] as u8) as u32) << 24)) as i32
-            };
-            mvpred::Col {
-                ref_idx_s: [pack4(&p.refIdx[0..4]), pack4(&p.refIdx[4..8])],
-                ref_pic_s: [pack4(&p.refPic[0..4]), pack4(&p.refPic[4..8])],
-                mvs: p.mvs,
-                inter_eqs: u32::from_le_bytes(p.f.inter_eqs),
+            },
+            Some(buf) => {
+                let p = &buf[self.mb_pos];
+                // C reads mbCol->refIdx_s/refPic_s as packed little-endian byte
+                // quads ([LX][i8x8]); replicate the exact 4-byte packing. Bytes
+                // must be zero-extended (a plain `i8 as u32` sign-extends and
+                // poisons the higher bytes after the shift).
+                let pack4 = |v: &[i8]| {
+                    (((v[0] as u8) as u32)
+                        | (((v[1] as u8) as u32) << 8)
+                        | (((v[2] as u8) as u32) << 16)
+                        | (((v[3] as u8) as u32) << 24)) as i32
+                };
+                mvpred::Col {
+                    ref_idx_s: [pack4(&p.refIdx[0..4]), pack4(&p.refIdx[4..8])],
+                    ref_pic_s: [pack4(&p.refPic[0..4]), pack4(&p.refPic[4..8])],
+                    mvs: p.mvs,
+                    inter_eqs: u32::from_le_bytes(p.f.inter_eqs),
+                }
             }
         };
         mvpred::State {
-            mb: mb_from(mb),
+            mb: mb_from(cur),
             mb_a: nb_from(a),
             mb_b: nb_from(b),
             mb_c: nb_from(c),
@@ -1962,12 +2003,13 @@ impl<'a> SliceContext<'a> {
             let y = self.bits.get_se16(-32768, 32767);
             pack_mv(x as i16, y as i16)
         } else {
-            let base = unsafe { (self.mb() as *const u8).offset(80 + absmvd_off) }; // absMvd @ offset 80
+            // absMvd @ offset 80 (L0) / 112 (L1); `nb_absmvd` resolves the
+            // neighbour element offset to a buffer entry.
             let mut first: i32 = 0;
             let mut ctx_base: i32 = 40;
             for i in 0..2 {
-                let a = unsafe { *base.offset(self.absmvd_a[i4x4] as isize + i as isize) } as i32;
-                let b = unsafe { *base.offset(self.absmvd_b[i4x4] as isize + i as isize) } as i32;
+                let a = self.nb_absmvd((80 + absmvd_off) as usize, self.absmvd_a[i4x4] as isize + i as isize);
+                let b = self.nb_absmvd((80 + absmvd_off) as usize, self.absmvd_b[i4x4] as isize + i as isize);
                 let sum = a + b;
                 let mut ctx_idx = (ctx_base + (sum >= 3) as i32 + (sum > 32) as i32) as usize;
                 let mut mvd: i32 = 0;
@@ -2012,11 +2054,10 @@ impl<'a> SliceContext<'a> {
     /// C `parse_ref_idx` (9.3.3.1.1.6): parse the ref_idx symbols flagged by `f`,
     /// clip, broadcast to the inferred block shapes and compute refPic.
     fn parse_ref_idx(&mut self, f: u32) {
-        let m = unsafe { &mut *self.mb() };
         let inc8x8 = [0i8, 5, 4, 2, 8, 13, 12, 10, 16, 21, 20, 18];
         let bit8x8 = [5i8, 3, 2, 7, 13, 11, 10, 15, 21, 19, 18, 23];
         // "set to 0 if parsed"
-        let mut ri: [i8; 8] = m.refIdx;
+        let mut ri: [i8; 8] = self.mb_ref().refIdx;
         for (i, r) in ri.iter_mut().enumerate() {
             if f & (1 << i) != 0 {
                 *r = 0;
@@ -2033,13 +2074,14 @@ impl<'a> SliceContext<'a> {
                 }
             } else {
                 let mut ref_idx: i8 = 0;
+                let bits0 = self.mb_ref().bits[0];
                 if self.cabac.get_ae(
                     &mut self.bits,
-                    54 + ((m.bits[0] >> inc8x8[4 + i]) & 3) as usize,
+                    54 + ((bits0 >> inc8x8[4 + i]) & 3) as usize,
                 ) != 0
                 {
                     ref_idx = 1;
-                    m.bits[0] |= 1 << bit8x8[4 + i];
+                    self.mb_mut().bits[0] |= 1 << bit8x8[4 + i];
                     let mut ctx_idx = 58usize;
                     while (ref_idx as u32) < 32 && self.cabac.get_ae(&mut self.bits, ctx_idx) != 0 {
                         ref_idx += 1;
@@ -2064,6 +2106,7 @@ impl<'a> SliceContext<'a> {
                 ri[k] = ri[idx[k] as usize];
             }
             if self.is_cabac {
+                let m = self.mb_mut();
                 m.bits[0] |= (m.bits[0] >> 2 & 0x080800) | (m.bits[0] << 5 & 0x808000);
             }
         }
@@ -2073,13 +2116,15 @@ impl<'a> SliceContext<'a> {
                 ri[k] = ri[idx[k] as usize];
             }
             if self.is_cabac {
+                let m = self.mb_mut();
                 m.bits[0] |= (m.bits[0] >> 3 & 0x040400) | (m.bits[0] << 4 & 0x808000);
             }
         }
-        m.refIdx = ri;
-        // compute reference picture numbers
+        // compute reference picture numbers (read before borrowing the current MB)
         let rpl0: [i8; 16] = self.ref_pic_list[0][..16].try_into().unwrap();
         let rpl1: [i8; 16] = self.ref_pic_list[1][..16].try_into().unwrap();
+        let m = self.mb_mut();
+        m.refIdx = ri;
         for (p, r) in m.refPic[..4].iter_mut().zip(ri[..4].iter()) {
             *p = shufflen_byte(&rpl0, *r);
         }
@@ -2090,19 +2135,22 @@ impl<'a> SliceContext<'a> {
 
     /// C `parse_P_mb` (mb_skip_flag + mb_type + large-block decode).
     fn parse_P_mb(&mut self) {
-        let m = unsafe { &mut *self.mb() };
         // Inter initializations
-        m.mbIsInterFlag = 1;
-        for i in 0..16 {
-            m.Intra4x4PredMode[i] = 2;
-        }
-        m.refIdx = [0, 0, 0, 0, -1, -1, -1, -1];
-        if self.is_cabac {
-            // C clears only the L0 half (`absMvd_v[0] = absMvd_v[1] = {}`);
-            // the L1 half keeps stale bytes from the previous frame that used
-            // this DPB slot. Mirror exactly — the record must be bit-exact.
-            for i in 0..32 {
-                m.absMvd[i] = 0;
+        {
+            let is_cabac = self.is_cabac;
+            let m = self.mb_mut();
+            m.mbIsInterFlag = 1;
+            for i in 0..16 {
+                m.Intra4x4PredMode[i] = 2;
+            }
+            m.refIdx = [0, 0, 0, 0, -1, -1, -1, -1];
+            if is_cabac {
+                // C clears only the L0 half (`absMvd_v[0] = absMvd_v[1] = {}`);
+                // the L1 half keeps stale bytes from the previous frame that used
+                // this DPB slot. Mirror exactly — the record must be bit-exact.
+                for i in 0..32 {
+                    m.absMvd[i] = 0;
+                }
             }
         }
 
@@ -2123,11 +2171,11 @@ impl<'a> SliceContext<'a> {
         // earliest handling for P_Skip
         if mb_skip_flag != 0 {
             if self.is_cabac {
-                m.f.mb_skip_flag = 1;
+                self.mb_mut().f.mb_skip_flag = 1;
                 self.mb_qp_delta_nz = 0;
             }
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::p_skip(&state));
+            mb_apply(self.mb_mut(), &mvpred::p_skip(&state));
             // C decode_P_skip ends with decode_inter(ctx, 0, 16, 16).
             self.decode_inter(0, 16, 16);
             return;
@@ -2154,7 +2202,7 @@ impl<'a> SliceContext<'a> {
 
         // mvs_v[4..8] = {} (L1 unused in P)
         for i in 32..64 {
-            m.mvs[i] = 0;
+            self.mb_mut().mvs[i] = 0;
         }
 
         if !self.is_cabac {
@@ -2174,30 +2222,30 @@ impl<'a> SliceContext<'a> {
         // decoding large blocks (each C decode_inter_*X* ends with its own
         // decode_inter call, interleaved with the next MVD parse)
         if mb_type == 0 {
-            m.f.inter_eqs = 0x1b5fbbffu32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b5fbbffu32.to_le_bytes();
             let mvd = self.parse_mvd_pair(0, 0);
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::inter_16x16(&state, mvd, 0));
+            mb_apply(self.mb_mut(), &mvpred::inter_16x16(&state, mvd, 0));
             self.decode_inter(0, 16, 16);
         } else if mb_type == 2 {
-            m.f.inter_eqs = 0x1b1bbbbb_u32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b1bbbbb_u32.to_le_bytes();
             let mvd0 = self.parse_mvd_pair(0, 0);
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::inter_8x16_left(&state, mvd0, 0));
+            mb_apply(self.mb_mut(), &mvpred::inter_8x16_left(&state, mvd0, 0));
             self.decode_inter(0, 8, 16);
             let mvd1 = self.parse_mvd_pair(4, 0);
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::inter_8x16_right(&state, mvd1, 0));
+            mb_apply(self.mb_mut(), &mvpred::inter_8x16_right(&state, mvd1, 0));
             self.decode_inter(4, 8, 16);
         } else {
-            m.f.inter_eqs = 0x1b5f1b5f_u32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b5f1b5f_u32.to_le_bytes();
             let mvd0 = self.parse_mvd_pair(0, 0);
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::inter_16x8_top(&state, mvd0, 0));
+            mb_apply(self.mb_mut(), &mvpred::inter_16x8_top(&state, mvd0, 0));
             self.decode_inter(0, 16, 8);
             let mvd1 = self.parse_mvd_pair(8, 0);
             let state = self.mvpred_state();
-            mb_apply(m, &mvpred::inter_16x8_bottom(&state, mvd1, 0));
+            mb_apply(self.mb_mut(), &mvpred::inter_16x8_bottom(&state, mvd1, 0));
             self.decode_inter(8, 16, 8);
         }
         self.parse_inter_residual();
@@ -2208,11 +2256,10 @@ impl<'a> SliceContext<'a> {
     /// test samples contain no sub-MB partitions, so this path is not exercised
     /// by the differential oracle; it needs synthetic-vector validation.
     fn parse_P_sub_mb(&mut self, ref_idx_flags: u32) {
-        let m = unsafe { &mut *self.mb() };
         for i in 0..32 {
-            m.mvs[i] = 0; // mvs_v[0..3] = {}
+            self.mb_mut().mvs[i] = 0; // mvs_v[0..3] = {}
         }
-        m.f.inter_eqs = [0; 4];
+        self.mb_mut().f.inter_eqs = [0; 4];
         let mut mvd_flags: u32 = 0;
         for i8x8 in 0..4 {
             let i4x4 = i8x8 * 4;
@@ -2265,21 +2312,22 @@ impl<'a> SliceContext<'a> {
                 }
             }
             mvd_flags |= flags << i4x4;
-            m.f.inter_eqs[i8x8] = eqs;
+            self.mb_mut().f.inter_eqs[i8x8] = eqs;
         }
         self.parse_ref_idx(ref_idx_flags);
 
-        // load neighbouring refIdx values and shuffle them into A/B/C/D
-        let b = unsafe { &*self.mb_b };
-        let c = unsafe { &*self.mb_c };
-        let a = unsafe { &*self.mb_a };
-        let d = unsafe { &*self.mb_d };
+        // load neighbouring refIdx values (copied out so the buffer borrows end
+        // before the MVD loop's `&mut self` calls) and shuffle them into A/B/C/D
+        let b = self.nb_mb(self.nb_b).refIdx;
+        let c = self.nb_mb(self.nb_c).refIdx;
+        let a = self.nb_mb(self.nb_a).refIdx;
+        let d = self.nb_mb(self.nb_d).refIdx;
         let mut bc = [0i8; 16];
-        bc[..8].copy_from_slice(&b.refIdx);
-        bc[8..].copy_from_slice(&c.refIdx);
+        bc[..8].copy_from_slice(&b);
+        bc[8..].copy_from_slice(&c);
         let mut ar = [0i8; 16];
-        ar[..8].copy_from_slice(&a.refIdx);
-        ar[8..].copy_from_slice(&m.refIdx);
+        ar[..8].copy_from_slice(&a);
+        ar[8..].copy_from_slice(&self.mb_ref().refIdx);
         let bcar0 = unziplo32_bytes(&bc, &ar);
         let r0 = shuffle_i8x16(
             &bcar0,
@@ -2300,7 +2348,7 @@ impl<'a> SliceContext<'a> {
             &bcar0,
             &[-1, 2, 9, 12, 2, 3, 12, 13, 9, 12, 11, 14, 12, 13, 14, 15],
         );
-        d0[0] = d.refIdx[3];
+        d0[0] = d[3];
 
         // combine into a per-4x4 4-bit equality mask:
         // bit0 = (r0==A0 | u==14), bit1 = r0==B0, bit2 = eqC (C->D if u&4), bit3 = u&4
@@ -2328,12 +2376,10 @@ impl<'a> SliceContext<'a> {
                 self.mvs_c[i]
             };
             let mvp = if (0xe9e9u16 >> eq) & 1 != 0 {
-                unsafe {
-                    let mv_a = self.read_mvs_s(self.mvs_a[i] as isize);
-                    let mv_b = self.read_mvs_s(self.mvs_b[i] as isize);
-                    let mv_dc = self.read_mvs_s(mvs_dc as isize);
-                    median_pair_i32(mv_a, mv_b, mv_dc)
-                }
+                let mv_a = self.read_mvs_s(self.mvs_a[i] as isize);
+                let mv_b = self.read_mvs_s(self.mvs_b[i] as isize);
+                let mv_dc = self.read_mvs_s(mvs_dc as isize);
+                median_pair_i32(mv_a, mv_b, mv_dc)
             } else {
                 let mvs_ab = if eq & 1 != 0 {
                     self.mvs_a[i] as i32
@@ -2341,7 +2387,7 @@ impl<'a> SliceContext<'a> {
                     self.mvs_b[i]
                 };
                 let off = if eq & 4 != 0 { mvs_dc } else { mvs_ab };
-                unsafe { self.read_mvs_s(off as isize) }
+                self.read_mvs_s(off as isize)
             };
 
             let type_ = ((mf >> (i & !3)) & 15) as usize;
@@ -2363,20 +2409,24 @@ impl<'a> SliceContext<'a> {
             // selectively write absMvd (low 4 i16 pairs of the 8x8)
             let p = pack_absmvd_bytes(mvd);
             let base = i8x8 * 8;
-            for (lane, &am) in abs_mask[..4].iter().enumerate() {
-                if am == -1 {
-                    m.absMvd[base + 2 * lane] = p[0] as u8;
-                    m.absMvd[base + 2 * lane + 1] = p[1] as u8;
-                }
-            }
-            // selectively write mvs (mvs_mask = ziplo16(abs_mask, abs_mask))
+            // selectively write absMvd (low 4 i16 pairs of the 8x8) and mvs
+            // (mvs_mask = ziplo16(abs_mask, abs_mask))
             let mv = add_pair_i32(mvp, mvd);
             let mvx = pair_x(mv);
             let mvy = pair_y(mv);
             let mvs_mask = ziplo16_self(&abs_mask);
-            for (lane, &mm) in mvs_mask.iter().enumerate() {
-                if mm == -1 {
-                    m.mvs[base + lane] = if lane & 1 == 0 { mvx } else { mvy };
+            {
+                let m = self.mb_mut();
+                for (lane, &am) in abs_mask[..4].iter().enumerate() {
+                    if am == -1 {
+                        m.absMvd[base + 2 * lane] = p[0] as u8;
+                        m.absMvd[base + 2 * lane + 1] = p[1] as u8;
+                    }
+                }
+                for (lane, &mm) in mvs_mask.iter().enumerate() {
+                    if mm == -1 {
+                        m.mvs[base + lane] = if lane & 1 == 0 { mvx } else { mvy };
+                    }
                 }
             }
             // C masks/widths/heights tables (edge264_slice.c parse_P_sub_mb)
@@ -2390,19 +2440,22 @@ impl<'a> SliceContext<'a> {
 
     /// C `parse_B_mb` (mb_skip_flag + mb_type + direct + large-block decode).
     fn parse_B_mb(&mut self) {
-        let m = unsafe { &mut *self.mb() };
         // Inter initializations
-        m.mbIsInterFlag = 1;
-        for i in 0..16 {
-            m.Intra4x4PredMode[i] = 2;
-        }
-        if self.is_cabac {
-            for i in 0..64 {
-                m.absMvd[i] = 0;
+        {
+            let is_cabac = self.is_cabac;
+            let m = self.mb_mut();
+            m.mbIsInterFlag = 1;
+            for i in 0..16 {
+                m.Intra4x4PredMode[i] = 2;
             }
-        }
-        for i in 0..64 {
-            m.mvs[i] = 0;
+            if is_cabac {
+                for i in 0..64 {
+                    m.absMvd[i] = 0;
+                }
+            }
+            for i in 0..64 {
+                m.mvs[i] = 0;
+            }
         }
 
         // parse mb_skip_run / flag
@@ -2422,11 +2475,12 @@ impl<'a> SliceContext<'a> {
         // B_Skip
         if mb_skip_flag != 0 {
             if self.is_cabac {
+                let m = self.mb_mut();
                 m.f.mb_skip_flag = 1;
                 m.f.mb_type_B_Direct = 1;
                 self.mb_qp_delta_nz = 0;
             }
-            m.f.inter_eqs = [0; 4];
+            self.mb_mut().f.inter_eqs = [0; 4];
             let state = self.mvpred_state();
             let mut mc = mvpred::McOps::new();
             let out = mvpred::direct(
@@ -2435,7 +2489,7 @@ impl<'a> SliceContext<'a> {
                 0xffffffff,
                 &mut mc,
             );
-            mb_apply(m, &out);
+            mb_apply(self.mb_mut(), &out);
             for (i, w, h) in mc.iter() {
                 self.decode_inter(*i, *w, *h);
             }
@@ -2457,22 +2511,20 @@ impl<'a> SliceContext<'a> {
         };
         if is_direct {
             if self.is_cabac {
-                m.f.mb_type_B_Direct = 1;
+                self.mb_mut().f.mb_type_B_Direct = 1;
             }
             self.transform_8x8_mode_flag =
                 self.pps_transform_8x8_mode_flag & self.direct_8x8_inference_flag;
-            m.f.inter_eqs = [0; 4];
+            self.mb_mut().f.inter_eqs = [0; 4];
             let state = self.mvpred_state();
             let mut mc = mvpred::McOps::new();
-            mb_apply(
-                m,
-                &mvpred::direct(
-                    &state,
-                    self.direct_spatial_mv_pred_flag != 0,
-                    0xffffffff,
-                    &mut mc,
-                ),
+            let out = mvpred::direct(
+                &state,
+                self.direct_spatial_mv_pred_flag != 0,
+                0xffffffff,
+                &mut mc,
             );
+            mb_apply(self.mb_mut(), &out);
             for (i, w, h) in mc.iter() {
                 self.decode_inter(*i, *w, *h);
             }
@@ -2487,9 +2539,12 @@ impl<'a> SliceContext<'a> {
                 self.parse_I_mb(mb_type_cavlc - 23);
                 return;
             }
-            m.refIdx = [-1; 8];
-            for i in 0..64 {
-                m.mvs[i] = 0;
+            {
+                let m = self.mb_mut();
+                m.refIdx = [-1; 8];
+                for i in 0..64 {
+                    m.mvs[i] = 0;
+                }
             }
             if mb_type_cavlc == 22 {
                 self.parse_B_sub_mb();
@@ -2517,9 +2572,12 @@ impl<'a> SliceContext<'a> {
                 self.parse_I_mb(32);
                 return;
             }
-            m.refIdx = [-1; 8];
-            for i in 0..64 {
-                m.mvs[i] = 0;
+            {
+                let m = self.mb_mut();
+                m.refIdx = [-1; 8];
+                for i in 0..64 {
+                    m.mvs[i] = 0;
+                }
             }
             if str_ == 15 {
                 self.parse_B_sub_mb();
@@ -2536,71 +2594,71 @@ impl<'a> SliceContext<'a> {
         self.parse_ref_idx(flags8x8);
         if flags8x8 & 0xee == 0 {
             // 16x16
-            m.f.inter_eqs = 0x1b5fbbff_u32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b5fbbff_u32.to_le_bytes();
             if flags8x8 & 0x01 != 0 {
                 let mvd = self.parse_mvd_pair(0, 0);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x16(&s, mvd, 0));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x16(&s, mvd, 0));
                 self.decode_inter(0, 16, 16);
             }
             if flags8x8 & 0x10 != 0 {
                 let mvd = self.parse_mvd_pair(0, 32);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x16(&s, mvd, 1));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x16(&s, mvd, 1));
                 self.decode_inter(16, 16, 16);
             }
         } else if flags8x8 & 0xcc == 0 {
             // 8x16
-            m.f.inter_eqs = 0x1b1bbbbb_u32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b1bbbbb_u32.to_le_bytes();
             if flags8x8 & 0x01 != 0 {
                 let mvd = self.parse_mvd_pair(0, 0);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_8x16_left(&s, mvd, 0));
+                mb_apply(self.mb_mut(), &mvpred::inter_8x16_left(&s, mvd, 0));
                 self.decode_inter(0, 8, 16);
             }
             if flags8x8 & 0x02 != 0 {
                 let mvd = self.parse_mvd_pair(4, 0);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_8x16_right(&s, mvd, 0));
+                mb_apply(self.mb_mut(), &mvpred::inter_8x16_right(&s, mvd, 0));
                 self.decode_inter(4, 8, 16);
             }
             if flags8x8 & 0x10 != 0 {
                 let mvd = self.parse_mvd_pair(0, 32);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_8x16_left(&s, mvd, 1));
+                mb_apply(self.mb_mut(), &mvpred::inter_8x16_left(&s, mvd, 1));
                 self.decode_inter(16, 8, 16);
             }
             if flags8x8 & 0x20 != 0 {
                 let mvd = self.parse_mvd_pair(4, 32);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_8x16_right(&s, mvd, 1));
+                mb_apply(self.mb_mut(), &mvpred::inter_8x16_right(&s, mvd, 1));
                 self.decode_inter(20, 8, 16);
             }
         } else {
             // 16x8
-            m.f.inter_eqs = 0x1b5f1b5f_u32.to_le_bytes();
+            self.mb_mut().f.inter_eqs = 0x1b5f1b5f_u32.to_le_bytes();
             if flags8x8 & 0x01 != 0 {
                 let mvd = self.parse_mvd_pair(0, 0);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x8_top(&s, mvd, 0));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x8_top(&s, mvd, 0));
                 self.decode_inter(0, 16, 8);
             }
             if flags8x8 & 0x04 != 0 {
                 let mvd = self.parse_mvd_pair(8, 0);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x8_bottom(&s, mvd, 0));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x8_bottom(&s, mvd, 0));
                 self.decode_inter(8, 16, 8);
             }
             if flags8x8 & 0x10 != 0 {
                 let mvd = self.parse_mvd_pair(0, 32);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x8_top(&s, mvd, 1));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x8_top(&s, mvd, 1));
                 self.decode_inter(16, 16, 8);
             }
             if flags8x8 & 0x40 != 0 {
                 let mvd = self.parse_mvd_pair(8, 32);
                 let s = self.mvpred_state();
-                mb_apply(m, &mvpred::inter_16x8_bottom(&s, mvd, 1));
+                mb_apply(self.mb_mut(), &mvpred::inter_16x8_bottom(&s, mvd, 1));
                 self.decode_inter(24, 16, 8);
             }
         }
@@ -2610,9 +2668,8 @@ impl<'a> SliceContext<'a> {
     /// C `parse_B_sub_mb` (sub_mb_type + L0/L1 refIdx shuffle + per-block MVD/MVP).
     /// Faithful scalar transcription; not exercised by the current test samples.
     fn parse_B_sub_mb(&mut self) {
-        let m = unsafe { &mut *self.mb() };
         let mut mvd_flags: u32 = 0;
-        m.f.inter_eqs = [0; 4];
+        self.mb_mut().f.inter_eqs = [0; 4];
         for i8x8 in 0..4 {
             let i4x4 = i8x8 * 4;
             let sub_mb_type = if !self.is_cabac {
@@ -2627,7 +2684,7 @@ impl<'a> SliceContext<'a> {
             };
             if is_direct {
                 // B_Direct_8x8
-                m.f.inter_eqs[i8x8] = 0x1b;
+                self.mb_mut().f.inter_eqs[i8x8] = 0x1b;
                 if self.direct_8x8_inference_flag == 0 {
                     self.transform_8x8_mode_flag = 0;
                 }
@@ -2643,7 +2700,7 @@ impl<'a> SliceContext<'a> {
                     ];
                     sub = sub_mb_type;
                     mvd_flags |= SUB_MB_TYPE2FLAGS[sub as usize] << i4x4;
-                    m.f.inter_eqs[i8x8] = SUB_MB_TYPE2EQS[sub as usize];
+                    self.mb_mut().f.inter_eqs[i8x8] = SUB_MB_TYPE2EQS[sub as usize];
                 } else {
                     let mut sub_ = 2i32;
                     if self.cabac.get_ae(&mut self.bits, 37) == 0 {
@@ -2665,7 +2722,7 @@ impl<'a> SliceContext<'a> {
                         0x1b, 0x11, 0x0a, 0x11, 0x1b, 0x1b, 0, 0, 0x0a, 0x11, 0x0a, 0,
                     ];
                     mvd_flags |= SUB2FLAGS[sub as usize] << i4x4;
-                    m.f.inter_eqs[i8x8] = SUB2EQS[sub as usize];
+                    self.mb_mut().f.inter_eqs[i8x8] = SUB2EQS[sub as usize];
                 }
                 let is_8xn = if self.is_cabac {
                     (0x23b & (1 << sub)) != 0
@@ -2701,15 +2758,13 @@ impl<'a> SliceContext<'a> {
         if direct_flags != 0 {
             let state = self.mvpred_state();
             let mut mc = mvpred::McOps::new();
-            mb_apply(
-                m,
-                &mvpred::direct(
-                    &state,
-                    self.direct_spatial_mv_pred_flag != 0,
-                    direct_flags,
-                    &mut mc,
-                ),
+            let out = mvpred::direct(
+                &state,
+                self.direct_spatial_mv_pred_flag != 0,
+                direct_flags,
+                &mut mc,
             );
+            mb_apply(self.mb_mut(), &out);
             for (i, w, h) in mc.iter() {
                 self.decode_inter(*i, *w, *h);
             }
@@ -2720,17 +2775,18 @@ impl<'a> SliceContext<'a> {
         }
         self.parse_ref_idx(0x100 | mvd_flags2ref_idx(mvd_flags));
 
-        // load neighbouring refIdx values and shuffle them into A/B/C/D (L0 + L1)
-        let b = unsafe { &*self.mb_b };
-        let c = unsafe { &*self.mb_c };
-        let a = unsafe { &*self.mb_a };
-        let d = unsafe { &*self.mb_d };
+        // load neighbouring refIdx values (copied out so the buffer borrows end
+        // before the MVD loop's `&mut self` calls) and shuffle into A/B/C/D
+        let b = self.nb_mb(self.nb_b).refIdx;
+        let c = self.nb_mb(self.nb_c).refIdx;
+        let a = self.nb_mb(self.nb_a).refIdx;
+        let d = self.nb_mb(self.nb_d).refIdx;
         let mut bc = [0i8; 16];
-        bc[..8].copy_from_slice(&b.refIdx);
-        bc[8..].copy_from_slice(&c.refIdx);
+        bc[..8].copy_from_slice(&b);
+        bc[8..].copy_from_slice(&c);
         let mut ar = [0i8; 16];
-        ar[..8].copy_from_slice(&a.refIdx);
-        ar[8..].copy_from_slice(&m.refIdx);
+        ar[..8].copy_from_slice(&a);
+        ar[8..].copy_from_slice(&self.mb_ref().refIdx);
         let bcar0 = unziplo32_bytes(&bc, &ar);
         let bcar1 = unziphi32_bytes(&bc, &ar);
         const IDX_R: [i8; 16] = [
@@ -2749,8 +2805,8 @@ impl<'a> SliceContext<'a> {
         let c1 = shuffle_i8x16(&bcar1, &self.refidx4x4_c);
         let mut d0 = shuffle_i8x16(&bcar0, &IDX_D);
         let mut d1 = shuffle_i8x16(&bcar1, &IDX_D);
-        d0[0] = d.refIdx[3];
-        d1[0] = d.refIdx[7];
+        d0[0] = d[3];
+        d1[0] = d[7];
 
         // 4-bit equality masks: L0 in [0..16], L1 in [16..32]
         let mut eqs = [0i8; 32];
@@ -2779,7 +2835,11 @@ impl<'a> SliceContext<'a> {
             let i = mf.trailing_zeros() as usize;
             let i4x4 = i & 15;
             // mb->mvs_s[i] = 0 (value pointed to when A/B/C/D are unavailable)
-            unsafe { *(self.mb() as *mut u8).add(176 + 4 * i).cast::<i32>() = 0 };
+            {
+                let m = self.mb_mut();
+                m.mvs[2 * i] = 0;
+                m.mvs[2 * i + 1] = 0;
+            }
             let absmvd_off = (i & 16) as isize * 2;
             let mvd = self.parse_mvd_pair(i4x4, absmvd_off);
 
@@ -2791,13 +2851,10 @@ impl<'a> SliceContext<'a> {
             };
             let mvs_base_off = (i & 16) as isize; // mvs_p = mb->mvs_s + (i & 16)
             let mvp = if (0xe9e9u16 >> eq) & 1 != 0 {
-                unsafe {
-                    let base = (self.mb() as *const u8).offset(176 + 4 * mvs_base_off);
-                    let mv_a = *(base.cast::<i32>().offset(self.mvs_a[i4x4] as isize));
-                    let mv_b = *(base.cast::<i32>().offset(self.mvs_b[i4x4] as isize));
-                    let mv_dc = *(base.cast::<i32>().offset(mvs_dc as isize));
-                    median_pair_i32(mv_a, mv_b, mv_dc)
-                }
+                let mv_a = self.read_mvs_s(mvs_base_off + self.mvs_a[i4x4] as isize);
+                let mv_b = self.read_mvs_s(mvs_base_off + self.mvs_b[i4x4] as isize);
+                let mv_dc = self.read_mvs_s(mvs_base_off + mvs_dc as isize);
+                median_pair_i32(mv_a, mv_b, mv_dc)
             } else {
                 let mvs_ab = if eq & 1 != 0 {
                     self.mvs_a[i4x4] as i32
@@ -2805,12 +2862,7 @@ impl<'a> SliceContext<'a> {
                     self.mvs_b[i4x4]
                 };
                 let off = if eq & 4 != 0 { mvs_dc } else { mvs_ab };
-                unsafe {
-                    *((self.mb() as *const u8)
-                        .offset(176 + 4 * mvs_base_off)
-                        .cast::<i32>()
-                        .offset(off as isize))
-                }
+                self.read_mvs_s(mvs_base_off + off as isize)
             };
 
             let type_ = ((mf >> (i & !3)) & 15) as usize;
@@ -2830,19 +2882,23 @@ impl<'a> SliceContext<'a> {
                 .unwrap();
             let p = pack_absmvd_bytes(mvd);
             let base = i8x8 * 8;
-            for (lane, &am) in abs_mask[..4].iter().enumerate() {
-                if am == -1 {
-                    m.absMvd[base + 2 * lane] = p[0] as u8;
-                    m.absMvd[base + 2 * lane + 1] = p[1] as u8;
-                }
-            }
+            // selectively write absMvd and mvs (mvs_mask = ziplo16(abs_mask))
             let mv = add_pair_i32(mvp, mvd);
             let mvx = pair_x(mv);
             let mvy = pair_y(mv);
             let mvs_mask = ziplo16_self(&abs_mask);
-            for (lane, &mm) in mvs_mask.iter().enumerate() {
-                if mm == -1 {
-                    m.mvs[base + lane] = if lane & 1 == 0 { mvx } else { mvy };
+            {
+                let m = self.mb_mut();
+                for (lane, &am) in abs_mask[..4].iter().enumerate() {
+                    if am == -1 {
+                        m.absMvd[base + 2 * lane] = p[0] as u8;
+                        m.absMvd[base + 2 * lane + 1] = p[1] as u8;
+                    }
+                }
+                for (lane, &mm) in mvs_mask.iter().enumerate() {
+                    if mm == -1 {
+                        m.mvs[base + lane] = if lane & 1 == 0 { mvx } else { mvy };
+                    }
                 }
             }
             // C: decode_inter(ctx, i, widths[type], heights[type])
@@ -2900,9 +2956,7 @@ impl<'a> SliceContext<'a> {
                 self.qp_c[1][qp_y as usize] as u8,
                 0,
             ];
-            unsafe {
-                (*self.mb()).QP = self.qp_s;
-            }
+            self.mb_mut().QP = self.qp_s;
         }
     }
 
@@ -2911,9 +2965,8 @@ impl<'a> SliceContext<'a> {
     /// `mb->Intra4x4PredMode` (negative ones reach into neighbour MBs).
     fn parse_intraNxN_pred_mode(&mut self, i4x4: usize) -> i32 {
         // C reads `*((int8_t *)mb->Intra4x4PredMode + off)` — signed!
-        let base = unsafe { (self.mb() as *const u8).offset(16) }; // Intra4x4PredMode @ 16
-        let a = unsafe { *base.offset(self.a4x4_int8[i4x4] as isize).cast::<i8>() } as i32;
-        let b = unsafe { *base.offset(self.b4x4_int8[i4x4] as isize).cast::<i8>() } as i32;
+        let a = self.nb_i8(16, self.a4x4_int8[i4x4] as isize);
+        let b = self.nb_i8(16, self.b4x4_int8[i4x4] as isize);
         let mut mode = (a.min(b)).abs();
         let flag = if !self.is_cabac {
             self.bits.get_u1() == 0
@@ -2945,30 +2998,26 @@ impl<'a> SliceContext<'a> {
                     mode += 1;
                     ctx_idx = 67;
                 }
-                unsafe {
-                    (*self.mb()).f.intra_chroma_pred_mode_non_zero = (mode > 0) as i8;
-                }
+                self.mb_mut().f.intra_chroma_pred_mode_non_zero = (mode > 0) as i8;
                 mode
             };
             // C decode_intraChroma(samples_mb[1], stride[1] >> 1, ...)
-            let off = self.plane_off(self.samples_mb[1] as *const u8);
+            let off = self.samples_mb[1];
             let stride = (self.stride[1] / 2) as usize;
             let variant = INTRA_CHROMA_MODES[mode as usize][self.unavail4x4[0] as usize & 3];
-            let buf = self.plane_slice();
-            intra_chroma(buf, off, stride, variant);
+            intra_chroma(&mut self.plane[..], off, stride, variant);
         }
     }
 
     /// C `parse_coded_block_pattern` (9.3.2.6 and 9.3.3.1.1.4). `map_me` is
     /// the CAVLC cbp->bits mapping table (`me_intra` or `me_inter`).
     fn parse_coded_block_pattern(&mut self, map_me: &[u8; 48]) {
-        let m = unsafe { &mut *self.mb() };
         let mut cbp: i32 = 0;
         if !self.is_cabac {
             cbp = map_me[self.bits.get_ue16(47) as usize] as i32;
-            m.bits[0] |= (cbp & 0xac) as u32;
+            self.mb_mut().bits[0] |= (cbp & 0xac) as u32;
         } else {
-            let mut bits = m.bits[0];
+            let mut bits = self.mb_ref().bits[0];
             bits |= self.cabac.get_ae(&mut self.bits, 76 - (bits & 3) as usize) << 5;
             bits |= self
                 .cabac
@@ -2982,7 +3031,7 @@ impl<'a> SliceContext<'a> {
                 .cabac
                 .get_ae(&mut self.bits, 76 - ((bits >> 2) & 3) as usize)
                 << 7;
-            m.bits[0] = bits;
+            self.mb_mut().bits[0] = bits;
         }
         // Chroma suffix
         let dc: i32 = if !self.is_cabac {
@@ -2994,8 +3043,7 @@ impl<'a> SliceContext<'a> {
             ) as i32
         };
         if (self.chroma_array_type == 1 || self.chroma_array_type == 2) && dc != 0 {
-            m.f.CodedBlockPatternChromaDC = 1;
-            m.f.CodedBlockPatternChromaAC = if !self.is_cabac {
+            let ac = if !self.is_cabac {
                 ((cbp >> 1) & 1) as i8
             } else {
                 self.cabac.get_ae(
@@ -3003,13 +3051,15 @@ impl<'a> SliceContext<'a> {
                     81 + self.inc.CodedBlockPatternChromaAC as usize,
                 ) as i8
             };
+            let m = self.mb_mut();
+            m.f.CodedBlockPatternChromaDC = 1;
+            m.f.CodedBlockPatternChromaAC = ac;
         }
     }
 
     /// C `parse_chroma_residual` — tail-called from the Intra residual paths.
     fn parse_chroma_residual(&mut self) {
-        let m = unsafe { &mut *self.mb() };
-        if m.f.CodedBlockPatternChromaDC != 0 {
+        if self.mb_ref().f.CodedBlockPatternChromaDC != 0 {
             if !self.is_cabac {
                 self.scan[..4].copy_from_slice(&[0, 4, 2, 6]);
                 self.parse_residual_block_2x2_cavlc();
@@ -3023,7 +3073,7 @@ impl<'a> SliceContext<'a> {
                     (self.ctx_idx_offsets[0] + self.inc.coded_block_flags_16x16[1] as i16) as usize,
                 ) != 0
                 {
-                    m.f.coded_block_flags_16x16[1] = 1;
+                    self.mb_mut().f.coded_block_flags_16x16[1] = 1;
                     self.scan[..4].copy_from_slice(&[0, 4, 2, 6]);
                     self.parse_residual_block_cabac(0, 3);
                 }
@@ -3032,46 +3082,44 @@ impl<'a> SliceContext<'a> {
                     (self.ctx_idx_offsets[0] + self.inc.coded_block_flags_16x16[2] as i16) as usize,
                 ) != 0
                 {
-                    m.f.coded_block_flags_16x16[2] = 1;
+                    self.mb_mut().f.coded_block_flags_16x16[2] = 1;
                     self.scan[..4].copy_from_slice(&[1, 5, 3, 7]);
                     self.parse_residual_block_cabac(0, 3);
                 }
             }
             // C transform_dc2x2(ctx)
             {
-                let m = unsafe { &mut *self.mb() };
+                let cur = &self.mb_buffer[self.mb_pos];
+                let off = self.samples_mb[1];
                 unsafe {
                     transform_dc2x2(
                         &mut self.c,
                         &self.ws4,
-                        m.mbIsInterFlag != 0,
+                        cur.mbIsInterFlag != 0,
                         &self.qp_s,
-                        m.f.CodedBlockPatternChromaAC != 0,
-                        self.samples_mb[1],
+                        cur.f.CodedBlockPatternChromaAC != 0,
+                        self.plane[off..].as_mut_ptr(),
                         self.stride[1] as usize,
                     );
                 }
             }
 
-            if m.f.CodedBlockPatternChromaAC != 0 {
+            if self.mb_ref().f.CodedBlockPatternChromaAC != 0 {
                 if self.is_cabac {
                     self.ctx_idx_offsets = CTX_IDX_CHROMA_AC[0];
                     self.coeff_abs_inc = [6, 7, 8, 9, 9, 0, 0, 0];
                 }
                 // C: ctx->scan_v[0] = scan_4x4[0]
                 self.scan[..16].copy_from_slice(&SCAN_4X4[0]);
-                let inter3 = (unsafe { (*self.mb()).mbIsInterFlag as usize }) * 3;
+                let inter3 = (self.mb_ref().mbIsInterFlag as usize) * 3;
                 for i4x4 in 0..8 {
                     let iycbcr = 1 + (i4x4 >> 2);
                     // C: samples_mb[iYCbCr] + y420[i4x4] * stride[1] + x420[i4x4]
-                    let pix = unsafe {
-                        self.samples_mb[iycbcr].add(
-                            Y420[i4x4] as usize * self.stride[1] as usize + X420[i4x4] as usize,
-                        )
-                    };
-                    let base = unsafe { (self.mb() as *const u8).offset(32 + 16) }; // nC + 16
-                    let n_a = unsafe { *base.offset(self.acbcr_int8[i4x4] as isize) } as i32;
-                    let n_b = unsafe { *base.offset(self.bcbcr_int8[i4x4] as isize) } as i32;
+                    let off = self.samples_mb[iycbcr]
+                        + Y420[i4x4] as usize * self.stride[1] as usize
+                        + X420[i4x4] as usize;
+                    let n_a = self.nb_i8(48, self.acbcr_int8[i4x4] as isize); // nC + 16
+                    let n_b = self.nb_i8(48, self.bcbcr_int8[i4x4] as isize);
                     if !self.is_cabac {
                         if self.parse_residual_block_4x4_cavlc(1, 16 + i4x4 as i32, n_a, n_b) {
                             // C add_idct4x4(ctx, iYCbCr, i4x4, samples)
@@ -3081,13 +3129,13 @@ impl<'a> SliceContext<'a> {
                                     self.qp_s[iycbcr],
                                     &self.ws4[iycbcr + inter3],
                                     i4x4 as i32,
-                                    pix,
+                                    self.plane[off..].as_mut_ptr(),
                                     self.stride[1] as usize,
                                 );
                             }
                         } else {
                             unsafe {
-                                add_dc4x4(&self.c, i4x4 as i32, pix, self.stride[1] as usize)
+                                add_dc4x4(&self.c, i4x4 as i32, self.plane[off..].as_mut_ptr(), self.stride[1] as usize)
                             };
                         }
                     } else if self.cabac.get_ae(
@@ -3098,9 +3146,7 @@ impl<'a> SliceContext<'a> {
                             + n_b as i16 * 2) as usize,
                     ) != 0
                     {
-                        unsafe {
-                            (*self.mb()).nC[16 + i4x4] = 1;
-                        }
+                        self.mb_mut().nC[16 + i4x4] = 1;
                         self.parse_residual_block_cabac(1, 15);
                         unsafe {
                             add_idct4x4(
@@ -3108,12 +3154,12 @@ impl<'a> SliceContext<'a> {
                                 self.qp_s[iycbcr],
                                 &self.ws4[iycbcr + inter3],
                                 i4x4 as i32,
-                                pix,
+                                self.plane[off..].as_mut_ptr(),
                                 self.stride[1] as usize,
                             );
                         }
                     } else {
-                        unsafe { add_dc4x4(&self.c, i4x4 as i32, pix, self.stride[1] as usize) };
+                        unsafe { add_dc4x4(&self.c, i4x4 as i32, self.plane[off..].as_mut_ptr(), self.stride[1] as usize) };
                     }
                 }
             }
@@ -3126,32 +3172,31 @@ impl<'a> SliceContext<'a> {
 
     /// C `parse_Intra16x16_residual` — tail-called from `parse_I_mb`.
     fn parse_Intra16x16_residual(&mut self) {
-        let m = unsafe { &mut *self.mb() };
         self.parse_mb_qp_delta();
         self.scan[..16].copy_from_slice(&SCAN_4X4[0]);
-        let inter3 = (m.mbIsInterFlag as usize) * 3;
+        let inter3 = (self.mb_ref().mbIsInterFlag as usize) * 3;
         for iycbcr in 0..3 {
             // DC block (parsed to c[0..15], then "transformed" to c[16..31])
             if !self.is_cabac {
-                let a = unsafe { &*self.mb_a };
-                let b = unsafe { &*self.mb_b };
+                let a = self.nb_mb(self.nb_a).nC;
+                let b = self.nb_mb(self.nb_b).nC;
                 if self.parse_residual_block_4x4_cavlc(
                     0,
                     0,
-                    a.nC[iycbcr * 16 + 5] as i32,
-                    b.nC[iycbcr * 16 + 10] as i32,
+                    a[iycbcr * 16 + 5] as i32,
+                    b[iycbcr * 16 + 10] as i32,
                 ) {
-                    unsafe {
-                        (*self.mb()).nC[0] = 0;
-                    }
+                    self.mb_mut().nC[0] = 0;
                     // C transform_dc4x4(ctx, iYCbCr)
+                    let off = self.samples_mb[iycbcr];
+                    let bits5 = self.mb_ref().bits[0] & (1 << 5) != 0;
                     unsafe {
                         transform_dc4x4(
                             &mut self.c,
                             &self.ws4[iycbcr],
                             self.qp_s[0],
-                            m.bits[0] & (1 << 5) != 0,
-                            self.samples_mb[iycbcr],
+                            bits5,
+                            self.plane[off..].as_mut_ptr(),
                             self.stride[iycbcr.min(1)] as usize,
                         );
                     }
@@ -3164,17 +3209,19 @@ impl<'a> SliceContext<'a> {
                         as usize,
                 ) != 0
                 {
-                    m.f.coded_block_flags_16x16[iycbcr] = 1;
+                    self.mb_mut().f.coded_block_flags_16x16[iycbcr] = 1;
                     self.coeff_abs_inc = [6, 7, 8, 9, 9, 0, 0, 0];
                     self.parse_residual_block_cabac(0, 15);
                     // C transform_dc4x4(ctx, iYCbCr)
+                    let off = self.samples_mb[iycbcr];
+                    let bits5 = self.mb_ref().bits[0] & (1 << 5) != 0;
                     unsafe {
                         transform_dc4x4(
                             &mut self.c,
                             &self.ws4[iycbcr],
                             self.qp_s[0],
-                            m.bits[0] & (1 << 5) != 0,
-                            self.samples_mb[iycbcr],
+                            bits5,
+                            self.plane[off..].as_mut_ptr(),
                             self.stride[iycbcr.min(1)] as usize,
                         );
                     }
@@ -3182,7 +3229,7 @@ impl<'a> SliceContext<'a> {
             }
 
             // All AC blocks pick a DC coeff, then go to c[1..15]
-            if m.bits[0] & (1 << 5) != 0 {
+            if self.mb_ref().bits[0] & (1 << 5) != 0 {
                 if self.is_cabac {
                     self.ctx_idx_offsets = CTX_IDX_16X16_AC[iycbcr][0];
                     self.coeff_abs_inc = [6, 7, 8, 9, 9, 0, 0, 0];
@@ -3190,13 +3237,11 @@ impl<'a> SliceContext<'a> {
                 let stride = self.stride[iycbcr.min(1)] as usize;
                 for i4x4 in 0..16 {
                     // C: samples_mb[iYCbCr] + y444[i4x4] * stride[iYCbCr] + x444[i4x4]
-                    let pix = unsafe {
-                        self.samples_mb[iycbcr]
-                            .add(Y444[i4x4] as usize * stride + X444[i4x4] as usize)
-                    };
-                    let base = unsafe { (self.mb() as *const u8).add(32 + iycbcr * 16) };
-                    let n_a = unsafe { *base.offset(self.a4x4_int8[i4x4] as isize) } as i32;
-                    let n_b = unsafe { *base.offset(self.b4x4_int8[i4x4] as isize) } as i32;
+                    let off = self.samples_mb[iycbcr]
+                        + Y444[i4x4] as usize * stride
+                        + X444[i4x4] as usize;
+                    let n_a = self.nb_i8(32 + iycbcr * 16, self.a4x4_int8[i4x4] as isize);
+                    let n_b = self.nb_i8(32 + iycbcr * 16, self.b4x4_int8[i4x4] as isize);
                     if !self.is_cabac {
                         if self.parse_residual_block_4x4_cavlc(
                             1,
@@ -3211,12 +3256,12 @@ impl<'a> SliceContext<'a> {
                                     self.qp_s[iycbcr],
                                     &self.ws4[iycbcr + inter3],
                                     i4x4 as i32,
-                                    pix,
+                                    self.plane[off..].as_mut_ptr(),
                                     stride,
                                 );
                             }
                         } else {
-                            unsafe { add_dc4x4(&self.c, i4x4 as i32, pix, stride) };
+                            unsafe { add_dc4x4(&self.c, i4x4 as i32, self.plane[off..].as_mut_ptr(), stride) };
                         }
                     } else if self.cabac.get_ae(
                         &mut self.bits,
@@ -3226,9 +3271,7 @@ impl<'a> SliceContext<'a> {
                             + n_b as i16 * 2) as usize,
                     ) != 0
                     {
-                        unsafe {
-                            (*self.mb()).nC[iycbcr * 16 + i4x4] = 1;
-                        }
+                        self.mb_mut().nC[iycbcr * 16 + i4x4] = 1;
                         self.parse_residual_block_cabac(1, 15);
                         unsafe {
                             add_idct4x4(
@@ -3236,12 +3279,12 @@ impl<'a> SliceContext<'a> {
                                 self.qp_s[iycbcr],
                                 &self.ws4[iycbcr + inter3],
                                 i4x4 as i32,
-                                pix,
+                                self.plane[off..].as_mut_ptr(),
                                 stride,
                             );
                         }
                     } else {
-                        unsafe { add_dc4x4(&self.c, i4x4 as i32, pix, stride) };
+                        unsafe { add_dc4x4(&self.c, i4x4 as i32, self.plane[off..].as_mut_ptr(), stride) };
                     }
                 }
             }
@@ -3260,44 +3303,40 @@ impl<'a> SliceContext<'a> {
 
     /// C `parse_NxN_residual` — Intra_4x4 and Inter sub-MB residual blocks.
     fn parse_NxN_residual(&mut self) {
-        let m = unsafe { &mut *self.mb() };
-        if m.f.CodedBlockPatternChromaDC != 0 || (m.bits[0] & 0xac) != 0 {
+        if self.mb_ref().f.CodedBlockPatternChromaDC != 0
+            || (self.mb_ref().bits[0] & 0xac) != 0
+        {
             self.parse_mb_qp_delta();
         } else if self.is_cabac {
             self.mb_qp_delta_nz = 0;
         }
 
         for iycbcr in 0..3 {
-            if m.f.transform_size_8x8_flag == 0 {
+            if self.mb_ref().f.transform_size_8x8_flag == 0 {
                 // 4x4 blocks
                 if self.is_cabac {
                     self.ctx_idx_offsets = CTX_IDX_4X4[iycbcr][0];
                     self.coeff_abs_inc = [6, 7, 8, 9, 9, 0, 0, 0];
                 }
                 self.scan[..16].copy_from_slice(&SCAN_4X4[0]);
-                let inter3 = (m.mbIsInterFlag as usize) * 3;
+                let inter3 = (self.mb_ref().mbIsInterFlag as usize) * 3;
                 let stride = self.stride[iycbcr.min(1)] as usize;
                 for i4x4 in 0..16 {
                     // C decode_intra4x4(samples, stride, Intra4x4Modes[mode][unavail])
-                    if m.mbIsInterFlag == 0 {
-                        let p = unsafe {
-                            (self.samples_mb[iycbcr] as *const u8)
-                                .add(Y444[i4x4] as usize * stride + X444[i4x4] as usize)
-                        };
-                        let off = self.plane_off(p);
-                        let variant = INTRA4X4_MODES[m.Intra4x4PredMode[i4x4] as usize]
-                            [self.unavail4x4[i4x4] as usize];
-                        let buf = self.plane_slice();
-                        intra4x4(buf, off, stride, variant);
+                    if self.mb_ref().mbIsInterFlag == 0 {
+                        let off = self.samples_mb[iycbcr]
+                            + Y444[i4x4] as usize * stride
+                            + X444[i4x4] as usize;
+                        let mode = self.mb_ref().Intra4x4PredMode[i4x4] as usize;
+                        let variant = INTRA4X4_MODES[mode][self.unavail4x4[i4x4] as usize];
+                        intra4x4(&mut self.plane[..], off, stride, variant);
                     }
-                    if m.bits[0] & (1 << BIT_8X8[i4x4 >> 2] as usize) != 0 {
-                        let pix = unsafe {
-                            self.samples_mb[iycbcr]
-                                .add(Y444[i4x4] as usize * stride + X444[i4x4] as usize)
-                        };
-                        let base = unsafe { (self.mb() as *const u8).add(32 + iycbcr * 16) };
-                        let n_a = unsafe { *base.offset(self.a4x4_int8[i4x4] as isize) } as i32;
-                        let n_b = unsafe { *base.offset(self.b4x4_int8[i4x4] as isize) } as i32;
+                    if self.mb_ref().bits[0] & (1 << BIT_8X8[i4x4 >> 2] as usize) != 0 {
+                        let off = self.samples_mb[iycbcr]
+                            + Y444[i4x4] as usize * stride
+                            + X444[i4x4] as usize;
+                        let n_a = self.nb_i8(32 + iycbcr * 16, self.a4x4_int8[i4x4] as isize);
+                        let n_b = self.nb_i8(32 + iycbcr * 16, self.b4x4_int8[i4x4] as isize);
                         if !self.is_cabac {
                             // C: parsed ? add_idct4x4(ctx, iYCbCr, -1, samples) : nothing
                             if self.parse_residual_block_4x4_cavlc(
@@ -3312,7 +3351,7 @@ impl<'a> SliceContext<'a> {
                                         self.qp_s[iycbcr],
                                         &self.ws4[iycbcr + inter3],
                                         -1,
-                                        pix,
+                                        self.plane[off..].as_mut_ptr(),
                                         stride,
                                     );
                                 }
@@ -3325,9 +3364,7 @@ impl<'a> SliceContext<'a> {
                                 + n_b as i16 * 2) as usize,
                         ) != 0
                         {
-                            unsafe {
-                                (*self.mb()).nC[iycbcr * 16 + i4x4] = 1;
-                            }
+                            self.mb_mut().nC[iycbcr * 16 + i4x4] = 1;
                             self.parse_residual_block_cabac(0, 15);
                             unsafe {
                                 add_idct4x4(
@@ -3335,7 +3372,7 @@ impl<'a> SliceContext<'a> {
                                     self.qp_s[iycbcr],
                                     &self.ws4[iycbcr + inter3],
                                     -1,
-                                    pix,
+                                    self.plane[off..].as_mut_ptr(),
                                     stride,
                                 );
                             }
@@ -3357,35 +3394,31 @@ impl<'a> SliceContext<'a> {
                 }
                 for i8x8 in 0..4 {
                     // C decode_intra8x8(samples, stride, Intra8x8Modes[mode][unavail])
-                    if m.mbIsInterFlag == 0 {
-                        let p = unsafe {
-                            (self.samples_mb[iycbcr] as *const u8)
-                                .add(Y444[i8x8 * 4] as usize * stride + X444[i8x8 * 4] as usize)
-                        };
-                        let off = self.plane_off(p);
-                        let variant = INTRA8X8_MODES[m.Intra4x4PredMode[i8x8 * 4] as usize]
-                            [self.unavail4x4[i8x8 * 5] as usize];
-                        let buf = self.plane_slice();
-                        intra8x8(buf, off, stride, variant);
+                    if self.mb_ref().mbIsInterFlag == 0 {
+                        let off = self.samples_mb[iycbcr]
+                            + Y444[i8x8 * 4] as usize * stride
+                            + X444[i8x8 * 4] as usize;
+                        let mode = self.mb_ref().Intra4x4PredMode[i8x8 * 4] as usize;
+                        let variant = INTRA8X8_MODES[mode][self.unavail4x4[i8x8 * 5] as usize];
+                        intra8x8(&mut self.plane[..], off, stride, variant);
                     }
-                    if m.bits[0] & (1 << BIT_8X8[i8x8] as usize) != 0 {
-                        let pix = unsafe {
-                            self.samples_mb[iycbcr]
-                                .add(Y444[i8x8 * 4] as usize * stride + X444[i8x8 * 4] as usize)
-                        };
+                    if self.mb_ref().bits[0] & (1 << BIT_8X8[i8x8] as usize) != 0 {
+                        let off = self.samples_mb[iycbcr]
+                            + Y444[i8x8 * 4] as usize * stride
+                            + X444[i8x8 * 4] as usize;
                         if !self.is_cabac {
                             for i4x4 in 0..4 {
                                 self.scan[..16].copy_from_slice(
                                     &SCAN_8X8_CAVLC[0][i4x4 * 16..(i4x4 + 1) * 16],
                                 );
-                                let base =
-                                    unsafe { (self.mb() as *const u8).add(32 + iycbcr * 16) };
-                                let n_a = unsafe {
-                                    *base.offset(self.a4x4_int8[i8x8 * 4 + i4x4] as isize)
-                                } as i32;
-                                let n_b = unsafe {
-                                    *base.offset(self.b4x4_int8[i8x8 * 4 + i4x4] as isize)
-                                } as i32;
+                                let n_a = self.nb_i8(
+                                    32 + iycbcr * 16,
+                                    self.a4x4_int8[i8x8 * 4 + i4x4] as isize,
+                                );
+                                let n_b = self.nb_i8(
+                                    32 + iycbcr * 16,
+                                    self.b4x4_int8[i8x8 * 4 + i4x4] as isize,
+                                );
                                 self.parse_residual_block_4x4_cavlc(
                                     0,
                                     (iycbcr * 16 + i8x8 * 4 + i4x4) as i32,
@@ -3398,8 +3431,8 @@ impl<'a> SliceContext<'a> {
                                 add_idct8x8(
                                     &mut self.c,
                                     self.qp_s[iycbcr],
-                                    &self.ws8[iycbcr * 2 + (m.mbIsInterFlag as usize)],
-                                    pix,
+                                    &self.ws8[iycbcr * 2 + (self.mb_buffer[self.mb_pos].mbIsInterFlag as usize)],
+                                    self.plane[off..].as_mut_ptr(),
                                     stride,
                                 );
                             }
@@ -3407,16 +3440,15 @@ impl<'a> SliceContext<'a> {
                             || self.cabac.get_ae(
                                 &mut self.bits,
                                 (self.ctx_idx_offsets[0]
-                                    + ((m.bits[1] >> INC_8X8[iycbcr * 4 + i8x8] as usize) & 3)
-                                        as i16) as usize,
+                                    + ((self.mb_buffer[self.mb_pos].bits[1]
+                                        >> INC_8X8[iycbcr * 4 + i8x8] as usize)
+                                        & 3) as i16) as usize,
                             ) != 0
                         {
-                            m.bits[1] |= 1 << BIT_8X8[iycbcr * 4 + i8x8] as usize;
+                            self.mb_mut().bits[1] |= 1 << BIT_8X8[iycbcr * 4 + i8x8] as usize;
                             // C `mb->nC_s[iYCbCr * 4 + i8x8] = 0x01010101`
                             for j in 0..4 {
-                                unsafe {
-                                    (*self.mb()).nC[iycbcr * 16 + i8x8 * 4 + j] = 1;
-                                }
+                                self.mb_mut().nC[iycbcr * 16 + i8x8 * 4 + j] = 1;
                             }
                             self.parse_residual_block_8x8_cabac(0, 63);
                             // C add_idct8x8(ctx, iYCbCr, samples)
@@ -3424,8 +3456,8 @@ impl<'a> SliceContext<'a> {
                                 add_idct8x8(
                                     &mut self.c,
                                     self.qp_s[iycbcr],
-                                    &self.ws8[iycbcr * 2 + (m.mbIsInterFlag as usize)],
-                                    pix,
+                                    &self.ws8[iycbcr * 2 + (self.mb_buffer[self.mb_pos].mbIsInterFlag as usize)],
+                                    self.plane[off..].as_mut_ptr(),
                                     stride,
                                 );
                             }
@@ -3451,10 +3483,9 @@ impl<'a> SliceContext<'a> {
             42, 38, 138, 134, 34, 10, 6, 130, 46, 170, 166, 142, 33, 9, 5, 129, 41, 37, 137, 133,
             45, 169, 165, 141, 13, 161, 14, 162,
         ];
-        let m = unsafe { &mut *self.mb() };
         self.parse_coded_block_pattern(&ME_INTER);
-        if (m.bits[0] & 0xac) != 0 && self.transform_8x8_mode_flag != 0 {
-            m.f.transform_size_8x8_flag = if !self.is_cabac {
+        if (self.mb_ref().bits[0] & 0xac) != 0 && self.transform_8x8_mode_flag != 0 {
+            let v = if !self.is_cabac {
                 self.bits.get_u1() as i8
             } else {
                 self.cabac.get_ae(
@@ -3462,6 +3493,7 @@ impl<'a> SliceContext<'a> {
                     399 + self.inc.transform_size_8x8_flag as usize,
                 ) as i8
             };
+            self.mb_mut().f.transform_size_8x8_flag = v;
         }
         if self.is_cabac {
             self.nc_inc = [[0; 16]; 3];
@@ -3478,13 +3510,12 @@ impl<'a> SliceContext<'a> {
             136, 132, 41, 37, 137, 133, 42, 38, 138, 134, 32, 8, 4, 128, 33, 9, 5, 129, 12, 160,
             13, 161, 2, 34, 10, 6, 130, 14, 162,
         ];
-        let m = unsafe { &mut *self.mb() };
 
         // Intra-specific initialisations
         if self.is_cabac {
             self.nc_inc = [[0; 16]; 3];
             if self.unavail4x4[0] & 1 != 0 {
-                m.bits[1] |= 0x111111;
+                self.mb_buffer[self.mb_pos].bits[1] |= 0x111111;
                 const INC0: [i8; 16] = [1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0];
                 const INC1: [i8; 16] = [1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
                 for i in 0..16 {
@@ -3497,7 +3528,7 @@ impl<'a> SliceContext<'a> {
                 }
             }
             if self.unavail4x4[0] & 2 != 0 {
-                m.bits[1] |= 0x424242;
+                self.mb_buffer[self.mb_pos].bits[1] |= 0x424242;
                 const INC: [i8; 8] = [2, 2, 0, 0, 2, 2, 0, 0];
                 for (i, inc) in INC.iter().enumerate() {
                     self.nc_inc[0][i] += *inc;
@@ -3509,12 +3540,15 @@ impl<'a> SliceContext<'a> {
                 }
             }
         }
-        m.mbIsInterFlag = 0;
-        m.f.inter_eqs = 0x1b5fbbff_u32.to_le_bytes();
-        m.refIdx = [-1; 8];
-        m.refPic = [-1; 8];
-        for i in 0..64 {
-            m.mvs[i] = 0;
+        {
+            let m = self.mb_mut();
+            m.mbIsInterFlag = 0;
+            m.f.inter_eqs = 0x1b5fbbff_u32.to_le_bytes();
+            m.refIdx = [-1; 8];
+            m.refPic = [-1; 8];
+            for i in 0..64 {
+                m.mvs[i] = 0;
+            }
         }
 
         // I_NxN
@@ -3527,7 +3561,7 @@ impl<'a> SliceContext<'a> {
         };
         if is_nxn {
             if self.is_cabac {
-                m.f.mb_type_I_NxN = 1;
+                self.mb_mut().f.mb_type_I_NxN = 1;
             }
             let ts88: i32 = if self.pps_transform_8x8_mode_flag != 0 {
                 if !self.is_cabac {
@@ -3541,19 +3575,20 @@ impl<'a> SliceContext<'a> {
             } else {
                 0
             };
-            m.Intra4x4PredMode = [-2; 16];
+            self.mb_mut().Intra4x4PredMode = [-2; 16];
             if ts88 != 0 {
-                m.f.transform_size_8x8_flag = ts88 as i8;
+                self.mb_mut().f.transform_size_8x8_flag = ts88 as i8;
                 // C stores mode * 0x01010101 per 4x4 group (i32)
                 for i in 0..4 {
                     let mode = self.parse_intraNxN_pred_mode(i * 4);
                     for j in 0..4 {
-                        m.Intra4x4PredMode[i * 4 + j] = mode as i8;
+                        self.mb_mut().Intra4x4PredMode[i * 4 + j] = mode as i8;
                     }
                 }
             } else {
                 for i in 0..16 {
-                    m.Intra4x4PredMode[i] = self.parse_intraNxN_pred_mode(i) as i8;
+                    let mode = self.parse_intraNxN_pred_mode(i);
+                    self.mb_mut().Intra4x4PredMode[i] = mode as i8;
                 }
             }
             self.parse_intra_chroma_pred_mode();
@@ -3570,15 +3605,16 @@ impl<'a> SliceContext<'a> {
                 let mode: i32 = if !self.is_cabac {
                     let mut mt = mb_type_or_ctxIdx - 1;
                     // zeroes ref_idx_nz as byproduct
-                    m.bits[0] = if mt > 11 { 0xac } else { 0 };
+                    self.mb_mut().bits[0] = if mt > 11 { 0xac } else { 0 };
                     mt = if mt > 11 { mt - 12 } else { mt };
+                    let m = self.mb_mut();
                     m.f.CodedBlockPatternChromaDC = (mt > 3) as i8;
                     m.f.CodedBlockPatternChromaAC = (mt >> 3) as i8;
                     mt & 3
                 } else {
                     let mut ctx_idx = mb_type_or_ctxIdx.max(5);
                     // zeroes ref_idx_nz as byproduct
-                    m.bits[0] = if self.cabac.get_ae(&mut self.bits, (ctx_idx + 1) as usize) != 0 {
+                    self.mb_mut().bits[0] = if self.cabac.get_ae(&mut self.bits, (ctx_idx + 1) as usize) != 0 {
                         0xac
                     } else {
                         0
@@ -3586,9 +3622,11 @@ impl<'a> SliceContext<'a> {
                     let cbp_dc = self.cabac.get_ae(&mut self.bits, (ctx_idx + 2) as usize);
                     ctx_idx = ctx_idx.max(6);
                     if cbp_dc != 0 {
-                        m.f.CodedBlockPatternChromaDC = 1;
-                        m.f.CodedBlockPatternChromaAC =
+                        let ac =
                             self.cabac.get_ae(&mut self.bits, (ctx_idx + 2) as usize) as i8;
+                        let m = self.mb_mut();
+                        m.f.CodedBlockPatternChromaDC = 1;
+                        m.f.CodedBlockPatternChromaAC = ac;
                     }
                     (self.cabac.get_ae(&mut self.bits, (ctx_idx + 3) as usize) << 1) as i32
                         + self
@@ -3596,14 +3634,13 @@ impl<'a> SliceContext<'a> {
                             .get_ae(&mut self.bits, (ctx_idx + 3).max(10) as usize)
                             as i32
                 };
-                m.Intra4x4PredMode = [2; 16];
+                self.mb_mut().Intra4x4PredMode = [2; 16];
                 // C decode_intra16x16(samples_mb[0], stride[0], ...)
                 {
-                    let off = self.plane_off(self.samples_mb[0] as *const u8);
+                    let off = self.samples_mb[0];
                     let stride = self.stride[0] as usize;
                     let variant = INTRA16X16_MODES[mode as usize][self.unavail4x4[0] as usize & 3];
-                    let buf = self.plane_slice();
-                    intra16x16(buf, off, stride, variant);
+                    intra16x16(&mut self.plane[..], off, stride, variant);
                 }
                 self.parse_intra_chroma_pred_mode();
                 self.parse_Intra16x16_residual();
@@ -3617,16 +3654,19 @@ impl<'a> SliceContext<'a> {
                 }
                 self.mb_qp_delta_nz = 0;
                 // C `mb->f.v |= flags_twice.v` (ChromaDC, ChromaAC, cbf_16x16)
+                let qp0 = self.qp_c[0][0] as u8;
+                let qp1 = self.qp_c[1][0] as u8;
+                let pcm_val: i8 = if !self.is_cabac { 16 } else { 1 };
+                let m = self.mb_mut();
                 m.f.CodedBlockPatternChromaDC |= 1;
                 m.f.CodedBlockPatternChromaAC |= 1;
                 for i in 0..3 {
                     m.f.coded_block_flags_16x16[i] |= 1;
                 }
                 // only mb->QP_s here (C does not touch ctx->t.QP_s for PCM)
-                m.QP = [0, self.qp_c[0][0] as u8, self.qp_c[1][0] as u8, 0];
+                m.QP = [0, qp0, qp1, 0];
                 m.bits[0] = 0xac;
                 m.bits[1] = 0xacacac;
-                let pcm_val: i8 = if !self.is_cabac { 16 } else { 1 };
                 for i in 0..48 {
                     m.nC[i] = pcm_val;
                 }
@@ -3637,27 +3677,26 @@ impl<'a> SliceContext<'a> {
                 let mut y: i32 = 16;
                 for iycbcr in 0..3 {
                     let bd = self.bit_depth[iycbcr];
-                    let mut p = self.samples_mb[iycbcr];
+                    let mut off = self.samples_mb[iycbcr];
                     for _ in 0..y {
                         if bd == 8 {
-                            unsafe {
-                                *(p.cast::<u32>()) = (self.bits.get_uv(32) as u32).to_be();
-                                *p.add(4).cast::<u32>() = (self.bits.get_uv(32) as u32).to_be();
-                                if mb_width == 16 {
-                                    *p.add(8).cast::<u32>() = (self.bits.get_uv(32) as u32).to_be();
-                                    *p.add(12).cast::<u32>() =
-                                        (self.bits.get_uv(32) as u32).to_be();
+                            for chunk in 0..4u32 {
+                                if mb_width != 16 && chunk >= 2 {
+                                    break;
                                 }
+                                let v = (self.bits.get_uv(32) as u32).to_be().to_ne_bytes();
+                                self.plane[off + (chunk * 4) as usize..off + (chunk * 4 + 4) as usize]
+                                    .copy_from_slice(&v);
                             }
                         } else {
                             for x in 0..mb_width {
-                                unsafe {
-                                    *p.cast::<u16>().add(x as usize) =
-                                        self.bits.get_uv(bd as usize) as u16;
-                                }
+                                let v = self.bits.get_uv(bd as usize) as u16;
+                                let b = v.to_be_bytes();
+                                self.plane[off + 2 * x as usize] = b[0];
+                                self.plane[off + 2 * x as usize + 1] = b[1];
                             }
                         }
-                        p = unsafe { p.add(self.stride[iycbcr.min(1)] as usize) };
+                        off += self.stride[iycbcr.min(1)] as usize;
                     }
                     mb_width = if self.chroma_array_type < 3 { 8 } else { 16 };
                     y = [0, 8, 16, 16][self.chroma_array_type as usize];
@@ -3701,22 +3740,21 @@ impl<'a> SliceContext<'a> {
             [14, 14, 0, 4, 14, 14, 0, 4, 0, 0, 0, 4, 0, 4, 0, 4],
             [15, 14, 9, 4, 14, 14, 0, 4, 9, 0, 9, 4, 0, 4, 0, 4],
         ];
-        const UNAVAIL: *const RustMb = &UNAVAIL_MB as *const RustMb;
         let width = self.pic_width_in_mbs as i32;
+        let w = width as usize;
         let smb = std::mem::size_of::<RustMb>() as i32; // 304
         let mut end_of_slice_flag = false;
 
         loop {
-            let mbp = self.mb();
-
             // update flip_bit atomically to signal mb is a priori decoded,
             // otherwise end the slice
-            let prev_recovery_bits = unsafe { (*mbp).recovery_bits };
-            unsafe {
-                (*mbp).recovery_bits = self.frame_flip_bit;
-            }
-            if prev_recovery_bits == self.frame_flip_bit {
-                return;
+            {
+                let ffb = self.frame_flip_bit;
+                let prev_recovery_bits = self.mb_buffer[self.mb_pos].recovery_bits;
+                self.mb_buffer[self.mb_pos].recovery_bits = ffb;
+                if prev_recovery_bits == ffb {
+                    return;
+                }
             }
 
             // set and reset neighbouring pointers depending on their
@@ -3727,11 +3765,16 @@ impl<'a> SliceContext<'a> {
                 | ((((self.mbx as i32) == (width - 1)) as i32) << 2)
                 | (if self.mby == 0 { 14 } else { 0 });
             let mut filter_edges: i32 = 4 | 3 & !unavail16x16;
-            let mut mb_a = unsafe { mbp.offset(-1) };
-            let mut mb_b = unsafe { mb_a.offset(-width as isize) };
-            let mut mb_c = unsafe { mb_b.offset(1) };
-            let mut mb_d = unsafe { mb_b.offset(-1) };
             let decoded = self.curr_mb_addr - self.first_mb_in_slice as i32;
+            // Neighbour availability mirrors C's pointer overrides in the
+            // slice's first row(s): A from the 2nd MB, B/C from column `width`,
+            // D from `width+1`. All other edge unavailability is carried by the
+            // `unavail4x4` bitmap below — the index then points at a valid dummy
+            // column that the bitmap marks unavailable, so it is never consumed.
+            let a_unavail = decoded == 0;
+            let b_unavail = decoded < width;
+            let c_unavail = decoded < width;
+            let d_unavail = decoded <= width;
             if decoded <= width + 1 {
                 if decoded == 1 {
                     // A becomes available
@@ -3759,7 +3802,6 @@ impl<'a> SliceContext<'a> {
                     }
                 } else if decoded == 0 {
                     // A is unavailable
-                    mb_a = UNAVAIL as *mut RustMb;
                     unavail16x16 |= 1;
                     filter_edges &= !(self.disable_deblocking_filter_idc as i32 >> 1); // impacts only bit 0
                 }
@@ -3769,7 +3811,6 @@ impl<'a> SliceContext<'a> {
                     self.mvs_d[0] = 15 - offD_int32;
                 } else {
                     // D is unavailable
-                    mb_d = UNAVAIL as *mut RustMb;
                     unavail16x16 |= 8;
                     if decoded == width {
                         // B becomes available
@@ -3801,7 +3842,6 @@ impl<'a> SliceContext<'a> {
                         }
                     } else {
                         // B is unavailable
-                        mb_b = UNAVAIL as *mut RustMb;
                         unavail16x16 |= 2;
                         filter_edges &= !(self.disable_deblocking_filter_idc as i32); // impacts only bit 1
                         if decoded == width - 1 {
@@ -3810,36 +3850,33 @@ impl<'a> SliceContext<'a> {
                             // does not exist — keep the pointer valid (the
                             // unavail bitmap marks C unavailable here, so its
                             // data is never consumed).
-                            mb_c = UNAVAIL as *mut RustMb;
                             let offC_int32 = (width * smb) >> 2;
                             self.mvs_c[5] = 10 - offC_int32;
                         } else {
                             // C is unavailable
-                            mb_c = UNAVAIL as *mut RustMb;
                             unavail16x16 |= 4;
                         }
                     }
                 }
             }
-            self.mb_a = mb_a as *const RustMb;
-            self.mb_b = mb_b as *const RustMb;
-            self.mb_c = mb_c as *const RustMb;
-            self.mb_d = mb_d as *const RustMb;
+            self.nb_a = if a_unavail { None } else { Some(self.mb_pos - 1) };
+            self.nb_b = if b_unavail { None } else { Some(self.mb_pos - (w + 1)) };
+            self.nb_c = if c_unavail { None } else { Some(self.mb_pos - w) };
+            self.nb_d = if d_unavail { None } else { Some(self.mb_pos - (w + 2)) };
 
             // initialize common macroblock values
-            let a_mb = unsafe { *mb_a };
-            let b_mb = unsafe { *mb_b };
+            let a_mb = *self.nb_mb(self.nb_a);
+            let b_mb = *self.nb_mb(self.nb_b);
             let unavail_row = BLOCK_UNAVAILABILITY[unavail16x16 as usize];
             self.unavail4x4[..16].copy_from_slice(&unavail_row);
             self.inc = flags_inc(a_mb.f, b_mb.f);
-            unsafe {
-                (*mbp).f = RustMbFlags::default();
-                (*mbp).filter_edges = if self.disable_deblocking_filter_idc != 1 {
-                    filter_edges as i8
-                } else {
-                    0
-                };
-                (*mbp).QP = self.qp_s;
+            {
+                let ddf = self.disable_deblocking_filter_idc;
+                let qp_s = self.qp_s;
+                let m = self.mb_mut();
+                m.f = RustMbFlags::default();
+                m.filter_edges = if ddf != 1 { filter_edges as i8 } else { 0 };
+                m.QP = qp_s;
             }
             if self.chroma_array_type == 1 {
                 // FIXME 4:2:2 — _mm_shuffle_epi8 semantics: negative mask -> 0
@@ -3852,12 +3889,14 @@ impl<'a> SliceContext<'a> {
                 let b_bits = ((b_mb.bits[1] as u64) << 32) | b_mb.bits[0] as u64;
                 let bits_l = ((a_bits >> 3) & 0x0011_1111_0011_1111)
                     | ((b_bits >> 1) & 0x0042_4242_0042_4242);
-                unsafe {
-                    (*mbp).bits = [bits_l as u32, (bits_l >> 32) as u32];
+                {
+                    let m = self.mb_mut();
+                    m.bits = [bits_l as u32, (bits_l >> 32) as u32];
                 }
             }
-            unsafe {
-                (*mbp).nC = [0; 48];
+            {
+                let m = self.mb_mut();
+                m.nC = [0; 48];
             }
 
             // dispatch on slice type
@@ -3879,13 +3918,18 @@ impl<'a> SliceContext<'a> {
             }
 
             // C `print_mb`: append [CurrMbAddr][macroblock] while dump armed.
-            if !self.mb_dump.is_null() && self.mb_dump_off + 4 + 304 <= self.mb_dump_cap {
-                unsafe {
-                    let p = self.mb_dump.add(self.mb_dump_off);
-                    std::ptr::write(p.cast::<u32>(), self.curr_mb_addr as u32);
-                    p.add(4).copy_from_nonoverlapping(mbp as *const u8, 304);
+            if let Some(cap) = self.mb_dump.as_ref().map(|d| d.len()) {
+                if self.mb_dump_off + SLICEDATA_RECORD_LEN <= cap {
+                    let rec = self.mb_ref().to_bytes();
+                    let addr = self.curr_mb_addr as u32;
+                    let off = self.mb_dump_off;
+                    if let Some(dump) = self.mb_dump.as_mut() {
+                        dump[off..off + 4].copy_from_slice(&addr.to_le_bytes());
+                        dump[off + 4..off + SLICEDATA_RECORD_LEN]
+                            .copy_from_slice(&rec);
+                    }
+                    self.mb_dump_off += SLICEDATA_RECORD_LEN;
                 }
-                self.mb_dump_off += 4 + 304;
             }
 
             // C L1778-1795: deblock mbB (same column, previous row) while it is
@@ -3893,34 +3937,26 @@ impl<'a> SliceContext<'a> {
             // movement is +16/+8/+8 in both of C's branches.
             if self.curr_mb_addr - width == self.next_deblock_addr {
                 self.next_deblock_addr += 1;
-                self.deblock_mb_at(self.mb_pos - (width as usize + 1));
+                self.deblock_mb_at(self.mb_pos - (w + 1));
             }
             self.mb_pos += 1;
-            unsafe {
-                self.samples_mb[0] = self.samples_mb[0].add(16);
-                self.samples_mb[1] = self.samples_mb[1].add(8);
-                self.samples_mb[2] = self.samples_mb[2].add(8);
-            }
+            self.samples_mb[0] += 16;
+            self.samples_mb[1] += 8;
+            self.samples_mb[2] += 8;
             self.mbx += 1;
             self.curr_mb_addr += 1;
-            unsafe {
-                self.mb_col = self.mb_col.add(1);
-            }
+            // `mb_col` is a full slice indexed by `mb_pos` (see `mvpred_state`),
+            // so it advances with `mb_pos` and needs no separate bump.
             if self.mbx >= self.pic_width_in_mbs {
                 self.mb_pos += 1; // skip the empty macroblock at the edge
-                unsafe {
-                    self.mb_col = self.mb_col.add(1);
-                }
                 self.mby += 1;
                 self.mbx = 0;
                 // C L1802-1804: row-wrap stride correction.
                 let s0 = (self.stride[0] as i64 * 16 - width as i64 * 16) as usize;
                 let sc = (self.stride[1] as i64 * 8 - width as i64 * 8) as usize;
-                unsafe {
-                    self.samples_mb[0] = self.samples_mb[0].add(s0);
-                    self.samples_mb[1] = self.samples_mb[1].add(sc);
-                    self.samples_mb[2] = self.samples_mb[2].add(sc);
-                }
+                self.samples_mb[0] += s0;
+                self.samples_mb[1] += sc;
+                self.samples_mb[2] += sc;
                 if self.mby >= self.pic_height_in_mbs {
                     return;
                 }

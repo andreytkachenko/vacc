@@ -125,9 +125,9 @@ fn readback_into_pixel_data(frame: &mut DecodedFrame) -> UnifiedResult<()> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     frame.pixel_data = Some(PixelData {
         format: "NV12".to_string(),
-        y: PixelPlane { data: buf.as_ptr(), pitch: w, width: w, height: h },
+        y: PixelPlane { data_offset: 0, pitch: w, width: w, height: h },
         u: PixelPlane {
-            data: unsafe { buf.as_ptr().add(w * h) },
+            data_offset: w * h,
             pitch: cw * 2,
             width: cw,
             height: ch,
@@ -184,8 +184,8 @@ pub(crate) fn map_source(pd: &PixelData) -> Result<MappedSource<'_>, vacc_image:
                     "NV12 frame must not carry a separate V plane".into(),
                 ));
             }
-            let y = plane_slice(&pd.y);
-            let uv = plane_slice(&pd.u);
+            let y = pd.plane_view(&pd.y);
+            let uv = pd.plane_view(&pd.u);
             Ok(MappedSource::Direct(YuvImage::semi(y, pd.y.pitch, uv, pd.u.pitch, w, h, 8)))
         }
         // Planar u16, top-justified: Vulkan P010, NVDEC I420_16BIT (P016).
@@ -211,11 +211,11 @@ fn planar_view<'a>(pd: &'a PixelData, bps: u8) -> Result<YuvImage<'a>, vacc_imag
         .as_ref()
         .ok_or_else(|| ImageError::Unsupported(format!("format '{}' must carry a V plane", pd.format)))?;
     Ok(YuvImage::planar(
-        plane_slice(&pd.y),
+        pd.plane_view(&pd.y),
         pd.y.pitch,
-        plane_slice(&pd.u),
+        pd.plane_view(&pd.u),
         pd.u.pitch,
-        plane_slice(v),
+        pd.plane_view(v),
         v.pitch,
         pd.y.width,
         pd.y.height,
@@ -233,7 +233,7 @@ fn normalize_u16_to_top(pd: &PixelData) -> Vec<u8> {
     for p in [Some(&pd.y), Some(&pd.u), pd.v.as_ref()] {
         if let Some(p) = p {
             for row in 0..p.height {
-                let r = unsafe { std::slice::from_raw_parts(p.data.add(row * p.pitch), p.width * 2) };
+                let r = pd.plane_row(p, row, p.width * 2);
                 for i in (0..r.len()).step_by(2) {
                     let v = u16::from_le_bytes([r[i], r[i + 1]]);
                     out.extend_from_slice(&(v << 6).to_le_bytes());
@@ -301,15 +301,15 @@ fn write_back(frame: &mut DecodedFrame, out: ProcessedFrame, img_cfg: &ImageConf
                     let v_off = u_off + cw * ch;
                     Some(PixelData {
                         format: "I420".to_string(),
-                        y: PixelPlane { data: buffer.as_ptr(), pitch: w, width: w, height: h },
+                        y: PixelPlane { data_offset: 0, pitch: w, width: w, height: h },
                         u: PixelPlane {
-                            data: unsafe { buffer.as_ptr().add(u_off) },
+                            data_offset: u_off,
                             pitch: cw,
                             width: cw,
                             height: ch,
                         },
                         v: Some(PixelPlane {
-                            data: unsafe { buffer.as_ptr().add(v_off) },
+                            data_offset: v_off,
                             pitch: cw,
                             width: cw,
                             height: ch,
@@ -321,9 +321,9 @@ fn write_back(frame: &mut DecodedFrame, out: ProcessedFrame, img_cfg: &ImageConf
                     let uv_off = w * h;
                     Some(PixelData {
                         format: "NV12".to_string(),
-                        y: PixelPlane { data: buffer.as_ptr(), pitch: w, width: w, height: h },
+                        y: PixelPlane { data_offset: 0, pitch: w, width: w, height: h },
                         u: PixelPlane {
-                            data: unsafe { buffer.as_ptr().add(uv_off) },
+                            data_offset: uv_off,
                             pitch: cw * 2,
                             width: cw,
                             height: ch,
@@ -355,12 +355,6 @@ fn write_back(frame: &mut DecodedFrame, out: ProcessedFrame, img_cfg: &ImageConf
     }
 }
 
-/// View over one plane's storage: `height * pitch` bytes starting at `data`.
-/// All backend producers point the planes into `PixelData::buffer`.
-fn plane_slice(p: &PixelPlane) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(p.data, p.height * p.pitch) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,10 +380,10 @@ mod tests {
         let mut frame = DecodedFrame::new(0, 0, w as u32, h as u32, false);
         frame.pixel_data = Some(PixelData {
             format: "I420".to_string(),
-            y: PixelPlane { data: buf.as_ptr(), pitch: w, width: w, height: h },
-            u: PixelPlane { data: unsafe { buf.as_ptr().add(uv_off) }, pitch: cw, width: cw, height: ch },
+            y: PixelPlane { data_offset: 0, pitch: w, width: w, height: h },
+            u: PixelPlane { data_offset: uv_off, pitch: cw, width: cw, height: ch },
             v: Some(PixelPlane {
-                data: unsafe { buf.as_ptr().add(uv_off + cw * ch) },
+                data_offset: uv_off + cw * ch,
                 pitch: cw,
                 width: cw,
                 height: ch,
@@ -480,10 +474,10 @@ mod tests {
         let mut frame = DecodedFrame::new(0, 0, w as u32, h as u32, false);
         frame.pixel_data = Some(PixelData {
             format: "I420-10".to_string(),
-            y: PixelPlane { data: buf.as_ptr(), pitch: w * 2, width: w, height: h },
-            u: PixelPlane { data: unsafe { buf.as_ptr().add(w * h * 2) }, pitch: cw * 2, width: cw, height: ch },
+            y: PixelPlane { data_offset: 0, pitch: w * 2, width: w, height: h },
+            u: PixelPlane { data_offset: w * h * 2, pitch: cw * 2, width: cw, height: ch },
             v: Some(PixelPlane {
-                data: unsafe { buf.as_ptr().add((w * h + cw * ch) * 2) },
+                data_offset: (w * h + cw * ch) * 2,
                 pitch: cw * 2,
                 width: cw,
                 height: ch,
@@ -521,8 +515,8 @@ mod tests {
         let mut frame = DecodedFrame::new(0, 0, w as u32, h as u32, false);
         frame.pixel_data = Some(PixelData {
             format: "NV12".to_string(),
-            y: PixelPlane { data: buf.as_ptr(), pitch: w, width: w, height: h },
-            u: PixelPlane { data: unsafe { buf.as_ptr().add(uv_off) }, pitch: cw * 2, width: cw, height: ch },
+            y: PixelPlane { data_offset: 0, pitch: w, width: w, height: h },
+            u: PixelPlane { data_offset: uv_off, pitch: cw * 2, width: cw, height: ch },
             v: None,
             buffer: buf,
         });

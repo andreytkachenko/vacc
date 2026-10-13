@@ -81,8 +81,8 @@ fn make_frame(frame_idx: u32, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
     for row in 0..(h / 2) {
         for col in 0..(w / 2) {
             let o = (row * w + col * 2) as usize;
-            uv[o] = (128 + frame_idx * 7) as u8;
-            uv[o + 1] = (128 - frame_idx * 5) as u8;
+            uv[o] = (128u32.wrapping_add(frame_idx * 7)) as u8;
+            uv[o + 1] = (128u32.wrapping_sub(frame_idx * 5)) as u8;
         }
     }
     (y, uv)

@@ -201,28 +201,25 @@ pub fn warp_rgb(
     }
 
     // `Kernel::Avx2` is only ever reported on x86_64 (see `simd_features`),
-    // so the guard below falls through to the scalar path elsewhere.
+    // so on other architectures this arm is never taken.
     let simd = pick_kernel(Kernel::Auto);
     let cl = |a: usize, rows: &mut [&mut [u8]]| {
         for (i, row) in rows.iter_mut().enumerate() {
             let oy = a + i;
             match interpolation {
                 Interpolation::Bilinear if ch == 4 && matches!(simd, Some(Kernel::Avx2)) => {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        avx2::warp_rgba_row(
-                            src.pixels_ptr(),
-                            src.pitch,
-                            src.width,
-                            src.height,
-                            inv,
-                            oy,
-                            row,
-                        );
-                    }
+                    avx2::warp_rgba_row(
+                        src.pixels(),
+                        src.pitch,
+                        src.width,
+                        src.height,
+                        inv,
+                        oy,
+                        row,
+                    );
                 }
                 Interpolation::Bilinear => scalar_warp_row(
-                    src.pixels_ptr(),
+                    src.pixels(),
                     src.pitch,
                     src.width,
                     src.height,
@@ -232,7 +229,7 @@ pub fn warp_rgb(
                     row,
                 ),
                 Interpolation::Nearest => scalar_warp_row_nearest(
-                    src.pixels_ptr(),
+                    src.pixels(),
                     src.pitch,
                     src.width,
                     src.height,
@@ -242,7 +239,7 @@ pub fn warp_rgb(
                     row,
                 ),
                 Interpolation::Bicubic => scalar_warp_row_bicubic(
-                    src.pixels_ptr(),
+                    src.pixels(),
                     src.pitch,
                     src.width,
                     src.height,
@@ -282,7 +279,7 @@ fn pick_kernel(kernel: Kernel) -> Option<Kernel> {
 /// (alpha 0). For 3-channel sources alpha is synthesized as 255.
 #[inline]
 fn sample_pixel(
-    src_pixels: *const u8,
+    src_pixels: &[u8],
     src_pitch: usize,
     src_width: usize,
     src_height: usize,
@@ -293,11 +290,10 @@ fn sample_pixel(
     if x < 0 || y < 0 || x >= src_width as i32 || y >= src_height as i32 {
         return [0.0; 4];
     }
-    let row = unsafe { src_pixels.add(y as usize * src_pitch) };
-    let px = unsafe { row.add(x as usize * ch) };
+    let base = y as usize * src_pitch + x as usize * ch;
     let mut vals = [0.0f32; 4];
     for c in 0..ch {
-        vals[c] = unsafe { *px.add(c) } as f32;
+        vals[c] = src_pixels[base + c] as f32;
     }
     if ch == 3 {
         vals[3] = 255.0;
@@ -307,7 +303,7 @@ fn sample_pixel(
 
 /// Scalar implementation: one output row via inverse mapping + bilinear interpolation.
 fn scalar_warp_row(
-    src_pixels: *const u8,
+    src_pixels: &[u8],
     src_pitch: usize,
     src_width: usize,
     src_height: usize,
@@ -358,7 +354,7 @@ fn scalar_warp_row(
 /// Scalar implementation: one output row via inverse mapping + nearest
 /// neighbor (the floor of the source position).
 fn scalar_warp_row_nearest(
-    src_pixels: *const u8,
+    src_pixels: &[u8],
     src_pitch: usize,
     src_width: usize,
     src_height: usize,
@@ -403,7 +399,7 @@ fn mitchell(d: f32) -> f32 {
 /// 4x4 cubic convolution (Mitchell, B = C = 0.5). Out-of-bounds taps
 /// contribute zero, so edges fade to black like the bilinear path.
 fn scalar_warp_row_bicubic(
-    src_pixels: *const u8,
+    src_pixels: &[u8],
     src_pitch: usize,
     src_width: usize,
     src_height: usize,

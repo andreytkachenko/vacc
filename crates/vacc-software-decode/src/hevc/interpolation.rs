@@ -1376,12 +1376,12 @@ mod avx2 {
     fn srai32(v: __m256i, n: i32) -> __m256i {
         match n {
             0 => v,
-            1 => unsafe { _mm256_srai_epi32::<1>(v) },
-            2 => unsafe { _mm256_srai_epi32::<2>(v) },
-            3 => unsafe { _mm256_srai_epi32::<3>(v) },
-            4 => unsafe { _mm256_srai_epi32::<4>(v) },
-            5 => unsafe { _mm256_srai_epi32::<5>(v) },
-            6 => unsafe { _mm256_srai_epi32::<6>(v) },
+            1 => _mm256_srai_epi32::<1>(v),
+            2 => _mm256_srai_epi32::<2>(v),
+            3 => _mm256_srai_epi32::<3>(v),
+            4 => _mm256_srai_epi32::<4>(v),
+            5 => _mm256_srai_epi32::<5>(v),
+            6 => _mm256_srai_epi32::<6>(v),
             _ => {
                 // Unreachable for our shift values; exact scalar fallback.
                 let mut a = [0i32; 8];
@@ -1395,9 +1395,7 @@ mod avx2 {
                 for x in a.iter_mut() {
                     *x = *x >> n;
                 }
-                unsafe {
-                    _mm256_setr_epi32(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
-                }
+                _mm256_setr_epi32(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
             }
         }
     }
@@ -1506,8 +1504,8 @@ mod avx2 {
         shift: i32,
         out: &mut [i16],
     ) {
-        let zero = unsafe { _mm256_setzero_si256() };
-        let mask16 = unsafe { _mm256_set1_epi32(0xFFFF) };
+        let zero = _mm256_setzero_si256();
+        let mask16 = _mm256_set1_epi32(0xFFFF);
         let mut y = 0usize;
         while y < rows_out {
             let mut x0 = 0usize;

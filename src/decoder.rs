@@ -108,11 +108,10 @@ struct VulkanAdapter {
     decoder: Option<vacc_vulkan_decode::VulkanDecoder>,
 }
 
-// SAFETY: the Vulkan device handles are process-global and the Vulkan API is
-// thread-safe; this adapter is used from a single owning decode thread, so
-// moving it across threads is safe.
-#[cfg(feature = "vulkan")]
-unsafe impl Send for VulkanAdapter {}
+// `VulkanAdapter` is auto-`Send`: its only non-trivial field is the inner
+// `vacc_vulkan_decode::VulkanDecoder`, which carries the `Send` proof itself
+// (see that crate — Vulkan device handles are process-global and the Vulkan
+// API is thread-safe).
 
 #[cfg(feature = "vulkan")]
 impl VulkanAdapter {
@@ -244,15 +243,15 @@ fn to_core_frame(vk_frame: vacc_vulkan_decode::DecodedFrame, index: u32) -> Deco
     frame.poc = vk_frame.poc;
     frame.pixel_data = Some(PixelData {
         format: if ss == 2 { "P010".to_string() } else { "I420".to_string() },
-        y: PixelPlane { data: buffer.as_ptr(), pitch: dw * ss, width: dw, height: dh },
+        y: PixelPlane { data_offset: 0, pitch: dw * ss, width: dw, height: dh },
         u: PixelPlane {
-            data: unsafe { buffer.as_ptr().add(u_off) },
+            data_offset: u_off,
             pitch: cw * ss,
             width: cw,
             height: ch,
         },
         v: Some(PixelPlane {
-            data: unsafe { buffer.as_ptr().add(v_off) },
+            data_offset: v_off,
             pitch: cw * ss,
             width: cw,
             height: ch,

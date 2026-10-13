@@ -1279,7 +1279,7 @@ fn cmd_pipeline_barrier_2(
         unsafe {
             type FnType =
                 unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
-            let f: FnType = std::mem::transmute(ptr);
+            let f: FnType = crate::video_fn!(ptr);
             f(cmd_buffer, dep_info);
         }
     }

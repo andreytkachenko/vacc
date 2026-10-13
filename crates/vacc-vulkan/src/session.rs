@@ -86,7 +86,7 @@ impl VideoSession {
                 *mut u32,
                 *mut vk::VideoSessionMemoryRequirementsKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(get_req_fn);
+            let fn_ptr: FnType = crate::video_fn!(get_req_fn);
             let result = fn_ptr(
                 device.handle(),
                 session,
@@ -120,7 +120,7 @@ impl VideoSession {
                 *mut u32,
                 *mut vk::VideoSessionMemoryRequirementsKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(get_req_fn);
+            let fn_ptr: FnType = crate::video_fn!(get_req_fn);
             let result = fn_ptr(
                 device.handle(),
                 session,
@@ -194,7 +194,7 @@ impl VideoSession {
                 u32,
                 *const vk::BindVideoSessionMemoryInfoKHR<'_>,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(bind_fn);
+            let fn_ptr: FnType = crate::video_fn!(bind_fn);
             let result = fn_ptr(
                 device.handle(),
                 session,
@@ -411,7 +411,7 @@ impl VideoSession {
                 *const vk::AllocationCallbacks,
                 *mut vk::VideoSessionKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(create_fn);
+            let fn_ptr: FnType = crate::video_fn!(create_fn);
 
             vkdbg!("[Session] Calling vkCreateVideoSessionKHR...");
             let mut session_handle = vk::VideoSessionKHR::null();
@@ -480,7 +480,7 @@ impl Drop for VideoSession {
                     vk::VideoSessionKHR,
                     *const vk::AllocationCallbacks,
                 );
-                let fn_ptr: FnType = std::mem::transmute(ptr);
+                let fn_ptr: FnType = crate::video_fn!(ptr);
                 fn_ptr(self.device.handle(), self.session, std::ptr::null());
             }
         }
@@ -911,7 +911,7 @@ impl VideoSessionParameters {
                 *const vk::AllocationCallbacks,
                 *mut vk::VideoSessionParametersKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(create_fn);
+            let fn_ptr: FnType = crate::video_fn!(create_fn);
 
             vkdbg!("[SessionParams] Calling vkCreateVideoSessionParametersKHR...");
             let mut params = vk::VideoSessionParametersKHR::null();
@@ -951,7 +951,7 @@ impl VideoSessionParameters {
                         vk::VideoSessionParametersKHR,
                         *const vk::VideoSessionParametersUpdateInfoKHR<'_>,
                     ) -> vk::Result;
-                    let upd: UpdFn = unsafe { std::mem::transmute(f) };
+                    let upd: UpdFn = crate::video_fn!(f);
                     // Vulkan spec (VUID-...-07215): update_sequence_count must be the
                     // object's current counter + 1 on every update (starts at 0).
                     // A zero count made the NVIDIA driver drop the SPS/PPS updates.
@@ -1066,7 +1066,7 @@ impl VideoSessionParameters {
                 vk::VideoSessionKHR,
                 vk::VideoSessionParametersKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(update_fn);
+            let fn_ptr: FnType = crate::video_fn!(update_fn);
             fn_ptr(self.device.handle(), session, self.parameters)
         };
 
@@ -1104,7 +1104,7 @@ impl Drop for VideoSessionParameters {
                     vk::VideoSessionParametersKHR,
                     *const vk::AllocationCallbacks,
                 );
-                let fn_ptr: FnType = std::mem::transmute(ptr);
+                let fn_ptr: FnType = crate::video_fn!(ptr);
                 fn_ptr(self.device.handle(), self.parameters, std::ptr::null());
             }
         }

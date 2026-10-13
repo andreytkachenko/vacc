@@ -1504,10 +1504,6 @@ impl NvdecAv1Decoder {
         buffer.extend_from_slice(&u_plane);
         buffer.extend_from_slice(&v_plane);
 
-        let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-        let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
-
         // Tightly packed: pitch (bytes) == width (samples) * ss.
         let y_pitch = display_width * ss;
         let uv_pitch = (display_width / 2) * ss;
@@ -1518,19 +1514,19 @@ impl NvdecAv1Decoder {
                 _ => "P010LE".to_string(),
             },
             y: PixelPlane {
-                data: y_ptr,
+                data_offset: 0,
                 pitch: y_pitch,
                 width: display_width,
                 height: display_height,
             },
             u: PixelPlane {
-                data: u_ptr,
+                data_offset: y_size,
                 pitch: uv_pitch,
                 width: display_width / 2,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
-                data: v_ptr,
+                data_offset: y_size + uv_size,
                 pitch: uv_pitch,
                 width: display_width / 2,
                 height: display_height / 2,

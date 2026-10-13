@@ -24,6 +24,9 @@ pub struct NvencEncoder {
     // Drop order matters: `session` (uses the vtable) must drop before `api`.
     session: Session,
     api: NvencApi,
+    /// Keeps the primary context alive for the encoder's lifetime; released on
+    /// drop (after the NVENC session, which references it).
+    #[allow(dead_code)]
     cuda: Cuda,
 
     width: u32,
@@ -34,6 +37,9 @@ pub struct NvencEncoder {
     fps_den: u32,
     frame_index: u32,
     out_next: usize,
+
+    /// SPS+PPS header bytes (global-header mode); prepended to every IDR AU.
+    sps_pps: Vec<u8>,
 
     /// Kept alive for the session's lifetime (passed by pointer to
     /// NvEncInitializeEncoder).
@@ -76,11 +82,14 @@ impl NvencEncoder {
             .map_err(|e| Error::EncoderInit(format!("open session: {e}")))?;
 
         // Start from the P3 preset config, then force CQP + our GOP shape.
+        // Driver 590+ requires the Ex variant (tuning-aware); older drivers
+        // fall back inside `get_preset_config`.
         let mut enc_config = unsafe {
             api.get_preset_config(
                 session.handle(),
                 api::NV_ENC_CODEC_H264_GUID,
                 api::NV_ENC_PRESET_P3_GUID,
+                api::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_LOW_LATENCY,
             )
         }
         .map_err(|e| Error::EncoderInit(format!("preset config: {e}")))?;
@@ -114,6 +123,13 @@ impl NvencEncoder {
         unsafe { api.initialize(session.handle(), &mut init) }
             .map_err(|e| Error::EncoderInit(format!("initialize encoder: {e}")))?;
 
+        // Global-header mode: fetch SPS/PPS once; each IDR AU we emit is
+        // self-contained (sps_pps prefix + slice), matching the other backends.
+        let mut sps_buf = vec![0u8; 4096];
+        let sps_len = unsafe { api.get_sequence_params(session.handle(), &mut sps_buf) }
+            .map_err(|e| Error::EncoderInit(format!("sequence params: {e}")))?;
+        sps_buf.truncate(sps_len);
+
         // Buffer pools.
         let mut inputs = Vec::with_capacity(N_INPUTS);
         for _ in 0..N_INPUTS {
@@ -145,42 +161,58 @@ impl NvencEncoder {
             fps_den: config.fps_den,
             frame_index: 0,
             out_next: 0,
+            sps_pps: sps_buf,
             config: config_box,
             inputs,
             outputs,
         })
     }
 
-    /// Upload one NV12 frame into an input buffer (luma then chroma).
-    fn upload(&self, buf: api::NV_ENC_INPUT_PTR, frame: &InputFrame) -> Result<(), Error> {
+    /// Upload one NV12 frame into an input buffer via the CPU staging path:
+    /// lock the buffer (host-visible, pitched), copy rows, unlock. Returns the
+    /// buffer pitch for `NV_ENC_PIC_PARAMS::inputPitch`.
+    fn upload(&self, buf: api::NV_ENC_INPUT_PTR, frame: &InputFrame) -> Result<u32, Error> {
         if frame.width != self.width || frame.height != self.height {
             return Err(Error::InvalidState(format!(
                 "input frame {}x{} does not match encoder {}x{}",
                 frame.width, frame.height, self.width, self.height
             )));
         }
+        // NVENC input buffers are not addressable via cuMemcpyHtoD on current
+        // drivers (the pointer is opaque to user CUDA calls); LockInputBuffer
+        // exposes the documented host staging view.
+        let (host, pitch) = unsafe { self.api.lock_input_buffer(self.session.handle(), buf) }?;
         let w = self.width as usize;
-        // Pack pitched rows into contiguous planes for a single HtoD copy each.
-        let mut y = Vec::with_capacity(w * self.height as usize);
-        for row in 0..self.height as usize {
-            y.extend_from_slice(&frame.y[row * frame.y_pitch..row * frame.y_pitch + w]);
+        let pitch = pitch as usize;
+        let h = self.height as usize;
+        unsafe {
+            for row in 0..h {
+                std::ptr::copy_nonoverlapping(
+                    frame.y[row * frame.y_pitch..row * frame.y_pitch + w].as_ptr(),
+                    host.add(row * pitch),
+                    w,
+                );
+            }
+            for row in 0..h / 2 {
+                std::ptr::copy_nonoverlapping(
+                    frame.uv[row * frame.uv_pitch..row * frame.uv_pitch + w].as_ptr(),
+                    host.add(pitch * (h + row)),
+                    w,
+                );
+            }
         }
-        let mut uv = Vec::with_capacity(w * (self.height / 2) as usize);
-        for row in 0..(self.height / 2) as usize {
-            uv.extend_from_slice(&frame.uv[row * frame.uv_pitch..row * frame.uv_pitch + w]);
-        }
-        let base = buf as crate::cuda::CUdeviceptr;
-        self.cuda.memcpy_htod(base, &y)?;
-        self.cuda.memcpy_htod(base + y.len() as u64, &uv)?;
-        Ok(())
+        unsafe { self.api.unlock_input_buffer(self.session.handle(), buf) }?;
+        Ok(pitch as u32)
     }
 
     /// Read back the coded access unit from a bitstream buffer.
     fn read_coded(&self, out: api::NV_ENC_OUTPUT_PTR) -> Result<Vec<u8>, Error> {
         let (ptr, size, hw_status) =
             unsafe { self.api.lock_bitstream(self.session.handle(), out) }?;
-        if hw_status != 0 {
-            return Err(Error::Api(format!("hw encode status {hw_status:#x}")));
+        // Status 0x2 (input dropped from the internal queue) still yields a
+        // valid access unit on driver 610; an empty output is the real error.
+        if size == 0 {
+            return Err(Error::Api(format!("hw encode status {hw_status:#x}: no output")));
         }
         let mut data = vec![0u8; size];
         unsafe {
@@ -216,8 +248,8 @@ impl Encoder for NvencEncoder {
         let idx = (self.frame_index as usize) % self.inputs.len();
         let is_idr = self.frame_index == 0 || self.frame_index.is_multiple_of(self.intra_period);
 
-        // 1. Upload input pixels.
-        self.upload(self.inputs[idx].0, frame)?;
+        // 1. Upload input pixels (returns the buffer pitch).
+        let pitch = self.upload(self.inputs[idx].0, frame)?;
 
         // 2. Encode (synchronous).
         let out_idx = self.out_next;
@@ -225,6 +257,7 @@ impl Encoder for NvencEncoder {
         let mut pic: api::_NV_ENC_PIC_PARAMS = unsafe { zeroed() };
         pic.version = api::NV_ENC_PIC_PARAMS_VER;
         pic.inputWidth = self.width;
+        pic.inputPitch = pitch;
         pic.inputHeight = self.height;
         pic.frameIdx = self.frame_index;
         pic.inputTimeStamp = timestamp as u64;
@@ -234,8 +267,15 @@ impl Encoder for NvencEncoder {
         pic.pictureStruct = api::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
         unsafe { self.api.encode_picture(self.session.handle(), &mut pic) }?;
 
-        // 3. Read back the access unit.
-        let data = self.read_coded(self.outputs[out_idx])?;
+        // 3. Read back the access unit; IDRs carry the SPS/PPS prefix so each
+        //    IDR AU is self-contained (same contract as the other backends).
+        let mut data = self.read_coded(self.outputs[out_idx])?;
+        if is_idr {
+            let mut prefixed = Vec::with_capacity(self.sps_pps.len() + data.len());
+            prefixed.extend_from_slice(&self.sps_pps);
+            prefixed.extend_from_slice(&data);
+            data = prefixed;
+        }
         let index = self.frame_index;
         self.frame_index += 1;
 

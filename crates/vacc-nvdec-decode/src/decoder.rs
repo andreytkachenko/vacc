@@ -1554,8 +1554,8 @@ impl NvdecH264Decoder {
                     seq,
                     &info,
                     None,
-                    Some(dst as *const u8),
-                    Some(done_event.raw()),
+                    Some(dst as usize),
+                    Some(done_event.raw() as usize),
                 );
                 gpu = gpu.with_copy_done(done_event);
                 frame.gpu = Some(gpu);
@@ -1695,10 +1695,6 @@ impl NvdecH264Decoder {
         buffer.extend_from_slice(&u_plane);
         buffer.extend_from_slice(&v_plane);
 
-        let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-        let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
-
         let pixel_data = Some(PixelData {
             // P016 samples stay left-justified (top-justified 10-bit in u16);
             // the consumer normalizes to bottom-justified for bps=2 formats.
@@ -1708,19 +1704,19 @@ impl NvdecH264Decoder {
                 "I420".to_string()
             },
             y: PixelPlane {
-                data: y_ptr,
+                data_offset: 0,
                 pitch: display_width * bps,
                 width: display_width,
                 height: display_height,
             },
             u: PixelPlane {
-                data: u_ptr,
+                data_offset: y_size,
                 pitch: display_width / 2 * bps,
                 width: display_width / 2,
                 height: display_height / 2,
             },
             v: Some(PixelPlane {
-                data: v_ptr,
+                data_offset: y_size + uv_size,
                 pitch: display_width / 2 * bps,
                 width: display_width / 2,
                 height: display_height / 2,
@@ -1814,8 +1810,8 @@ impl NvdecH264Decoder {
         seq: i32,
         info: &DecoderInfo,
         pixel_data: Option<PixelData>,
-        device_ptr: Option<*const u8>,
-        device_copy_event: Option<*const std::ffi::c_void>,
+        device_ptr: Option<usize>,
+        device_copy_event: Option<usize>,
     ) -> DecodedFrame {
         // Get frame index
         let frame_index = {

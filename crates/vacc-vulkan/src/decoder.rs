@@ -4092,7 +4092,7 @@ fn query_decode_formats_raw(
         *mut u32,
         *mut vk::VideoFormatPropertiesKHR<'_>,
     ) -> vk::Result;
-    let f: FnType = unsafe { std::mem::transmute(fn_ptr) };
+    let f: FnType = crate::video_fn!(fn_ptr);
 
     let mut count = 0u32;
     let r = unsafe { f(physical_device, &fmt_info, &mut count, std::ptr::null_mut()) };
@@ -4493,7 +4493,7 @@ fn destroy_session_parameters(
                 vk::VideoSessionParametersKHR,
                 *const vk::AllocationCallbacks,
             );
-            let f: FnType = std::mem::transmute(ptr);
+            let f: FnType = crate::video_fn!(ptr);
             f(device, session_params, std::ptr::null());
         }
     }
@@ -4512,7 +4512,7 @@ fn destroy_session(instance: &ash::Instance, device: vk::Device, session: vk::Vi
                 vk::VideoSessionKHR,
                 *const vk::AllocationCallbacks,
             );
-            let f: FnType = std::mem::transmute(ptr);
+            let f: FnType = crate::video_fn!(ptr);
             f(device, session, std::ptr::null());
         }
     }

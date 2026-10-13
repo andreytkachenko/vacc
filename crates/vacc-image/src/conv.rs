@@ -294,29 +294,28 @@ pub fn convert_rows(
             let cl = |a: usize, rows: &mut [&mut [u8]]| {
                 for (i, row) in rows.iter_mut().enumerate() {
                     let y = a + i;
-                    let (y_ptr, cb_ptr, cr_ptr) = unsafe {
-                        (
-                            src.y.as_ptr().add(y * src.y_pitch),
-                            src.cb.as_ptr().add((y >> 1) * src.cb_pitch),
-                            cr.as_ptr().add((y >> 1) * src.cr_pitch),
-                        )
-                    };
+                    let y0 = y * src.y_pitch;
+                    let y_row = &src.y[y0..y0 + src.width];
+                    let c0 = (y >> 1) * src.cb_pitch;
+                    let cb_row = &src.cb[c0..c0 + (src.width + 1) / 2];
+                    let r0 = (y >> 1) * src.cr_pitch;
+                    let cr_row = &cr[r0..r0 + (src.width + 1) / 2];
                     let dst_row = &mut (**row)[..row_bytes];
                     #[cfg(target_arch = "x86_64")]
                     match pick(true, true) {
                         Some(Kernel::Avx2) => unsafe {
-                            avx2::planar_row(y_ptr, cb_ptr, cr_ptr, src.width, c, dst_row);
+                            avx2::planar_row(y_row.as_ptr(), cb_row.as_ptr(), cr_row.as_ptr(), src.width, c, dst_row);
                             continue;
                         },
                         Some(Kernel::Sse) => unsafe {
-                            sse4::planar_row(y_ptr, cb_ptr, cr_ptr, src.width, c, dst_row);
+                            sse4::planar_row(y_row.as_ptr(), cb_row.as_ptr(), cr_row.as_ptr(), src.width, c, dst_row);
                             continue;
                         },
                         // Stays correct even if `pick` ever reports a
                         // non-SIMD kernel again: fall through to scalar.
                         _ => {}
                     }
-                    scalar_planar_row(y_ptr, cb_ptr, cr_ptr, src.width, c, dst_row);
+                    scalar_planar_row(y_row, cb_row, cr_row, src.width, c, dst_row);
                 }
             };
             parallel_rows(&mut bands, &cl);
@@ -325,26 +324,24 @@ pub fn convert_rows(
             let cl = |a: usize, rows: &mut [&mut [u8]]| {
                 for (i, row) in rows.iter_mut().enumerate() {
                     let y = a + i;
-                    let (y_ptr, uv_ptr) = unsafe {
-                        (
-                            src.y.as_ptr().add(y * src.y_pitch),
-                            src.cb.as_ptr().add((y >> 1) * src.cb_pitch),
-                        )
-                    };
+                    let y0 = y * src.y_pitch;
+                    let y_row = &src.y[y0..y0 + src.width];
+                    let u0 = (y >> 1) * src.cb_pitch;
+                    let uv_row = &src.cb[u0..u0 + src.width];
                     let dst_row = &mut (**row)[..row_bytes];
                     #[cfg(target_arch = "x86_64")]
                     match pick(true, true) {
                         Some(Kernel::Avx2) => unsafe {
-                            avx2::semi_row(y_ptr, uv_ptr, src.width, c, dst_row);
+                            avx2::semi_row(y_row.as_ptr(), uv_row.as_ptr(), src.width, c, dst_row);
                             continue;
                         },
                         Some(Kernel::Sse) => unsafe {
-                            sse4::semi_row(y_ptr, uv_ptr, src.width, c, dst_row);
+                            sse4::semi_row(y_row.as_ptr(), uv_row.as_ptr(), src.width, c, dst_row);
                             continue;
                         },
                         _ => {}
                     }
-                    scalar_semi_row(y_ptr, uv_ptr, src.width, c, dst_row);
+                    scalar_semi_row(y_row, uv_row, src.width, c, dst_row);
                 }
             };
             parallel_rows(&mut bands, &cl);
@@ -354,18 +351,18 @@ pub fn convert_rows(
 
 /// One luma row (planar layout) via the scalar kernel.
 fn scalar_planar_row(
-    y_row: *const u8,
-    cb_row: *const u8,
-    cr_row: *const u8,
+    y_row: &[u8],
+    cb_row: &[u8],
+    cr_row: &[u8],
     width: usize,
     c: &Conv8,
     dst_row: &mut [u8],
 ) {
     let ch = if dst_row.len() == width * 4 { 4 } else { 3 };
     for x in 0..width {
-        let yy = unsafe { *y_row.add(x) } as i32;
-        let cc = unsafe { *cb_row.add(x >> 1) } as i32;
-        let cr = unsafe { *cr_row.add(x >> 1) } as i32;
+        let yy = y_row[x] as i32;
+        let cc = cb_row[x >> 1] as i32;
+        let cr = cr_row[x >> 1] as i32;
         let (r, g, b) = conv_px(c, yy, cc, cr);
         let d = &mut dst_row[x * ch..x * ch + 3];
         d[0] = r;
@@ -379,19 +376,19 @@ fn scalar_planar_row(
 
 /// One luma row (semi-planar NV12) via the scalar kernel.
 fn scalar_semi_row(
-    y_row: *const u8,
-    uv_row: *const u8,
+    y_row: &[u8],
+    uv_row: &[u8],
     width: usize,
     c: &Conv8,
     dst_row: &mut [u8],
 ) {
     let ch = if dst_row.len() == width * 4 { 4 } else { 3 };
     for x in 0..width {
-        let yy = unsafe { *y_row.add(x) } as i32;
+        let yy = y_row[x] as i32;
         // Luma x is covered by CbCr pair x / 2 => bytes (2 * (x / 2), +1).
         let uo = x & !1;
-        let cc = unsafe { *uv_row.add(uo) } as i32;
-        let cr = unsafe { *uv_row.add(uo + 1) } as i32;
+        let cc = uv_row[uo] as i32;
+        let cr = uv_row[uo + 1] as i32;
         let (r, g, b) = conv_px(c, yy, cc, cr);
         let d = &mut dst_row[x * ch..x * ch + 3];
         d[0] = r;
@@ -434,15 +431,16 @@ fn downcast_rows(src: &YuvImage, dst: &mut [u8]) {
     let cl = |a: usize, rows: &mut [&mut [u8]]| {
         for (i, row) in rows.iter_mut().enumerate() {
             let y = a + i;
-            let y_ptr = unsafe { src.y.as_ptr().add(y * src.y_pitch) };
+            let y0 = y * src.y_pitch;
+            let y_row = &src.y[y0..y0 + w * 2];
             #[cfg(target_arch = "x86_64")]
             if is_x86_avx2() {
                 unsafe {
-                    avx2::u16_shift_row(y_ptr, &mut (**row)[..], shift);
+                    avx2::u16_shift_row(y_row, &mut (**row)[..], shift);
                 }
                 continue;
             }
-            sc_shift_row(y_ptr, &mut (**row)[..], shift);
+            sc_shift_row(y_row, &mut (**row)[..], shift);
         }
     };
     parallel_rows(&mut bands, &cl);
@@ -464,15 +462,9 @@ fn downcast_rows(src: &YuvImage, dst: &mut [u8]) {
             let y = a + i;
             let out_u = &mut (**ou)[..];
             let out_v = &mut (**ov)[..];
-            let semi_ptrs = unsafe {
-                if semi {
-                    Some(src.cb.as_ptr().add(y * src.cb_pitch))
-                } else {
-                    None
-                }
-            };
             if semi {
-                let uv = semi_ptrs.expect("semi set");
+                let u0 = y * src.cb_pitch;
+                let uv = &src.cb[u0..u0 + cw * 4];
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_avx2() {
                     unsafe {
@@ -482,15 +474,13 @@ fn downcast_rows(src: &YuvImage, dst: &mut [u8]) {
                 }
                 sc_semi_u16_row(uv, out_u, out_v, shift, cw);
             } else {
-                let (su, sv) = unsafe {
-                    let cr = src
-                        .cr
-                        .expect("planar layout requires a Cr plane");
-                    (
-                        src.cb.as_ptr().add(y * src.cb_pitch),
-                        cr.as_ptr().add(y * src.cr_pitch),
-                    )
-                };
+                let cr = src
+                    .cr
+                    .expect("planar layout requires a Cr plane");
+                let u0 = y * src.cb_pitch;
+                let su = &src.cb[u0..u0 + cw * 2];
+                let v0 = y * src.cr_pitch;
+                let sv = &cr[v0..v0 + cw * 2];
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_avx2() {
                     unsafe {
@@ -510,10 +500,10 @@ fn downcast_rows(src: &YuvImage, dst: &mut [u8]) {
 /// One tight `u16` row -> `u8` row (right-shift by `shift`, saturating to
 /// 255 so the scalar tail agrees with `u16_shift_row`'s SIMD `packus`).
 #[inline]
-fn sc_shift_row(row: *const u8, out: &mut [u8], shift: u32) {
+fn sc_shift_row(row: &[u8], out: &mut [u8], shift: u32) {
     for i in 0..out.len() {
-        let lo = unsafe { *row.add(i * 2) } as u32;
-        let hi = unsafe { *row.add(i * 2 + 1) } as u32;
+        let lo = row[i * 2] as u32;
+        let hi = row[i * 2 + 1] as u32;
         let v = ((hi << 8) | lo) >> shift;
         out[i] = v.min(255) as u8;
     }
@@ -521,7 +511,7 @@ fn sc_shift_row(row: *const u8, out: &mut [u8], shift: u32) {
 
 /// One interleaved `u16` CbCr row -> two `u8` rows (right-shift, saturating).
 pub(crate) fn sc_semi_u16_row(
-    uv: *const u8,
+    uv: &[u8],
     out_u: &mut [u8],
     out_v: &mut [u8],
     shift: u32,
@@ -530,8 +520,8 @@ pub(crate) fn sc_semi_u16_row(
     for i in 0..width {
         let base = i * 4;
         let au =
-            u16::from_le_bytes(unsafe { [*uv.add(base), *uv.add(base + 1)] });
-        let av = u16::from_le_bytes(unsafe { [*uv.add(base + 2), *uv.add(base + 3)] });
+            u16::from_le_bytes([uv[base], uv[base + 1]]);
+        let av = u16::from_le_bytes([uv[base + 2], uv[base + 3]]);
         out_u[i] = (au >> shift).min(255) as u8;
         out_v[i] = (av >> shift).min(255) as u8;
     }

@@ -125,7 +125,7 @@ impl H264Decoder {
                 vk::VideoSessionParametersKHR,
                 *const vk::VideoSessionParametersUpdateInfoKHR<'_>,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(update_fn);
+            let fn_ptr: FnType = crate::video_fn!(update_fn);
 
             let result = fn_ptr(self.device.handle(), session_params, update_info);
             if result != vk::Result::SUCCESS {
@@ -713,7 +713,7 @@ impl H264Decoder {
             unsafe {
                 type FnType =
                     unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, dep_info);
             }
         }
@@ -735,7 +735,7 @@ impl H264Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoBeginCodingInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, info);
             }
         }
@@ -751,7 +751,7 @@ impl H264Decoder {
             unsafe {
                 type FnType =
                     unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, info);
             }
         }
@@ -776,7 +776,7 @@ impl H264Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoEndCodingInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, &end_coding_info);
             }
         }
@@ -798,7 +798,7 @@ impl H264Decoder {
         if let Some(ptr) = fn_ptr {
             unsafe {
                 type FnType = unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32);
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, query_pool, first_query, query_count);
             }
         } else {
@@ -824,7 +824,7 @@ impl H264Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoCodingControlInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, &coding_control_info);
             }
         }

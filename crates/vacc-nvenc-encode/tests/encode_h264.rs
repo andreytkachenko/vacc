@@ -40,7 +40,12 @@ fn encode_h264_10_frames() {
     let mut enc = match NvencEncoder::new(&config) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("NVENC unavailable (skipping): {e}");
+            // Silent skips have hidden real breakage before; fail loudly when
+            // the caller demands a GPU (VACC_NVENC_STRICT=1), otherwise skip.
+            if std::env::var_os("VACC_NVENC_STRICT").is_some() {
+                panic!("NVENC unavailable: {e}");
+            }
+            eprintln!("SKIP: NVENC unavailable ({e}); set VACC_NVENC_STRICT=1 to fail instead");
             return;
         }
     };

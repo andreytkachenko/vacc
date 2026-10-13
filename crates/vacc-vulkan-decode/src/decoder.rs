@@ -15,6 +15,14 @@ pub struct VulkanDecoder {
     inner: vacc_vulkan::VideoDecoder,
 }
 
+// SAFETY: `VideoDecoder` holds Vulkan device handles (`vk::Device`, images,
+// memories, queues) and `'static` codec info structs whose raw pointer fields
+// are never dereferenced outside the owning decoder. Vulkan handles are
+// process-global and the Vulkan API is thread-safe, so moving the decoder
+// between threads is safe; consumers synchronize frame access via the fences
+// the decoder issues.
+unsafe impl Send for VulkanDecoder {}
+
 impl VulkanDecoder {
     /// Create a new video decoder from bitstream data.
     pub fn new(data: Vec<u8>) -> Result<Self> {

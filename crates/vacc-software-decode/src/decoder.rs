@@ -11,10 +11,8 @@
 //! Ported bit-exactly from the edge264 C routines; every output is pinned to
 //! golden hashes (`src/avc/golden_data.rs`).
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ptr::NonNull;
 
 use vacc_core::codec::VideoCodec as CoreVideoCodec;
 use vacc_core::decoder::{Decoder, DecoderInfo};
@@ -34,45 +32,6 @@ use crate::avc::cabac::Cabac;
 use crate::avc::slice::{
     PIXEL_MARGIN, RustMb, RustMbFlags, SLICEDATA_RECORD_LEN, SliceContext, UNAVAIL_MB,
 };
-
-/// 16-byte-aligned zero-initialized buffer (edge264 performs aligned SIMD
-/// loads on sample planes; strides are multiples of 16 by construction).
-struct AlignedBuf {
-    ptr: NonNull<u8>,
-    layout: Layout,
-}
-
-impl AlignedBuf {
-    fn new(size: usize) -> Option<Self> {
-        let layout = Layout::from_size_align(size, 16).ok()?;
-        let raw = unsafe { alloc_zeroed(layout) };
-        if raw.is_null() {
-            return None;
-        }
-        Some(Self {
-            ptr: NonNull::new(raw)?,
-            layout,
-        })
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
-    fn as_mut_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
-    }
-}
-
-// SAFETY: plain aligned memory with no thread-affinity; the pointer is only
-// ever dereferenced through this type's own accessors.
-unsafe impl Send for AlignedBuf {}
 
 /// Error type for the software decoder.
 #[derive(Debug, thiserror::Error)]
@@ -122,7 +81,7 @@ pub struct SwH264Decoder {
     // up to a couple of rows past the chroma plane end; the margins absorb
     // those reads (upstream UB in the C core).
     n_slots: usize,
-    slot_planes: Vec<Option<AlignedBuf>>,
+    slot_planes: Vec<Option<Vec<u8>>>,
     /// Per-slot macroblock arrays. A slot's flip bit toggles on every frame
     /// start; a freshly (re)allocated array has recovery_bits == 0 and its
     /// flip bit is reset, so the per-MB sentinel detects stale state.
@@ -375,8 +334,7 @@ impl SwH264Decoder {
             // Leading zero margin so the intra kernels' edge reads (upstream UB
             // in the C core) stay in valid memory; trailing overread margin via
             // plane_block_size.
-            let buf =
-                AlignedBuf::new(PIXEL_MARGIN + self.plane_block_size()).ok_or(Error::Alloc)?;
+            let buf = vec![0u8; PIXEL_MARGIN + self.plane_block_size()];
             // Each row's trailing padding macroblock slot is unavail_mb;
             // column-0 MBs read it as their left neighbor. A freshly zeroed mb
             // array has recovery_bits == 0, so reset this slot's flip-bit
@@ -707,7 +665,7 @@ impl SwH264Decoder {
     /// (test-only), the per-MB record stream (`CurrMbAddr` u32 + 304-byte
     /// macroblock per MB) is collected as well.
     fn decode_slice(
-        &self,
+        &mut self,
         h: &vacc_parser::h264::SliceHeader,
         entry: &SliceEntry,
         lists: &RefPicLists,
@@ -737,11 +695,6 @@ impl SwH264Decoder {
             let _ = bits.get_u1();
         }
 
-        let mbs = self
-            .slot_mbs
-            .get(slot)
-            .and_then(Option::as_ref)
-            .ok_or(Error::InvalidState("no mb buffer for slot"))?;
         // B slices: collocated picture mb array (RefPicList1[0]).
         let col_slot = if st == 1 {
             lists.l1.first().map(|r| r.slot)
@@ -816,43 +769,62 @@ impl SwH264Decoder {
             }
         }
 
-        // Reference planes for inter MC (C `t.samples_buffers`). A slot with
-        // no storage (invalid streams may reference freed slots) falls back
-        // to slot 0, which is always allocated (see ensure_slot_storage(0)
-        // in frame setup) and doubles as the dummy buffer for missing refs.
-        let dummy = self
-            .slot_planes
-            .first()
-            .and_then(Option::as_ref)
-            .map_or(std::ptr::null(), |b| unsafe { b.as_ptr().add(PIXEL_MARGIN) });
-        let ref_plane_bases: Vec<*const u8> = self
-            .slot_planes
-            .iter()
-            .map(|p| p.as_ref().map_or(dummy, |b| unsafe { b.as_ptr().add(PIXEL_MARGIN) }))
-            .collect();
+        // Disjoint borrows of the DPB storage: the current slot's macroblock
+        // array and pixel plane are borrowed mutably; the collocated mb array
+        // (B slices) and the reference planes are borrowed immutably.
+        // `split_at_mut` keeps these element borrows disjoint so they can
+        // coexist in `SliceContext`.
+        let (mbs_before, mbs_after) = self.slot_mbs.split_at_mut(slot);
+        let (mbs_cur, mbs_rest) = mbs_after.split_at_mut(1);
+        let mb_buffer: &mut [RustMb] = mbs_cur[0]
+            .as_mut()
+            .ok_or(Error::InvalidState("no mb buffer for slot"))?;
+        let mb_col: Option<&[RustMb]> = match col_slot {
+            Some(c) if c < slot => mbs_before.get(c).and_then(Option::as_ref).map(Vec::as_slice),
+            Some(c) => mbs_rest.get(c - slot - 1).and_then(Option::as_ref).map(Vec::as_slice),
+            None => None,
+        };
+
+        let n_slots = self.slot_planes.len();
+        let (pl_before, pl_after) = self.slot_planes.split_at_mut(slot);
+        let (pl_cur, pl_rest) = pl_after.split_at_mut(1);
+        // Full slot buffer: leading PIXEL_MARGIN + Y + C (+ trailing overread).
+        // `samples_mb` are byte offsets into it (first luma sample at PIXEL_MARGIN).
+        let plane: &mut [u8] = pl_cur[0]
+            .as_mut()
+            .ok_or(Error::InvalidState("no plane for slot"))?;
+        // Reference planes for inter MC (C `t.samples_buffers`): each Y-plane base
+        // (after PIXEL_MARGIN). A slot with no storage (invalid streams may
+        // reference freed slots) falls back to slot 0, which is always allocated.
+        let dummy: &[u8] = if slot == 0 {
+            &[]
+        } else {
+            pl_before.get(0).and_then(Option::as_ref).map_or(&[], |b| &b[PIXEL_MARGIN..])
+        };
+        let mut ref_plane_bases: Vec<&[u8]> = Vec::with_capacity(n_slots);
+        for p in pl_before.iter() {
+            ref_plane_bases.push(p.as_ref().map_or(dummy, |b| &b[PIXEL_MARGIN..]));
+        }
+        // Current-slot placeholder: the frame being decoded is never its own
+        // reference (valid H.264), so this entry is never indexed.
+        ref_plane_bases.push(&[]);
+        for p in pl_rest.iter() {
+            ref_plane_bases.push(p.as_ref().map_or(dummy, |b| &b[PIXEL_MARGIN..]));
+        }
 
         let mut ctx = SliceContext {
             bits,
             cabac: Cabac::new(),
             is_cabac: pps.entropy_coding_mode_flag,
-            mb_buffer: mbs.as_ptr() as *mut RustMb,
+            mb_buffer,
             mb_pos: 0,
-            mb_col: std::ptr::null(),
-            mb_col_buffer: match col_slot {
-                Some(s) => self
-                    .slot_mbs
-                    .get(s)
-                    .and_then(Option::as_ref)
-                    .map_or(std::ptr::null(), |v| v.as_ptr()),
-                None => std::ptr::null(),
-            },
-            mb_dump: std::ptr::null_mut(),
+            mb_col,
+            mb_dump: None,
             mb_dump_off: 0,
-            mb_dump_cap: 0,
-            mb_a: std::ptr::null(),
-            mb_b: std::ptr::null(),
-            mb_c: std::ptr::null(),
-            mb_d: std::ptr::null(),
+            nb_a: None,
+            nb_b: None,
+            nb_c: None,
+            nb_d: None,
             pic_width_in_mbs: sps.pic_width_in_mbs_minus1 as i16 + 1,
             pic_height_in_mbs: (sps.pic_height_in_map_units_minus1 + 1) as i16,
             first_mb_in_slice: h.first_mb_in_slice,
@@ -927,24 +899,13 @@ impl SwH264Decoder {
                 (8 + sps.bit_depth_chroma_minus8) as u32,
                 (8 + sps.bit_depth_chroma_minus8) as u32,
             ],
-            pixel_margin_base: self
-                .slot_planes
-                .get(slot)
-                .and_then(Option::as_ref)
-                .map_or(std::ptr::null_mut(), AlignedBuf::as_mut_ptr),
-            samples_base: self
-                .slot_planes
-                .get(slot)
-                .and_then(Option::as_ref)
-                .map_or(std::ptr::null_mut(), |b| unsafe {
-                    b.as_mut_ptr().add(PIXEL_MARGIN)
-                }),
+            plane,
             stride: [self.stride_y as u16, self.stride_c as u16],
             plane_size_y: self.plane_size_y,
             plane_size_c: self.plane_size_c,
             coded_w: self.coded_w,
             coded_h: self.coded_h,
-            samples_mb: [std::ptr::null_mut(); 3],
+            samples_mb: [0; 3],
             ref_plane_bases,
             mc_y: [0u8; 672],
             mc_c: [0u8; 320],
@@ -990,10 +951,7 @@ impl SwH264Decoder {
             .borrow()
             .armed
             .then(|| vec![0u8; self.mbs_per_frame * SLICEDATA_RECORD_LEN]);
-        ctx.mb_dump = rec_buf
-            .as_mut()
-            .map_or(std::ptr::null_mut(), Vec::as_mut_ptr);
-        ctx.mb_dump_cap = rec_buf.as_ref().map_or(0, Vec::len);
+        ctx.mb_dump = rec_buf.as_mut().map(|b| &mut b[..]);
 
         if ctx.is_cabac {
             // TEMP DEBUG (BBB-360 errno 114): identify the failing slice.
@@ -1036,23 +994,24 @@ impl SwH264Decoder {
         // E0 plumbing check: samples_mb must track the closed-form position of
         // (mbx, mby) — C initialises and advances it identically, so any drift
         // in the per-MB advance arithmetic shows up here on every slice.
-        let base = ctx.samples_base as usize;
         let mbx = ctx.mbx as i64;
         let mby = ctx.mby as i64;
         let sy = self.stride_y as i64;
         let sc = self.stride_c as i64;
+        // samples_mb are byte offsets into `plane` (margin-start-based), so the
+        // Y plane sits at PIXEL_MARGIN.
         assert_eq!(
-            ctx.samples_mb[0] as usize - base,
+            ctx.samples_mb[0] - PIXEL_MARGIN,
             ((mbx + mby * sy) * 16) as usize,
             "samples_mb[0] drift at mbx={mbx} mby={mby}"
         );
         assert_eq!(
-            ctx.samples_mb[1] as usize - base,
+            ctx.samples_mb[1] - PIXEL_MARGIN,
             ((mbx + mby * sc) * 8 + self.plane_size_y as i64) as usize,
             "samples_mb[1] drift at mbx={mbx} mby={mby}"
         );
         assert_eq!(
-            ctx.samples_mb[2] as usize - base,
+            ctx.samples_mb[2] - PIXEL_MARGIN,
             ((mbx + mby * sc) * 8 + self.plane_size_y as i64) as usize
                 + (self.stride_c / 2) as usize,
             "samples_mb[2] drift at mbx={mbx} mby={mby}"
@@ -1079,8 +1038,12 @@ impl SwH264Decoder {
             }
             dec_next_out = i32::MAX;
         }
+        // Read the dump offset, then drop ctx (releasing its borrow of rec_buf
+        // and the DPB storage) before moving the record buffer out.
+        let dump_off = ctx.mb_dump_off;
+        drop(ctx);
         if let Some(mut buf) = rec_buf {
-            buf.truncate(ctx.mb_dump_off);
+            buf.truncate(dump_off);
             self.mb_dump.borrow_mut().records.push(buf);
         }
         Ok(dec_next_out)
@@ -1088,9 +1051,8 @@ impl SwH264Decoder {
 
     /// Copy the cropped display area out of a DPB slot plane into I420.
     fn extract_frame(&self, slot: usize) -> PixelData {
-        let plane = self.slot_planes[slot].as_ref().expect("slot plane");
-        // Slot planes carry a leading zero margin before the Y plane.
-        let base = unsafe { plane.as_ptr().add(PIXEL_MARGIN) };
+        let plane = &self.slot_planes[slot].as_ref().expect("slot plane")[PIXEL_MARGIN..];
+        // plane[0] is the first Y sample (the leading zero margin is skipped).
         let sps = self.sps.as_ref().unwrap();
         let idc = sps.chroma_format_idc;
         // Luma crop start = SubWidthC/SubHeightC * raw offset (spec 8.3.1);
@@ -1108,24 +1070,22 @@ impl SwH264Decoder {
         let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
         // Y
         for row in 0..h {
-            let src = unsafe { base.add((ct + row) * self.stride_y as usize + cl) };
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, w) });
+            let off = (ct + row) * self.stride_y as usize + cl;
+            out.extend_from_slice(&plane[off..off + w]);
         }
         // Cb / Cr. The C side stores chroma as row-pairs: at offset
         // plane_size_Y + r*stride_c, bytes [0..width_C) are the Cb samples of
         // chroma row r and [width_C..stride_C) (== +stride_C/2) are the Cr
         // samples. See edge264 get_frame / inter.c edge copy.
-        let chroma_base = unsafe { base.add(self.plane_size_y as usize) };
+        let chroma_off = self.plane_size_y as usize;
         let half_stride_c = (self.stride_c / 2) as usize;
         for row in 0..ch {
-            let rp = unsafe { chroma_base.add((ctc + row) * self.stride_c as usize + clc) };
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(rp, cw) });
+            let off = chroma_off + (ctc + row) * self.stride_c as usize + clc;
+            out.extend_from_slice(&plane[off..off + cw]);
         }
         for row in 0..ch {
-            let src = unsafe {
-                chroma_base.add((ctc + row) * self.stride_c as usize + half_stride_c + clc)
-            };
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, cw) });
+            let off = chroma_off + (ctc + row) * self.stride_c as usize + half_stride_c + clc;
+            out.extend_from_slice(&plane[off..off + cw]);
         }
 
         let y_off = 0;
@@ -1134,19 +1094,19 @@ impl SwH264Decoder {
         PixelData {
             format: "I420".to_string(),
             y: PixelPlane {
-                data: unsafe { out.as_ptr().add(y_off) },
+                data_offset: y_off,
                 pitch: w,
                 width: w,
                 height: h,
             },
             u: PixelPlane {
-                data: unsafe { out.as_ptr().add(u_off) },
+                data_offset: u_off,
                 pitch: cw,
                 width: cw,
                 height: ch,
             },
             v: Some(PixelPlane {
-                data: unsafe { out.as_ptr().add(v_off) },
+                data_offset: v_off,
                 pitch: cw,
                 width: cw,
                 height: ch,

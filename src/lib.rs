@@ -108,8 +108,9 @@
 //!     let y = vec![i as u8; 320 * 240];
 //!     let uv = vec![128u8; 320 * 120];
 //!     let frame = InputFrame::packed(320, 240, &y, &uv);
-//!     let au = enc.encode(&frame, (i as i64) * 33_333_333).unwrap();
-//!     out.extend_from_slice(&au.data);
+//!     for au in enc.encode(&frame, (i as i64) * 33_333_333).unwrap() {
+//!         out.extend_from_slice(&au.data);
+//!     }
 //! }
 //! for au in enc.flush().unwrap() {
 //!     out.extend_from_slice(&au.data);

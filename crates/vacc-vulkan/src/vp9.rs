@@ -483,7 +483,7 @@ impl Vp9Decoder {
             unsafe {
                 type FnType =
                     unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, dep_info);
             }
         }
@@ -505,7 +505,7 @@ impl Vp9Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoBeginCodingInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, info);
             }
         }
@@ -521,7 +521,7 @@ impl Vp9Decoder {
             unsafe {
                 type FnType =
                     unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, info);
             }
         }
@@ -545,7 +545,7 @@ impl Vp9Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoCodingControlInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, &coding_control_info);
             }
         }
@@ -570,7 +570,7 @@ impl Vp9Decoder {
                     vk::CommandBuffer,
                     *const vk::VideoEndCodingInfoKHR<'_>,
                 );
-                let f: FnType = std::mem::transmute(ptr);
+                let f: FnType = crate::video_fn!(ptr);
                 f(cmd_buffer, &end_coding_info);
             }
         }

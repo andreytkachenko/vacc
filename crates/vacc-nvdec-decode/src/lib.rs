@@ -53,6 +53,24 @@
 //!
 //! Use [`is_available()`](device::is_available) to check runtime availability.
 //!
+//! ## SAFETY (this crate's `unsafe` inventory)
+//!
+//! - **CUDA Driver / cuvid entry points**: resolved once via `libloading`
+//!   into the cached `CudaFuncs`/`NvdecFuncs` tables (`OnceLock` statics);
+//!   each call site keeps its arguments valid for the call and checks the
+//!   returned error code. The `unsafe extern "C" fn` *field types* in the
+//!   tables are the FFI floor — no safe spelling exists.
+//! - **Handle wrappers** (`CtxPtr`, `CuStream`, `CuEvent`, `CuEventView`,
+//!   `DeviceBuffer`, `PinnedHostBuffer`, per-codec decoders): manual
+//!   `Send`/`Sync` impls, each documented where the invariant is non-obvious
+//!   (context binding via `cuCtxSetCurrent`, destroy-after-synchronize on
+//!   drop, exclusive ownership of the allocation).
+//! - **Zero-initialized cuvid structs** (`CUVID*PARAMS` etc.): C POD types
+//!   without `Default`; all-bits-zero is the documented "unset" state.
+//! - **`PinnedHostBuffer::as_slice/as_mut_slice`**: the two accessors that
+//!   materialize a slice over the CUDA-owned pinned allocation; validity and
+//!   exclusive ownership follow from the type's alloc/free pairing.
+//!
 //! ## Examples
 //!
 //! ### Basic Decode

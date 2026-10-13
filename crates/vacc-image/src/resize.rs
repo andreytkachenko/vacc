@@ -206,24 +206,19 @@ fn mitchell(d: f64) -> f64 {
 // ─────────────────────────── row views ───────────────────────────
 
 /// A row-major plane with an explicit pitch (tight when `pitch == width*ch`).
-struct PlaneRows {
-    base: *const u8,
+struct PlaneRows<'a> {
+    base: &'a [u8],
     pitch: usize,
     width: usize,
     height: usize,
     ch: usize, // bytes per sample/pixel (1 for YUV planes, 3 or 4 for RGB)
 }
 
-// SAFETY: `base` points to immutable caller-owned data that outlives every
-// borrow of `PlaneRows`; sharing `&PlaneRows` across threads only reads it.
-unsafe impl Sync for PlaneRows {}
-
-impl PlaneRows {
+impl PlaneRows<'_> {
     #[inline]
     fn row(&self, y: usize) -> &[u8] {
-        let start = unsafe { self.base.add(y * self.pitch) };
-        // SAFETY: the caller guarantees `height` rows of `pitch` bytes.
-        unsafe { std::slice::from_raw_parts(start, self.pitch) }
+        let start = y * self.pitch;
+        &self.base[start..start + self.pitch]
     }
 
     /// One tight row of `width * ch` bytes.
@@ -346,7 +341,7 @@ fn v_pass(
             match simd {
                 Some(Kernel::Sse) | Some(Kernel::Avx2) => {
                     unsafe {
-                        sse4::v_pass_row(src.base, src.pitch, width, ch, taps, oy, row);
+                        sse4::v_pass_row(src.base.as_ptr(), src.pitch, width, ch, taps, oy, row);
                     }
                     continue;
                 }
@@ -417,7 +412,7 @@ pub fn resize_rgb(
     let x_taps = TapAxis::build(scale.filter, src.width, dw);
     let y_taps = TapAxis::build(scale.filter, src.height, dh);
     let src_rows = PlaneRows {
-        base: src.pixels_ptr(),
+        base: src.pixels(),
         pitch: src.pitch,
         width: src.width,
         height: src.height,
@@ -438,7 +433,7 @@ pub fn resize_rgb(
     let mut tmp = vec![0u8; dw * src.height * ch];
     h_pass(&src_rows, &x_taps, kernel, &mut tmp);
     let tmp_rows = PlaneRows {
-        base: tmp.as_ptr(),
+        base: &tmp,
         pitch: dw * ch,
         width: dw,
         height: src.height,
@@ -466,7 +461,7 @@ fn h_pass(src: &PlaneRows, taps: &TapAxis, kernel: Kernel, tmp: &mut [u8]) {
             #[cfg(target_arch = "x86_64")]
             if matches!(simd, Some(Kernel::Avx2)) && src.ch == 4 {
                 unsafe {
-                    avx2::h_pass_rgba_row(src.base, src.pitch, src.width, taps, oy, row);
+                    avx2::h_pass_rgba_row(src.base.as_ptr(), src.pitch, src.width, taps, oy, row);
                 }
                 continue;
             }
@@ -537,7 +532,7 @@ pub fn resize_yuv(
     // Luma: full pipeline (H scratch -> V).
     {
         let rows = PlaneRows {
-            base: src.y.as_ptr(),
+            base: src.y,
             pitch: src.y_pitch,
             width: sw,
             height: sh,
@@ -556,7 +551,7 @@ pub fn resize_yuv(
             let mut tmp = vec![0u8; dw * sh];
             h_pass(&rows, &x_luma, kernel, &mut tmp);
             let trows = PlaneRows {
-                base: tmp.as_ptr(),
+                base: &tmp,
                 pitch: dw,
                 width: dw,
                 height: sh,
@@ -574,9 +569,8 @@ pub fn resize_yuv(
         let mut u_src = vec![0u8; swc * shc];
         let mut v_src = vec![0u8; swc * shc];
         for oy in 0..shc {
-            let srow = unsafe {
-                std::slice::from_raw_parts(src.cb.as_ptr().add(oy * src.cb_pitch), swc * 2)
-            };
+            let c0 = oy * src.cb_pitch;
+            let srow = &src.cb[c0..c0 + swc * 2];
             for ox in 0..swc {
                 u_src[oy * swc + ox] = srow[ox * 2];
                 v_src[oy * swc + ox] = srow[ox * 2 + 1];
@@ -585,7 +579,7 @@ pub fn resize_yuv(
         let mut u_tmp = vec![0u8; dwc * dhc];
         let mut v_tmp = vec![0u8; dwc * dhc];
         resize_plane(
-            u_src.as_ptr(),
+            &u_src,
             swc,
             swc,
             shc,
@@ -595,7 +589,7 @@ pub fn resize_yuv(
             &mut u_tmp,
         );
         resize_plane(
-            v_src.as_ptr(),
+            &v_src,
             swc,
             swc,
             shc,
@@ -613,7 +607,7 @@ pub fn resize_yuv(
     } else {
         let cr_off = dwc * dhc;
         resize_plane(
-            src.cb.as_ptr(),
+            src.cb,
             src.cb_pitch,
             swc,
             shc,
@@ -626,7 +620,7 @@ pub fn resize_yuv(
             .cr
             .expect("planar layout requires a Cr plane");
         resize_plane(
-            cr.as_ptr(),
+            cr,
             src.cr_pitch,
             swc,
             shc,
@@ -641,8 +635,8 @@ pub fn resize_yuv(
 
 /// Resize one 8-bit plane (`base`, pitch `pitch`, `sw x sh`) into tight
 /// `dwc x dhc` output using the shared chroma tap tables.
-fn resize_plane(
-    base: *const u8,
+fn resize_plane<'a>(
+    base: &'a [u8],
     pitch: usize,
     sw: usize,
     sh: usize,
@@ -671,7 +665,7 @@ fn resize_plane(
         let mut tmp = vec![0u8; dw * sh];
         h_pass(&rows, x_taps, kernel, &mut tmp);
         let trows = PlaneRows {
-            base: tmp.as_ptr(),
+            base: &tmp,
             pitch: dw,
             width: dw,
             height: sh,

@@ -60,10 +60,10 @@ unsafe fn u16_shift_row_c<const S: i32>(row: *const u8, out: &mut [u8]) {
 /// in practice (P012: 4, P010: 6) get SIMD; anything else falls back to
 /// the scalar loop in `conv.rs`.
 #[target_feature(enable = "avx2")]
-pub unsafe fn u16_shift_row(row: *const u8, out: &mut [u8], shift: u32) {
+pub unsafe fn u16_shift_row(row: &[u8], out: &mut [u8], shift: u32) {
     match shift {
-        4 => unsafe { u16_shift_row_c::<4>(row, out) },
-        6 => unsafe { u16_shift_row_c::<6>(row, out) },
+        4 => unsafe { u16_shift_row_c::<4>(row.as_ptr(), out) },
+        6 => unsafe { u16_shift_row_c::<6>(row.as_ptr(), out) },
         _ => crate::conv::sc_shift_row(row, out, shift),
     }
 }
@@ -112,15 +112,15 @@ unsafe fn u16_semi_shift_row_c<const S: i32>(
 /// One tight interleaved `u16` CbCr row -> two `u8` rows (right-shift).
 #[target_feature(enable = "avx2")]
 pub unsafe fn u16_semi_shift_row(
-    uv: *const u8,
+    uv: &[u8],
     out_u: &mut [u8],
     out_v: &mut [u8],
     shift: u32,
     width: usize,
 ) {
     match shift {
-        4 => unsafe { u16_semi_shift_row_c::<4>(uv, out_u, out_v, width) },
-        6 => unsafe { u16_semi_shift_row_c::<6>(uv, out_u, out_v, width) },
+        4 => unsafe { u16_semi_shift_row_c::<4>(uv.as_ptr(), out_u, out_v, width) },
+        6 => unsafe { u16_semi_shift_row_c::<6>(uv.as_ptr(), out_u, out_v, width) },
         _ => crate::conv::sc_semi_u16_row(uv, out_u, out_v, shift, width),
     }
 }

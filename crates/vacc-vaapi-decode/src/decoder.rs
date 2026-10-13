@@ -3024,7 +3024,7 @@ fn put_cpu_pixels_to_surface(
     // Y plane.
     let yw = pix.y.width.min(width as usize);
     for row in 0..pix.y.height.min(height as usize) {
-        let src = unsafe { std::slice::from_raw_parts(pix.y.data.add(row * pix.y.pitch), yw) };
+        let src = pix.plane_row(&pix.y, row, yw);
         let start = offsets[0] as usize + row * pitches[0] as usize;
         data[start..start + yw].copy_from_slice(src);
     }
@@ -3035,7 +3035,7 @@ fn put_cpu_pixels_to_surface(
     let uh = pix.u.height.min((height / 2) as usize);
     let u_idx = if uv_first { 2 } else { 1 }; // YV12 stores V in plane 1
     for row in 0..uh {
-        let src = unsafe { std::slice::from_raw_parts(pix.u.data.add(row * pix.u.pitch), u_bytes) };
+        let src = pix.plane_row(&pix.u, row, u_bytes);
         let start = offsets[u_idx] as usize + row * pitches[u_idx] as usize;
         data[start..start + u_bytes].copy_from_slice(src);
     }
@@ -3044,7 +3044,7 @@ fn put_cpu_pixels_to_surface(
     if !is_nv12 {
         let v = pix.v.as_ref().ok_or_else(|| Error::InvalidState("missing V plane".to_string()))?;
         for row in 0..uh {
-            let src = unsafe { std::slice::from_raw_parts(v.data.add(row * v.pitch), u_bytes) };
+            let src = pix.plane_row(v, row, u_bytes);
             let start = offsets[1] as usize + row * pitches[1] as usize;
             data[start..start + u_bytes].copy_from_slice(src);
         }
@@ -3132,17 +3132,11 @@ fn read_from_image(
         let off = va_image.offsets[0] as usize;
         let plane_size = out_width * out_height;
         let mut buffer = vec![0u8; 3 * plane_size * 2];
-        let src = data.as_ptr();
         for row in 0..out_height {
             let row_off = off + row * pitch;
             for col in 0..out_width {
-                let p = unsafe { src.add(row_off + col * 4) };
-                let word = u32::from_ne_bytes([
-                    unsafe { *p },
-                    unsafe { *p.add(1) },
-                    unsafe { *p.add(2) },
-                    unsafe { *p.add(3) },
-                ]);
+                let b = &data[row_off + col * 4..row_off + col * 4 + 4];
+                let word = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
                 let y = ((word >> 10) & 0x3FF) as u16;
                 let u = (word & 0x3FF) as u16;
                 let v = ((word >> 20) & 0x3FF) as u16;
@@ -3157,26 +3151,23 @@ fn read_from_image(
             }
         }
         drop(image);
-        let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { y_ptr.add(plane_size * 2) };
-        let v_ptr = unsafe { y_ptr.add(2 * plane_size * 2) };
         return Ok(Some(PixelData {
             // "16" => bps=2 in the consumer; not "P016" => no top-justification shift.
             format: "Y410P16".to_string(),
             y: PixelPlane {
-                data: y_ptr,
+                data_offset: 0,
                 pitch: out_width * 2,
                 width: out_width,
                 height: out_height,
             },
             u: PixelPlane {
-                data: u_ptr,
+                data_offset: plane_size * 2,
                 pitch: out_width * 2,
                 width: out_width,
                 height: out_height,
             },
             v: Some(PixelPlane {
-                data: v_ptr,
+                data_offset: 2 * plane_size * 2,
                 pitch: out_width * 2,
                 width: out_width,
                 height: out_height,
@@ -3194,37 +3185,33 @@ fn read_from_image(
         let off = va_image.offsets[0] as usize;
         let plane_size = out_width * out_height;
         let mut buffer = vec![0u8; 3 * plane_size];
-        let src = data.as_ptr();
         for row in 0..out_height {
             let row_off = off + row * pitch;
             for col in 0..out_width {
-                let px = unsafe { src.add(row_off + col * 4) };
-                buffer[row * out_width + col] = unsafe { *px.add(2) }; // Y
-                buffer[plane_size + row * out_width + col] = unsafe { *px.add(1) }; // U
-                buffer[2 * plane_size + row * out_width + col] = unsafe { *px };
+                let b = &data[row_off + col * 4..row_off + col * 4 + 4];
+                buffer[row * out_width + col] = b[2]; // Y
+                buffer[plane_size + row * out_width + col] = b[1]; // U
+                buffer[2 * plane_size + row * out_width + col] = b[0];
                 // V
             }
         }
         drop(image);
-        let y_ptr = buffer.as_ptr();
-        let u_ptr = unsafe { y_ptr.add(plane_size) };
-        let v_ptr = unsafe { y_ptr.add(2 * plane_size) };
         return Ok(Some(PixelData {
             format: "YUV444".to_string(),
             y: PixelPlane {
-                data: y_ptr,
+                data_offset: 0,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
             },
             u: PixelPlane {
-                data: u_ptr,
+                data_offset: plane_size,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
             },
             v: Some(PixelPlane {
-                data: v_ptr,
+                data_offset: 2 * plane_size,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
@@ -3314,13 +3301,12 @@ fn read_from_image(
         let base = va_image.offsets[0] as usize;
         let mut out = vec![0u8; out_width * 3 * out_height];
         for y in 0..out_height {
-            let row = unsafe { buffer.as_ptr().add(base + y * y_pitch) };
             for x in 0..out_width {
-                let p = unsafe { row.add(x * 4) };
+                let b = &buffer[base + y * y_pitch + x * 4..base + y * y_pitch + x * 4 + 4];
                 // iHD stores the AYUV view as [V, U, Y, A] in memory.
-                out[y * out_width + x] = unsafe { *p.add(2) }; // Y
-                out[out_width * out_height + y * out_width + x] = unsafe { *p.add(1) }; // U
-                out[2 * out_width * out_height + y * out_width + x] = unsafe { *p.add(0) };
+                out[y * out_width + x] = b[2]; // Y
+                out[out_width * out_height + y * out_width + x] = b[1]; // U
+                out[2 * out_width * out_height + y * out_width + x] = b[0];
                 // V
             }
         }
@@ -3328,19 +3314,19 @@ fn read_from_image(
         return Ok(Some(PixelData {
             format: format_str,
             y: PixelPlane {
-                data: out.as_ptr(),
+                data_offset: 0,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
             },
             u: PixelPlane {
-                data: unsafe { out.as_ptr().add(out_width * out_height) },
+                data_offset: out_width * out_height,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
             },
             v: Some(PixelPlane {
-                data: unsafe { out.as_ptr().add(2 * out_width * out_height) },
+                data_offset: 2 * out_width * out_height,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
@@ -3359,8 +3345,8 @@ fn read_from_image(
             let x = (v >> shift) as u32;
             (((x * 256 + half) >> bits).min(255)) as u8
         };
-        let read_u16 = |base: *const u8, off: usize| -> u16 {
-            unsafe { u16::from_ne_bytes([*base.add(off), *base.add(off + 1)]) }
+        let read_u16 = |buf: &[u8], off: usize| -> u16 {
+            u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap())
         };
 
         let y_offset = va_image.offsets[0] as usize;
@@ -3370,19 +3356,17 @@ fn read_from_image(
 
         let mut out = vec![0u8; out_width * out_height + uv_width * 2 * uv_height];
         for y in 0..out_height {
-            let row = unsafe { buffer.as_ptr().add(y_offset) };
             for x in 0..out_width {
-                out[y * out_width + x] = scale(read_u16(row, y * y_pitch * 2 + x * 2));
+                out[y * out_width + x] = scale(read_u16(&buffer, y_offset + y * y_pitch * 2 + x * 2));
             }
         }
-        let uv_row = unsafe { buffer.as_ptr().add(u_offset) };
         for y in 0..uv_height {
             for x in 0..uv_width {
-                let base = y * uv_pitch * 2 + x * 4;
+                let base = u_offset + y * uv_pitch * 2 + x * 4;
                 out[out_width * out_height + y * (uv_width * 2) + x * 2] =
-                    scale(read_u16(uv_row, base));
+                    scale(read_u16(&buffer, base));
                 out[out_width * out_height + y * (uv_width * 2) + x * 2 + 1] =
-                    scale(read_u16(uv_row, base + 2));
+                    scale(read_u16(&buffer, base + 2));
             }
         }
 
@@ -3392,13 +3376,13 @@ fn read_from_image(
         return Ok(Some(PixelData {
             format: format_str,
             y: PixelPlane {
-                data: out.as_ptr(),
+                data_offset: 0,
                 pitch: out_width,
                 width: out_width,
                 height: out_height,
             },
             u: PixelPlane {
-                data: unsafe { out.as_ptr().add(out_width * out_height) },
+                data_offset: out_width * out_height,
                 pitch: uv_width * 2,
                 width: uv_width,
                 height: uv_height,
@@ -3415,14 +3399,14 @@ fn read_from_image(
     let u_offset = va_image.offsets[uv_base] as usize;
 
     let y_plane = PixelPlane {
-        data: unsafe { buffer.as_ptr().add(y_offset) },
+        data_offset: y_offset,
         pitch: va_image.pitches[0] as usize,
         width: out_width,
         height: out_height,
     };
 
     let u_plane = PixelPlane {
-        data: unsafe { buffer.as_ptr().add(u_offset) },
+        data_offset: u_offset,
         pitch: va_image.pitches[1] as usize,
         width: uv_width,
         height: uv_height,
@@ -3431,7 +3415,7 @@ fn read_from_image(
     let v_plane = if !is_nv12 && !is_p016 {
         let v_offset = va_image.offsets[uv_base + 1] as usize;
         Some(PixelPlane {
-            data: unsafe { buffer.as_ptr().add(v_offset) },
+            data_offset: v_offset,
             pitch: va_image.pitches[2] as usize,
             width: uv_width,
             height: uv_height,
@@ -3531,19 +3515,19 @@ fn read_from_image_p01x_native(
     Ok(Some(PixelData {
         format: format_str,
         y: PixelPlane {
-            data: out.as_ptr(),
+            data_offset: 0,
             pitch: out_width * 2,
             width: out_width,
             height: out_height,
         },
         u: PixelPlane {
-            data: unsafe { out.as_ptr().add(y_samples * 2) },
+            data_offset: y_samples * 2,
             pitch: uv_width * 2,
             width: uv_width,
             height: uv_height,
         },
         v: Some(PixelPlane {
-            data: unsafe { out.as_ptr().add((y_samples + uv_samples) * 2) },
+            data_offset: (y_samples + uv_samples) * 2,
             pitch: uv_width * 2,
             width: uv_width,
             height: uv_height,

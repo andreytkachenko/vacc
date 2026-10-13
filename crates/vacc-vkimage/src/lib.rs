@@ -22,6 +22,27 @@
 //! after a fence wait the CPU repacks the result into tight bytes. There is
 //! no device-local staging; the win is the ALU work (conversion/resampling)
 //! on the GPU.
+//!
+//! # SAFETY (this crate's `unsafe` inventory)
+//!
+//! Every `unsafe` block here falls into one of four documented categories:
+//!
+//! 1. **ash API calls** (the large majority). ash 0.38 exposes all entry
+//!    points as `unsafe fn`; each call site keeps its arguments valid for
+//!    the duration of the call and checks the returned `vk::Result`.
+//! 2. **Device-mapped memory.** `vkMapMemory` returns a raw pointer into
+//!    host-visible memory owned by this crate's buffers; it is only
+//!    dereferenced while the owning `Gpu` context is locked, and every map
+//!    is paired with `vkUnmapMemory`. This makes [`Gpu`] safe to send
+//!    across threads (single-owner mutex discipline), hence its manual
+//!    `Send` impl.
+//! 3. **POD byte views.** [`params_bytes`] reinterprets a `#[repr(C)]`
+//!    uniform struct (integer/handle fields only) as bytes for upload —
+//!    all-bits patterns are valid for these types, and the reference
+//!    guarantees the value outlives the copy.
+//! 4. **Down-cast copy** ([`copy_plane_words`]): writes `u32` words into
+//!    the mapped arena; bounds follow from the arena layout computed at
+//!    allocation time (slot sizes are exact multiples of the row strides).
 
 mod shaders;
 
@@ -263,6 +284,9 @@ struct Gpu {
 }
 
 fn create() -> Result<Gpu, String> {
+    // Serialize entry-level init against the loader's lazy ICD-init race.
+    // See vacc_core::vulkan_init.
+    let _init = vacc_core::vulkan_init::vulkan_init_guard();
     let entry = entry()?;
 
     let app_name = std::ffi::CString::new("vacc-vkimage").unwrap();

@@ -158,6 +158,10 @@ impl VideoDeviceBuilder {
     }
 
     pub fn build(self) -> VideoResult<VulkanDevice> {
+        // Serialize entry-level init: the system Vulkan loader races on
+        // concurrent vkCreateInstance / entry-level enumeration (NULL call in
+        // libvulkan -> SIGSEGV). See vacc_core::vulkan_init.
+        let _init = vacc_core::vulkan_init::vulkan_init_guard();
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| VideoError::VulkanInit(e.to_string()))?;
         let (instance, has_validation) = Self::create_instance(&entry, &self)?;
@@ -885,7 +889,7 @@ impl VulkanDevice {
                 *const vk::VideoProfileInfoKHR<'_>,
                 *mut vk::VideoCapabilitiesKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(get_caps_fn);
+            let fn_ptr: FnType = crate::video_fn!(get_caps_fn);
 
             // Codec-specific capabilities structs
             let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
@@ -1030,7 +1034,7 @@ impl VulkanDevice {
                 *const vk::VideoProfileInfoKHR<'_>,
                 *mut vk::VideoCapabilitiesKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(get_caps_fn);
+            let fn_ptr: FnType = crate::video_fn!(get_caps_fn);
 
             // Chain: VideoCapabilitiesKHR -> VideoEncodeCapabilitiesKHR -> VideoEncodeH264CapabilitiesKHR
             let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
@@ -1136,7 +1140,7 @@ impl VulkanDevice {
                 *mut u32,
                 *mut vk::VideoFormatPropertiesKHR,
             ) -> vk::Result;
-            let fn_ptr: FnType = std::mem::transmute(fn_ptr_raw);
+            let fn_ptr: FnType = crate::video_fn!(fn_ptr_raw);
 
             let mut count: u32 = 0;
             let result = fn_ptr(

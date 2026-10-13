@@ -468,25 +468,25 @@ impl<'a> FrameRef<'a> {
 
 /// Append one sample from `src`, honoring bytes-per-sample and the iHD
 /// P016 top-justification (value << 6, normalized with >> 6).
-fn push_sample(out: &mut Vec<u8>, src: *const u8, bps: usize, top_justified: bool) {
+fn push_sample(out: &mut Vec<u8>, src: &[u8], bps: usize, top_justified: bool) {
     if top_justified && bps == 2 {
-        let v = u16::from_le_bytes(unsafe { [*src, *src.add(1)] }) >> 6;
+        let v = u16::from_le_bytes([src[0], src[1]]) >> 6;
         out.extend_from_slice(&v.to_le_bytes());
     } else {
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, bps) });
+        out.extend_from_slice(src);
     }
 }
 
 /// Copy one plane row by row (honoring pitch) into `out`.
-fn copy_plane(out: &mut Vec<u8>, plane: &PixelPlane, bps: usize, top_justified: bool) {
+fn copy_plane(out: &mut Vec<u8>, pd: &PixelData, plane: &PixelPlane, bps: usize, top_justified: bool) {
     for row in 0..plane.height {
-        let src = unsafe { plane.data.add(row * plane.pitch) };
+        let src = pd.plane_row(plane, row, plane.width * bps);
         if top_justified && bps == 2 {
             for col in 0..plane.width {
-                push_sample(out, unsafe { src.add(col * bps) }, bps, true);
+                push_sample(out, &src[col * bps..col * bps + bps], bps, true);
             }
         } else {
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, plane.width * bps) });
+            out.extend_from_slice(src);
         }
     }
 }
@@ -508,7 +508,7 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
     };
 
     let mut out = Vec::with_capacity(pd.buffer.len());
-    copy_plane(&mut out, &pd.y, bps, top_justified);
+    copy_plane(&mut out, pd, &pd.y, bps, top_justified);
 
     if pd.format.starts_with("GRAY") {
         return out;
@@ -518,22 +518,22 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
         // Semi-planar: U and V interleaved in the u plane. De-interleave
         // into planar U then planar V.
         for row in 0..pd.u.height {
-            let src = unsafe { pd.u.data.add(row * pd.u.pitch) };
+            let src = pd.plane_row(&pd.u, row, pd.u.width * 2 * bps);
             for col in 0..pd.u.width {
                 push_sample(
                     &mut out,
-                    unsafe { src.add(col * 2 * bps) },
+                    &src[col * 2 * bps..col * 2 * bps + bps],
                     bps,
                     top_justified,
                 );
             }
         }
         for row in 0..pd.u.height {
-            let src = unsafe { pd.u.data.add(row * pd.u.pitch) };
+            let src = pd.plane_row(&pd.u, row, pd.u.width * 2 * bps);
             for col in 0..pd.u.width {
                 push_sample(
                     &mut out,
-                    unsafe { src.add(col * 2 * bps + bps) },
+                    &src[col * 2 * bps + bps..col * 2 * bps + 2 * bps],
                     bps,
                     top_justified,
                 );
@@ -542,11 +542,11 @@ fn canonical_core(pd: &PixelData) -> Vec<u8> {
     } else if let Some(v) = pd.v.as_ref() {
         if pd.format == "YV12" {
             // YV12 stores V before U.
-            copy_plane(&mut out, v, bps, top_justified);
-            copy_plane(&mut out, &pd.u, bps, top_justified);
+            copy_plane(&mut out, pd, v, bps, top_justified);
+            copy_plane(&mut out, pd, &pd.u, bps, top_justified);
         } else {
-            copy_plane(&mut out, &pd.u, bps, top_justified);
-            copy_plane(&mut out, v, bps, top_justified);
+            copy_plane(&mut out, pd, &pd.u, bps, top_justified);
+            copy_plane(&mut out, pd, v, bps, top_justified);
         }
     }
 

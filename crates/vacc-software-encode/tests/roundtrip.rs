@@ -32,7 +32,7 @@ fn frame_bytes(f: &vacc_core::DecodedFrame) -> Vec<u8> {
     let mut buf = Vec::with_capacity(f.width as usize * f.height as usize * 3 / 2);
     for plane in [&pd.y, &pd.u, pd.v.as_ref().expect("I420 has a V plane")] {
         for r in 0..plane.height {
-            let row = unsafe { std::slice::from_raw_parts(plane.data.add(r * plane.pitch), plane.width) };
+            let row = pd.plane_row(plane, r, plane.width);
             buf.extend_from_slice(row);
         }
     }

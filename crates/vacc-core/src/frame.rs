@@ -23,15 +23,15 @@ pub struct DecodedFrame {
     pub sync_info: FrameSyncInfo,
     /// Pixel data for the decoded frame (if available).
     pub pixel_data: Option<PixelData>,
-    /// Device pointer to NV12 pixel data when the backend was configured
+    /// Raw device address of NV12 pixel data when the backend was configured
     /// for device output (e.g. the NVDEC decoder's `set_device_output_ring`).
     /// When set, `pixel_data` is `None` and the pixels live at this device
     /// address in tightly-packed NV12 layout (Y plane followed by the
     /// interleaved UV plane) at `width x height`. The backing buffer belongs
     /// to the caller's ring of device buffers; it stays valid until the
     /// backend reuses it for a later frame.
-    pub device_ptr: Option<*const u8>,
-    /// CUDA event (`CUevent` as a raw pointer) that is signaled when the
+    pub device_ptr: Option<usize>,
+    /// CUDA event (`CUevent` handle value) that is signaled when the
     /// device-to-device copy into [`device_ptr`](Self::device_ptr) has
     /// completed. Device-output extraction is asynchronous: the backend
     /// enqueues the copies and returns before they finish, so consumers must
@@ -41,7 +41,7 @@ pub struct DecodedFrame {
     /// from a *different* context is not reliable (observed to not order on
     /// current NVIDIA drivers), so do not rely on it — host-sync instead, and
     /// call the backend's copy-done notification (see [`device_seq`]).
-    pub device_copy_event: Option<*const std::ffi::c_void>,
+    pub device_copy_event: Option<usize>,
     /// DPB sequence id of the source surface for device-output frames. Pass
     /// it back to the backend's copy-done notification once
     /// [`device_copy_event`](Self::device_copy_event) has been host-synced,
@@ -59,12 +59,11 @@ pub struct DecodedFrame {
     pub gpu: Option<crate::gpu::GpuFrame>,
 }
 
-// The raw device handles (`device_ptr`, `device_copy_event`) are carried as
-// metadata: a frame is only valid while its producer (decoder ring / event
-// pool) is alive, and consumers order access via the fences it carries.
-// Sharing the descriptor across threads is safe.
-unsafe impl Send for DecodedFrame {}
-unsafe impl Sync for DecodedFrame {}
+// `DecodedFrame` is auto `Send + Sync`: every field is a plain value, an
+// owned buffer, or an opaque integer handle (`device_ptr`,
+// `device_copy_event`) carried as metadata — valid only while its producer
+// (decoder ring / event pool) is alive, with access ordered by the fences it
+// carries. No raw pointers escape the type.
 
 impl DecodedFrame {
     /// Create a new decoded frame.
@@ -209,21 +208,34 @@ pub struct FrameSyncInfo {
     pub unpaired_field: bool,
     /// Whether to use semaphore from unpaired field.
     pub sync_to_first_field: bool,
-    /// Debug interface pointer (reserved for future use).
-    pub debug_interface: Option<*mut std::ffi::c_void>,
+    /// Debug interface handle (reserved for future use).
+    pub debug_interface: Option<usize>,
 }
 
 /// A single plane of pixel data (Y, U, or V).
+///
+/// A plane is a view into the owning [`PixelData::buffer`]: `data_offset`
+/// is the byte offset of the plane's first sample within that buffer. Every
+/// producer stores its planes inside the buffer, so no raw pointers are
+/// needed and the type is trivially `Send + Sync`.
 #[derive(Debug, Clone, Copy)]
 pub struct PixelPlane {
-    /// Pointer to plane data.
-    pub data: *const u8,
+    /// Byte offset of the first sample within [`PixelData::buffer`].
+    pub data_offset: usize,
     /// Row pitch in bytes.
     pub pitch: usize,
     /// Plane width in pixels.
     pub width: usize,
     /// Plane height in pixels.
     pub height: usize,
+}
+
+impl PixelPlane {
+    /// Byte offset, within the owning buffer, of the start of row `row`.
+    #[inline]
+    pub const fn row_offset(&self, row: usize) -> usize {
+        self.data_offset + row * self.pitch
+    }
 }
 
 /// Packed (interleaved) RGB(X) pixel data.
@@ -255,7 +267,7 @@ impl RgbFrame {
 }
 
 /// Planar pixel data for a decoded frame.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PixelData {
     /// Format string (e.g., "NV12", "YV12", "I420").
     pub format: String,
@@ -269,31 +281,19 @@ pub struct PixelData {
     pub buffer: Vec<u8>,
 }
 
-impl Clone for PixelData {
-    fn clone(&self) -> Self {
-        // Plane pointers are offsets into `buffer`; rebase them onto the
-        // cloned buffer so the clone is self-contained. A derived clone would
-        // leave them pointing at the original buffer (dangling once the
-        // original drops).
-        let buffer = self.buffer.clone();
-        let base = self.buffer.as_ptr() as usize;
-        let len = self.buffer.len();
-        let rebased = |p: &PixelPlane| -> PixelPlane {
-            let addr = p.data as usize;
-            if addr >= base && addr < base + len {
-                let mut q = *p;
-                q.data = unsafe { buffer.as_ptr().add(addr - base) };
-                q
-            } else {
-                *p
-            }
-        };
-        PixelData {
-            format: self.format.clone(),
-            y: rebased(&self.y),
-            u: rebased(&self.u),
-            v: self.v.as_ref().map(rebased),
-            buffer,
-        }
+impl PixelData {
+    /// View of one plane's storage: `height * pitch` bytes from its offset.
+    #[inline]
+    pub fn plane_view(&self, p: &PixelPlane) -> &[u8] {
+        let end = p.data_offset + p.height * p.pitch;
+        &self.buffer[p.data_offset..end]
+    }
+
+    /// One row of a plane: the first `row_bytes` bytes of the row at `row`
+    /// (typically `width * bytes_per_sample`).
+    #[inline]
+    pub fn plane_row(&self, p: &PixelPlane, row: usize, row_bytes: usize) -> &[u8] {
+        let start = p.row_offset(row);
+        &self.buffer[start..start + row_bytes]
     }
 }

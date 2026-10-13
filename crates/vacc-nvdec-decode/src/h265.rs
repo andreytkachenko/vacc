@@ -1208,17 +1208,16 @@ impl NvdecH265Decoder {
             // Monochrome (YUV400): Y plane only.
             let mut buffer = vec![0u8; y_size];
             buffer.copy_from_slice(&y_plane);
-            let y_ptr = buffer.as_ptr();
             Some(PixelData {
                 format: if bps == 2 { "GRAY_16BIT" } else { "GRAY" }.to_string(),
                 y: PixelPlane {
-                    data: y_ptr,
+                    data_offset: 0,
                     pitch: row_bytes,
                     width: display_width,
                     height: display_height,
                 },
                 u: PixelPlane {
-                    data: y_ptr,
+                    data_offset: 0,
                     pitch: 0,
                     width: 0,
                     height: 0,
@@ -1232,25 +1231,22 @@ impl NvdecH265Decoder {
             let mut buffer = Vec::with_capacity(y_size + uv_size * 2);
             buffer.extend_from_slice(&y_plane);
             buffer.extend_from_slice(&interleaved_uv);
-            let y_ptr = buffer.as_ptr();
-            let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-            let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
             Some(PixelData {
                 format: if bps == 2 { "YUV444_16BIT" } else { "YUV444" }.to_string(),
                 y: PixelPlane {
-                    data: y_ptr,
+                    data_offset: 0,
                     pitch: row_bytes,
                     width: display_width,
                     height: display_height,
                 },
                 u: PixelPlane {
-                    data: u_ptr,
+                    data_offset: y_size,
                     pitch: row_bytes,
                     width: display_width,
                     height: display_height,
                 },
                 v: Some(PixelPlane {
-                    data: v_ptr,
+                    data_offset: y_size + uv_size,
                     pitch: row_bytes,
                     width: display_width,
                     height: display_height,
@@ -1280,26 +1276,22 @@ impl NvdecH265Decoder {
             buffer.extend_from_slice(&u_plane);
             buffer.extend_from_slice(&v_plane);
 
-            let y_ptr = buffer.as_ptr();
-            let u_ptr = unsafe { buffer.as_ptr().add(y_size) };
-            let v_ptr = unsafe { buffer.as_ptr().add(y_size + uv_size) };
-
             Some(PixelData {
                 format: if bps == 2 { "I420_16BIT" } else { "I420" }.to_string(),
                 y: PixelPlane {
-                    data: y_ptr,
+                    data_offset: 0,
                     pitch: row_bytes,
                     width: display_width,
                     height: display_height,
                 },
                 u: PixelPlane {
-                    data: u_ptr,
+                    data_offset: y_size,
                     pitch: row_bytes / 2,
                     width: display_width / 2,
                     height: display_height / 2,
                 },
                 v: Some(PixelPlane {
-                    data: v_ptr,
+                    data_offset: y_size + uv_size,
                     pitch: row_bytes / 2,
                     width: display_width / 2,
                     height: display_height / 2,

@@ -1605,7 +1605,7 @@ impl Av1Decoder {
             // Note: vkCmdPipelineBarrier2KHR returns void; no result to check.
             type FnType =
                 unsafe extern "system" fn(vk::CommandBuffer, *const vk::DependencyInfo<'_>);
-            let f: FnType = std::mem::transmute(fn_ptr);
+            let f: FnType = crate::video_fn!(fn_ptr);
             f(cmd_buffer, dep_info);
         }
         Ok(())
@@ -1632,7 +1632,7 @@ impl Av1Decoder {
                 vk::CommandBuffer,
                 *const vk::VideoBeginCodingInfoKHR<'_>,
             );
-            let f: FnType = std::mem::transmute(fn_ptr);
+            let f: FnType = crate::video_fn!(fn_ptr);
             f(cmd_buffer, info);
         }
         Ok(())
@@ -1657,7 +1657,7 @@ impl Av1Decoder {
             // Note: vkCmdDecodeVideoKHR returns void; no result to check.
             type FnType =
                 unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoDecodeInfoKHR<'_>);
-            let f: FnType = std::mem::transmute(fn_ptr);
+            let f: FnType = crate::video_fn!(fn_ptr);
             f(cmd_buffer, info);
         }
         Ok(())
@@ -1684,7 +1684,7 @@ impl Av1Decoder {
             // Note: vkCmdControlVideoCodingKHR returns void; no result to check.
             type FnType =
                 unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoCodingControlInfoKHR);
-            let f: FnType = std::mem::transmute(fn_ptr);
+            let f: FnType = crate::video_fn!(fn_ptr);
             f(cmd_buffer, &coding_control_info);
         }
         Ok(())
@@ -1712,7 +1712,7 @@ impl Av1Decoder {
             // Note: vkCmdEndVideoCodingKHR returns void; no result to check.
             type FnType =
                 unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEndCodingInfoKHR);
-            let f: FnType = std::mem::transmute(fn_ptr);
+            let f: FnType = crate::video_fn!(fn_ptr);
             f(cmd_buffer, &end_coding_info);
         }
         Ok(())

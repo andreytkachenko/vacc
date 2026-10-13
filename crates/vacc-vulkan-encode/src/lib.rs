@@ -5,6 +5,20 @@
 //!
 //! Motion estimation is performed by the driver; this crate supplies SPS/PPS,
 //! DPB management, reference lists and per-slice QP (CQP mode).
+//!
+//! # SAFETY (this crate's `unsafe` inventory)
+//!
+//! - **ash API calls**: each call site keeps arguments valid for the call
+//!   and checks returned `vk::Result`s.
+//! - **Video entry points** (`load_fn`): resolved once via
+//!   `vkGetDeviceProcAddr` into the cached [`session::VideoFns`] table; the
+//!   loader-provided code pointer is reinterpreted as a spec-exact 64-bit
+//!   fn pointer (see the SAFETY note at `load_fn`).
+//! - **Zero-initialized FFI structs**: `std::mem::zeroed()` on ash
+//!   `vk::native` POD flag/struct types (no `Default` impl); all-bits-zero
+//!   is a valid value for these integer C types.
+//! - **Staging map/unmap** (`map_memory`/`unmap_memory`): paired, and the
+//!   mapped pointer is only used between the two calls.
 
 mod h264_params;
 mod session;

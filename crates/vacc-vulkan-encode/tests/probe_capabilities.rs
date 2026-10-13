@@ -16,6 +16,9 @@ fn device_name(dev: &vacc_vulkan::VulkanDevice) -> String {
 
 #[test]
 fn probe_h264_encode_capabilities() {
+    // build() takes the process-wide init lock internally (the system loader
+    // races on concurrent entry-level calls, see vacc_core::vulkan_init).
+    // Do NOT take it here too: the Mutex is not reentrant.
     let dev = VideoDeviceBuilder::new()
         .with_video_codecs(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
         .build()
@@ -109,6 +112,9 @@ fn video_codec_encode_flag() {
 
 #[test]
 fn diag_all_devices() {
+    // Raw ash instance: per the contract in vacc_core::vulkan_init, any
+    // self-managed Vulkan init must also hold the shared lock.
+    let _init = vacc_core::vulkan_init::vulkan_init_guard();
     let entry = unsafe { ash::Entry::load() }.unwrap();
     let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 2, 0));
     let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }

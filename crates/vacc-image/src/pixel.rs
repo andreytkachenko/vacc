@@ -192,11 +192,6 @@ impl<'a> RgbImage<'a> {
         &self.pixels[start..start + self.pitch]
     }
 
-    /// Pointer to the first pixel byte (for SIMD row kernels).
-    pub(crate) fn pixels_ptr(&self) -> *const u8 {
-        self.pixels.as_ptr()
-    }
-
     /// Raw pixel data.
     pub fn pixels(&self) -> &'a [u8] {
         self.pixels

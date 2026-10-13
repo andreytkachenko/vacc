@@ -43,6 +43,19 @@
 //!   [`ImageError::Unsupported`] for any warp request and the caller falls
 //!   back to Vulkan compute / software. [`Npp::warp_rgb`] remains available
 //!   for hosts whose NPP build handles it.
+//!
+//! ## SAFETY (this crate's `unsafe` inventory)
+//!
+//! - **NPP entry points**: one `extern "C"` block in `ffi.rs` declares the
+//!   resolved symbols; each is looked up once through `libloading` into the
+//!   cached `Ffi` table (`OnceLock` static). Call sites check every returned
+//!   status code. The `unsafe extern "C" fn` *type aliases* are the FFI
+//!   floor.
+//! - **Handle wrappers** (`NppStreamContext`, `Ffi`): manual `Send`/`Sync`
+//!   — the raw values are CUDA driver handles never dereferenced from Rust,
+//!   process-lifetime, shared through the `OnceLock`.
+//! - **Zero-initialized NPP contexts** (`NppStreamContext::zeroed` etc.):
+//!   C POD types without `Default`; fieldwise zero is the documented state.
 
 mod ffi;
 

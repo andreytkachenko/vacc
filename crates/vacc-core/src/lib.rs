@@ -30,6 +30,7 @@ pub mod frame;
 pub mod gpu;
 pub mod picture;
 pub mod session;
+pub mod vulkan_init;
 
 pub use bitstream::{BitWriter, escape_rbsp, unescape_rbsp};
 pub use codec::{VideoCodec, VideoCodecFlagBits, VideoCodecOperation};

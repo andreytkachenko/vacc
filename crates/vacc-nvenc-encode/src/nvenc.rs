@@ -92,22 +92,39 @@ impl NvencApi {
     /// Retrieve the preset configuration for a codec/preset pair.
     /// # Safety
     /// `handle` must be a valid live encoder session handle.
+    /// Fetch the preset config for a codec/preset pair.
+    ///
+    /// Driver 590+ removed `nvEncGetEncodePresetConfig` (it returns
+    /// `NV_ENC_ERR_UNSUPPORTED_PARAM`); prefer `nvEncGetEncodePresetConfigEx`
+    /// when the driver populates it, falling back to the legacy entry on
+    /// older drivers. Both the outer `NV_ENC_PRESET_CONFIG::version` and the
+    /// inner `presetCfg.version` must be set.
     pub unsafe fn get_preset_config(
         &self,
         handle: *mut c_void,
         encode_guid: api::GUID,
         preset_guid: api::GUID,
+        tuning_info: api::NV_ENC_TUNING_INFO,
     ) -> Result<api::NV_ENC_CONFIG> {
         let mut out: api::_NV_ENC_PRESET_CONFIG = unsafe { zeroed() };
         out.version = api::NV_ENC_PRESET_CONFIG_VER;
-        let f = self
-            .vtable
-            .nvEncGetEncodePresetConfig
-            .ok_or_else(|| Error::Api("vtable missing nvEncGetEncodePresetConfig".into()))?;
-        check(
-            unsafe { f(handle, encode_guid, preset_guid, &mut out) },
-            "NvEncGetEncodePresetConfig",
-        )?;
+        out.presetCfg.version = api::NV_ENC_CONFIG_VER;
+
+        if let Some(f) = self.vtable.nvEncGetEncodePresetConfigEx {
+            check(
+                unsafe { f(handle, encode_guid, preset_guid, tuning_info, &mut out) },
+                "NvEncGetEncodePresetConfigEx",
+            )?;
+        } else {
+            let f = self
+                .vtable
+                .nvEncGetEncodePresetConfig
+                .ok_or_else(|| Error::Api("vtable missing nvEncGetEncodePresetConfig".into()))?;
+            check(
+                unsafe { f(handle, encode_guid, preset_guid, &mut out) },
+                "NvEncGetEncodePresetConfig",
+            )?;
+        }
         Ok(out.presetCfg)
     }
 
@@ -216,6 +233,63 @@ impl NvencApi {
             .nvEncUnlockBitstream
             .ok_or_else(|| Error::Api("vtable missing nvEncUnlockBitstream".into()))?;
         check(unsafe { f(handle, buf) }, "NvEncUnlockBitstream")
+    }
+
+    /// Fetch the SPS/PPS header bytes for an initialized encoder (global
+    /// header mode). Returns the number of valid bytes in `buf`.
+    /// # Safety
+    /// `handle` must be a valid live, initialized encoder session handle.
+    pub unsafe fn get_sequence_params(&self, handle: *mut c_void, buf: &mut [u8]) -> Result<usize> {
+        let mut params: api::_NV_ENC_SEQUENCE_PARAM_PAYLOAD = unsafe { zeroed() };
+        params.version = api::NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
+        params.inBufferSize = buf.len() as u32;
+        params.spsppsBuffer = buf.as_mut_ptr().cast();
+        let mut size: u32 = 0;
+        params.outSPSPPSPayloadSize = &mut size;
+        let f = self
+            .vtable
+            .nvEncGetSequenceParams
+            .ok_or_else(|| Error::Api("vtable missing nvEncGetSequenceParams".into()))?;
+        check(unsafe { f(handle, &mut params) }, "NvEncGetSequenceParams")?;
+        if size as usize > buf.len() {
+            return Err(Error::Api(format!(
+                "SPS/PPS payload too large: {size} > {}",
+                buf.len()
+            )));
+        }
+        Ok(size as usize)
+    }
+
+    /// Lock an input buffer for CPU writes. Returns (host pointer, pitch).
+    /// The host view is valid until [`Self::unlock_input_buffer`].
+    /// # Safety
+    /// `handle` must be a valid live encoder session handle and `buf` a buffer
+    /// created by this session.
+    pub unsafe fn lock_input_buffer(&self, handle: *mut c_void, buf: api::NV_ENC_INPUT_PTR) -> Result<(*mut u8, u32)> {
+        let mut params: api::_NV_ENC_LOCK_INPUT_BUFFER = unsafe { zeroed() };
+        params.version = api::NV_ENC_LOCK_INPUT_BUFFER_VER;
+        params.inputBuffer = buf;
+        let f = self
+            .vtable
+            .nvEncLockInputBuffer
+            .ok_or_else(|| Error::Api("vtable missing nvEncLockInputBuffer".into()))?;
+        check(unsafe { f(handle, &mut params) }, "NvEncLockInputBuffer")?;
+        if params.bufferDataPtr.is_null() {
+            return Err(Error::Api("locked input buffer pointer is null".into()));
+        }
+        Ok((params.bufferDataPtr as *mut u8, params.pitch))
+    }
+
+    /// Unlock a previously locked input buffer.
+    /// # Safety
+    /// `handle` must be a valid live encoder session handle and `buf` a buffer
+    /// created by this session.
+    pub unsafe fn unlock_input_buffer(&self, handle: *mut c_void, buf: api::NV_ENC_INPUT_PTR) -> Result<()> {
+        let f = self
+            .vtable
+            .nvEncUnlockInputBuffer
+            .ok_or_else(|| Error::Api("vtable missing nvEncUnlockInputBuffer".into()))?;
+        check(unsafe { f(handle, buf) }, "NvEncUnlockInputBuffer")
     }
 
     /// Destroy an input buffer.

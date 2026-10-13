@@ -656,13 +656,10 @@ impl SoftwareH265Decoder {
             }
         }
 
-        // Plane pointers into the single backing buffer (safe splits; the
-        // pointers stay valid while `buf` lives inside PixelData).
-        let (y_part, uv_part) = buf.split_at_mut(y_len);
-        let (u_part, v_part) = uv_part.split_at_mut(c_len);
-        let y_ptr = y_part.as_ptr();
-        let u_ptr = u_part.as_ptr();
-        let v_ptr = v_part.as_ptr();
+        // Plane offsets into the single backing buffer: Y, then U, then V.
+        let y_off = 0;
+        let u_off = y_len;
+        let v_off = y_len + c_len;
 
         // The slot may have been recycled since decode; only mark displayed
         // if a live slot still holds this POC.
@@ -684,19 +681,19 @@ impl SoftwareH265Decoder {
         let pixel_data = PixelData {
             format: if self.bps > 1 { "I420-10" } else { "I420" }.to_string(),
             y: PixelPlane {
-                data: y_ptr,
+                data_offset: y_off,
                 pitch: cw * bps,
                 width: cw,
                 height: ch,
             },
             u: PixelPlane {
-                data: u_ptr,
+                data_offset: u_off,
                 pitch: cwidth * bps,
                 width: cwidth,
                 height: cheight,
             },
             v: Some(PixelPlane {
-                data: v_ptr,
+                data_offset: v_off,
                 pitch: cwidth * bps,
                 width: cwidth,
                 height: cheight,

@@ -1,6 +1,20 @@
 //! # vacc-vulkan
 //!
 //! Vulkan Video Decoder implementation using `ash` for Vulkan bindings.
+//!
+//! # SAFETY (this crate's `unsafe` inventory)
+//!
+//! - **ash API calls** (the large majority of `unsafe { }` blocks): ash 0.38
+//!   exposes every entry point as `unsafe fn`. Call sites keep arguments
+//!   valid for the call, check returned `vk::Result`s, and manage object
+//!   lifetimes (create/destroy pairs) within the owning struct.
+//! - **Vulkan Video entry points** (not in ash's safe API): resolved via
+//!   `vkGetDeviceProcAddr` and called through typed fn pointers; see the
+//!   module-level SAFETY proof in [`video_ffi`] (covers every `video_fn!`
+//!   use site).
+//! - **Zero-initialized FFI structs**: `std::mem::zeroed()` on ash
+//!   `vk::native` POD types (they do not implement `Default`); all-bits-zero
+//!   is a valid value for these integer/handle C structs.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::large_enum_variant)]
@@ -24,6 +38,7 @@ pub mod inline_queries;
 pub mod profile_chain;
 pub mod readback;
 pub mod session;
+pub mod video_ffi;
 pub mod vp9;
 
 pub use access_unit::{
