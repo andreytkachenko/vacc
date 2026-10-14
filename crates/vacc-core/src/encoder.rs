@@ -13,7 +13,7 @@
 //! }
 //! ```
 
-use crate::codec::{VideoCodec, H264ProfileIdc};
+use crate::codec::{VideoCodec, H264ProfileIdc, H265ProfileIdc};
 use crate::session::Extent2D;
 
 /// Configuration for creating an encoder.
@@ -37,6 +37,9 @@ pub struct EncoderConfig {
     pub max_ref_frames: u32,
     /// H.264 profile to encode with.
     pub h264_profile: H264ProfileIdc,
+    /// H.265/HEVC profile to encode with (only 8-bit `Main` is encodable via
+    /// the NV12 input path).
+    pub h265_profile: H265ProfileIdc,
 }
 
 impl Default for EncoderConfig {
@@ -51,6 +54,7 @@ impl Default for EncoderConfig {
             intra_period: 30,
             max_ref_frames: 1,
             h264_profile: H264ProfileIdc::Main,
+            h265_profile: H265ProfileIdc::Main,
         }
     }
 }
@@ -63,7 +67,7 @@ impl EncoderConfig {
         }
         if !self.width.is_multiple_of(16) || !self.height.is_multiple_of(16) {
             return Err(format!(
-                "H.264 requires width/height to be multiples of 16 (got {}x{})",
+                "width/height must be multiples of 16 (got {}x{})",
                 self.width, self.height
             ));
         }

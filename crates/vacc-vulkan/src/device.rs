@@ -664,6 +664,25 @@ impl VideoDeviceBuilder {
             }
         }
 
+        // Encode extensions for H.265 (VK_KHR_video_encode_queue shared with H.264)
+        if builder
+            .video_codecs
+            .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+        {
+            for ext in ["VK_KHR_video_encode_queue", "VK_KHR_video_encode_h265"] {
+                if available_names.iter().any(|n| n.as_str() == ext) {
+                    if !extensions.contains(&ext) {
+                        extensions.push(ext);
+                    }
+                } else {
+                    vkdbg!(
+                        "[VideoDeviceBuilder] WARNING: {} not available (H.265 encode not supported)",
+                        ext
+                    );
+                }
+            }
+        }
+
         let c_extensions: Vec<CString> = extensions
             .iter()
             .map(|e| CString::new(*e).unwrap())
@@ -1057,6 +1076,82 @@ impl VulkanDevice {
         };
 
         Ok((caps, encode_caps, h264_caps))
+    }
+
+    /// Query H.265 **encode** capabilities for a given profile / chroma / bit depth.
+    ///
+    /// Returns the generic `VkVideoCapabilitiesKHR` plus the encode-specific
+    /// `VkVideoEncodeCapabilitiesKHR` and `VkVideoEncodeH265CapabilitiesKHR`.
+    pub fn query_video_encode_capabilities_h265(
+        &self,
+        profile_idc: u32,
+        chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
+        luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+        chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
+    ) -> VideoResult<(
+        vk::VideoCapabilitiesKHR<'_>,
+        vk::VideoEncodeCapabilitiesKHR<'_>,
+        vk::VideoEncodeH265CapabilitiesKHR<'_>,
+    )> {
+        let h265_profile = vk::VideoEncodeH265ProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
+            p_next: std::ptr::null(),
+            std_profile_idc: profile_idc as vk::native::StdVideoH265ProfileIdc,
+            _marker: Default::default(),
+        };
+
+        let profile_info = vk::VideoProfileInfoKHR {
+            s_type: vk::StructureType::VIDEO_PROFILE_INFO_KHR,
+            p_next: &h265_profile as *const _ as *const _,
+            video_codec_operation: vk::VideoCodecOperationFlagsKHR::ENCODE_H265,
+            chroma_subsampling,
+            luma_bit_depth,
+            chroma_bit_depth,
+            _marker: Default::default(),
+        };
+        let profile_ptr: *const vk::VideoProfileInfoKHR = &profile_info;
+
+        let get_caps_fn = unsafe {
+            self.entry.get_instance_proc_addr(
+                self.instance.handle(),
+                c"vkGetPhysicalDeviceVideoCapabilitiesKHR".as_ptr(),
+            )
+        }
+        .ok_or_else(|| {
+            VideoError::CapabilityNotAvailable(
+                "vkGetPhysicalDeviceVideoCapabilitiesKHR not found".to_string(),
+            )
+        })?;
+
+        let (caps, encode_caps, h265_caps) = unsafe {
+            type FnType = unsafe extern "system" fn(
+                vk::PhysicalDevice,
+                *const vk::VideoProfileInfoKHR<'_>,
+                *mut vk::VideoCapabilitiesKHR,
+            ) -> vk::Result;
+            let fn_ptr: FnType = crate::video_fn!(get_caps_fn);
+
+            // Chain: VideoCapabilitiesKHR -> VideoEncodeCapabilitiesKHR -> VideoEncodeH265CapabilitiesKHR
+            let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+            let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+            encode_caps.s_type = vk::StructureType::VIDEO_ENCODE_CAPABILITIES_KHR;
+            encode_caps.p_next = &mut h265_caps as *mut _ as *mut _;
+
+            let mut caps = vk::VideoCapabilitiesKHR::default();
+            caps.p_next = &mut encode_caps as *mut _ as *mut _;
+
+            let result = fn_ptr(self.physical_device, profile_ptr, &mut caps);
+            if result != vk::Result::SUCCESS {
+                return Err(VideoError::CapabilityNotAvailable(format!(
+                    "vkGetPhysicalDeviceVideoCapabilitiesKHR (H.265 encode) failed: {:?}",
+                    result
+                )));
+            }
+
+            (caps, encode_caps, h265_caps)
+        };
+
+        Ok((caps, encode_caps, h265_caps))
     }
 
     /// Query supported video formats for a codec.

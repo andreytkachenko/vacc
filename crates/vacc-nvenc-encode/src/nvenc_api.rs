@@ -6303,6 +6303,12 @@ const _: () = {
 pub type NV_ENCODE_API_FUNCTION_LIST = _NV_ENCODE_API_FUNCTION_LIST;
 
 pub const NV_ENC_CONFIG_VER: u32 = 0xF1_09_00_0D;
+/// `NV_ENC_RC_PARAMS::version`. The SDK header of this build ships no dedicated
+/// macro; struct version 1 (0x71_01_00_0D) is the API-wide convention (same
+/// value as `NV_ENC_LOCK_INPUT_BUFFER_VER` & friends). Empirically required:
+/// modifying `rcParams` while `version == 0` makes `nvEncEncodePicture` fail
+/// with `NV_ENC_ERR_GENERIC` on driver 610 (the HEVC P3 preset returns it zero).
+pub const NV_ENC_RC_PARAMS_VER: u32 = 0x71_01_00_0D;
 pub const NV_ENC_INITIALIZE_PARAMS_VER: u32 = 0xF1_07_00_0D;
 pub const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = 0x71_01_00_0D;
 pub const NV_ENC_PIC_PARAMS_VER: u32 = 0xF1_07_00_0D;

@@ -1,9 +1,9 @@
 //! # vacc-nvenc-encode
 //!
-//! NVIDIA NVENC H.264 encode implementation using `libnvidia-encode.so`
+//! NVIDIA NVENC H.264 / H.265 encode implementation using `libnvidia-encode.so`
 //! (loaded at runtime via libloading, vtable populated by
 //! `NvEncodeAPICreateInstance`). Implements `vacc_core::Encoder` for
-//! `VideoCodec::EncodeH264`.
+//! `VideoCodec::EncodeH264` and `VideoCodec::EncodeH265` (8-bit Main).
 //!
 //! The encoder runs in synchronous CQP mode with the driver's internal motion
 //! estimation: the app supplies NV12 frames and receives Annex B access units.

@@ -10,6 +10,7 @@
 pub mod device;
 pub mod encoder;
 pub mod h264;
+pub mod h265;
 
 pub use device::VaapiEncoderDevice;
 pub use encoder::VaapiEncoder;

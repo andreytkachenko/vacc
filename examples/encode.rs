@@ -5,11 +5,13 @@
 //!
 //!   -o, --order    <csv>     backend order, e.g. "nvdec,vaapi"
 //!                             (default: vulkan,nvdec,vaapi)
+//!   -c, --codec    <name>    codec to encode: h264 or h265 (default: h264)
 //!   -n, --frames   <num>     number of frames to encode (default: 30)
 //!   -w, --width    <px>      frame width, multiple of 16 (default: 320)
 //!   -H, --height   <px>      frame height, multiple of 16 (default: 240)
 //!   -q, --qp       <n>       constant QP 0-51 (default: 26)
 //!   -I, --intra    <n>       IDR period in frames (default: 30)
+//!   -r, --refs     <n>       max reference frames (default: 1)
 //!   -O, --out      <file>    output bitstream (default: /tmp/vacc_encode.h264)
 //! ```
 
@@ -17,6 +19,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use vacc_core::encoder::{Encoder, EncoderConfig as CoreCfg, FrameKind, InputFrame};
+use vacc_core::VideoCodec;
 use vacc::{Backend, EncoderConfig, VaccEncoder};
 
 fn die(msg: &str) -> ! {
@@ -26,23 +29,27 @@ fn die(msg: &str) -> ! {
 
 struct Args {
     order: Vec<Backend>,
+    codec: String,
     frames: u32,
     width: u32,
     height: u32,
     qp: u8,
     intra: u32,
-    out: String,
+    refs: u32,
+    out: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut args = Args {
         order: vec![],
+        codec: "h264".to_string(),
         frames: 30,
         width: 320,
         height: 240,
         qp: 26,
         intra: 30,
-        out: "/tmp/vacc_encode.h264".to_string(),
+        refs: 1,
+        out: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -54,12 +61,14 @@ fn parse_args() -> Args {
                     .map(|b| b.trim().parse::<Backend>().unwrap_or_else(|e| die(&e)))
                     .collect();
             }
+            "-c" | "--codec" => args.codec = it.next().unwrap_or_else(|| die("missing codec")), 
             "-n" | "--frames" => args.frames = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad frame count")),
             "-w" | "--width" => args.width = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad width")),
             "-H" | "--height" => args.height = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad height")),
             "-q" | "--qp" => args.qp = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad qp")),
             "-I" | "--intra" => args.intra = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad intra period")),
-            "-O" | "--out" => args.out = it.next().unwrap_or_else(|| die("missing output path")),
+            "-r" | "--refs" => args.refs = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad ref count")),
+            "-O" | "--out" => args.out = Some(it.next().unwrap_or_else(|| die("missing output path"))),
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -90,11 +99,25 @@ fn make_frame(frame_idx: u32, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
 
 fn main() {
     let args = parse_args();
+    let codec = match args.codec.as_str() {
+        "h264" => VideoCodec::EncodeH264,
+        "h265" | "hevc" => VideoCodec::EncodeH265,
+        other => die(&format!("unsupported codec {other} (use h264 or h265)")),
+    };
+    let out_path = args.out.unwrap_or_else(|| {
+        if codec == VideoCodec::EncodeH265 {
+            "/tmp/vacc_encode.h265".to_string()
+        } else {
+            "/tmp/vacc_encode.h264".to_string()
+        }
+    });
     let params = CoreCfg {
         width: args.width,
         height: args.height,
         qp: args.qp,
         intra_period: args.intra,
+        max_ref_frames: args.refs,
+        codec,
         ..Default::default()
     };
     let config = if args.order.is_empty() {
@@ -137,12 +160,12 @@ fn main() {
         out.extend_from_slice(&au.data);
     }
 
-    let mut f = std::fs::File::create(&args.out).unwrap_or_else(|e| die(&e.to_string()));
+    let mut f = std::fs::File::create(&out_path).unwrap_or_else(|e| die(&e.to_string()));
     f.write_all(&out).unwrap_or_else(|e| die(&e.to_string()));
     println!(
         "wrote {} bytes to {} in {:.1} ms ({:.1} fps)",
         out.len(),
-        args.out,
+        out_path,
         t0.elapsed().as_secs_f64() * 1000.0,
         args.frames as f64 / t0.elapsed().as_secs_f64()
     );

@@ -195,7 +195,7 @@ impl BitWriter {
         Self::default()
     }
 
-    fn put_bit(&mut self, v: bool) {
+    pub(crate) fn put_bit(&mut self, v: bool) {
         if self.bitpos == 0 {
             self.bytes.push(0);
         }

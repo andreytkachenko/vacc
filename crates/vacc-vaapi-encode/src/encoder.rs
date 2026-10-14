@@ -6,8 +6,11 @@
 
 use libva::buffer::{
     BufferType, EncPackedHeaderParameter, EncPackedHeaderType,
-    EncPictureParameterBufferH264, EncSequenceParameterBufferH264,
-    EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, MappedCodedBuffer, PictureH264,
+    EncPictureParameterBufferH264, EncPictureParameterBufferHEVC,
+    EncSequenceParameterBufferH264, EncSequenceParameterBufferHEVC,
+    EncSliceParameterBufferH264, EncSliceParameterBufferHEVC, HEVCEncPicFields,
+    HEVCEncSeqFields, HevcEncPicSccFields, HevcEncSeqSccFields, HevcEncSliceFields,
+    H264EncPicFields, H264EncSeqFields, MappedCodedBuffer, PictureH264, PictureHEVC,
 };
 use libva::{
     Buffer, Config, Context, Display, Image, Picture, VAEntrypoint, VAProfile, VAConfigAttrib,
@@ -16,16 +19,17 @@ use libva::{
 use std::rc::Rc;
 use vacc_core::encoder::{EncodedFrame, Encoder, EncoderConfig, EncoderInfo, FrameKind, InputFrame};
 use vacc_core::session::Extent2D;
+use vacc_core::VideoCodec;
 
 use super::Error;
-use crate::h264;
+use crate::{h264, h265};
 
 /// Number of surfaces in the reference pool. Must exceed max_ref_frames so
 /// a surface is never overwritten before the driver stops using it as a
 /// reference.
 const NSURFACES: usize = 6;
 
-/// VAAPI H.264 encoder.
+/// VAAPI H.264 / H.265 encoder.
 pub struct VaapiEncoder {
     /// Must outlive the context.
     #[allow(dead_code)]
@@ -33,6 +37,7 @@ pub struct VaapiEncoder {
     context: Rc<Context>,
     surfaces: Vec<libva::Surface<()>>,
 
+    codec: VideoCodec,
     width: u32,
     height: u32,
     qp: u8,
@@ -52,28 +57,40 @@ impl VaapiEncoder {
     /// Create an encoder on an existing display.
     pub fn open_on(display: &Rc<Display>, config: &EncoderConfig) -> Result<Self, Error> {
         config.validate().map_err(Error::InvalidState)?;
-        if config.codec != vacc_core::VideoCodec::EncodeH264 {
+        let is_h265 = config.codec == vacc_core::VideoCodec::EncodeH265;
+        if config.codec != vacc_core::VideoCodec::EncodeH264 && !is_h265 {
             return Err(Error::CodecNotSupported(format!(
-                "vaapi-encode supports EncodeH264 only (got {:?})",
+                "vaapi-encode supports EncodeH264/EncodeH265 only (got {:?})",
                 config.codec
             )));
         }
 
         let width = config.width;
         let height = config.height;
-        let profile = VAProfile::VAProfileH264Main;
+        let profile = if is_h265 {
+            VAProfile::VAProfileHEVCMain
+        } else {
+            VAProfile::VAProfileH264Main
+        };
         if !display
             .query_config_entrypoints(profile)
             .map(|eps| eps.contains(&VAEntrypoint::VAEntrypointEncSlice))
             .unwrap_or(false)
         {
-            return Err(Error::CodecNotSupported(
-                "VAProfileH264Main + VAEntrypointEncSlice not supported".into(),
-            ));
+            return Err(Error::CodecNotSupported(format!(
+                "{:?} + VAEntrypointEncSlice not supported",
+                profile
+            )));
         }
 
         // Config attributes: CQP rate control, NV12 render format, packed
-        // SPS/PICTURE/SLICE headers.
+        // headers. H.264 uses SEQUENCE|PICTURE|SLICE; H.265 packs VPS+SPS+PPS
+        // in the Sequence buffer and the slice header in the Slice buffer.
+        let packed_headers: u32 = if is_h265 {
+            0x1 | 0x4 // VA_ENC_PACKED_HEADER_SEQUENCE | SLICE
+        } else {
+            0x7 // SEQUENCE|PICTURE|SLICE
+        };
         let attrs = vec![
             VAConfigAttrib {
                 type_: VAConfigAttribType::VAConfigAttribRateControl,
@@ -85,7 +102,7 @@ impl VaapiEncoder {
             },
             VAConfigAttrib {
                 type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
-                value: 0x7, // SEQUENCE|PICTURE|SLICE
+                value: packed_headers,
             },
         ];
         let cfg = display
@@ -115,6 +132,7 @@ impl VaapiEncoder {
             config: cfg,
             context,
             surfaces,
+            codec: config.codec,
             width,
             height,
             qp: config.qp,
@@ -278,44 +296,16 @@ impl VaapiEncoder {
         }
         Ok(out)
     }
-}
-
-impl Encoder for VaapiEncoder {
-    type Error = Error;
-
-    fn new(config: &EncoderConfig) -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        Self::open(config)
-    }
-
-    fn info(&self) -> EncoderInfo {
-        EncoderInfo {
-            backend: "vaapi".into(),
-            codec: vacc_core::VideoCodec::EncodeH264,
-            coded_size: Extent2D::new(self.width, self.height),
-            qp: self.qp,
-            fps_num: self.fps_num,
-            fps_den: self.fps_den,
-        }
-    }
-
-    fn encode(&mut self, frame: &InputFrame, timestamp: i64) -> Result<Vec<EncodedFrame>, Self::Error> {
-        let idx = (self.frame_index as usize) % self.surfaces.len();
-        let is_idr = self.frame_index == 0 || self.frame_index.is_multiple_of(self.intra_period);
+    fn encode_h264(
+        &self,
+        idx: usize,
+        coded: &libva::buffer::EncCodedBuffer,
+        is_idr: bool,
+        poc_lsb: u16,
+        timestamp: i64,
+    ) -> Result<Vec<u8>, Error> {
         let nmb = (self.width / 16) * (self.height / 16);
         let frame_num = (self.frame_index & 0xF) as u16;
-        let poc_lsb = (self.frame_index & 0xFF) as u16;
-
-        // 1. Upload input pixels.
-        self.upload_frame(&self.surfaces[idx], frame)?;
-
-        // 2. Per-frame buffers.
-        let coded = self
-            .context
-            .create_enc_coded((self.width * self.height * 2) as usize)
-            .map_err(|e| Error::VaApi(format!("create coded buffer: {}", e)))?;
 
         let curr = PictureH264::new(self.surfaces[idx].id(), self.frame_index, 0, 0, 0);
         // Previous-frame reference (PictureH264 is not Clone; rebuild from
@@ -437,7 +427,7 @@ impl Encoder for VaapiEncoder {
             .create_buffer(BufferType::EncPackedHeaderData(slh_bytes))
             .map_err(|e| Error::VaApi(format!("slice hdr data buffer: {}", e)))?;
 
-        // 3. Render. Order matters: iHD processes render buffers sequentially
+        // Render. Order matters: iHD processes render buffers sequentially
         // and must see the packed slice header BEFORE the slice parameter
         // buffer (sets bHavePackedSliceHdr), matching the C probe layout:
         // seq, packed SPS (param+data), packed PPS (param+data),
@@ -462,8 +452,308 @@ impl Encoder for VaapiEncoder {
             })
             .map_err(|e| Error::VaApi(format!("render: {}", e)))?;
 
-        // 4. Read back the coded bitstream (Annex B).
-        let data = Self::read_coded(&coded)?;
+        // Read back the coded bitstream (Annex B).
+        Self::read_coded(coded)
+    }
+
+    /// H.265/HEVC: build picture/slice/packed-header buffers, render, read back.
+    fn encode_h265(
+        &self,
+        idx: usize,
+        coded: &libva::buffer::EncCodedBuffer,
+        is_idr: bool,
+        poc_lsb: u16,
+        timestamp: i64,
+    ) -> Result<Vec<u8>, Error> {
+        const RPS_ST_CURR_BEFORE: u32 = 0x10; // VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
+        let nctu = self.num_ctus();
+        let poc = self.frame_index as i32;
+
+        let curr = PictureHEVC::new(self.surfaces[idx].id(), poc, 0);
+        let prev: Option<u32> = if is_idr {
+            None
+        } else {
+            let prev_idx = ((self.frame_index - 1) as usize) % self.surfaces.len();
+            Some(self.surfaces[prev_idx].id())
+        };
+        let refs: [PictureHEVC; 15] = std::array::from_fn(|i| match (prev, i) {
+            (Some(pid), 0) => PictureHEVC::new(pid, poc - 1, RPS_ST_CURR_BEFORE),
+            _ => PictureHEVC::new(0, 0, 0),
+        });
+
+        let pic_fields = HEVCEncPicFields::new(
+            if is_idr { 1 } else { 0 }, // idr_pic_flag
+            if is_idr { 1 } else { 2 }, // coding_type (HEVC: I=1, P=2, B=3)
+            1,                          // reference_pic_flag
+            0,                          // dependent_slice_segments_enabled
+            1,                          // sign_data_hiding_enabled
+            0,                          // constrained_intra_pred
+            0,                          // transform_skip_enabled
+            1,                          // cu_qp_delta_enabled
+            0,                          // weighted_pred
+            0,                          // weighted_bipred
+            0,                          // transquant_bypass
+            0,                          // tiles_enabled
+            0,                          // entropy_coding_sync
+            1,                          // loop_filter_across_tiles
+            1,                          // pps_loop_filter_across_slices
+            0,                          // scaling_list_data_present
+            0,                          // screen_content
+            0,                          // enable_gpu_weighted_prediction
+            0,                          // no_output_of_prior_pics
+        );
+        let pic_param = EncPictureParameterBufferHEVC::new(
+            curr,
+            refs,
+            coded.id(),
+            0, // collocated_ref_pic_index
+            0, // last_picture
+            self.qp, // pic_init_qp
+            0,       // diff_cu_qp_delta_depth
+            0,       // pps_cb_qp_offset
+            0,       // pps_cr_qp_offset
+            0,       // num_tile_columns_minus1
+            0,       // num_tile_rows_minus1
+            [0; 19], // column_width_minus1
+            [0; 21], // row_height_minus1
+            0, // log2_parallel_merge_level_minus2
+            0, // ctu_max_bitsize_allowed
+            0, // num_ref_idx_l0_default_active_minus1
+            0, // num_ref_idx_l1_default_active_minus1
+            0, // slice_pic_parameter_set_id
+            if is_idr { 19 } else { 1 }, // nal_unit_type (IDR_W_RADL / TRAIL_N)
+            &pic_fields,
+            1, // hierarchical_level_plus1
+            0, // va_byte_reserved
+            &HevcEncPicSccFields::new(0),
+        );
+
+        let rpl0: [PictureHEVC; 15] = std::array::from_fn(|i| match (prev, i) {
+            (Some(pid), 0) => PictureHEVC::new(pid, poc - 1, RPS_ST_CURR_BEFORE),
+            _ => PictureHEVC::new(0, 0, 0),
+        });
+        let slice_fields = HevcEncSliceFields::new(
+            1, // last_slice_of_pic_flag
+            0, // dependent_slice_segment_flag
+            0, // colour_plane_id
+            0, // slice_temporal_mvp_enabled
+            1, // slice_sao_luma_flag
+            1, // slice_sao_chroma_flag
+            0, // num_ref_idx_active_override
+            0, // mvd_l1_zero
+            0, // cabac_init
+            0, // slice_deblocking_filter_disabled
+            1, // slice_loop_filter_across_slices_enabled
+            0, // collocated_from_l0
+        );
+        let slice_param = EncSliceParameterBufferHEVC::new(
+            0, // slice_segment_address
+            nctu, // num_ctu_in_slice
+            if is_idr { 2 } else { 1 }, // slice_type (raw HEVC syntax: I=2, P=1, B=0)
+            0, // slice_pic_parameter_set_id
+            0, // num_ref_idx_l0_active_minus1
+            0, // num_ref_idx_l1_active_minus1
+            rpl0, // ref_pic_list0
+            std::array::from_fn(|_| PictureHEVC::new(0, 0, 0)), // ref_pic_list1
+            0, // luma_log2_weight_denom
+            0, // delta_chroma_log2_weight_denom
+            [0i8; 15], // delta_luma_weight_l0
+            [0i8; 15], // luma_offset_l0
+            [[0i8; 2]; 15], // delta_chroma_weight_l0
+            [[0i8; 2]; 15], // chroma_offset_l0
+            [0i8; 15], // delta_luma_weight_l1
+            [0i8; 15], // luma_offset_l1
+            [[0i8; 2]; 15], // delta_chroma_weight_l1
+            [[0i8; 2]; 15], // chroma_offset_l1
+            5, // max_num_merge_cand (matches five_minus_max_num_merge_cand=0)
+            0, // slice_qp_delta
+            0, // slice_cb_qp_offset
+            0, // slice_cr_qp_offset
+            0, // slice_beta_offset_div2
+            0, // slice_tc_offset_div2
+            &slice_fields,
+            0, // pred_weight_table_bit_offset
+            0, // pred_weight_table_bit_length
+        );
+
+        // Packed Slice header (sent every frame). has_emulation_bytes=1: the
+        // data already carries start code + EPB'd RBSP.
+        let (slh_bytes, slh_bits) = h265::make_slice_hdr(is_idr, poc_lsb as u32);
+        let slh_hdr = self
+            .context
+            .create_buffer(BufferType::EncPackedHeaderParameter(
+                EncPackedHeaderParameter::new(EncPackedHeaderType::Slice, slh_bits, true),
+            ))
+            .map_err(|e| Error::VaApi(format!("slice hdr param buffer: {}", e)))?;
+        let slh_data = self
+            .context
+            .create_buffer(BufferType::EncPackedHeaderData(slh_bytes))
+            .map_err(|e| Error::VaApi(format!("slice hdr data buffer: {}", e)))?;
+
+        let pic_buf = self
+            .context
+            .create_buffer(BufferType::EncPictureParameter(
+                libva::buffer::EncPictureParameter::HEVC(pic_param),
+            ))
+            .map_err(|e| Error::VaApi(format!("picture param buffer: {}", e)))?;
+        let slice_buf = self
+            .context
+            .create_buffer(BufferType::EncSliceParameter(
+                libva::buffer::EncSliceParameter::HEVC(slice_param),
+            ))
+            .map_err(|e| Error::VaApi(format!("slice param buffer: {}", e)))?;
+
+        // Render order mirrors FFmpeg's hevc_vaapi: on IDR, the sequence
+        // parameter buffer + packed VPS/SPS/PPS precede the picture buffer.
+        let mut picture = Picture::new(timestamp as u64, Rc::clone(&self.context), &self.surfaces[idx]);
+        if is_idr {
+            picture.add_buffer(self.h265_seq_buffer());
+            let (seq_hdr, seq_data) = self.seq_packed_buffers();
+            picture.add_buffer(seq_hdr);
+            picture.add_buffer(seq_data);
+        }
+        picture.add_buffer(pic_buf);
+        picture.add_buffer(slh_hdr);
+        picture.add_buffer(slh_data);
+        picture.add_buffer(slice_buf);
+        picture
+            .begin()
+            .and_then(|p| p.render())
+            .and_then(|p| p.end())
+            .and_then(|p| match p.sync() {
+                Ok(p) => Ok(p),
+                Err((e, _)) => Err(e),
+            })
+            .map_err(|e| Error::VaApi(format!("render: {}", e)))?;
+
+        Self::read_coded(coded)
+    }
+
+    /// Total CTU count for a 64x64 CTB grid (matches the SPS).
+    fn num_ctus(&self) -> u32 {
+        ((self.width + 63) / 64) * ((self.height + 63) / 64)
+    }
+
+    /// HEVC sequence parameter buffer (static contents; recreated per picture).
+    fn h265_seq_buffer(&self) -> Buffer {
+        let seq_fields = HEVCEncSeqFields::new(
+            1, // chroma_format_idc (4:2:0)
+            0, // separate_colour_plane
+            0, // bit_depth_luma_minus8
+            0, // bit_depth_chroma_minus8
+            0, // scaling_list_enabled
+            1, // strong_intra_smoothing (matches SPS)
+            0, // amp_enabled (matches SPS)
+            1, // sample_adaptive_offset (matches SPS)
+            0, // pcm_enabled
+            0, // pcm_loop_filter_disabled
+            0, // sps_temporal_mvp (matches SPS)
+            1, // low_delay_seq
+            0, // hierarchical_flag
+        );
+        let seq = EncSequenceParameterBufferHEVC::new(
+            1, // general_profile_idc (Main)
+            60, // general_level_idc
+            0, // general_tier_flag
+            self.intra_period,
+            self.intra_period,
+            1, // ip_period
+            500_000, // bits_per_second (nominal; CQP ignores it)
+            self.width as u16,
+            self.height as u16,
+            &seq_fields,
+            0, // log2_min_luma_coding_block_size_minus3
+            3, // log2_diff_max_min_luma_coding_block_size
+            0, // log2_min_transform_block_size_minus2
+            3, // log2_diff_max_min_transform_block_size
+            0, // max_transform_hierarchy_depth_inter (maxTU = 4x4, matches SPS/x265)
+            0, // max_transform_hierarchy_depth_intra
+            0, // pcm_sample_bit_depth_luma_minus1
+            0, // pcm_sample_bit_depth_chroma_minus1
+            0, // log2_min_pcm_luma_coding_block_size_minus3
+            0, // log2_max_pcm_luma_coding_block_size_minus3
+            None, // vui_fields
+            0, // aspect_ratio_idc
+            0, // sar_width
+            0, // sar_height
+            0, // vui_num_units_in_tick
+            0, // vui_time_scale
+            0, // min_spatial_segmentation_idc
+            0, // max_bytes_per_pic_denom
+            0, // max_bits_per_min_cu_denom
+            &HevcEncSeqSccFields::new(0),
+        );
+        self.context
+            .create_buffer(BufferType::EncSequenceParameter(
+                libva::buffer::EncSequenceParameter::HEVC(seq),
+            ))
+            .expect("h265 seq param buffer")
+    }
+
+    /// Packed Sequence buffer: VPS + SPS + PPS NALs (4-byte start-coded).
+    fn seq_packed_buffers(&self) -> (Buffer, Buffer) {
+        let data = h265::seq_packed_data(self.width, self.height);
+        (
+            self.context
+                .create_buffer(BufferType::EncPackedHeaderParameter(
+                    EncPackedHeaderParameter::new(
+                        EncPackedHeaderType::Sequence,
+                        (data.len() as u32) * 8,
+                        true,
+                    ),
+                ))
+                .expect("seq packed param buffer"),
+            self.context
+                .create_buffer(BufferType::EncPackedHeaderData(data))
+                .expect("seq packed data buffer"),
+        )
+    }
+
+}
+
+impl Encoder for VaapiEncoder {
+    type Error = Error;
+
+    fn new(config: &EncoderConfig) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        Self::open(config)
+    }
+
+    fn info(&self) -> EncoderInfo {
+        EncoderInfo {
+            backend: "vaapi".into(),
+            codec: self.codec,
+            coded_size: Extent2D::new(self.width, self.height),
+            qp: self.qp,
+            fps_num: self.fps_num,
+            fps_den: self.fps_den,
+        }
+    }
+
+    fn encode(&mut self, frame: &InputFrame, timestamp: i64) -> Result<Vec<EncodedFrame>, Self::Error> {
+        let idx = (self.frame_index as usize) % self.surfaces.len();
+        let is_idr = self.frame_index == 0 || self.frame_index.is_multiple_of(self.intra_period);
+        let poc_lsb = (self.frame_index & 0xFF) as u16;
+
+        // 1. Upload input pixels.
+        self.upload_frame(&self.surfaces[idx], frame)?;
+
+        // 2. Coded buffer.
+        let coded = self
+            .context
+            .create_enc_coded((self.width * self.height * 2) as usize)
+            .map_err(|e| Error::VaApi(format!("create coded buffer: {}", e)))?;
+
+        // 3. Build per-frame buffers + render (codec-specific), then read back.
+        let data = match self.codec {
+            VideoCodec::EncodeH265 => {
+                self.encode_h265(idx, &coded, is_idr, poc_lsb, timestamp)
+            }
+            _ => self.encode_h264(idx, &coded, is_idr, poc_lsb, timestamp),
+        }?;
+
         self.frame_index += 1;
 
         Ok(vec![EncodedFrame {
@@ -477,6 +767,7 @@ impl Encoder for VaapiEncoder {
         }])
     }
 
+    /// H.264: build picture/slice/packed-header buffers, render, read back.
     fn flush(&mut self) -> Result<Vec<EncodedFrame>, Self::Error> {
         // Synchronous backend: nothing in flight.
         Ok(Vec::new())

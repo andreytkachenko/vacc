@@ -1,11 +1,11 @@
-//! NVENC H.264 encoder implementing `vacc_core::Encoder`.
+//! NVENC H.264 / H.265 encoder implementing `vacc_core::Encoder`.
 //!
 //! Synchronous CQP mode with the driver's internal motion estimation:
 //! NV12 frames in, Annex B access units out (SPS/PPS emitted by the driver).
 
 use std::mem::zeroed;
 
-use vacc_core::codec::H264ProfileIdc;
+use vacc_core::codec::{H264ProfileIdc, H265ProfileIdc, VideoCodec};
 use vacc_core::encoder::{EncodedFrame, Encoder, EncoderConfig, EncoderInfo, FrameKind, InputFrame};
 use vacc_core::session::Extent2D;
 
@@ -19,7 +19,7 @@ const N_INPUTS: usize = 6;
 /// Output bitstream buffer pool size.
 const N_OUTPUTS: usize = 2;
 
-/// NVENC H.264 encoder.
+/// NVENC H.264/H.265 encoder.
 pub struct NvencEncoder {
     // Drop order matters: `session` (uses the vtable) must drop before `api`.
     session: Session,
@@ -29,6 +29,7 @@ pub struct NvencEncoder {
     #[allow(dead_code)]
     cuda: Cuda,
 
+    codec: VideoCodec,
     width: u32,
     height: u32,
     qp: u8,
@@ -58,16 +59,45 @@ fn profile_guid(profile: H264ProfileIdc) -> api::GUID {
     }
 }
 
+/// HEVC level from the max luma sample rate (w*h*fps), Main tier.
+fn hevc_level(width: u32, height: u32, fps_num: u32, fps_den: u32) -> u32 {
+    let samples = width as u64 * height as u64 * fps_num as u64 / fps_den.max(1) as u64;
+    if samples <= 552_960 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_1
+    } else if samples <= 1_105_920 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_2
+    } else if samples <= 2_211_840 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_3
+    } else if samples <= 4_423_680 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_31
+    } else if samples <= 7_903_488 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_4
+    } else if samples <= 12_636_960 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_41
+    } else if samples <= 25_273_920 {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_5
+    } else {
+        api::_NV_ENC_LEVEL_NV_ENC_LEVEL_HEVC_51
+    }
+}
+
 impl NvencEncoder {
     /// Open a CUDA context + NVENC session for the given configuration.
     pub fn open(config: &EncoderConfig) -> Result<Self, Error> {
         config.validate().map_err(Error::InvalidState)?;
-        if config.codec != vacc_core::VideoCodec::EncodeH264 {
-            return Err(Error::CodecNotSupported(format!(
-                "nvenc-encode supports EncodeH264 only (got {:?})",
-                config.codec
-            )));
-        }
+        let (codec_guid, profile_guid) = match config.codec {
+            VideoCodec::EncodeH264 => (api::NV_ENC_CODEC_H264_GUID, profile_guid(config.h264_profile)),
+            VideoCodec::EncodeH265 if config.h265_profile == H265ProfileIdc::Main => (
+                api::NV_ENC_CODEC_HEVC_GUID,
+                api::NV_ENC_HEVC_PROFILE_MAIN_GUID,
+            ),
+            other => {
+                return Err(Error::CodecNotSupported(format!(
+                    "nvenc-encode supports EncodeH264 and 8-bit HEVC Main (got {:?})",
+                    other
+                )));
+            }
+        };
 
         // Device selection: NVD_GPU env var (0-based index), default 0.
         let device_index: i32 = std::env::var("NVD_GPU")
@@ -87,12 +117,13 @@ impl NvencEncoder {
         let mut enc_config = unsafe {
             api.get_preset_config(
                 session.handle(),
-                api::NV_ENC_CODEC_H264_GUID,
+                codec_guid,
                 api::NV_ENC_PRESET_P3_GUID,
                 api::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_LOW_LATENCY,
             )
         }
         .map_err(|e| Error::EncoderInit(format!("preset config: {e}")))?;
+        enc_config.rcParams.version = api::NV_ENC_RC_PARAMS_VER;
         enc_config.rcParams.rateControlMode = api::_NV_ENC_PARAMS_RC_MODE_NV_ENC_PARAMS_RC_CONSTQP;
         let qp = config.qp as u32;
         enc_config.rcParams.constQP.qpInterP = qp;
@@ -101,11 +132,22 @@ impl NvencEncoder {
         enc_config.gopLength = config.intra_period;
         enc_config.frameIntervalP = 1;
         enc_config.frameFieldMode = api::_NV_ENC_PARAMS_FRAME_FIELD_MODE_NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
-        enc_config.profileGUID = profile_guid(config.h264_profile);
+        enc_config.profileGUID = profile_guid;
+        if config.codec == VideoCodec::EncodeH265 {
+            // 8-bit Main: pin the bit depths (the preset may default to 10) and
+            // size the DPB; level from the sample rate.
+            enc_config.encodeCodecConfig.hevcConfig.inputBitDepth =
+                api::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
+            enc_config.encodeCodecConfig.hevcConfig.outputBitDepth =
+                api::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
+            enc_config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = config.max_ref_frames;
+            enc_config.encodeCodecConfig.hevcConfig.level =
+                hevc_level(config.width, config.height, config.fps_num, config.fps_den);
+        }
 
         let mut init: api::_NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
         init.version = api::NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = api::NV_ENC_CODEC_H264_GUID;
+        init.encodeGUID = codec_guid;
         init.presetGUID = api::NV_ENC_PRESET_P3_GUID;
         init.encodeWidth = config.width;
         init.encodeHeight = config.height;
@@ -114,7 +156,9 @@ impl NvencEncoder {
         init.frameRateNum = config.fps_num;
         init.frameRateDen = config.fps_den;
         init.enableEncodeAsync = 0;
-        init.enablePTD = 0;
+        // The driver's HEVC path rejects the first inter frame (GENERIC) unless
+        // picture-type decision is handed to the API; ffmpeg sets this too.
+        init.enablePTD = 1;
         init.tuningInfo = api::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_LOW_LATENCY;
         init.bufferFormat = api::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12;
 
@@ -153,6 +197,7 @@ impl NvencEncoder {
             session,
             api,
             cuda,
+            codec: config.codec,
             width: config.width,
             height: config.height,
             qp: config.qp,
@@ -236,7 +281,7 @@ impl Encoder for NvencEncoder {
     fn info(&self) -> EncoderInfo {
         EncoderInfo {
             backend: "nvenc".into(),
-            codec: vacc_core::VideoCodec::EncodeH264,
+            codec: self.codec,
             coded_size: Extent2D::new(self.width, self.height),
             qp: self.qp,
             fps_num: self.fps_num,
@@ -265,7 +310,15 @@ impl Encoder for NvencEncoder {
         pic.outputBitstream = self.outputs[out_idx];
         pic.bufferFmt = api::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12;
         pic.pictureStruct = api::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
-        unsafe { self.api.encode_picture(self.session.handle(), &mut pic) }?;
+        match unsafe { self.api.encode_picture(self.session.handle(), &mut pic) } {
+            Ok(()) => {}
+            Err(e) => {
+                // Surface the driver's own description; status 20 (GENERIC)
+                // is otherwise a black box.
+                let detail = unsafe { self.api.last_error(self.session.handle()) };
+                return Err(Error::Api(format!("NvEncEncodePicture failed: {e}; last_error: {detail}")));
+            }
+        }
 
         // 3. Read back the access unit; IDRs carry the SPS/PPS prefix so each
         //    IDR AU is self-contained (same contract as the other backends).

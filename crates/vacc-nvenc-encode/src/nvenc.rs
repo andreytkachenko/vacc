@@ -315,6 +315,18 @@ impl NvencApi {
             .ok_or_else(|| Error::Api("vtable missing nvEncDestroyBitstreamBuffer".into()))?;
         check(unsafe { f(handle, buf) }, "NvEncDestroyBitstreamBuffer")
     }
+
+    /// Human-readable description of the last error on `handle` (empty if none).
+    pub unsafe fn last_error(&self, handle: *mut c_void) -> String {
+        let Some(f) = self.vtable.nvEncGetLastErrorString else {
+            return String::new();
+        };
+        let ptr = unsafe { f(handle) };
+        if ptr.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
 }
 
 /// An NVENC encode session. Holds a raw pointer into the owning

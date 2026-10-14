@@ -17,7 +17,7 @@ impl BitWriter {
         Self::default()
     }
 
-    fn put_bit(&mut self, v: bool) {
+    pub fn put_bit(&mut self, v: bool) {
         if self.bitpos == 0 {
             self.bytes.push(0);
         }
@@ -73,18 +73,18 @@ impl BitWriter {
             self.put_bit(false);
         }
         // Emulation prevention: after two consecutive zero bytes, insert a
-        // 0x03 before any byte <= 0x03.
+        // 0x03 BEFORE any byte <= 0x03 (so the stream never contains
+        // `00 00 00`/`00 00 01`/`00 00 02`).
         let input = std::mem::take(&mut self.bytes);
         let mut out = Vec::with_capacity(input.len() * 2);
         let mut zeros = 0u32;
         for &b in &input {
-            out.push(b);
             if zeros >= 2 && (b as u32) <= 3 {
                 out.push(3);
                 zeros = 0;
-            } else {
-                zeros = if b == 0 { zeros + 1 } else { 0 };
             }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
         }
         out
     }

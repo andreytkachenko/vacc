@@ -43,7 +43,7 @@ pub const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
 const STD_HEADER_NAME: &str = "VK_STD_vulkan_video_codec_h264_encode";
 
-fn build_std_header_version(extension_name: &str) -> vk::ExtensionProperties {
+pub(crate) fn build_std_header_version(extension_name: &str) -> vk::ExtensionProperties {
     let mut props = vk::ExtensionProperties::default();
     let bytes = format!("{}\0", extension_name).into_bytes();
     props
@@ -55,48 +55,56 @@ fn build_std_header_version(extension_name: &str) -> vk::ExtensionProperties {
     props
 }
 
-/// All VK Video entry points (ash 0.38 does not wrap them).
-struct VideoFns {
-    create_session: unsafe extern "system" fn(
+/// All VK Video entry points (ash 0.38 does not wrap them). Shared by the
+/// H.264 and H.265 sessions — every entry point here is codec-independent.
+pub(crate) struct VideoFns {
+    pub(crate) create_session: unsafe extern "system" fn(
         vk::Device,
         *const vk::VideoSessionCreateInfoKHR<'_>,
         *const vk::AllocationCallbacks<'_>,
         *mut vk::VideoSessionKHR,
     ) -> vk::Result,
-    destroy_session:
+    pub(crate) destroy_session:
         unsafe extern "system" fn(vk::Device, vk::VideoSessionKHR, *const vk::AllocationCallbacks<'_>),
-    get_session_mem_reqs: unsafe extern "system" fn(
+    pub(crate) get_session_mem_reqs: unsafe extern "system" fn(
         vk::Device,
         vk::VideoSessionKHR,
         *mut u32,
         *mut vk::VideoSessionMemoryRequirementsKHR<'_>,
     ) -> vk::Result,
-    bind_session_memory: unsafe extern "system" fn(
+    pub(crate) bind_session_memory: unsafe extern "system" fn(
         vk::Device,
         vk::VideoSessionKHR,
         u32,
         *const vk::BindVideoSessionMemoryInfoKHR<'_>,
     ) -> vk::Result,
-    create_params: unsafe extern "system" fn(
+    pub(crate) create_params: unsafe extern "system" fn(
         vk::Device,
         *const vk::VideoSessionParametersCreateInfoKHR<'_>,
         *const vk::AllocationCallbacks<'_>,
         *mut vk::VideoSessionParametersKHR,
     ) -> vk::Result,
-    destroy_params: unsafe extern "system" fn(
+    pub(crate) destroy_params: unsafe extern "system" fn(
         vk::Device,
         vk::VideoSessionParametersKHR,
         *const vk::AllocationCallbacks<'_>,
     ),
-    cmd_begin_coding:
+    pub(crate) cmd_begin_coding:
         unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoBeginCodingInfoKHR<'_>),
-    cmd_encode_video: unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEncodeInfoKHR<'_>),
-    cmd_end_coding: unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEndCodingInfoKHR<'_>),
-    cmd_control_coding:
+    pub(crate) cmd_encode_video: unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEncodeInfoKHR<'_>),
+    pub(crate) cmd_end_coding: unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoEndCodingInfoKHR<'_>),
+    pub(crate) cmd_control_coding:
         unsafe extern "system" fn(vk::CommandBuffer, *const vk::VideoCodingControlInfoKHR<'_>),
+    pub(crate) get_encoded_session_params: unsafe extern "system" fn(
+        vk::Device,
+        *const vk::VideoEncodeSessionParametersGetInfoKHR<'_>,
+        *mut vk::VideoEncodeSessionParametersFeedbackInfoKHR<'_>,
+        *mut usize,
+        *mut std::ffi::c_void,
+    ) -> vk::Result,
 }
 
-fn load_fn<T>(instance: &ash::Instance, device: vk::Device, name: &str) -> Result<T, Error> {
+pub(crate) fn load_fn<T>(instance: &ash::Instance, device: vk::Device, name: &str) -> Result<T, Error> {
     let cname = CString::new(name).unwrap();
     let ptr = unsafe { instance.get_device_proc_addr(device, cname.as_ptr()) }
         .ok_or_else(|| Error::EncoderInit(format!("{name} not found")))?;
@@ -110,7 +118,7 @@ fn load_fn<T>(instance: &ash::Instance, device: vk::Device, name: &str) -> Resul
 }
 
 impl VideoFns {
-    fn load(instance: &ash::Instance, device: vk::Device) -> Result<Self, Error> {
+    pub(crate) fn load(instance: &ash::Instance, device: vk::Device) -> Result<Self, Error> {
         Ok(Self {
             create_session: load_fn(instance, device, "vkCreateVideoSessionKHR")?,
             destroy_session: load_fn(instance, device, "vkDestroyVideoSessionKHR")?,
@@ -122,11 +130,16 @@ impl VideoFns {
             cmd_encode_video: load_fn(instance, device, "vkCmdEncodeVideoKHR")?,
             cmd_end_coding: load_fn(instance, device, "vkCmdEndVideoCodingKHR")?,
             cmd_control_coding: load_fn(instance, device, "vkCmdControlVideoCodingKHR")?,
+            get_encoded_session_params: load_fn(
+                instance,
+                device,
+                "vkGetEncodedVideoSessionParametersKHR",
+            )?,
         })
     }
 }
 
-fn find_memory_type(
+pub(crate) fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,
@@ -139,7 +152,7 @@ fn find_memory_type(
         .map(|(i, _)| i as u32)
 }
 
-fn alloc_memory(
+pub(crate) fn alloc_memory(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     size: vk::DeviceSize,
@@ -157,7 +170,7 @@ fn alloc_memory(
 
 /// Query + allocate + bind the memory of a video session or session parameters.
 /// (vkBindVideoSessionMemoryKHR accepts either object type per the spec.)
-fn bind_video_memories<T: Handle + Copy>(
+pub(crate) fn bind_video_memories<T: Handle + Copy>(
     fns: &VideoFns,
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -185,7 +198,7 @@ fn bind_video_memories<T: Handle + Copy>(
 
     let mut memories = Vec::new();
     let mut bind_infos = Vec::new();
-    for (i, req) in reqs.iter().enumerate() {
+    for req in reqs.iter() {
         let mr = &req.memory_requirements;
         if mr.memory_type_bits == 0 {
             return Err(Error::EncoderInit("video memory requirement has no valid memory types".into()));
@@ -200,7 +213,10 @@ fn bind_video_memories<T: Handle + Copy>(
         bind_infos.push(vk::BindVideoSessionMemoryInfoKHR {
             s_type: vk::StructureType::BIND_VIDEO_SESSION_MEMORY_INFO_KHR,
             p_next: std::ptr::null(),
-            memory_bind_index: i as u32,
+            // Use the driver-reported binding index, not the array position:
+            // some drivers (NVIDIA H.265) skip empty bindings and return
+            // non-contiguous indices (e.g. 0, 2, 3, 4).
+            memory_bind_index: req.memory_bind_index,
             memory: mem,
             memory_offset: 0,
             memory_size: mr.size,
@@ -227,7 +243,7 @@ fn bind_video_memories<T: Handle + Copy>(
     Ok(memories)
 }
 
-fn create_video_image(
+pub(crate) fn create_video_image(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     extent: vk::Extent3D,
@@ -255,7 +271,7 @@ fn create_video_image(
     Ok((image, mem))
 }
 
-fn create_full_image_view(device: &ash::Device, image: vk::Image) -> Result<vk::ImageView, Error> {
+pub(crate) fn create_full_image_view(device: &ash::Device, image: vk::Image) -> Result<vk::ImageView, Error> {
     let info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
@@ -270,7 +286,7 @@ fn create_full_image_view(device: &ash::Device, image: vk::Image) -> Result<vk::
         .map_err(|e| Error::Vulkan(format!("create_image_view: {e}")))
 }
 
-fn create_host_buffer(
+pub(crate) fn create_host_buffer(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
@@ -959,26 +975,43 @@ impl EncodeSession {
         };
         unsafe { dev.cmd_pipeline_barrier2(cmd, &dep) };
 
-        let copy_region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0, // tightly packed
-            buffer_image_height: height,
-            image_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
+        // NV12 is a multi-plane format: each plane needs its own copy region.
+        let y_size = (width as u64) * (height as u64);
+        let copy_regions = [
+            vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0, // tightly packed
+                buffer_image_height: height,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D { width, height, depth: 1 },
             },
-            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-            image_extent: vk::Extent3D { width, height, depth: 1 },
-        };
+            vk::BufferImageCopy {
+                buffer_offset: y_size,
+                buffer_row_length: 0, // tightly packed
+                buffer_image_height: height / 2,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D { width: width / 2, height: height / 2, depth: 1 },
+            },
+        ];
         unsafe {
             dev.cmd_copy_buffer_to_image(
                 cmd,
                 self.staging_buffer,
                 self.input_image,
                 vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-                &[copy_region],
+                &copy_regions,
             )
         };
         eprintln!("[ENC] frame {index}: copied");
