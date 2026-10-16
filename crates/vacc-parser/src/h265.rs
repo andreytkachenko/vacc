@@ -293,6 +293,11 @@ impl H265Parser {
         self.active_sps.as_ref()
     }
 
+    /// Returns a reference to the active VPS, if any.
+    pub fn active_vps(&self) -> Option<&vacc_core::picture::H265Vps> {
+        self.active_vps.as_ref()
+    }
+
     /// Returns a reference to the active PPS, if any.
     pub fn active_pps(&self) -> Option<&vacc_core::picture::H265Pps> {
         self.active_pps.as_ref()

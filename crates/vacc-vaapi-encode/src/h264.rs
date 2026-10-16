@@ -52,7 +52,8 @@ impl BitWriter {
 
     /// Write a signed Exp-Golomb value.
     pub fn put_se(&mut self, v: i32) {
-        let ue = if v < 0 { (-2 * v) as u32 } else { (2 * v) as u32 };
+        // ITU-T signed Exp-Golomb: codeNum = 2v-1 (v>0), -2v (v<=0).
+        let ue = if v > 0 { (2 * v - 1) as u32 } else { (-2 * v) as u32 };
         self.put_ue(ue);
     }
 
@@ -241,7 +242,7 @@ mod tests {
         w.put_se(-1);
         w.put_se(3);
         let bits = w.valid_bits();
-        // ue(0)=1, ue(1)=3('010'), ue(7)=7, se(-1)=ue(1)=3, se(3)=ue(6)=5 => 19 bits
+        // ue(0)=1, ue(1)=3('010'), ue(7)=7, se(-1)=ue(2)=3, se(3)=ue(5)=5 => 19 bits
         assert_eq!(bits, 19);
     }
 

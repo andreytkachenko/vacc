@@ -3,7 +3,7 @@
 //! Requires a VA display with HEVC Main encode support; skipped otherwise.
 
 use std::io::Write;
-use vacc_core::encoder::{Encoder, EncoderConfig, InputFrame};
+use vacc_core::encoder::{EncodedFrame, Encoder, EncoderConfig, InputFrame};
 use vacc_core::VideoCodec;
 use vacc_vaapi_encode::VaapiEncoder;
 
@@ -35,12 +35,12 @@ fn nal_types(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {
-        if &data[i..i + 4] == [0, 0, 0, 1] {
+        if data[i..i + 4] == [0, 0, 0, 1] {
             if i + 4 < data.len() {
                 out.push((data[i + 4] >> 1) & 0x3F);
             }
             i += 4;
-        } else if &data[i..i + 3] == [0, 0, 1] && (i == 0 || data[i - 1] != 0) {
+        } else if data[i..i + 3] == [0, 0, 1] && (i == 0 || data[i - 1] != 0) {
             if i + 3 < data.len() {
                 out.push((data[i + 3] >> 1) & 0x3F);
             }
@@ -74,45 +74,68 @@ fn encode_h265_10_frames() {
     assert_eq!(info.coded_size.width, W);
     assert_eq!(info.coded_size.height, H);
 
-    let mut out = Vec::new();
+    // B-frame reordering: a mini-GOP's anchor must be encoded *before* the B
+    // frames that reference it, so `encode()` returns AUs in decode order and
+    // may emit several (a completed mini-GOP) or none (frame still buffered)
+    // per call. Accumulate every AU across all calls plus flush().
+    let mut all: Vec<EncodedFrame> = Vec::new();
     for i in 0..NFRAMES {
         let (y, uv) = make_frame(i);
         let frame = InputFrame::packed(W, H, &y, &uv);
         let aus = enc.encode(&frame, (i as i64) * 33_333_333).unwrap();
-        assert_eq!(aus.len(), 1, "frame {i}: GPU backends emit exactly one AU");
-        let encoded = &aus[0];
-        assert!(!encoded.data.is_empty(), "frame {i} produced no data");
-        assert_eq!(encoded.frame_index, i);
-        assert_eq!(encoded.is_idr, i == 0);
-        // Annex B: must start with a start code.
-        let sc = encoded
-            .data
-            .windows(4)
-            .position(|w| w == [0, 0, 0, 1])
-            .unwrap_or_else(|| panic!("frame {i}: no start code in output"));
-        assert!(sc <= 4, "start code not at beginning (offset {sc})");
-        // HEVC NAL types: 19 = IDR_W_RADL, 1 = TRAIL_N; the first access unit
-        // also carries VPS(32)/SPS(33)/PPS(34).
-        let nals = nal_types(&encoded.data);
-        assert!(!nals.is_empty(), "frame {i}: no NAL units found");
-        if i == 0 {
+        for au in &aus {
+            assert!(!au.data.is_empty(), "frame {} produced no data", au.frame_index);
+            // Annex B: must start with a start code.
+            let sc = au.data
+                .windows(4)
+                .position(|w| w == [0, 0, 0, 1])
+                .unwrap_or_else(|| panic!("frame {}: no start code in output", au.frame_index));
+            assert!(sc <= 4, "start code not at beginning (offset {sc})");
+            let nals = nal_types(&au.data);
+            assert!(!nals.is_empty(), "frame {}: no NAL units found", au.frame_index);
+            // DTS contract: never ahead of the presentation timestamp.
             assert!(
-                nals.contains(&19),
-                "first frame must contain IDR_W_RADL, got {nals:?}"
-            );
-        } else {
-            assert!(
-                nals.iter().any(|&t| t <= 21 && t != 0),
-                "frame {i}: no VCL NAL, got {nals:?}"
+                au.dts <= au.timestamp,
+                "frame {}: dts {} > timestamp {}",
+                au.frame_index,
+                au.dts,
+                au.timestamp
             );
         }
-        out.extend_from_slice(&encoded.data);
+        all.extend(aus);
     }
-    enc.flush().unwrap();
+    all.extend(enc.flush().unwrap());
+
+    // Every input frame is emitted exactly once (decode order differs).
+    assert_eq!(all.len() as u32, NFRAMES, "expected {NFRAMES} AUs, got {}", all.len());
+    let mut idxs: Vec<u32> = all.iter().map(|f| f.frame_index).collect();
+    idxs.sort_unstable();
+    assert_eq!(idxs, (0..NFRAMES).collect::<Vec<_>>(), "each frame emitted exactly once");
+
+    // First AU is the IDR and carries VPS(32)/SPS(33)/PPS(34) + IDR_W_RADL(19).
+    let first = &all[0];
+    assert_eq!(first.frame_index, 0);
+    assert!(first.is_idr, "first AU must be IDR");
+    let nals0 = nal_types(&first.data);
+    for t in [32u8, 33, 34, 19] {
+        assert!(nals0.contains(&t), "IDR AU missing NAL type {t}: {nals0:?}");
+    }
+
+    // Decode order for 10 frames with bf=2: IDR then mini-GOPs [anchor,B,B].
+    let order: Vec<u32> = all.iter().map(|f| f.frame_index).collect();
+    assert_eq!(
+        order,
+        vec![0, 3, 1, 2, 6, 4, 5, 9, 7, 8],
+        "decode order mismatch: {order:?}"
+    );
 
     // Write for external validation (ffmpeg / project oracle).
+    let mut out = Vec::new();
+    for f in &all {
+        out.extend_from_slice(&f.data);
+    }
     let path = std::env::temp_dir().join("vacc_vaenc_test.hevc");
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&out).unwrap();
+    let mut fh = std::fs::File::create(&path).unwrap();
+    fh.write_all(&out).unwrap();
     eprintln!("wrote {} bytes to {}", out.len(), path.display());
 }

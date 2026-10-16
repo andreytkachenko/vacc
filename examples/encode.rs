@@ -80,10 +80,19 @@ fn parse_args() -> Args {
 
 /// Synthetic NV12 frame (moving gradient luma, drifting chroma).
 fn make_frame(frame_idx: u32, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+    let pattern = std::env::var("VACC_TEST_PATTERN").unwrap_or_default();
     let mut y = vec![0u8; (w * h) as usize];
     for py in 0..h {
         for px in 0..w {
-            y[(py * w + px) as usize] = ((px * 7 + py * 3 + frame_idx * 16) % 256) as u8;
+            let v = match pattern.as_str() {
+                // constant 16x16 blocks: pure-DC content
+                "checker16" => ((px / 16 * 47 + py / 16 * 31 + frame_idx * 16) % 256) as u8,
+                // uniform: uni:<value>
+                p if p.starts_with("uni:") => p[4..].parse::<u8>().unwrap_or(128),
+                // per-pixel gradient (default)
+                _ => ((px * 7 + py * 3 + frame_idx * 16) % 256) as u8,
+            };
+            y[(py * w + px) as usize] = v;
         }
     }
     let mut uv = vec![0u8; (w * h / 2) as usize];
